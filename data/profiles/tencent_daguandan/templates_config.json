@@ -1,0 +1,2285 @@
+{
+  "schema_version": 2,
+  "templates": [
+    {
+      "sample_id": "rank_a_001",
+      "kind": "rank",
+      "label": "A",
+      "file": "templates/rank/A_hand.png",
+      "source_image": "shot_20260730_142649_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        372,
+        510,
+        41,
+        50
+      ],
+      "ratio_box": [
+        0.290625,
+        0.708333,
+        0.032031,
+        0.069444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_6_001",
+      "kind": "rank",
+      "label": "6",
+      "file": "templates/rank/6_hand.png",
+      "source_image": "shot_20260730_142649_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        738,
+        509,
+        36,
+        51
+      ],
+      "ratio_box": [
+        0.576562,
+        0.706944,
+        0.028125,
+        0.070833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_8_001",
+      "kind": "rank",
+      "label": "8",
+      "file": "templates/rank/8_hand.png",
+      "source_image": "shot_20260730_142649_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        664,
+        509,
+        37,
+        51
+      ],
+      "ratio_box": [
+        0.51875,
+        0.706944,
+        0.028906,
+        0.070833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_9_001",
+      "kind": "rank",
+      "label": "9",
+      "file": "templates/rank/9_hand.png",
+      "source_image": "shot_20260730_142649_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        592,
+        509,
+        35,
+        51
+      ],
+      "ratio_box": [
+        0.4625,
+        0.706944,
+        0.027344,
+        0.070833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_j_001",
+      "kind": "rank",
+      "label": "J",
+      "file": "templates/rank/J_hand.png",
+      "source_image": "shot_20260730_142649_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        519,
+        509,
+        36,
+        51
+      ],
+      "ratio_box": [
+        0.405469,
+        0.706944,
+        0.028125,
+        0.070833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_5_001",
+      "kind": "rank",
+      "label": "5",
+      "file": "templates/rank/5_hand.png",
+      "source_image": "shot_20260730_142649_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        811,
+        509,
+        35,
+        50
+      ],
+      "ratio_box": [
+        0.633594,
+        0.706944,
+        0.027344,
+        0.069444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "auto_rank_k",
+      "kind": "rank",
+      "label": "K",
+      "file": "templates/rank/K_hand.png",
+      "source_image": "",
+      "source_role": "hand",
+      "abs_box": [
+        0,
+        0,
+        40,
+        50
+      ],
+      "ratio_box": [
+        0.0,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "base_size": [
+        40,
+        50
+      ]
+    },
+    {
+      "sample_id": "rank_3_001",
+      "kind": "rank",
+      "label": "3",
+      "file": "templates/rank/3_play.png",
+      "source_image": "shot_20260730_142635_001.png",
+      "source_role": "play",
+      "abs_box": [
+        507,
+        232,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.396094,
+        0.322222,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_4_001",
+      "kind": "rank",
+      "label": "4",
+      "file": "templates/rank/4_play.png",
+      "source_image": "shot_20260730_142635_001.png",
+      "source_role": "play",
+      "abs_box": [
+        621,
+        232,
+        28,
+        38
+      ],
+      "ratio_box": [
+        0.485156,
+        0.322222,
+        0.021875,
+        0.052778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_2_001",
+      "kind": "rank",
+      "label": "2",
+      "file": "templates/rank/2_hand.png",
+      "source_image": "shot_20260730_230957_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        701,
+        510,
+        36,
+        50
+      ],
+      "ratio_box": [
+        0.547656,
+        0.708333,
+        0.028125,
+        0.069444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_7_001",
+      "kind": "rank",
+      "label": "7",
+      "file": "templates/rank/7_play.png",
+      "source_image": "shot_20260730_230947_001.png",
+      "source_role": "play",
+      "abs_box": [
+        545,
+        112,
+        27,
+        38
+      ],
+      "ratio_box": [
+        0.425781,
+        0.155556,
+        0.021094,
+        0.052778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_q_001",
+      "kind": "rank",
+      "label": "Q",
+      "file": "templates/rank/Q_play.png",
+      "source_image": "shot_20260730_230922_001.png",
+      "source_role": "play",
+      "abs_box": [
+        189,
+        197,
+        31,
+        43
+      ],
+      "ratio_box": [
+        0.147656,
+        0.273611,
+        0.024219,
+        0.059722
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_4_002",
+      "kind": "rank",
+      "label": "4",
+      "file": "templates/rank/4_play_002.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        229,
+        199,
+        29,
+        39
+      ],
+      "ratio_box": [
+        0.178906,
+        0.276389,
+        0.022656,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_k_002",
+      "kind": "rank",
+      "label": "K",
+      "file": "templates/rank/K_play.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        933,
+        199,
+        30,
+        39
+      ],
+      "ratio_box": [
+        0.728906,
+        0.276389,
+        0.023438,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_001",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_play.png",
+      "source_image": "shot_20260730_230847_001.png",
+      "source_role": "play",
+      "abs_box": [
+        586,
+        100,
+        110,
+        128
+      ],
+      "ratio_box": [
+        0.457813,
+        0.138889,
+        0.085938,
+        0.177778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_6_002",
+      "kind": "rank",
+      "label": "6",
+      "file": "templates/rank/6_play.png",
+      "source_image": "shot_20260730_230842_001.png",
+      "source_role": "play",
+      "abs_box": [
+        603,
+        112,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.471094,
+        0.155556,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_spade_001",
+      "kind": "suit",
+      "label": "spade",
+      "file": "templates/suit/spade_hand.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        705,
+        521,
+        31,
+        31
+      ],
+      "ratio_box": [
+        0.550781,
+        0.723611,
+        0.024219,
+        0.043056
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_spade_002",
+      "kind": "suit",
+      "label": "spade",
+      "file": "templates/suit/spade_hand_002.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        704,
+        579,
+        61,
+        62
+      ],
+      "ratio_box": [
+        0.55,
+        0.804167,
+        0.047656,
+        0.086111
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_diamond_001",
+      "kind": "suit",
+      "label": "diamond",
+      "file": "templates/suit/diamond_hand.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        632,
+        520,
+        30,
+        32
+      ],
+      "ratio_box": [
+        0.49375,
+        0.722222,
+        0.023438,
+        0.044444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_club_001",
+      "kind": "suit",
+      "label": "club",
+      "file": "templates/suit/club_hand.png",
+      "source_image": "shot_20260730_230957_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        741,
+        520,
+        31,
+        32
+      ],
+      "ratio_box": [
+        0.578906,
+        0.722222,
+        0.024219,
+        0.044444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_club_002",
+      "kind": "suit",
+      "label": "club",
+      "file": "templates/suit/club_hand_002.png",
+      "source_image": "shot_20260730_230957_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        743,
+        580,
+        57,
+        59
+      ],
+      "ratio_box": [
+        0.580469,
+        0.805556,
+        0.044531,
+        0.081944
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_heart_001",
+      "kind": "suit",
+      "label": "heart",
+      "file": "templates/suit/heart_play.png",
+      "source_image": "shot_20260730_230917_001.png",
+      "source_role": "play",
+      "abs_box": [
+        1009,
+        236,
+        28,
+        27
+      ],
+      "ratio_box": [
+        0.788281,
+        0.327778,
+        0.021875,
+        0.0375
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_diamond_002",
+      "kind": "suit",
+      "label": "diamond",
+      "file": "templates/suit/diamond_play.png",
+      "source_image": "shot_20260730_230917_001.png",
+      "source_role": "play",
+      "abs_box": [
+        1047,
+        235,
+        28,
+        29
+      ],
+      "ratio_box": [
+        0.817969,
+        0.326389,
+        0.021875,
+        0.040278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_diamond_003",
+      "kind": "suit",
+      "label": "diamond",
+      "file": "templates/suit/diamond_play_002.png",
+      "source_image": "shot_20260730_230917_001.png",
+      "source_role": "play",
+      "abs_box": [
+        1080,
+        254,
+        47,
+        49
+      ],
+      "ratio_box": [
+        0.84375,
+        0.352778,
+        0.036719,
+        0.068056
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_spade_003",
+      "kind": "suit",
+      "label": "spade",
+      "file": "templates/suit/spade_play.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        658,
+        268,
+        29,
+        29
+      ],
+      "ratio_box": [
+        0.514062,
+        0.372222,
+        0.022656,
+        0.040278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_spade_004",
+      "kind": "suit",
+      "label": "spade",
+      "file": "templates/suit/spade_play_002.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        691,
+        287,
+        48,
+        49
+      ],
+      "ratio_box": [
+        0.539844,
+        0.398611,
+        0.0375,
+        0.068056
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_club_003",
+      "kind": "suit",
+      "label": "club",
+      "file": "templates/suit/club_play.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        620,
+        268,
+        28,
+        29
+      ],
+      "ratio_box": [
+        0.484375,
+        0.372222,
+        0.021875,
+        0.040278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_heart_002",
+      "kind": "suit",
+      "label": "heart",
+      "file": "templates/suit/heart_play_002.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        543,
+        268,
+        28,
+        28
+      ],
+      "ratio_box": [
+        0.424219,
+        0.372222,
+        0.021875,
+        0.038889
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_diamond_004",
+      "kind": "suit",
+      "label": "diamond",
+      "file": "templates/suit/diamond_play_003.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        152,
+        235,
+        27,
+        29
+      ],
+      "ratio_box": [
+        0.11875,
+        0.326389,
+        0.021094,
+        0.040278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_10_001",
+      "kind": "rank",
+      "label": "10",
+      "file": "templates/rank/10_hand.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        660,
+        509,
+        46,
+        51
+      ],
+      "ratio_box": [
+        0.515625,
+        0.706944,
+        0.035937,
+        0.070833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_002",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_play_002.png",
+      "source_image": "shot_20260730_230847_001.png",
+      "source_role": "play",
+      "abs_box": [
+        576,
+        92,
+        125,
+        145
+      ],
+      "ratio_box": [
+        0.45,
+        0.127778,
+        0.097656,
+        0.201389
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "anchor_table_anchor_1_001",
+      "kind": "anchor",
+      "label": "table_anchor_1",
+      "file": "templates/anchor/table_anchor_1.png",
+      "source_image": "shot_20260730_230827_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1150,
+        2,
+        52,
+        70
+      ],
+      "ratio_box": [
+        0.898438,
+        0.002778,
+        0.040625,
+        0.097222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "anchor_table_anchor_2_001",
+      "kind": "anchor",
+      "label": "table_anchor_2",
+      "file": "templates/anchor/table_anchor_2.png",
+      "source_image": "shot_20260730_230827_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        16,
+        5,
+        54,
+        70
+      ],
+      "ratio_box": [
+        0.0125,
+        0.006944,
+        0.042188,
+        0.097222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_spade_005",
+      "kind": "suit",
+      "label": "spade",
+      "file": "templates/suit/spade_hand_003.png",
+      "source_image": "shot_20260730_230957_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        523,
+        517,
+        33,
+        40
+      ],
+      "ratio_box": [
+        0.408594,
+        0.718056,
+        0.025781,
+        0.055556
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_001",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_play.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "play",
+      "abs_box": [
+        1033,
+        186,
+        107,
+        132
+      ],
+      "ratio_box": [
+        0.807031,
+        0.258333,
+        0.083594,
+        0.183333
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_002",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_play_002.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "play",
+      "abs_box": [
+        1046,
+        198,
+        82,
+        108
+      ],
+      "ratio_box": [
+        0.817187,
+        0.275,
+        0.064062,
+        0.15
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_2_002",
+      "kind": "rank",
+      "label": "2",
+      "file": "templates/rank/2_play.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        268,
+        199,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.209375,
+        0.276389,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_2_003",
+      "kind": "rank",
+      "label": "2",
+      "file": "templates/rank/2_play_002.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        306,
+        199,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.239063,
+        0.276389,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_club_004",
+      "kind": "suit",
+      "label": "club",
+      "file": "templates/suit/club_play_002.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        266,
+        235,
+        29,
+        29
+      ],
+      "ratio_box": [
+        0.207813,
+        0.326389,
+        0.022656,
+        0.040278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_spade_006",
+      "kind": "suit",
+      "label": "spade",
+      "file": "templates/suit/spade_play_003.png",
+      "source_image": "shot_20260730_230907_001.png",
+      "source_role": "play",
+      "abs_box": [
+        304,
+        235,
+        29,
+        29
+      ],
+      "ratio_box": [
+        0.2375,
+        0.326389,
+        0.022656,
+        0.040278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_10_002",
+      "kind": "rank",
+      "label": "10",
+      "file": "templates/rank/10_play.png",
+      "source_image": "shot_20260730_230922_001.png",
+      "source_role": "play",
+      "abs_box": [
+        579,
+        112,
+        35,
+        39
+      ],
+      "ratio_box": [
+        0.452344,
+        0.155556,
+        0.027344,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_3_002",
+      "kind": "rank",
+      "label": "3",
+      "file": "templates/rank/3_hand.png",
+      "source_image": "shot_20260730_230852_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        666,
+        510,
+        34,
+        50
+      ],
+      "ratio_box": [
+        0.520312,
+        0.708333,
+        0.026562,
+        0.069444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_a_002",
+      "kind": "rank",
+      "label": "A",
+      "file": "templates/rank/A_play.png",
+      "source_image": "shot_20260730_230847_001.png",
+      "source_role": "play",
+      "abs_box": [
+        1047,
+        200,
+        33,
+        38
+      ],
+      "ratio_box": [
+        0.817969,
+        0.277778,
+        0.025781,
+        0.052778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_9_002",
+      "kind": "rank",
+      "label": "9",
+      "file": "templates/rank/9_play.png",
+      "source_image": "shot_20260730_230827_001.png",
+      "source_role": "play",
+      "abs_box": [
+        526,
+        232,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.410938,
+        0.322222,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_7_002",
+      "kind": "rank",
+      "label": "7",
+      "file": "templates/rank/7_hand.png",
+      "source_image": "shot_20260730_230827_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        629,
+        510,
+        35,
+        50
+      ],
+      "ratio_box": [
+        0.491406,
+        0.708333,
+        0.027344,
+        0.069444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_5_002",
+      "kind": "rank",
+      "label": "5",
+      "file": "templates/rank/5_play.png",
+      "source_image": "shot_20260730_230727_001.png",
+      "source_role": "play",
+      "abs_box": [
+        153,
+        199,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.119531,
+        0.276389,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_8_002",
+      "kind": "rank",
+      "label": "8",
+      "file": "templates/rank/8_play.png",
+      "source_image": "shot_20260730_230817_001.png",
+      "source_role": "play",
+      "abs_box": [
+        525,
+        232,
+        28,
+        39
+      ],
+      "ratio_box": [
+        0.410156,
+        0.322222,
+        0.021875,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_j_002",
+      "kind": "rank",
+      "label": "J",
+      "file": "templates/rank/J_play.png",
+      "source_image": "shot_20260730_230802_001.png",
+      "source_role": "play",
+      "abs_box": [
+        153,
+        199,
+        27,
+        39
+      ],
+      "ratio_box": [
+        0.119531,
+        0.276389,
+        0.021094,
+        0.054167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_q_002",
+      "kind": "rank",
+      "label": "Q",
+      "file": "templates/rank/Q_play_002.png",
+      "source_image": "shot_20260730_230802_001.png",
+      "source_role": "play",
+      "abs_box": [
+        408,
+        507,
+        39,
+        56
+      ],
+      "ratio_box": [
+        0.31875,
+        0.704167,
+        0.030469,
+        0.077778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_q_003",
+      "kind": "rank",
+      "label": "Q",
+      "file": "templates/rank/Q_hand.png",
+      "source_image": "shot_20260730_230802_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        408,
+        507,
+        39,
+        56
+      ],
+      "ratio_box": [
+        0.31875,
+        0.704167,
+        0.030469,
+        0.077778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_4_003",
+      "kind": "rank",
+      "label": "4",
+      "file": "templates/rank/4_hand.png",
+      "source_image": "shot_20260730_230802_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        774,
+        509,
+        37,
+        51
+      ],
+      "ratio_box": [
+        0.604688,
+        0.706944,
+        0.028906,
+        0.070833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_003",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_hand.png",
+      "source_image": "shot_20260801_090410_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        520,
+        513,
+        71,
+        128
+      ],
+      "ratio_box": [
+        0.40625,
+        0.7125,
+        0.055469,
+        0.177778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_pass_001",
+      "kind": "button",
+      "label": "pass",
+      "file": "templates/button/pass.png",
+      "source_image": "shot_20260801_090350_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        276,
+        234,
+        210,
+        81
+      ],
+      "ratio_box": [
+        0.215625,
+        0.325,
+        0.164062,
+        0.1125
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_passed_001",
+      "kind": "status",
+      "label": "passed",
+      "file": "templates/status/passed.png",
+      "source_image": "shot_20260801_090210_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1038,
+        223,
+        97,
+        54
+      ],
+      "ratio_box": [
+        0.810937,
+        0.309722,
+        0.075781,
+        0.075
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_pass_002",
+      "kind": "button",
+      "label": "pass",
+      "file": "templates/button/pass_002.png",
+      "source_image": "shot_20260801_090155_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        290,
+        238,
+        197,
+        77
+      ],
+      "ratio_box": [
+        0.226562,
+        0.330556,
+        0.153906,
+        0.106944
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_hint_001",
+      "kind": "button",
+      "label": "hint",
+      "file": "templates/button/hint.png",
+      "source_image": "shot_20260801_090155_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        598,
+        240,
+        192,
+        75
+      ],
+      "ratio_box": [
+        0.467187,
+        0.333333,
+        0.15,
+        0.104167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_play_cards_001",
+      "kind": "button",
+      "label": "play_cards",
+      "file": "templates/button/play_cards.png",
+      "source_image": "shot_20260801_090155_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        789,
+        231,
+        202,
+        87
+      ],
+      "ratio_box": [
+        0.616406,
+        0.320833,
+        0.157812,
+        0.120833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_passed_002",
+      "kind": "status",
+      "label": "passed",
+      "file": "templates/status/passed_002.png",
+      "source_image": "shot_20260801_090205_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1034,
+        220,
+        104,
+        61
+      ],
+      "ratio_box": [
+        0.807813,
+        0.305556,
+        0.08125,
+        0.084722
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_cannot_beat_001",
+      "kind": "button",
+      "label": "cannot_beat",
+      "file": "templates/button/cannot_beat.png",
+      "source_image": "shot_20260730_231007_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        599,
+        237,
+        203,
+        78
+      ],
+      "ratio_box": [
+        0.467969,
+        0.329167,
+        0.158594,
+        0.108333
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_arrange_001",
+      "kind": "button",
+      "label": "arrange",
+      "file": "templates/button/arrange.png",
+      "source_image": "shot_20260801_090150_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        823,
+        653,
+        148,
+        52
+      ],
+      "ratio_box": [
+        0.642969,
+        0.906944,
+        0.115625,
+        0.072222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_quick_arrange_001",
+      "kind": "button",
+      "label": "quick_arrange",
+      "file": "templates/button/quick_arrange.png",
+      "source_image": "shot_20260801_090150_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        984,
+        653,
+        142,
+        52
+      ],
+      "ratio_box": [
+        0.76875,
+        0.906944,
+        0.110937,
+        0.072222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_chat_001",
+      "kind": "button",
+      "label": "chat",
+      "file": "templates/button/chat.png",
+      "source_image": "shot_20260801_090150_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1138,
+        650,
+        142,
+        55
+      ],
+      "ratio_box": [
+        0.889062,
+        0.902778,
+        0.110937,
+        0.076389
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_more_001",
+      "kind": "button",
+      "label": "more",
+      "file": "templates/button/more.png",
+      "source_image": "shot_20260801_090150_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        13,
+        10,
+        52,
+        63
+      ],
+      "ratio_box": [
+        0.010156,
+        0.013889,
+        0.040625,
+        0.0875
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_rules_001",
+      "kind": "button",
+      "label": "rules",
+      "file": "templates/button/rules.png",
+      "source_image": "shot_20260801_090150_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1143,
+        6,
+        57,
+        63
+      ],
+      "ratio_box": [
+        0.892969,
+        0.008333,
+        0.044531,
+        0.0875
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_change_table_001",
+      "kind": "button",
+      "label": "change_table",
+      "file": "templates/button/change_table.png",
+      "source_image": "shot_20260801_013428_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        355,
+        577,
+        239,
+        86
+      ],
+      "ratio_box": [
+        0.277344,
+        0.801389,
+        0.186719,
+        0.119444
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_first_play_001",
+      "kind": "status",
+      "label": "first_play",
+      "file": "templates/status/first_play.png",
+      "source_image": "shot_20260801_013353_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1133,
+        198,
+        32,
+        35
+      ],
+      "ratio_box": [
+        0.885156,
+        0.275,
+        0.025,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "anchor_game_logo_anchor_001",
+      "kind": "anchor",
+      "label": "game_logo_anchor",
+      "file": "templates/anchor/game_logo_anchor.png",
+      "source_image": "shot_20260730_231012_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        204,
+        6,
+        59,
+        64
+      ],
+      "ratio_box": [
+        0.159375,
+        0.008333,
+        0.046094,
+        0.088889
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "effect_bomb_001",
+      "kind": "effect",
+      "label": "bomb",
+      "file": "templates/effect/bomb.png",
+      "source_image": "shot_20260730_230932_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        561,
+        5,
+        167,
+        85
+      ],
+      "ratio_box": [
+        0.438281,
+        0.006944,
+        0.130469,
+        0.118056
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "effect_triple_pair_001",
+      "kind": "effect",
+      "label": "triple_pair",
+      "file": "templates/effect/triple_pair.png",
+      "source_image": "shot_20260730_230822_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        493,
+        270,
+        195,
+        75
+      ],
+      "ratio_box": [
+        0.385156,
+        0.375,
+        0.152344,
+        0.104167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "effect_consecutive_pairs_001",
+      "kind": "effect",
+      "label": "consecutive_pairs",
+      "file": "templates/effect/consecutive_pairs.png",
+      "source_image": "shot_20260801_090410_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        897,
+        251,
+        168,
+        53
+      ],
+      "ratio_box": [
+        0.700781,
+        0.348611,
+        0.13125,
+        0.073611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "anchor_game_logo_anchor_002",
+      "kind": "anchor",
+      "label": "game_logo_anchor",
+      "file": "templates/anchor/game_logo_anchor_002.png",
+      "source_image": "shot_20260801_090415_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        1153,
+        6,
+        90,
+        70
+      ],
+      "ratio_box": [
+        0.900781,
+        0.008333,
+        0.070312,
+        0.097222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_continue_game_001",
+      "kind": "button",
+      "label": "continue_game",
+      "file": "templates/button/continue_game.png",
+      "source_image": "shot_20260801_090415_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        698,
+        586,
+        235,
+        75
+      ],
+      "ratio_box": [
+        0.545312,
+        0.813889,
+        0.183594,
+        0.104167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_first_play_002",
+      "kind": "status",
+      "label": "first_play",
+      "file": "templates/status/first_play_002.png",
+      "source_image": "shot_20260730_230641_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        142,
+        225,
+        93,
+        52
+      ],
+      "ratio_box": [
+        0.110937,
+        0.3125,
+        0.072656,
+        0.072222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_heart_003",
+      "kind": "suit",
+      "label": "heart",
+      "file": "templates/suit/heart_hand.png",
+      "source_image": "shot_20260801_013033_001.png",
+      "source_role": "hand",
+      "abs_box": [
+        669,
+        516,
+        32,
+        36
+      ],
+      "ratio_box": [
+        0.522656,
+        0.716667,
+        0.025,
+        0.05
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_super_double_001",
+      "kind": "button",
+      "label": "super_double",
+      "file": "templates/button/super_double.png",
+      "source_image": "shot_20260801_013033_001.png",
+      "source_role": "generic",
+      "abs_box": [
+        518,
+        245,
+        171,
+        62
+      ],
+      "ratio_box": [
+        0.404687,
+        0.340278,
+        0.133594,
+        0.086111
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "suit_heart_004",
+      "kind": "suit",
+      "label": "heart",
+      "file": "templates/suit/heart_level.png",
+      "source_image": "shot_20260801_013038_001.png",
+      "source_role": "level",
+      "abs_box": [
+        231,
+        517,
+        34,
+        36
+      ],
+      "ratio_box": [
+        0.180469,
+        0.718056,
+        0.026562,
+        0.05
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_9_003",
+      "kind": "rank",
+      "label": "9",
+      "file": "templates/rank/9_level.png",
+      "source_image": "shot_20260730_230636_001.png",
+      "source_role": "level",
+      "abs_box": [
+        151,
+        38,
+        27,
+        35
+      ],
+      "ratio_box": [
+        0.117969,
+        0.052778,
+        0.021094,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_7_003",
+      "kind": "rank",
+      "label": "7",
+      "file": "templates/rank/7_level.png",
+      "source_image": "shot_20260801_013238_001.png",
+      "source_role": "level",
+      "abs_box": [
+        151,
+        39,
+        27,
+        33
+      ],
+      "ratio_box": [
+        0.117969,
+        0.054167,
+        0.021094,
+        0.045833
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_8_003",
+      "kind": "rank",
+      "label": "8",
+      "file": "templates/rank/8_level.png",
+      "source_image": "shot_20260801_090350_001.png",
+      "source_role": "level",
+      "abs_box": [
+        151,
+        38,
+        28,
+        35
+      ],
+      "ratio_box": [
+        0.117969,
+        0.052778,
+        0.021875,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_003",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_hand.png",
+      "source_image": "000001.png",
+      "source_role": "hand",
+      "abs_box": [
+        155,
+        510,
+        74,
+        128
+      ],
+      "ratio_box": [
+        0.121094,
+        0.708333,
+        0.057813,
+        0.177778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_q_004",
+      "kind": "rank",
+      "label": "Q",
+      "file": "templates/rank/Q_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        86,
+        38,
+        33,
+        35
+      ],
+      "ratio_box": [
+        0.067187,
+        0.052778,
+        0.025781,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_004",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_hand_partial.png",
+      "source_image": "000001.png",
+      "source_role": "hand_partial",
+      "abs_box": [
+        152,
+        466,
+        80,
+        44
+      ],
+      "ratio_box": [
+        0.11875,
+        0.647222,
+        0.0625,
+        0.061111
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_3_003",
+      "kind": "rank",
+      "label": "3",
+      "file": "templates/rank/3_level.png",
+      "source_image": "000003.png",
+      "source_role": "level",
+      "abs_box": [
+        90,
+        38,
+        27,
+        35
+      ],
+      "ratio_box": [
+        0.070312,
+        0.052778,
+        0.021094,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_6_003",
+      "kind": "rank",
+      "label": "6",
+      "file": "templates/rank/6_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        89,
+        38,
+        28,
+        35
+      ],
+      "ratio_box": [
+        0.069531,
+        0.052778,
+        0.021875,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "timer_active_001",
+      "kind": "timer",
+      "label": "active",
+      "file": "templates/timer/active.png",
+      "source_image": "000001.png",
+      "source_role": "generic",
+      "abs_box": [
+        488,
+        223,
+        109,
+        92
+      ],
+      "ratio_box": [
+        0.38125,
+        0.309722,
+        0.085156,
+        0.127778
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_5_003",
+      "kind": "rank",
+      "label": "5",
+      "file": "templates/rank/5_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        90,
+        39,
+        26,
+        34
+      ],
+      "ratio_box": [
+        0.070312,
+        0.054167,
+        0.020313,
+        0.047222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_10_003",
+      "kind": "rank",
+      "label": "10",
+      "file": "templates/rank/10_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        80,
+        37,
+        47,
+        37
+      ],
+      "ratio_box": [
+        0.0625,
+        0.051389,
+        0.036719,
+        0.051389
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_4_004",
+      "kind": "rank",
+      "label": "4",
+      "file": "templates/rank/4_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        86,
+        34,
+        29,
+        34
+      ],
+      "ratio_box": [
+        0.067187,
+        0.047222,
+        0.022656,
+        0.047222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_2_004",
+      "kind": "rank",
+      "label": "2",
+      "file": "templates/rank/2_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        87,
+        34,
+        27,
+        34
+      ],
+      "ratio_box": [
+        0.067969,
+        0.047222,
+        0.021094,
+        0.047222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_j_003",
+      "kind": "rank",
+      "label": "J",
+      "file": "templates/rank/J_level.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        86,
+        39,
+        27,
+        34
+      ],
+      "ratio_box": [
+        0.067187,
+        0.054167,
+        0.021094,
+        0.047222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_004",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_hand_002.png",
+      "source_image": "000001.png",
+      "source_role": "hand",
+      "abs_box": [
+        27,
+        507,
+        43,
+        134
+      ],
+      "ratio_box": [
+        0.021094,
+        0.704167,
+        0.033594,
+        0.186111
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_005",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_hand_002.png",
+      "source_image": "000002.png",
+      "source_role": "hand",
+      "abs_box": [
+        74,
+        507,
+        41,
+        109
+      ],
+      "ratio_box": [
+        0.057813,
+        0.704167,
+        0.032031,
+        0.151389
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_j_004",
+      "kind": "rank",
+      "label": "J",
+      "file": "templates/rank/J_level_002.png",
+      "source_image": "000001.png",
+      "source_role": "level",
+      "abs_box": [
+        83,
+        38,
+        27,
+        35
+      ],
+      "ratio_box": [
+        0.064844,
+        0.052778,
+        0.021094,
+        0.048611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_double_001",
+      "kind": "button",
+      "label": "double",
+      "file": "templates/button/double.png",
+      "source_image": "game_20260804_005737/000006.png",
+      "source_role": "generic",
+      "abs_box": [
+        250,
+        235,
+        192,
+        82
+      ],
+      "ratio_box": [
+        0.195312,
+        0.326389,
+        0.15,
+        0.113889
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "button_cannot_beat_002",
+      "kind": "button",
+      "label": "cannot_beat",
+      "file": "templates/button/cannot_beat_002.png",
+      "source_image": "game_20260804_005737/000031.png",
+      "source_role": "generic",
+      "abs_box": [
+        608,
+        230,
+        199,
+        89
+      ],
+      "ratio_box": [
+        0.475,
+        0.319444,
+        0.155469,
+        0.123611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    }
+  ]
+}

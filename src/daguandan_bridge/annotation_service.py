@@ -33,6 +33,7 @@ REGION_DISPLAY_NAMES = {
     "timer_opposite": "对侧计时器",
     "timer_right": "右侧计时器",
     "timer_self": "己方计时器",
+    "button_actions": "按钮区域",
 }
 ROLE_DISPLAY_NAMES = {
     "hand": "手牌",

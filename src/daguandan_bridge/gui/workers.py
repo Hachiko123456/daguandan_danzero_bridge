@@ -68,3 +68,41 @@ class WorkerHandle(QObject):
 
     def wait(self, timeout_ms: int = 3000) -> bool:
         return bool(self.thread.wait(timeout_ms))
+
+
+class OneShotWorker(QObject):
+    """Run one potentially blocking operation outside the GUI thread."""
+
+    result = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, operation: Callable[[], Any]):
+        super().__init__()
+        self.operation = operation
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.result.emit(self.operation())
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class OneShotThread(QThread):
+    """Run one blocking operation in a thread without a movable worker object."""
+
+    result = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, operation: Callable[[], Any], parent: QObject | None = None):
+        super().__init__(parent)
+        self.operation = operation
+
+    def run(self) -> None:
+        try:
+            self.result.emit(self.operation())
+        except Exception as exc:
+            self.error.emit(str(exc))

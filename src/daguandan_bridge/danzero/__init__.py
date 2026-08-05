@@ -10,6 +10,10 @@ class DanzeroAdvisor:
     def __init__(self) -> None:
         self._advisor = LocalGuandanAdvisor("danzero")
 
+    def initialize(self) -> None:
+        """Load the DanZero model so the first advice call stays responsive."""
+        self._advisor.initialize()
+
     def recommend(
         self,
         state: GuanDanState,
