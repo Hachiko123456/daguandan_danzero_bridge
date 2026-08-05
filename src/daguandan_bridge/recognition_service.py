@@ -14,6 +14,7 @@ from .danzero.state import Seat
 from .image_io import read_image_unicode
 from .models import Box
 from .template_service import TemplateService
+from .live.turns import TURN_ORDER
 
 
 PLAY_REGION_TO_SEAT: dict[str, Seat] = {
@@ -22,7 +23,7 @@ PLAY_REGION_TO_SEAT: dict[str, Seat] = {
     "opposite_play": "opposite",
     "right_play": "right",
 }
-SEATS_IN_ORDER: tuple[Seat, ...] = ("self", "left", "opposite", "right")
+SEATS_IN_ORDER: tuple[Seat, ...] = TURN_ORDER
 BUTTON_LABELS: dict[str, str] = {
     "pass": "不出",
     "play_cards": "出牌",

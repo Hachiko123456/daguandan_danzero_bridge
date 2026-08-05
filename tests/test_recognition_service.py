@@ -10,7 +10,10 @@ from daguandan_bridge.annotation_service import AnnotationService
 from daguandan_bridge.config import PROFILES_ROOT
 from daguandan_bridge.image_io import read_image_unicode
 from daguandan_bridge.models import Box
-from daguandan_bridge.recognition_service import ScreenshotRecognitionService
+from daguandan_bridge.recognition_service import (
+    RecognizedEvent,
+    ScreenshotRecognitionService,
+)
 from daguandan_bridge.template_service import TemplateService
 
 
@@ -219,3 +222,21 @@ def test_play_templates_still_recognize_a_real_card_in_play_region():
         event.player == "self" and event.cards == ("AC",) and not event.is_pass
         for event in result.events
     )
+
+
+def test_recognized_events_follow_counter_clockwise_order_from_right_lead():
+    events = [
+        RecognizedEvent("self", ("3S",), False, 0.9, "test"),
+        RecognizedEvent("left", (), True, 0.9, "test"),
+        RecognizedEvent("right", ("4S",), False, 0.9, "test"),
+        RecognizedEvent("opposite", (), True, 0.9, "test"),
+    ]
+
+    ordered = ScreenshotRecognitionService._order_events(events, "right")
+
+    assert [event.player for event in ordered] == [
+        "right",
+        "opposite",
+        "left",
+        "self",
+    ]
