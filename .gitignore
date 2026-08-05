@@ -17,6 +17,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+.worktrees/
 
 # Project runtime output
 data/profiles/*/screenshots/
