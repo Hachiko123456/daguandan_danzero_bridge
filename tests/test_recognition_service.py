@@ -240,3 +240,59 @@ def test_recognized_events_follow_counter_clockwise_order_from_right_lead():
         "left",
         "self",
     ]
+
+
+def test_templates_are_loaded_once_until_explicit_reload(monkeypatch):
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    calls = 0
+    original = service.template_service.list_templates
+
+    def counted():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(service.template_service, "list_templates", counted)
+
+    service.recognize(image)
+    service.recognize(image)
+    service.reload_templates()
+    service.recognize(image)
+
+    assert calls == 2
+
+
+def test_targeted_play_recognition_only_returns_expected_seat():
+    image_path = (
+        PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000031.png"
+    )
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    result = service.recognize_play_region(image_path, "left", wild_rank="2")
+
+    assert result.player == "left"
+    assert result.cards == ("2S", "3S", "4S", "2H", "6S")
+    assert not result.is_pass
+    assert all(annotation.category == "play" for annotation in result.annotations)
+
+
+def test_fast_signals_are_narrow_and_keep_expected_player():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/timer/active.png", 120, 180)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signals = service.recognize_fast_signals(image, "left")
+
+    assert signals.expected_player == "left"
+    assert signals.active_player == "left"
+    assert not signals.pass_visible

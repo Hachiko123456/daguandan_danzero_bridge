@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from typing import Iterable
 
@@ -76,6 +77,26 @@ class RecognitionResult:
 
 
 @dataclass(frozen=True)
+class PlayRegionResult:
+    player: Seat
+    cards: tuple[str, ...]
+    is_pass: bool
+    confidence: float
+    diagnostics: tuple[str, ...]
+    annotations: tuple[RecognitionAnnotation, ...]
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class FastSignalResult:
+    expected_player: Seat
+    active_player: Seat | None
+    pass_visible: bool
+    self_action_buttons_visible: bool
+    effect_visible: bool
+
+
+@dataclass(frozen=True)
 class _TemplateMatch:
     label: str
     kind: str
@@ -130,6 +151,10 @@ class ScreenshotRecognitionService:
             self.annotation_service.profiles_root,
             self.annotation_service.profile_name,
         )
+        self._template_lock = RLock()
+        self._template_cache: tuple[
+            tuple[dict[str, object], np.ndarray], ...
+        ] | None = None
 
     def recognize(self, image: np.ndarray | Path) -> RecognitionResult:
         started = perf_counter()
@@ -140,7 +165,7 @@ class ScreenshotRecognitionService:
             raise ValueError("识别图片尺寸必须大于 0")
 
         regions = {region.name: region for region in self.annotation_service.list_regions()}
-        templates = self._load_templates()
+        templates = self._templates()
         diagnostics: list[str] = []
         confidences: dict[str, float] = {}
         sources: dict[str, str] = {}
@@ -327,6 +352,143 @@ class ScreenshotRecognitionService:
             buttons=buttons,
             elapsed_ms=(perf_counter() - started) * 1000,
         )
+
+    def recognize_play_region(
+        self,
+        image: np.ndarray | Path,
+        seat: Seat,
+        *,
+        wild_rank: str | None,
+    ) -> PlayRegionResult:
+        """Run the expensive card matcher only in the expected action zone."""
+
+        if seat not in SEATS_IN_ORDER:
+            raise ValueError("待识别座位无效")
+        source_image = self._source_image(image)
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        templates = self._templates()
+        region_name = next(
+            name for name, mapped_seat in PLAY_REGION_TO_SEAT.items() if mapped_seat == seat
+        )
+        cards, score, source, diagnostics, annotations = self._recognize_cards(
+            source_image,
+            regions.get(region_name),
+            templates,
+            source_roles={"play"},
+            wild_rank=wild_rank,
+            rank_threshold=self._PLAY_RANK_THRESHOLD,
+            suit_threshold=self._PLAY_SUIT_THRESHOLD,
+        )
+        if cards:
+            return PlayRegionResult(
+                player=seat,
+                cards=cards,
+                is_pass=False,
+                confidence=score,
+                diagnostics=diagnostics,
+                annotations=annotations,
+                source=source,
+            )
+        passed, pass_score, pass_source, pass_match = self._recognize_status(
+            source_image,
+            regions.get(f"passed_{seat}"),
+            templates,
+            label="passed",
+        )
+        pass_annotations: tuple[RecognitionAnnotation, ...] = ()
+        if passed and pass_match is not None:
+            pass_annotations = (
+                RecognitionAnnotation(
+                    label=pass_match.label,
+                    box=self._box_for_matches((pass_match,)),
+                    confidence=pass_match.score,
+                    category="status",
+                ),
+            )
+        return PlayRegionResult(
+            player=seat,
+            cards=(),
+            is_pass=passed,
+            confidence=pass_score,
+            diagnostics=diagnostics,
+            annotations=pass_annotations,
+            source=pass_source,
+        )
+
+    def recognize_fast_signals(
+        self,
+        image: np.ndarray | Path,
+        expected_player: Seat,
+    ) -> FastSignalResult:
+        """Read only turn/pass/button/effect signals for one capture frame."""
+
+        if expected_player not in SEATS_IN_ORDER:
+            raise ValueError("待识别座位无效")
+        source_image = self._source_image(image)
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        templates = self._templates()
+        active_player, _, _, _ = self._recognize_seat_status(
+            source_image,
+            regions,
+            templates,
+            prefix="timer",
+            kind="timer",
+            label="active",
+        )
+        pass_visible, _, _, _ = self._recognize_status(
+            source_image,
+            regions.get(f"passed_{expected_player}"),
+            templates,
+            label="passed",
+        )
+        buttons, _, _, _ = self._recognize_buttons(
+            source_image,
+            regions.get("button_actions"),
+            templates,
+        )
+        play_region_name = next(
+            name
+            for name, mapped_seat in PLAY_REGION_TO_SEAT.items()
+            if mapped_seat == expected_player
+        )
+        effects = self._matches_for_region(
+            source_image,
+            regions.get(play_region_name),
+            templates,
+            predicate=lambda raw: raw.get("kind") == "effect",
+            threshold=self._STATUS_THRESHOLD,
+            limit=1,
+        )
+        return FastSignalResult(
+            expected_player=expected_player,
+            active_player=active_player,
+            pass_visible=pass_visible,
+            self_action_buttons_visible=expected_player == "self" and bool(buttons),
+            effect_visible=bool(effects),
+        )
+
+    @staticmethod
+    def _source_image(image: np.ndarray | Path) -> np.ndarray:
+        source_image = read_image_unicode(image) if isinstance(image, Path) else image
+        if not isinstance(source_image, np.ndarray) or source_image.ndim not in {2, 3}:
+            raise ValueError("识别输入必须是有效的 OpenCV 图片")
+        if source_image.shape[0] <= 0 or source_image.shape[1] <= 0:
+            raise ValueError("识别图片尺寸必须大于 0")
+        return source_image
+
+    def _templates(self) -> tuple[tuple[dict[str, object], np.ndarray], ...]:
+        with self._template_lock:
+            if self._template_cache is None:
+                self._template_cache = self._load_templates()
+            return self._template_cache
+
+    def reload_templates(self) -> tuple[tuple[dict[str, object], np.ndarray], ...]:
+        """Replace cached files after an explicit template mutation."""
+
+        with self._template_lock:
+            loaded = self._load_templates()
+            self._template_cache = loaded
+            return loaded
 
     def _load_templates(self) -> tuple[tuple[dict[str, object], np.ndarray], ...]:
         loaded: list[tuple[dict[str, object], np.ndarray]] = []

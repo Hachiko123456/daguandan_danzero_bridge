@@ -1038,6 +1038,7 @@ class AnnotationPage(QWidget):
         except Exception as exc:
             self.status.setText(f"删除失败：{exc}")
             return
+        self.recognition_service.reload_templates()
         self._refresh_template_status()
         self.status.setText(f"已删除 {len(deleted)} 个模板，原始截图未删除")
 
@@ -1058,6 +1059,7 @@ class AnnotationPage(QWidget):
             widget.setEnabled(not busy)
 
     def _crop_succeeded(self, sample) -> None:
+        self.recognition_service.reload_templates()
         self._refresh_template_status()
         self.status.setText(f"模板已保存：{sample.sample_id}")
 
