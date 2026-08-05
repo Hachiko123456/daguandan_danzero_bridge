@@ -1,0 +1,22 @@
+[project]
+name = "daguandan-danzero-bridge"
+version = "0.1.0"
+description = "Tencent DaGuandan screenshot recorder and manual-state DanZero bridge."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "opencv-python==4.13.0.92",
+  "mss==10.2.0",
+  "pywin32==311",
+  "numpy==2.3.5",
+  "PySide6==6.11.1",
+  "PySide6-Fluent-Widgets==1.11.2",
+  "rlcard==1.2.0",
+  "torch>=2.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["daguandan_bridge*"]
+
+[tool.setuptools.package-data]
+"daguandan_bridge.danzero._vendor.guandan_rlcard" = ["baselines/danzero/q_network.ckpt"]
