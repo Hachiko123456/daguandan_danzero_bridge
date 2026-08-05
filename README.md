@@ -14,6 +14,18 @@ py -3.12 -m venv .venv
 
 也可以双击 `start_gui.bat`。在界面中先点击“开始预览”，确认画面后点击“开始本局录制”；录制按设置的间隔保存帧，点击“结束本局”关闭当前会话。
 
+## 区域标注
+
+“区域标注”页会完整显示迁移的 20 个区域配置，并递归读取本项目录制目录中的图片：
+
+```text
+data/profiles/tencent_daguandan/screenshots/
+```
+
+选择一张录制截图后会立即显示图片预览；在表格中多选区域并点击“标注选中区域”可以查看不同颜色的框和中文名称。编辑保存时请只选中一个区域；名称和角色通过中文下拉框选择，`x/y/w/h` 会写回 `regions_config.json`，比例坐标会自动重算。标注页不会打开该目录之外的图片。
+
+区域角色包括 `hand`（手牌）、`play`（出牌）、`anchor`（锚点）和 `generic`（通用）。模板记录和图片资产分别保存在 `templates_config.json` 与 `templates/`。
+
 ## 录制文件
 
 默认 profile 为 `tencent_daguandan`。每局录制都会创建独立目录：

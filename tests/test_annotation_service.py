@@ -88,6 +88,15 @@ def test_region_and_role_labels_are_chinese_but_keep_internal_keys():
     }
 
 
+def test_profile_region_config_has_no_source_image_field():
+    service = AnnotationService()
+    payload = json.loads(service.regions_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 2
+    assert len(payload["regions"]) == 20
+    assert all("source_image" not in item for item in payload["regions"])
+
+
 def test_legacy_source_image_is_ignored_and_not_written(tmp_path):
     service = _temp_service(tmp_path)
     original = service.list_regions()[0]
