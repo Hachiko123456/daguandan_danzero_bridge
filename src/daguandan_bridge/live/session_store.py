@@ -235,54 +235,68 @@ class LiveSessionStore:
     ) -> Path:
         with self._lock:
             self._ensure_writable()
-            incident_id = f"INC-{len(self._incident_ids) + 1:04d}"
+            incident_number = len(self._incident_ids) + 1
+            while (self.incidents_directory / f"INC-{incident_number:04d}").exists():
+                incident_number += 1
+            incident_id = f"INC-{incident_number:04d}"
             path = self.incidents_directory / incident_id
-            path.mkdir()
-            copied_frames = self._copy_incident_frames(path, frame_paths)
-            incident = {
-                "schema_version": SCHEMA_VERSION,
-                "incident_id": incident_id,
-                "session_id": self.session_id,
-                "reason": reason,
-                "wall_time": _now_text(),
-                "observation_ids": [
-                    item.get("id") for item in observations if item.get("id")
-                ],
-                "frames": copied_frames,
-                "state_advanced": state_before != state_after,
-                "media_manifest": "media.json",
-                "media_error": "media_error.json",
-            }
-            if trigger_ms is not None:
-                incident["trigger_ms"] = int(trigger_ms)
-            atomic_write_json(path / "incident.json", incident)
-            atomic_write_json(path / "state_before.json", state_before)
-            atomic_write_json(path / "state_after.json", state_after)
-            atomic_write_json(path / "observations.json", observations)
-            _append_json_line(
-                path / "occurrences.jsonl",
-                {
-                    "monotonic_ms": None,
-                    "wall_time": incident["wall_time"],
+            # Build the complete incident in a hidden sibling directory and
+            # publish it with one rename.  Readers (including
+            # the UI and diagnostic scripts) must never observe an incident
+            # directory before engine_input.json and the other evidence files
+            # have been written.
+            staging_path = self.directory / f".{incident_id}.{uuid4().hex}.tmp"
+            staging_path.mkdir()
+            try:
+                copied_frames = self._copy_incident_frames(staging_path, frame_paths)
+                incident = {
+                    "schema_version": SCHEMA_VERSION,
+                    "incident_id": incident_id,
+                    "session_id": self.session_id,
                     "reason": reason,
-                    "coalesced": False,
-                },
-                durable=False,
-            )
-            if engine_input is not None:
-                atomic_write_json(path / "engine_input.json", engine_input)
-            (path / "llm_report.md").write_text(
-                self._format_incident_report(
-                    incident_id,
-                    reason,
-                    state_before,
-                    state_after,
-                    observations,
-                    copied_frames,
-                    engine_input is not None,
-                ),
-                encoding="utf-8",
-            )
+                    "wall_time": _now_text(),
+                    "observation_ids": [
+                        item.get("id") for item in observations if item.get("id")
+                    ],
+                    "frames": copied_frames,
+                    "state_advanced": state_before != state_after,
+                    "media_manifest": "media.json",
+                    "media_error": "media_error.json",
+                }
+                if trigger_ms is not None:
+                    incident["trigger_ms"] = int(trigger_ms)
+                atomic_write_json(staging_path / "incident.json", incident)
+                atomic_write_json(staging_path / "state_before.json", state_before)
+                atomic_write_json(staging_path / "state_after.json", state_after)
+                atomic_write_json(staging_path / "observations.json", observations)
+                _append_json_line(
+                    staging_path / "occurrences.jsonl",
+                    {
+                        "monotonic_ms": None,
+                        "wall_time": incident["wall_time"],
+                        "reason": reason,
+                        "coalesced": False,
+                    },
+                    durable=False,
+                )
+                if engine_input is not None:
+                    atomic_write_json(staging_path / "engine_input.json", engine_input)
+                (staging_path / "llm_report.md").write_text(
+                    self._format_incident_report(
+                        incident_id,
+                        reason,
+                        state_before,
+                        state_after,
+                        observations,
+                        copied_frames,
+                        engine_input is not None,
+                    ),
+                    encoding="utf-8",
+                )
+                staging_path.replace(path)
+            except BaseException:
+                shutil.rmtree(staging_path, ignore_errors=True)
+                raise
             self._incident_ids.append(incident_id)
             self._update_manifest({"incidents": list(self._incident_ids)})
             return path

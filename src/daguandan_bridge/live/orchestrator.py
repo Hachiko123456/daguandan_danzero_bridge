@@ -747,10 +747,20 @@ class LiveOrchestrator:
                     )
                 return
             if completion.error or completion.advice is None:
+                error = completion.error or "DanZero 未返回建议"
+                # Publish the incident before exposing the failed advice state.
+                # Consumers use the state transition as the readiness signal and
+                # must never observe ``status=failed`` while its evidence bundle
+                # is still being assembled.
+                self._create_incident(
+                    "advisor_failed",
+                    self._last_monotonic_ms,
+                    engine_input=completion.engine_input,
+                )
                 self.latest_advice = LiveAdvice(
                     key=key,
                     status="failed",
-                    error=completion.error or "DanZero 未返回建议",
+                    error=error,
                 )
                 self.store.append_advice(
                     {
@@ -758,7 +768,7 @@ class LiveOrchestrator:
                         "status": "failed",
                         "turn_id": key.turn_id,
                         "state_revision": key.state_revision,
-                        "error": self.latest_advice.error,
+                        "error": error,
                         "engine_input": completion.engine_input,
                         "trace": completion.trace,
                     }
@@ -767,14 +777,9 @@ class LiveOrchestrator:
                     "advice_failed",
                     {
                         "request_id": key.request_id,
-                        "error": self.latest_advice.error,
+                        "error": error,
                     },
                     confidence=0.0,
-                )
-                self._create_incident(
-                    "advisor_failed",
-                    self._last_monotonic_ms,
-                    engine_input=completion.engine_input,
                 )
                 return
             advice = completion.advice
