@@ -60,6 +60,7 @@ class LiveAssistantController(QObject):
         self._finish_thread: OneShotThread | None = None
         self._deferred_source_close = None
         self._capture_generation = 0
+        self._resume_requested = False
 
     @property
     def is_running(self) -> bool:
@@ -210,6 +211,7 @@ class LiveAssistantController(QObject):
         worker.error.connect(self._accept_live_error)
         worker.finished.connect(lambda: self._capture_finished(worker))
         self._capture_worker = worker
+        self._resume_requested = False
         worker.start()
 
     def _accept_live_frame(self, value: object) -> None:
@@ -234,6 +236,12 @@ class LiveAssistantController(QObject):
         deferred, self._deferred_source_close = self._deferred_source_close, None
         if deferred is not None:
             deferred.close()
+        if (
+            self._resume_requested
+            and self.orchestrator is not None
+            and self.orchestrator.status == "running"
+        ):
+            self._start_capture_worker()
 
     def confirm_candidate(self, candidate_id: str) -> None:
         self._invoke(lambda value: value.confirm_candidate(candidate_id))
@@ -268,6 +276,7 @@ class LiveAssistantController(QObject):
         self.update_ready.emit(update)
 
     def pause(self) -> None:
+        self._resume_requested = False
         self._stop_capture_worker()
         self._stop_analysis_worker()
         self._invoke(lambda value: value.pause())
@@ -278,6 +287,7 @@ class LiveAssistantController(QObject):
         self._invoke(
             lambda value: value.resume(monotonic_ms=monotonic_ns() // 1_000_000)
         )
+        self._resume_requested = True
         self._start_analysis_worker()
         self._start_capture_worker()
 
@@ -288,6 +298,7 @@ class LiveAssistantController(QObject):
         ):
             return
         orchestrator.begin_finalizing()
+        self._resume_requested = False
         capture_stopped = self._stop_capture_worker()
         self._stop_analysis_worker()
         if self._live_source is not None:

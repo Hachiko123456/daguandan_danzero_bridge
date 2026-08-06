@@ -47,6 +47,11 @@ class _PauseOrchestrator:
         self.status = "paused"
         return SimpleNamespace(status="paused")
 
+    def resume(self, *, monotonic_ms):
+        del monotonic_ms
+        self.status = "running"
+        return SimpleNamespace(status="running")
+
 
 def test_pause_never_waits_for_blocked_capture_or_recognition(tmp_path):
     _app()
@@ -62,6 +67,35 @@ def test_pause_never_waits_for_blocked_capture_or_recognition(tmp_path):
 
     assert elapsed < 0.2
     assert orchestrator.status == "paused"
+
+
+def test_resume_restarts_capture_after_prior_blocked_capture_exits(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    orchestrator = _PauseOrchestrator()
+    old_worker = _SlowCaptureWorker()
+    controller.orchestrator = orchestrator  # type: ignore[assignment]
+    controller._capture_worker = old_worker  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_start_analysis_worker", lambda: None)
+    restarted = []
+    monkeypatch.setattr(
+        controller,
+        "_start_capture_worker",
+        lambda: restarted.append(True)
+        if controller._capture_worker is None
+        else None,
+    )
+
+    controller.pause()
+    controller.resume()
+    assert restarted == []
+
+    controller._capture_finished(old_worker)  # type: ignore[arg-type]
+
+    assert restarted == [True]
 
 
 class _FinishOrchestrator:
