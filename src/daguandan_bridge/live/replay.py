@@ -44,6 +44,84 @@ class ReplayWarning:
     details: str
 
 
+@dataclass(frozen=True)
+class ChangedTurn:
+    turn_id: int
+    expected: LiveEvent
+    actual: LiveEvent
+
+
+@dataclass(frozen=True)
+class ReplayMetricDelta:
+    turn_id: int
+    confidence_delta: float
+    latency_delta_ms: int
+
+
+@dataclass(frozen=True)
+class ReplayComparison:
+    identical_turn_ids: tuple[int, ...]
+    missing: tuple[LiveEvent, ...]
+    added: tuple[LiveEvent, ...]
+    changed: tuple[ChangedTurn, ...]
+    metric_deltas: tuple[ReplayMetricDelta, ...]
+
+
+_ACTION_TYPES = {"player_played", "player_passed", "manual_confirmed_event"}
+
+
+def _action_semantics(event: LiveEvent) -> tuple[object, ...]:
+    is_pass = event.event_type == "player_passed" or bool(
+        event.payload.get("is_pass", False)
+    )
+    cards = () if is_pass else tuple(
+        sorted(str(card) for card in event.payload.get("cards", ()))
+    )
+    return event.actor, is_pass, cards
+
+
+def compare_timelines(
+    expected: list[LiveEvent] | tuple[LiveEvent, ...],
+    actual: list[LiveEvent] | tuple[LiveEvent, ...],
+) -> ReplayComparison:
+    """Compare formal actions by turn without treating score drift as card drift."""
+
+    expected_by_turn = {
+        event.turn_id: event for event in expected if event.event_type in _ACTION_TYPES
+    }
+    actual_by_turn = {
+        event.turn_id: event for event in actual if event.event_type in _ACTION_TYPES
+    }
+    expected_turns = set(expected_by_turn)
+    actual_turns = set(actual_by_turn)
+    missing = tuple(expected_by_turn[key] for key in sorted(expected_turns - actual_turns))
+    added = tuple(actual_by_turn[key] for key in sorted(actual_turns - expected_turns))
+    identical: list[int] = []
+    changed: list[ChangedTurn] = []
+    deltas: list[ReplayMetricDelta] = []
+    for turn_id in sorted(expected_turns & actual_turns):
+        left = expected_by_turn[turn_id]
+        right = actual_by_turn[turn_id]
+        if _action_semantics(left) == _action_semantics(right):
+            identical.append(turn_id)
+        else:
+            changed.append(ChangedTurn(turn_id, left, right))
+        deltas.append(
+            ReplayMetricDelta(
+                turn_id=turn_id,
+                confidence_delta=right.confidence - left.confidence,
+                latency_delta_ms=right.monotonic_ms - left.monotonic_ms,
+            )
+        )
+    return ReplayComparison(
+        identical_turn_ids=tuple(identical),
+        missing=missing,
+        added=added,
+        changed=tuple(changed),
+        metric_deltas=tuple(deltas),
+    )
+
+
 class EventReplayer:
     """Replay confirmed events on a virtual monotonic clock with no waiting."""
 

@@ -9,7 +9,12 @@ import pytest
 
 from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.live.reducer import LiveReducer
-from daguandan_bridge.live.replay import EventReplayer, VideoReplaySource
+from daguandan_bridge.live.replay import (
+    EventReplayer,
+    VideoReplaySource,
+    compare_timelines,
+)
+from daguandan_bridge.live.models import LiveEvent
 
 
 HAND = tuple(f"{rank}{suit}" for rank in ("2", "3", "4", "5", "6", "7") for suit in "SHCD") + (
@@ -91,3 +96,45 @@ def test_video_replay_uses_index_timestamps_and_reports_missing_frames(tmp_path)
     short_source = VideoReplaySource(short_path, recording.index_path)
     assert len(list(short_source.frames())) == 1
     assert short_source.warnings[0].reason == "missing_video_frames"
+
+
+def _timeline_event(turn_id, cards, *, confidence=0.9, monotonic_ms=100):
+    return LiveEvent(
+        event_id=f"EVT-{turn_id}",
+        event_type="player_played",
+        session_id="comparison",
+        seq=turn_id,
+        monotonic_ms=monotonic_ms,
+        wall_time="2026-08-06T12:00:00+08:00",
+        trick_id=1,
+        turn_id=turn_id,
+        actor="right",
+        payload={"cards": list(cards), "is_pass": False},
+        confidence=confidence,
+        source="test",
+        state_revision_before=turn_id,
+        state_revision_after=turn_id + 1,
+    )
+
+
+def test_compare_timelines_reports_changed_turn():
+    result = compare_timelines(
+        [_timeline_event(3, ("7S",))],
+        [_timeline_event(3, ("8S",))],
+    )
+
+    assert result.changed[0].turn_id == 3
+    assert result.missing == ()
+    assert result.added == ()
+
+
+def test_confidence_and_latency_delta_do_not_become_semantic_change():
+    result = compare_timelines(
+        [_timeline_event(3, ("7S",), confidence=0.9, monotonic_ms=100)],
+        [_timeline_event(3, ("7S",), confidence=0.8, monotonic_ms=160)],
+    )
+
+    assert result.changed == ()
+    assert result.identical_turn_ids == (3,)
+    assert result.metric_deltas[0].confidence_delta == pytest.approx(-0.1)
+    assert result.metric_deltas[0].latency_delta_ms == 60
