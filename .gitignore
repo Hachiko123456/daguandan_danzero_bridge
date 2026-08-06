@@ -18,9 +18,11 @@ build/
 dist/
 *.egg-info/
 .worktrees/
+.superpowers/
 
 # Project runtime output
 data/profiles/*/screenshots/
+data/profiles/*/sessions/
 *.log
 
 # IDE and OS files

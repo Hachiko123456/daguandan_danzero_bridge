@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "round_level": "2",
+  "lead_player": "right",
+  "actions": [
+    {"player": "right", "cards": ["7S", "7H"], "is_pass": false},
+    {"player": "opposite", "cards": [], "is_pass": true},
+    {
+      "player": "left",
+      "cards": ["9C", "9D"],
+      "is_pass": false,
+      "long_effect": true
+    },
+    {"player": "self", "cards": ["JC", "JD"], "is_pass": false}
+  ],
+  "expected_current_player": "right",
+  "expected_advice": ["JC", "JD"]
+}

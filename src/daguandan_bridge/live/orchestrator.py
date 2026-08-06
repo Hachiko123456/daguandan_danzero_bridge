@@ -93,6 +93,24 @@ class LiveAdvice:
 
 
 @dataclass(frozen=True)
+class LiveMetrics:
+    frame_count: int
+    confirmed_action_count: int
+    review_count: int
+    recognition_sample_count: int
+    advice_visible_latency_ms: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "frame_count": self.frame_count,
+            "confirmed_action_count": self.confirmed_action_count,
+            "review_count": self.review_count,
+            "recognition_sample_count": self.recognition_sample_count,
+            "advice_visible_latency_ms": self.advice_visible_latency_ms,
+        }
+
+
+@dataclass(frozen=True)
 class _AdviceJob:
     key: AdviceRequestKey
     state: GuanDanState
@@ -152,6 +170,9 @@ class LiveOrchestrator:
         self._self_turn_corroborated = False
         self.latest_advice: LiveAdvice | None = None
         self._advice_worker: LatestOnlyWorker | None = None
+        self._review_count = 0
+        self._advice_requested_at_ms: dict[AdviceRequestKey, int] = {}
+        self._advice_visible_latency_ms: int | None = None
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -167,6 +188,19 @@ class LiveOrchestrator:
     def events(self) -> tuple[LiveEvent, ...]:
         with self._advice_lock:
             return tuple(self._all_events)
+
+    @property
+    def metrics(self) -> LiveMetrics:
+        action_types = {"player_played", "player_passed", "manual_confirmed_event"}
+        return LiveMetrics(
+            frame_count=self.recorder.frame_count,
+            confirmed_action_count=sum(
+                event.event_type in action_types for event in self.reducer.events
+            ),
+            review_count=self._review_count,
+            recognition_sample_count=self._observation_sequence,
+            advice_visible_latency_ms=self._advice_visible_latency_ms,
+        )
 
     def start(
         self,
@@ -398,6 +432,7 @@ class LiveOrchestrator:
         self.store.seal(
             frame_count=recording.frame_count,
             dropped_frames=recording.dropped_frames,
+            metrics=self.metrics.to_dict(),
         )
         self.status = "sealed"
         self._zone = None
@@ -435,6 +470,7 @@ class LiveOrchestrator:
                 return key
             state = self.reducer.to_guandan_state()
             self._requested_advice.add(key)
+            self._advice_requested_at_ms[key] = self._last_monotonic_ms
             self.latest_advice = LiveAdvice(key=key, status="requested")
             self.store.append_advice(
                 {
@@ -530,6 +566,8 @@ class LiveOrchestrator:
                 return
             advice = completion.advice
             visible = self._self_turn_corroborated
+            if visible:
+                self._set_advice_visible_latency(key)
             self.latest_advice = LiveAdvice(
                 key=key,
                 status="ready",
@@ -584,6 +622,7 @@ class LiveOrchestrator:
                 visible=True,
                 error=current.error,
             )
+            self._set_advice_visible_latency(current.key)
             self._append_advice_event(
                 "advice_visible",
                 {"request_id": current.key.request_id},
@@ -621,6 +660,14 @@ class LiveOrchestrator:
     def _remember_event(self, event: LiveEvent) -> None:
         with self._advice_lock:
             self._all_events.append(event)
+
+    def _set_advice_visible_latency(self, key: AdviceRequestKey) -> None:
+        requested_at = self._advice_requested_at_ms.get(key)
+        if requested_at is not None:
+            self._advice_visible_latency_ms = max(
+                0,
+                self._last_monotonic_ms - requested_at,
+            )
 
     def _append_sample(self, result: PlayRegionResult, monotonic_ms: int) -> None:
         self._observation_sequence += 1
@@ -740,6 +787,7 @@ class LiveOrchestrator:
             candidates=candidates,
             evidence_refs=evidence,
         )
+        self._review_count += 1
         self.status = "review_required"
         if self._zone is not None:
             self._zone.require_review(reason)

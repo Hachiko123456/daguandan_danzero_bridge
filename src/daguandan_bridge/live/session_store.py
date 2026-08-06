@@ -215,22 +215,29 @@ class LiveSessionStore:
             self._update_manifest({"incidents": list(self._incident_ids)})
             return path
 
-    def seal(self, *, frame_count: int, dropped_frames: int) -> None:
+    def seal(
+        self,
+        *,
+        frame_count: int,
+        dropped_frames: int,
+        metrics: dict[str, object] | None = None,
+    ) -> None:
         with self._lock:
             self._ensure_writable()
             with self.observations_part_path.open("rb") as source:
                 with gzip.open(self.observations_gzip_path, "wb") as target:
                     shutil.copyfileobj(source, target)
             self.observations_part_path.unlink()
-            self._update_manifest(
-                {
+            changes: dict[str, object] = {
                     "status": "sealed",
                     "finished_at": _now_text(),
                     "frame_count": frame_count,
                     "dropped_frames": dropped_frames,
                     "incidents": list(self._incident_ids),
                 }
-            )
+            if metrics is not None:
+                changes["performance_metrics"] = dict(metrics)
+            self._update_manifest(changes)
             self._sealed = True
 
     def _ensure_writable(self) -> None:
