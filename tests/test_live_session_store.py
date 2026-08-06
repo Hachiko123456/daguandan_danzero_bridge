@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 
 from daguandan_bridge.live.models import LiveEvent
 from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
@@ -148,3 +149,21 @@ def test_recovery_marks_unsealed_previous_process_session_aborted(tmp_path):
     assert manifest["status"] == "aborted"
     assert manifest["recovery_reason"] == "previous_process_did_not_seal"
     assert store.observations_part_path.is_file()
+
+
+def test_recovery_does_not_abort_session_owned_by_a_live_process(tmp_path):
+    store = LiveSessionStore(
+        tmp_path,
+        "tencent_daguandan",
+        session_id="active-game",
+    )
+    store.start({"owner_pid": os.getpid()})
+
+    recovered = LiveSessionStore.recover_incomplete_sessions(
+        tmp_path,
+        "tencent_daguandan",
+    )
+
+    manifest = json.loads(store.manifest_path.read_text("utf-8"))
+    assert recovered == ()
+    assert manifest["status"] == "running"

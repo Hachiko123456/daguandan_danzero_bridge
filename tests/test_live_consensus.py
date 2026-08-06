@@ -7,12 +7,17 @@ from daguandan_bridge.live.consensus import (
 )
 
 
-def _play(*cards: str, confidence: float = 0.9) -> RecognitionSample:
+def _play(
+    *cards: str,
+    confidence: float = 0.9,
+    post_hand: tuple[str, ...] = (),
+) -> RecognitionSample:
     return RecognitionSample(
         cards=cards,
         is_pass=False,
         confidence=confidence,
         source="targeted_template",
+        post_hand=post_hand,
     )
 
 
@@ -22,6 +27,7 @@ def _context(**changes) -> ConsensusContext:
         "remaining_cards": 27,
         "allow_pass": True,
         "known_hand": (),
+        "table_cards": (),
         "region_empty": False,
         "next_turn_evidence": False,
     }
@@ -75,3 +81,30 @@ def test_inferred_pass_is_never_auto_confirmed_in_version_one():
     assert result.status == "needs_confirmation"
     assert result.is_pass
     assert result.source == "inferred_pass"
+
+
+def test_play_that_does_not_beat_current_table_action_is_rejected():
+    result = BurstConsensus(min_votes=3).decide(
+        [_play("6S") for _ in range(3)],
+        context=_context(table_cards=("7S",)),
+    )
+
+    assert result.status == "review_required"
+    assert "does_not_beat_table" in result.rejected_reasons
+
+
+def test_self_play_requires_three_matching_exact_post_hand_differences():
+    old_hand = ("6S", "7S", "8S", "9S")
+    expected_post = ("6S", "8S", "9S")
+    accepted = BurstConsensus(min_votes=3).decide(
+        [_play("7S", post_hand=expected_post) for _ in range(3)],
+        context=_context(known_hand=old_hand),
+    )
+    rejected = BurstConsensus(min_votes=3).decide(
+        [_play("7S", post_hand=old_hand) for _ in range(3)],
+        context=_context(known_hand=old_hand),
+    )
+
+    assert accepted.status == "confirmed"
+    assert rejected.status == "review_required"
+    assert "self_hand_delta_unverified" in rejected.rejected_reasons

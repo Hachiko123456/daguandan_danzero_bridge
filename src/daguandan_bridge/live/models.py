@@ -32,6 +32,9 @@ class LiveEvent:
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> "LiveEvent":
         values: dict[str, Any] = dict(raw)
+        schema_version = values.pop("schema_version", 1)
+        if schema_version != 1:
+            raise ValueError(f"不支持的对局事件版本：{schema_version}")
         values["evidence_refs"] = tuple(values.get("evidence_refs", ()))
         return cls(**values)
 

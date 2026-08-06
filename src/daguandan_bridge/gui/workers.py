@@ -29,6 +29,8 @@ class CaptureWorker(QObject):
                 except Exception as exc:
                     self.error.emit(str(exc))
                     break
+                if self._stop_event.is_set():
+                    break
                 self.frame_ready.emit(value)
                 if self._stop_event.wait(self.interval_sec):
                     break

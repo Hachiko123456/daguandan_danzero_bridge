@@ -59,3 +59,30 @@ def action_for_cards(cards: tuple[str, ...], level_rank: str) -> list[object] | 
         ),
         None,
     )
+
+
+def play_beats_table(
+    cards: tuple[str, ...],
+    table_cards: tuple[str, ...],
+    level_rank: str,
+) -> bool:
+    """Return whether one already-validated card set beats the table action."""
+
+    if not table_cards:
+        return True
+    candidate = action_for_cards(cards, level_rank)
+    current = action_for_cards(table_cards, level_rank)
+    if candidate is None or current is None:
+        return False
+
+    from types import SimpleNamespace
+
+    from daguandan_bridge.danzero._vendor.guandan_rlcard.constants import CARD_RANK
+    from daguandan_bridge.danzero._vendor.guandan_rlcard.game.action_compare import (
+        get_gt_actions,
+    )
+
+    level = "T" if level_rank == "10" else str(level_rank)
+    greater_player = SimpleNamespace(played_action=current)
+    greater = get_gt_actions(CARD_RANK.index(level), greater_player, [candidate])
+    return candidate in greater

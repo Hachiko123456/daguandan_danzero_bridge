@@ -100,6 +100,12 @@ class LiveSessionStore:
                 continue
             if not isinstance(manifest, dict) or manifest.get("status") != "running":
                 continue
+            try:
+                owner_pid = int(manifest.get("owner_pid", 0))
+            except (TypeError, ValueError):
+                owner_pid = 0
+            if owner_pid > 0 and cls._process_is_alive(owner_pid):
+                continue
             manifest.update(
                 {
                     "status": "aborted",
@@ -110,6 +116,20 @@ class LiveSessionStore:
             atomic_write_json(manifest_path, manifest)
             recovered.append(manifest_path.parent)
         return tuple(recovered)
+
+    @staticmethod
+    def _process_is_alive(process_id: int) -> bool:
+        if int(process_id) == os.getpid():
+            return True
+        try:
+            os.kill(int(process_id), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
 
     def __init__(
         self,
@@ -211,6 +231,7 @@ class LiveSessionStore:
         observations: list[dict[str, object]],
         frame_paths: Iterable[Path] = (),
         engine_input: dict[str, object] | None = None,
+        trigger_ms: int | None = None,
     ) -> Path:
         with self._lock:
             self._ensure_writable()
@@ -228,11 +249,26 @@ class LiveSessionStore:
                     item.get("id") for item in observations if item.get("id")
                 ],
                 "frames": copied_frames,
+                "state_advanced": state_before != state_after,
+                "media_manifest": "media.json",
+                "media_error": "media_error.json",
             }
+            if trigger_ms is not None:
+                incident["trigger_ms"] = int(trigger_ms)
             atomic_write_json(path / "incident.json", incident)
             atomic_write_json(path / "state_before.json", state_before)
             atomic_write_json(path / "state_after.json", state_after)
             atomic_write_json(path / "observations.json", observations)
+            _append_json_line(
+                path / "occurrences.jsonl",
+                {
+                    "monotonic_ms": None,
+                    "wall_time": incident["wall_time"],
+                    "reason": reason,
+                    "coalesced": False,
+                },
+                durable=False,
+            )
             if engine_input is not None:
                 atomic_write_json(path / "engine_input.json", engine_input)
             (path / "llm_report.md").write_text(
@@ -251,12 +287,36 @@ class LiveSessionStore:
             self._update_manifest({"incidents": list(self._incident_ids)})
             return path
 
+    def append_incident_occurrence(
+        self,
+        incident_directory: Path,
+        *,
+        monotonic_ms: int,
+        reason: str,
+    ) -> None:
+        with self._lock:
+            self._ensure_writable()
+            path = Path(incident_directory)
+            if path.parent != self.incidents_directory or not path.is_dir():
+                raise ValueError("事故目录不属于当前对局")
+            _append_json_line(
+                path / "occurrences.jsonl",
+                {
+                    "monotonic_ms": int(monotonic_ms),
+                    "wall_time": _now_text(),
+                    "reason": str(reason),
+                    "coalesced": True,
+                },
+                durable=False,
+            )
+
     def seal(
         self,
         *,
         frame_count: int,
         dropped_frames: int,
         metrics: dict[str, object] | None = None,
+        incident_media_failures: Iterable[dict[str, object]] = (),
     ) -> None:
         with self._lock:
             self._ensure_writable()
@@ -273,6 +333,9 @@ class LiveSessionStore:
                 }
             if metrics is not None:
                 changes["performance_metrics"] = dict(metrics)
+            failures = [dict(item) for item in incident_media_failures]
+            if failures:
+                changes["incident_media_failures"] = failures
             self._update_manifest(changes)
             self._sealed = True
 
@@ -324,6 +387,12 @@ class LiveSessionStore:
             "state_before.json",
             "state_after.json",
             "observations.json",
+            "occurrences.jsonl",
+            "media.json（媒体成功后原子生成）",
+            "media_error.json（仅媒体失败时生成）",
+            "clip.avi（媒体成功时）",
+            "contact_sheet.png（媒体成功时）",
+            "frames/trigger.png（媒体成功时）",
         ]
         if has_engine_input:
             files.append("engine_input.json")
@@ -333,6 +402,7 @@ class LiveSessionStore:
             f"- 异常原因：`{reason}`\n"
             f"- 相关观察：{', '.join(observation_ids) or '无'}\n"
             f"- 状态变化字段：{', '.join(changed_keys) or '无（状态未推进）'}\n\n"
+            "- 说明：识别不确定时状态机不会推进，因此状态前后相同是预期的安全行为。\n\n"
             "## 建议排查顺序\n\n"
             "1. 查看 `observations.json` 中的候选、置信度和采用/拒绝原因。\n"
             "2. 比较 `state_before.json` 与 `state_after.json`。\n"

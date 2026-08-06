@@ -117,3 +117,38 @@ def test_scheduled_incident_media_collects_frames_after_trigger(tmp_path):
     finally:
         capture.release()
     assert (incident_dir / "contact_sheet.png").is_file()
+
+
+def test_close_releases_main_recording_and_reports_incident_media_failure(
+    tmp_path,
+    monkeypatch,
+):
+    recorder = SessionRecorder(tmp_path, size=(64, 32), fps=10, buffer_seconds=2)
+    recorder.write_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        captured_monotonic_ms=100,
+        wall_time="trigger",
+    )
+    incident_dir = tmp_path / "incidents" / "INC-0003"
+    recorder.schedule_incident_media(
+        incident_dir,
+        trigger_ms=100,
+        after_ms=5_000,
+    )
+    monkeypatch.setattr(
+        recorder,
+        "_write_incident_media",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("codec full")),
+    )
+
+    result = recorder.close()
+
+    assert recorder._closed
+    assert result.incident_media_failures[0].reason == "incident_media_finalize_failed"
+    assert result.incident_media_failures[0].trigger_ms == 100
+    assert (incident_dir / "media_error.json").is_file()
+    capture = cv2.VideoCapture(str(result.video_path))
+    try:
+        assert int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) == 1
+    finally:
+        capture.release()

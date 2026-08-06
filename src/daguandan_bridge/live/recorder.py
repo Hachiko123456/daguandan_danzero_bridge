@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from ..image_io import save_image_unicode
-from ..storage import append_json_line
+from ..storage import append_json_line, atomic_write_json
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class RecordingResult:
     index_path: Path
     frame_count: int
     dropped_frames: int
+    incident_media_failures: tuple["IncidentMediaFailure", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,22 @@ class IncidentMedia:
     contact_sheet_path: Path
     trigger_frame_path: Path
     frame_count: int
+
+
+@dataclass(frozen=True)
+class IncidentMediaFailure:
+    reason: str
+    incident_directory: Path
+    trigger_ms: int
+    details: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "reason": self.reason,
+            "incident_directory": str(self.incident_directory),
+            "trigger_ms": self.trigger_ms,
+            "details": self.details,
+        }
 
 
 @dataclass
@@ -81,6 +98,7 @@ class SessionRecorder:
         self._closed = False
         self._lock = RLock()
         self._pending_incidents: list[_PendingIncidentMedia] = []
+        self._incident_media_failures: list[IncidentMediaFailure] = []
 
     @property
     def frame_count(self) -> int:
@@ -134,8 +152,12 @@ class SessionRecorder:
                 "dropped_before": self._pending_drops,
             }
             append_json_line(self.index_path, record)
-            self._buffer.append((int(captured_monotonic_ms), frame.copy()))
-            self._advance_pending_incidents(int(captured_monotonic_ms), frame)
+            buffered_frame = frame.copy()
+            self._buffer.append((int(captured_monotonic_ms), buffered_frame))
+            self._advance_pending_incidents(
+                int(captured_monotonic_ms),
+                buffered_frame,
+            )
             self._frame_count += 1
             self._pending_drops = 0
             return None
@@ -165,7 +187,7 @@ class SessionRecorder:
             incident_directory = Path(incident_directory)
             incident_directory.mkdir(parents=True, exist_ok=True)
             selected = [
-                (timestamp, frame.copy())
+                (timestamp, frame)
                 for timestamp, frame in self._buffer
                 if trigger_ms - before_ms <= timestamp <= trigger_ms + after_ms
             ]
@@ -192,7 +214,7 @@ class SessionRecorder:
             directory = Path(incident_directory)
             directory.mkdir(parents=True, exist_ok=True)
             selected = [
-                (timestamp, frame.copy())
+                (timestamp, frame)
                 for timestamp, frame in self._buffer
                 if trigger_ms - before_ms <= timestamp <= trigger_ms
             ]
@@ -216,17 +238,38 @@ class SessionRecorder:
         completed: list[_PendingIncidentMedia] = []
         for pending in self._pending_incidents:
             if pending.trigger_ms < monotonic_ms <= pending.deadline_ms:
-                pending.frames.append((monotonic_ms, frame.copy()))
+                pending.frames.append((monotonic_ms, frame))
             if monotonic_ms >= pending.deadline_ms:
                 completed.append(pending)
         for pending in completed:
-            if pending.frames:
-                self._write_incident_media(
-                    pending.directory,
-                    pending.trigger_ms,
-                    pending.frames,
-                )
+            self._finalize_pending_incident(pending)
             self._pending_incidents.remove(pending)
+
+    def _finalize_pending_incident(self, pending: _PendingIncidentMedia) -> None:
+        if not pending.frames:
+            return
+        try:
+            self._write_incident_media(
+                pending.directory,
+                pending.trigger_ms,
+                pending.frames,
+            )
+        except Exception as exc:
+            failure = IncidentMediaFailure(
+                reason="incident_media_finalize_failed",
+                incident_directory=pending.directory,
+                trigger_ms=pending.trigger_ms,
+                details=str(exc),
+            )
+            self._incident_media_failures.append(failure)
+            try:
+                atomic_write_json(
+                    pending.directory / "media_error.json",
+                    {"schema_version": 1, **failure.to_dict()},
+                )
+            except Exception:
+                # The in-memory failure is still returned to the session manifest.
+                pass
 
     def _write_incident_media(
         self,
@@ -252,6 +295,23 @@ class SessionRecorder:
         save_image_unicode(
             contact_sheet_path,
             self._make_contact_sheet([frame for _, frame in selected]),
+        )
+        atomic_write_json(
+            incident_directory / "media.json",
+            {
+                "schema_version": 1,
+                "trigger_ms": int(trigger_ms),
+                "first_frame_ms": int(selected[0][0]),
+                "last_frame_ms": int(selected[-1][0]),
+                "frame_count": len(selected),
+                "clip": clip_path.relative_to(incident_directory).as_posix(),
+                "contact_sheet": contact_sheet_path.relative_to(
+                    incident_directory
+                ).as_posix(),
+                "trigger_frame": trigger_path.relative_to(
+                    incident_directory
+                ).as_posix(),
+            },
         )
         return IncidentMedia(
             clip_path=clip_path,
@@ -283,21 +343,28 @@ class SessionRecorder:
     def close(self) -> RecordingResult:
         with self._lock:
             if not self._closed:
-                for pending in tuple(self._pending_incidents):
-                    if pending.frames:
-                        self._write_incident_media(
-                            pending.directory,
-                            pending.trigger_ms,
-                            pending.frames,
+                try:
+                    self._writer.release()
+                except Exception as exc:
+                    self._incident_media_failures.append(
+                        IncidentMediaFailure(
+                            reason="main_video_release_failed",
+                            incident_directory=self.video_directory,
+                            trigger_ms=-1,
+                            details=str(exc),
                         )
+                    )
+                finally:
+                    self._closed = True
+                for pending in tuple(self._pending_incidents):
+                    self._finalize_pending_incident(pending)
                 self._pending_incidents.clear()
-                self._writer.release()
-                self._closed = True
             return RecordingResult(
                 video_path=self.video_path,
                 index_path=self.index_path,
                 frame_count=self._frame_count,
                 dropped_frames=self._dropped_frames,
+                incident_media_failures=tuple(self._incident_media_failures),
             )
 
     def _ensure_open(self) -> None:

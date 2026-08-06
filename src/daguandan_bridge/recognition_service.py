@@ -85,6 +85,8 @@ class PlayRegionResult:
     diagnostics: tuple[str, ...]
     annotations: tuple[RecognitionAnnotation, ...]
     source: str = ""
+    post_hand: tuple[str, ...] = ()
+    post_hand_confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -379,6 +381,27 @@ class ScreenshotRecognitionService:
             rank_threshold=self._PLAY_RANK_THRESHOLD,
             suit_threshold=self._PLAY_SUIT_THRESHOLD,
         )
+        post_hand: tuple[str, ...] = ()
+        post_hand_score = 0.0
+        if seat == "self":
+            (
+                post_hand,
+                post_hand_score,
+                _,
+                hand_diagnostics,
+                _,
+            ) = self._recognize_cards(
+                source_image,
+                regions.get("my_hand"),
+                templates,
+                source_roles={"hand", "hand_partial"},
+                wild_rank=wild_rank,
+                rank_threshold=self._HAND_RANK_THRESHOLD,
+                suit_threshold=self._HAND_SUIT_THRESHOLD,
+            )
+            diagnostics = tuple(diagnostics) + tuple(
+                f"出牌后手牌：{item}" for item in hand_diagnostics
+            )
         if cards:
             return PlayRegionResult(
                 player=seat,
@@ -388,6 +411,8 @@ class ScreenshotRecognitionService:
                 diagnostics=diagnostics,
                 annotations=annotations,
                 source=source,
+                post_hand=post_hand,
+                post_hand_confidence=post_hand_score,
             )
         passed, pass_score, pass_source, pass_match = self._recognize_status(
             source_image,
@@ -413,6 +438,8 @@ class ScreenshotRecognitionService:
             diagnostics=diagnostics,
             annotations=pass_annotations,
             source=pass_source,
+            post_hand=post_hand,
+            post_hand_confidence=post_hand_score,
         )
 
     def recognize_fast_signals(

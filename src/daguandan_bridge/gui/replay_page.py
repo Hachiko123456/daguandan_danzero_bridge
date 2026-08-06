@@ -26,10 +26,14 @@ from ..annotation_service import AnnotationService
 from ..config import PROFILES_ROOT
 from ..live.models import LiveEvent
 from ..live.reducer import LiveReducer
-from ..live.replay import EventReplayer, FrameIndexRecord, VideoReplaySource
+from ..live.replay import (
+    EventReplayer,
+    FrameIndexRecord,
+    VideoReplaySource,
+    replay_video_through_live_pipeline,
+)
 from ..live.session_store import read_json_lines
 from ..recognition_service import ScreenshotRecognitionService
-from ..storage import append_json_line
 from ..template_service import TemplateService
 
 
@@ -37,7 +41,14 @@ class ReplayDecodeThread(QThread):
     frame_ready = Signal(object, object)
     failed = Signal(str)
 
-    def __init__(self, video_path: Path, index_path: Path, parent=None) -> None:
+    def __init__(
+        self,
+        video_path: Path,
+        index_path: Path,
+        parent=None,
+        *,
+        start_ms: int | None = None,
+    ) -> None:
         super().__init__(parent)
         self.video_path = video_path
         self.index_path = index_path
@@ -46,6 +57,7 @@ class ReplayDecodeThread(QThread):
         self._step_requested = False
         self._stop_requested = False
         self._speed = 1.0
+        self._start_ms = start_ms
 
     def play(self) -> None:
         with self._condition:
@@ -77,6 +89,8 @@ class ReplayDecodeThread(QThread):
             for record, frame in VideoReplaySource(
                 self.video_path, self.index_path
             ).frames():
+                if self._start_ms is not None and record.monotonic_ms < self._start_ms:
+                    continue
                 with self._condition:
                     self._condition.wait_for(
                         lambda: self._stop_requested
@@ -124,48 +138,19 @@ class VisualRecognitionReplayThread(QThread):
         self._stop_requested.set()
 
     def run(self) -> None:
-        output = self.session / "visual_replay.jsonl"
         try:
-            output.unlink(missing_ok=True)
             profile_root = self.session.parents[2]
             profile_name = self.session.parents[1].name
             recognition = ScreenshotRecognitionService(
                 AnnotationService(profile_root, profile_name),
                 TemplateService(profile_root, profile_name),
             )
-            source = VideoReplaySource(
-                self.session / "video" / "game.avi",
-                self.session / "video" / "frame_index.jsonl",
+            result = replay_video_through_live_pipeline(
+                self.session,
+                recognition,
+                stop_requested=self._stop_requested.is_set,
             )
-            count = 0
-            for record, frame in source.frames():
-                if self._stop_requested.is_set():
-                    return
-                result = recognition.recognize(frame)
-                append_json_line(
-                    output,
-                    {
-                        "frame_index": record.frame_index,
-                        "monotonic_ms": record.monotonic_ms,
-                        "round_level": result.round_level,
-                        "current_player": result.current_player,
-                        "lead_player": result.lead_player,
-                        "my_hand": list(result.my_hand),
-                        "events": [
-                            {
-                                "player": event.player,
-                                "cards": list(event.cards),
-                                "is_pass": event.is_pass,
-                                "confidence": event.confidence,
-                            }
-                            for event in result.events
-                        ],
-                        "unresolved_fields": list(result.unresolved_fields),
-                        "elapsed_ms": result.elapsed_ms,
-                    },
-                )
-                count += 1
-            self.completed.emit((output, count, source.warnings))
+            self.completed.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -180,6 +165,7 @@ class ReplayPage(QWidget):
         self.current_session: Path | None = None
         self._decode_thread: ReplayDecodeThread | None = None
         self._visual_thread: VisualRecognitionReplayThread | None = None
+        self._seek_ms: int | None = None
         self.setObjectName("replayPage")
         self._build_ui()
         qconfig.themeChanged.connect(self._apply_theme)
@@ -345,7 +331,9 @@ class ReplayPage(QWidget):
                 self.current_session / "video" / "game.avi",
                 self.current_session / "video" / "frame_index.jsonl",
                 self,
+                start_ms=self._seek_ms,
             )
+            self._seek_ms = None
             thread.frame_ready.connect(self._show_frame)
             thread.failed.connect(self._show_error)
             thread.finished.connect(self._decode_finished)
@@ -443,10 +431,15 @@ class ReplayPage(QWidget):
         thread.start()
 
     def _visual_completed(self, value: object) -> None:
-        output, count, warnings = value  # type: ignore[misc]
+        result = value
+        comparison = result.comparison
         self.diagnostics.setPlainText(
-            f"视觉重新识别完成\n帧数：{count}\n结果：{output}\n"
-            f"录像警告：{warnings or '无'}"
+            f"实时管线视觉复测完成\n帧数：{result.frame_count}\n"
+            f"逐帧结果：{result.output_path}\n比较结果：{result.comparison_path}\n"
+            f"一致回合：{len(comparison.identical_turn_ids)}　"
+            f"缺失：{len(comparison.missing)}　新增：{len(comparison.added)}　"
+            f"变化：{len(comparison.changed)}\n"
+            f"录像警告：{result.warnings or '无'}"
         )
 
     def _visual_finished(self) -> None:
@@ -471,6 +464,26 @@ class ReplayPage(QWidget):
             return
         path = Path(str(value))
         report = path / "llm_report.md"
+        trigger_ms = None
+        incident_path = path / "incident.json"
+        media_path = path / "media.json"
+        try:
+            if incident_path.is_file():
+                trigger_ms = json.loads(incident_path.read_text("utf-8")).get(
+                    "trigger_ms"
+                )
+            if trigger_ms is None and media_path.is_file():
+                trigger_ms = json.loads(media_path.read_text("utf-8")).get(
+                    "trigger_ms"
+                )
+        except (OSError, json.JSONDecodeError):
+            trigger_ms = None
+        if trigger_ms is not None:
+            self._stop_decode()
+            self._seek_ms = int(trigger_ms)
+            thread = self._ensure_decode()
+            if thread is not None:
+                thread.step()
         self.diagnostics.setPlainText(
             report.read_text("utf-8") if report.is_file() else f"事故目录：{path}"
         )
@@ -487,6 +500,7 @@ class ReplayPage(QWidget):
             "observations.jsonl.gz",
             "observations.jsonl.part",
             "visual_replay.jsonl",
+            "visual_replay_comparison.json",
         }
         try:
             with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:

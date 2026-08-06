@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-from ..danzero.rules import action_for_cards
+from ..danzero.rules import action_for_cards, play_beats_table
 
 
 ConsensusStatus = Literal["confirmed", "needs_confirmation", "review_required"]
@@ -17,6 +17,7 @@ class RecognitionSample:
     confidence: float
     source: str
     evidence_ref: str = ""
+    post_hand: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class ConsensusContext:
     remaining_cards: int
     allow_pass: bool
     known_hand: tuple[str, ...] = ()
+    table_cards: tuple[str, ...] = ()
     region_empty: bool = False
     next_turn_evidence: bool = False
 
@@ -69,6 +71,13 @@ class BurstConsensus:
         items = tuple(samples)
         if not items:
             if context.region_empty and context.next_turn_evidence and context.allow_pass:
+                inferred = ConsensusCandidate(
+                    cards=(),
+                    is_pass=True,
+                    votes=0,
+                    mean_confidence=0.0,
+                    valid=True,
+                )
                 return ConsensusResult(
                     status="needs_confirmation",
                     cards=(),
@@ -76,7 +85,7 @@ class BurstConsensus:
                     confidence=0.0,
                     source="inferred_pass",
                     vote_count=0,
-                    candidates=(),
+                    candidates=(inferred,),
                     rejected_reasons=("pass_template_missing",),
                 )
             return self._review((), ("no_recognition_samples",))
@@ -91,6 +100,18 @@ class BurstConsensus:
         evidence_by_key: dict[tuple[bool, tuple[str, ...]], tuple[str, ...]] = {}
         for (is_pass, cards), votes in grouped.items():
             rejected_reason = self._validate_candidate(is_pass, cards, context)
+            if not rejected_reason and context.known_hand:
+                expected = Counter(context.known_hand)
+                if not is_pass:
+                    expected.subtract(Counter(cards))
+                expected_post_hand = Counter(+expected)
+                verified_votes = sum(
+                    bool(item.post_hand)
+                    and Counter(item.post_hand) == expected_post_hand
+                    for item in votes
+                )
+                if verified_votes < self.min_votes:
+                    rejected_reason = "self_hand_delta_unverified"
             candidates.append(
                 ConsensusCandidate(
                     cards=cards,
@@ -154,6 +175,12 @@ class BurstConsensus:
         try:
             if action_for_cards(cards, context.level_rank) is None:
                 return "illegal_pattern"
+            if context.table_cards and not play_beats_table(
+                cards,
+                context.table_cards,
+                context.level_rank,
+            ):
+                return "does_not_beat_table"
         except (ImportError, ModuleNotFoundError, ValueError):
             return "illegal_pattern"
         return ""

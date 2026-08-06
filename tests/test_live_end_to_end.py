@@ -52,6 +52,12 @@ class ScriptedRecognition:
             diagnostics=(),
             annotations=(),
             source="golden_fixture",
+            post_hand=(
+                tuple(card for card in HAND if card not in {"JC", "JD"})
+                if seat == "self"
+                else ()
+            ),
+            post_hand_confidence=0.96 if seat == "self" else 0.0,
         )
 
 
@@ -174,6 +180,9 @@ def test_golden_session_produces_exact_events_advice_and_replay_data(tmp_path):
         ("left", "player_played", ("9C", "9D")),
         ("self", "player_played", ("JC", "JD")),
     ]
+    assert [event.seq for event in runner.events] == list(
+        range(1, len(runner.events) + 1)
+    )
     assert runner.snapshot.current_player == fixture["expected_current_player"]
     assert advisor.calls == 1
     assert runner.metrics.advice_visible_latency_ms is not None

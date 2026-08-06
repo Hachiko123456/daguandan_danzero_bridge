@@ -62,10 +62,14 @@ class LatestOnlyWorker:
             try:
                 result = self.operation(value)
             except Exception as exc:
-                if self.on_error is not None:
+                with self._condition:
+                    stopped = self._stop_requested
+                if not stopped and self.on_error is not None:
                     self.on_error(exc)
             else:
-                if self.on_result is not None:
+                with self._condition:
+                    stopped = self._stop_requested
+                if not stopped and self.on_result is not None:
                     self.on_result(result)
 
     def stop(self, *, timeout: float | None = None) -> bool:

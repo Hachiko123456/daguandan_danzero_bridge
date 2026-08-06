@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -40,6 +40,7 @@ LiveStatus = Literal[
     "running",
     "review_required",
     "paused",
+    "finalizing",
     "sealed",
 ]
 
@@ -176,6 +177,7 @@ class LiveOrchestrator:
         self._previous_by_seat: dict[Seat, np.ndarray] = {}
         self._all_events: list[LiveEvent] = []
         self._aux_event_sequence = 0
+        self._published_sequence = 0
         self._advice_lock = RLock()
         self._requested_advice: set[AdviceRequestKey] = set()
         self._self_turn_corroborated = False
@@ -185,6 +187,10 @@ class LiveOrchestrator:
         self._advice_requested_at_ms: dict[AdviceRequestKey, int] = {}
         self._advice_visible_latency_ms: int | None = None
         self._accept_advice_results = True
+        self._status_before_pause: LiveStatus | None = None
+        self._analysis_epoch = 0
+        self._next_turn_evidence_started_ms: int | None = None
+        self._recent_incidents: dict[str, tuple[int, Path]] = {}
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -238,11 +244,15 @@ class LiveOrchestrator:
             lead_player=lead_player,
             source="manual_start_with_single_image_recognition",
         )
-        self.store.append_event(event)
-        self._remember_event(event)
+        event = self._publish_event(event)
         self.status = "running"
         self._last_monotonic_ms = int(monotonic_ms)
         self._activate_zone(int(monotonic_ms), started_with_clear_zone=True)
+        self._append_lifecycle_event(
+            "turn_started",
+            {"player": lead_player},
+            actor=lead_player,
+        )
         self._request_advice_if_needed()
         return self._update(event=event)
 
@@ -272,14 +282,18 @@ class LiveOrchestrator:
         monotonic_ms: int,
         wall_time: str,
     ) -> RecorderWarning | None:
-        if self.status == "sealed":
+        with self._state_lock:
+            status = self.status
+        if status == "sealed":
             raise RuntimeError("对局已经结束")
+        if status == "finalizing":
+            return None
         warning = self.recorder.write_frame(frame, monotonic_ms, wall_time)
         if warning is not None:
-            self._record_recorder_warning(warning)
+            with self._state_lock:
+                self._record_recorder_warning(warning)
         return warning
 
-    @_state_synchronized
     def analyze_frame(
         self,
         frame: np.ndarray,
@@ -287,45 +301,67 @@ class LiveOrchestrator:
         monotonic_ms: int,
         metrics: ZoneFrameMetrics | None = None,
     ) -> LiveUpdate:
-        if self.status == "sealed":
-            raise RuntimeError("对局已经结束")
-        self._last_monotonic_ms = int(monotonic_ms)
-        if self.status in {"paused", "initializing"}:
-            return self._update()
+        with self._state_lock:
+            if self.status == "sealed":
+                raise RuntimeError("对局已经结束")
+            self._last_monotonic_ms = int(monotonic_ms)
+            if self.status != "running":
+                return self._update()
+            expected = self.reducer.snapshot().current_player
+            if expected is None:
+                return self._require_review("missing_expected_player", monotonic_ms)
+            job_key = self._analysis_job_key()
 
-        expected = self.snapshot.current_player
-        if expected is None:
-            return self._require_review("missing_expected_player", monotonic_ms)
+        # Vision runs without the state lock so pause/correction/finalize stay instant.
         fast = self.recognition_service.recognize_fast_signals(frame, expected)
-        self._apply_fast_signal(fast)
-        if self.status == "review_required":
-            return self._update(fast_signals=fast)
-        if self._zone is None or self._zone.expected_player != expected:
-            self._activate_zone(monotonic_ms, started_with_clear_zone=False)
-        assert self._zone is not None
-        if metrics is None:
-            metrics = self._extract_metrics(frame, expected, monotonic_ms, fast)
-        else:
-            metrics = ZoneFrameMetrics(
-                monotonic_ms=int(monotonic_ms),
-                occupied=metrics.occupied,
-                motion_score=metrics.motion_score,
-                pass_visible=metrics.pass_visible or fast.pass_visible,
-                effect_visible=metrics.effect_visible or fast.effect_visible,
-            )
-        decision = self._zone.observe(metrics)
-        if decision.discard_burst:
-            self._clear_burst()
-        if decision.phase == ZonePhase.REVIEW_REQUIRED:
-            return self._require_review(decision.reason, monotonic_ms, fast)
-        if decision.collect_sample and self._sample_due(monotonic_ms):
-            result = self.recognition_service.recognize_play_region(
-                frame,
-                expected,
-                wild_rank=self.snapshot.wild_rank,
-            )
+        with self._state_lock:
+            if not self._analysis_job_is_current(job_key):
+                return self._update()
+            self._apply_fast_signal(fast)
+            if self._zone is None or self._zone.expected_player != expected:
+                self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+            assert self._zone is not None
+            if metrics is None:
+                current_metrics = self._extract_metrics(
+                    frame, expected, monotonic_ms, fast
+                )
+            else:
+                current_metrics = ZoneFrameMetrics(
+                    monotonic_ms=int(monotonic_ms),
+                    occupied=metrics.occupied,
+                    motion_score=metrics.motion_score,
+                    pass_visible=metrics.pass_visible or fast.pass_visible,
+                    effect_visible=metrics.effect_visible or fast.effect_visible,
+                )
+            decision = self._zone.observe(current_metrics)
+            if decision.discard_burst:
+                self._clear_burst()
+            if decision.phase == ZonePhase.REVIEW_REQUIRED:
+                return self._require_review(decision.reason, monotonic_ms, fast)
+            inferred_pass = self._inferred_pass_if_ready(current_metrics, fast)
+            if inferred_pass is not None:
+                return self._require_review(
+                    "pass_template_missing",
+                    monotonic_ms,
+                    fast,
+                    inferred_pass,
+                )
+            if not decision.collect_sample or not self._sample_due(monotonic_ms):
+                return self._update(fast_signals=fast)
+            wild_rank = self.reducer.snapshot().wild_rank
+
+        result = self.recognition_service.recognize_play_region(
+            frame,
+            expected,
+            wild_rank=wild_rank,
+        )
+        with self._state_lock:
+            if not self._analysis_job_is_current(job_key):
+                return self._update()
+            if self._zone is None or self._zone.expected_player != expected:
+                return self._update()
             self._append_sample(result, monotonic_ms)
-            consensus = self._decide_if_ready(metrics, fast)
+            consensus = self._decide_if_ready(current_metrics, fast)
             if consensus is not None:
                 if consensus.status == "confirmed":
                     event = self._commit_consensus(consensus, monotonic_ms)
@@ -340,7 +376,20 @@ class LiveOrchestrator:
                         fast,
                         consensus,
                     )
-        return self._update(fast_signals=fast)
+            return self._update(fast_signals=fast)
+
+    def _analysis_job_key(self) -> tuple[object, ...]:
+        snapshot = self.reducer.snapshot()
+        return (
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+            snapshot.current_player,
+            self._analysis_epoch,
+        )
+
+    def _analysis_job_is_current(self, key: tuple[object, ...]) -> bool:
+        return self.status == "running" and key == self._analysis_job_key()
 
     @_state_synchronized
     def confirm_candidate(self, candidate_id: str) -> LiveUpdate:
@@ -361,12 +410,21 @@ class LiveOrchestrator:
             source="manual_one_click_confirmation",
             evidence_refs=review.evidence_refs,
         )
-        self.store.append_event(event)
-        self._remember_event(event)
+        event = self._publish_event(event)
+        self._append_lifecycle_event(
+            "review_resolved",
+            {
+                "resolution": "candidate_confirmed",
+                "candidate_id": candidate.candidate_id,
+                "action_event_id": event.event_id,
+            },
+            actor=review.player,
+        )
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._append_current_turn_started()
         self._request_advice_if_needed()
         return self._update(event=event)
 
@@ -387,12 +445,20 @@ class LiveOrchestrator:
             confidence=1.0,
             source="manual_minimal_editor",
         )
-        self.store.append_event(event)
-        self._remember_event(event)
+        event = self._publish_event(event)
+        self._append_lifecycle_event(
+            "review_resolved",
+            {
+                "resolution": "manual_action",
+                "action_event_id": event.event_id,
+            },
+            actor=player,
+        )
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._append_current_turn_started()
         self._request_advice_if_needed()
         return self._update(event=event)
 
@@ -417,8 +483,15 @@ class LiveOrchestrator:
             is_pass=is_pass,
             reason=reason,
         )
-        self.store.append_event(event)
-        self._remember_event(event)
+        event = self._publish_event(event)
+        self._append_lifecycle_event(
+            "correction_applied",
+            {
+                "correction_event_id": event.event_id,
+                "target_event_id": event.payload.get("target_event_id"),
+            },
+            actor=event.actor,
+        )
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
@@ -428,22 +501,44 @@ class LiveOrchestrator:
 
     @_state_synchronized
     def pause(self) -> LiveUpdate:
-        if self.status == "running":
+        if self.status in {"running", "review_required"}:
+            self._status_before_pause = self.status
             self.status = "paused"
+            self._analysis_epoch += 1
             self._clear_burst()
             self._zone = None
+            self._append_lifecycle_event("session_paused", {})
         return self._update()
 
     @_state_synchronized
     def resume(self, *, monotonic_ms: int) -> LiveUpdate:
         if self.status != "paused":
             raise RuntimeError("只有暂停状态可以继续")
-        self.status = "running"
-        self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+        self.status = self._status_before_pause or "running"
+        self._status_before_pause = None
+        self._analysis_epoch += 1
+        if self.status == "running":
+            self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+        self._append_lifecycle_event("session_resumed", {})
+        return self._update()
+
+    @_state_synchronized
+    def begin_finalizing(self) -> LiveUpdate:
+        if self.status == "sealed":
+            return self._update()
+        self.status = "finalizing"
+        self._analysis_epoch += 1
+        self._accept_advice_results = False
+        self._zone = None
+        self._clear_burst()
         return self._update()
 
     @_state_synchronized
     def capture_interrupted(self, reason: str, *, monotonic_ms: int) -> LiveUpdate:
+        self._append_lifecycle_event(
+            "capture_interrupted",
+            {"reason": str(reason)},
+        )
         self._create_incident("capture_interrupted:" + str(reason), monotonic_ms)
         return self.pause()
 
@@ -489,7 +584,10 @@ class LiveOrchestrator:
         with self._state_lock:
             if self.status == "sealed":
                 return self._update()
+            self.status = "finalizing"
+            self._analysis_epoch += 1
             self._accept_advice_results = False
+            self._append_lifecycle_event("session_finalizing", {})
         if self._advice_worker is not None:
             self._advice_worker.stop(timeout=5.0)
         with self._state_lock:
@@ -498,6 +596,10 @@ class LiveOrchestrator:
                 frame_count=recording.frame_count,
                 dropped_frames=recording.dropped_frames,
                 metrics=self.metrics.to_dict(),
+                incident_media_failures=(
+                    failure.to_dict()
+                    for failure in recording.incident_media_failures
+                ),
             )
             self.status = "sealed"
             self._zone = None
@@ -721,13 +823,51 @@ class LiveOrchestrator:
             state_revision_before=snapshot.revision,
             state_revision_after=snapshot.revision,
         )
-        self.store.append_event(event)
-        self._all_events.append(event)
-        return event
+        return self._publish_event(event)
 
-    def _remember_event(self, event: LiveEvent) -> None:
+    def _publish_event(self, event: LiveEvent) -> LiveEvent:
         with self._advice_lock:
-            self._all_events.append(event)
+            self._published_sequence += 1
+            published = replace(event, seq=self._published_sequence)
+            self.store.append_event(published)
+            self._all_events.append(published)
+            return published
+
+    def _append_lifecycle_event(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        actor: Seat | None = None,
+    ) -> LiveEvent:
+        snapshot = self.reducer.snapshot()
+        self._aux_event_sequence += 1
+        event = LiveEvent(
+            event_id=f"AUX-{self._aux_event_sequence:06d}",
+            event_type=event_type,
+            session_id=snapshot.session_id,
+            seq=0,
+            monotonic_ms=self._last_monotonic_ms,
+            wall_time=datetime.now().astimezone().isoformat(),
+            trick_id=max(1, snapshot.trick_id),
+            turn_id=max(1, snapshot.turn_id),
+            actor=actor,
+            payload=dict(payload),
+            confidence=1.0,
+            source="live_orchestrator",
+            state_revision_before=snapshot.revision,
+            state_revision_after=snapshot.revision,
+        )
+        return self._publish_event(event)
+
+    def _append_current_turn_started(self) -> None:
+        player = self.reducer.snapshot().current_player
+        if player is not None:
+            self._append_lifecycle_event(
+                "turn_started",
+                {"player": player},
+                actor=player,
+            )
 
     def _set_advice_visible_latency(self, key: AdviceRequestKey) -> None:
         requested_at = self._advice_requested_at_ms.get(key)
@@ -746,6 +886,7 @@ class LiveOrchestrator:
             confidence=result.confidence,
             source=result.source,
             evidence_ref=observation_id,
+            post_hand=result.post_hand,
         )
         record: dict[str, object] = {
             "id": observation_id,
@@ -755,6 +896,8 @@ class LiveOrchestrator:
             "is_pass": result.is_pass,
             "confidence": result.confidence,
             "source": result.source,
+            "post_hand": list(result.post_hand),
+            "post_hand_confidence": result.post_hand_confidence,
             "diagnostics": list(result.diagnostics),
             "phase": "burst_read",
         }
@@ -783,12 +926,60 @@ class LiveOrchestrator:
             remaining_cards=snapshot.remaining_cards[player],
             allow_pass=bool(snapshot.trick_plays),
             known_hand=snapshot.my_hand if player == "self" else (),
+            table_cards=next(
+                (
+                    play.cards
+                    for play in reversed(snapshot.trick_plays)
+                    if not play.is_pass
+                ),
+                (),
+            ),
             region_empty=not metrics.occupied,
             next_turn_evidence=(
                 fast.active_player is not None and fast.active_player != player
             ),
         )
         return self.consensus.decide(self._samples, context=context)
+
+    def _inferred_pass_if_ready(
+        self,
+        metrics: ZoneFrameMetrics,
+        fast: FastSignalResult,
+    ) -> ConsensusResult | None:
+        snapshot = self.reducer.snapshot()
+        player = snapshot.current_player
+        independent_next_turn = (
+            player is not None
+            and fast.active_player is not None
+            and fast.active_player != player
+        )
+        eligible = (
+            self._zone is not None
+            and self._zone.phase == ZonePhase.WAIT_ACTION
+            and bool(snapshot.trick_plays)
+            and not metrics.occupied
+            and not metrics.pass_visible
+            and not metrics.effect_visible
+            and independent_next_turn
+        )
+        if not eligible:
+            self._next_turn_evidence_started_ms = None
+            return None
+        now = int(metrics.monotonic_ms)
+        if self._next_turn_evidence_started_ms is None:
+            self._next_turn_evidence_started_ms = now
+            return None
+        if now - self._next_turn_evidence_started_ms < 300:
+            return None
+        context = ConsensusContext(
+            level_rank=snapshot.wild_rank,
+            remaining_cards=snapshot.remaining_cards[player],
+            allow_pass=True,
+            known_hand=snapshot.my_hand if player == "self" else (),
+            region_empty=True,
+            next_turn_evidence=True,
+        )
+        return self.consensus.decide((), context=context)
 
     def _commit_consensus(self, result: ConsensusResult, monotonic_ms: int) -> LiveEvent:
         player = self.snapshot.current_player
@@ -801,9 +992,9 @@ class LiveOrchestrator:
             source=result.source,
             evidence_refs=result.evidence_refs,
         )
-        self.store.append_event(event)
-        self._remember_event(event)
+        event = self._publish_event(event)
         self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+        self._append_current_turn_started()
         self._request_advice_if_needed()
         return event
 
@@ -859,6 +1050,15 @@ class LiveOrchestrator:
         self.status = "review_required"
         if self._zone is not None:
             self._zone.require_review(reason)
+        self._append_lifecycle_event(
+            "review_required",
+            {
+                "reason": str(reason),
+                "candidate_ids": [item.candidate_id for item in candidates],
+                "evidence_refs": list(evidence),
+            },
+            actor=player,
+        )
         self._create_incident(reason, monotonic_ms)
         return self._update(review=self.latest_review, fast_signals=fast)
 
@@ -875,12 +1075,28 @@ class LiveOrchestrator:
         )
 
     def _create_incident(self, reason: str, monotonic_ms: int) -> Path:
+        previous = self._recent_incidents.get(str(reason))
+        if previous is not None:
+            previous_ms, previous_path = previous
+            elapsed = int(monotonic_ms) - previous_ms
+            if 0 <= elapsed <= 5_000 and previous_path.is_dir():
+                self.store.append_incident_occurrence(
+                    previous_path,
+                    monotonic_ms=int(monotonic_ms),
+                    reason=str(reason),
+                )
+                self._recent_incidents[str(reason)] = (
+                    int(monotonic_ms),
+                    previous_path,
+                )
+                return previous_path
         state = self._snapshot_document()
         path = self.store.create_incident(
             reason=str(reason),
             state_before=state,
             state_after=state,
             observations=list(self._observations),
+            trigger_ms=int(monotonic_ms),
         )
         try:
             self.recorder.schedule_incident_media(
@@ -889,9 +1105,14 @@ class LiveOrchestrator:
             )
         except RuntimeError:
             pass
+        self._recent_incidents[str(reason)] = (int(monotonic_ms), path)
         return path
 
     def _record_recorder_warning(self, warning: RecorderWarning) -> None:
+        self._append_lifecycle_event(
+            "recording_frame_dropped",
+            {"reason": warning.reason, "details": warning.details},
+        )
         self._create_incident(
             f"recording_frame_dropped:{warning.reason}", warning.monotonic_ms
         )
@@ -960,6 +1181,7 @@ class LiveOrchestrator:
         self._samples.clear()
         self._observations.clear()
         self._last_sample_ms = None
+        self._next_turn_evidence_started_ms = None
 
     def _update(
         self,

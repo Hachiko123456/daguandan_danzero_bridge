@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from time import monotonic_ns
@@ -56,6 +57,8 @@ class LiveAssistantController(QObject):
         self._capture_worker: WorkerHandle | None = None
         self._analysis_worker: LatestOnlyWorker | None = None
         self._initial_thread: OneShotThread | None = None
+        self._deferred_source_close = None
+        self._capture_generation = 0
 
     @property
     def is_running(self) -> bool:
@@ -133,6 +136,10 @@ class LiveAssistantController(QObject):
                     store.seal(
                         frame_count=recording.frame_count,
                         dropped_frames=recording.dropped_frames,
+                        incident_media_failures=(
+                            failure.to_dict()
+                            for failure in recording.incident_media_failures
+                        ),
                     )
             self.error.emit(str(exc))
             return False
@@ -179,11 +186,15 @@ class LiveAssistantController(QObject):
     def _start_capture_worker(self) -> None:
         if self.orchestrator is None or self._live_source is None or self.is_running:
             return
+        orchestrator = self.orchestrator
+        generation = self._capture_generation
 
         def operation():
             snapshot: FrameSnapshot = self._live_source.capture()
+            if generation != self._capture_generation:
+                return snapshot
             captured_ms = monotonic_ns() // 1_000_000
-            self.orchestrator.record_frame(
+            orchestrator.record_frame(
                 snapshot.image,
                 monotonic_ms=captured_ms,
                 wall_time=snapshot.captured_at.isoformat(),
@@ -196,7 +207,7 @@ class LiveAssistantController(QObject):
         worker = WorkerHandle(operation, 0.1)
         worker.frame_ready.connect(self._accept_live_frame)
         worker.error.connect(self._accept_live_error)
-        worker.finished.connect(self._capture_finished)
+        worker.finished.connect(lambda: self._capture_finished(worker))
         self._capture_worker = worker
         worker.start()
 
@@ -213,8 +224,12 @@ class LiveAssistantController(QObject):
             self.update_ready.emit(update)
         self.error.emit(message)
 
-    def _capture_finished(self) -> None:
-        self._capture_worker = None
+    def _capture_finished(self, worker: WorkerHandle) -> None:
+        if self._capture_worker is worker:
+            self._capture_worker = None
+        deferred, self._deferred_source_close = self._deferred_source_close, None
+        if deferred is not None:
+            deferred.close()
 
     def confirm_candidate(self, candidate_id: str) -> None:
         self._invoke(lambda value: value.confirm_candidate(candidate_id))
@@ -266,10 +281,14 @@ class LiveAssistantController(QObject):
         orchestrator = self.orchestrator
         if orchestrator is None:
             return
-        self._stop_capture_worker()
+        orchestrator.begin_finalizing()
+        capture_stopped = self._stop_capture_worker()
         self._stop_analysis_worker()
         if self._live_source is not None:
-            self._live_source.close()
+            if capture_stopped:
+                self._live_source.close()
+            else:
+                self._deferred_source_close = self._live_source
             self._live_source = None
         try:
             update = orchestrator.finish()
@@ -280,16 +299,24 @@ class LiveAssistantController(QObject):
         self.update_ready.emit(update)
         self.session_finished.emit(update)
 
-    def _stop_capture_worker(self) -> None:
-        worker, self._capture_worker = self._capture_worker, None
-        if worker is not None:
-            worker.stop()
-            worker.wait(5_000)
+    def _stop_capture_worker(self) -> bool:
+        worker = self._capture_worker
+        if worker is None:
+            return True
+        self._capture_generation += 1
+        worker.stop()
+        stopped = worker.wait(5_000)
+        if stopped:
+            self._capture_worker = None
+        else:
+            self.error.emit("采集任务未在 5 秒内停止，已阻止后续写入并等待安全退出")
+        return stopped
 
     def _stop_analysis_worker(self) -> None:
         worker, self._analysis_worker = self._analysis_worker, None
         if worker is not None:
-            worker.stop(timeout=10.0)
+            if not worker.stop(timeout=10.0):
+                self.error.emit("识别任务未在 10 秒内停止，结果已作废")
 
     def shutdown(self) -> None:
         self.finish()
@@ -304,6 +331,7 @@ class LiveAssistantController(QObject):
             application_version = "0.1.0"
         return {
             "application_version": application_version,
+            "owner_pid": os.getpid(),
             "configuration_hash": LiveAssistantController._file_hash(config_path),
             "template_manifest_hash": LiveAssistantController._file_hash(templates_path),
             "target_fps": 10,
