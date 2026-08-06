@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import shutil
-from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any, Literal
 
 import cv2
 import numpy as np
 
 from ..annotation_service import AnnotationService
-from ..danzero.state import Seat
+from ..danzero.advisor import LocalAdvice
+from ..danzero.state import GuanDanState, Seat
 from ..recognition_service import (
     PLAY_REGION_TO_SEAT,
     FastSignalResult,
@@ -25,6 +27,7 @@ from .consensus import (
     RecognitionSample,
 )
 from .models import LiveEvent, LiveSnapshot
+from .latest_worker import LatestOnlyWorker
 from .recorder import RecorderWarning, SessionRecorder
 from .reducer import LiveReducer
 from .session_store import LiveSessionStore
@@ -69,6 +72,39 @@ class LiveUpdate:
     fast_signals: FastSignalResult | None = None
 
 
+@dataclass(frozen=True)
+class AdviceRequestKey:
+    session_id: str
+    turn_id: int
+    state_revision: int
+
+    @property
+    def request_id(self) -> str:
+        return f"ADV-{self.turn_id:04d}-{self.state_revision:04d}"
+
+
+@dataclass(frozen=True)
+class LiveAdvice:
+    key: AdviceRequestKey
+    status: Literal["requested", "ready", "stale", "failed"]
+    advice: LocalAdvice | None = None
+    visible: bool = False
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class _AdviceJob:
+    key: AdviceRequestKey
+    state: GuanDanState
+
+
+@dataclass(frozen=True)
+class _AdviceCompletion:
+    key: AdviceRequestKey
+    advice: LocalAdvice | None = None
+    error: str = ""
+
+
 class LiveOrchestrator:
     """Qt-free coordinator for recording, gating, recognition, and reduction."""
 
@@ -79,6 +115,7 @@ class LiveOrchestrator:
         store: LiveSessionStore,
         recorder: SessionRecorder,
         recognition_service: ScreenshotRecognitionService | Any,
+        advisor: Any | None = None,
         settle_ms: int = 400,
         action_timeout_ms: int = 15_000,
         burst_sample_limit: int = 5,
@@ -91,6 +128,7 @@ class LiveOrchestrator:
         self.store = store
         self.recorder = recorder
         self.recognition_service = recognition_service
+        self.advisor = advisor
         self.settle_ms = int(settle_ms)
         self.action_timeout_ms = int(action_timeout_ms)
         self.burst_sample_limit = int(burst_sample_limit)
@@ -107,6 +145,19 @@ class LiveOrchestrator:
         self._last_monotonic_ms = 0
         self._baseline_by_seat: dict[Seat, np.ndarray] = {}
         self._previous_by_seat: dict[Seat, np.ndarray] = {}
+        self._all_events: list[LiveEvent] = []
+        self._aux_event_sequence = 0
+        self._advice_lock = RLock()
+        self._requested_advice: set[AdviceRequestKey] = set()
+        self._self_turn_corroborated = False
+        self.latest_advice: LiveAdvice | None = None
+        self._advice_worker: LatestOnlyWorker | None = None
+        if advisor is not None:
+            self._advice_worker = LatestOnlyWorker(
+                self._run_advice,
+                on_result=self._complete_advice_job,
+            )
+            self._advice_worker.start()
 
     @property
     def snapshot(self) -> LiveSnapshot:
@@ -114,7 +165,8 @@ class LiveOrchestrator:
 
     @property
     def events(self) -> tuple[LiveEvent, ...]:
-        return self.reducer.events
+        with self._advice_lock:
+            return tuple(self._all_events)
 
     def start(
         self,
@@ -138,9 +190,11 @@ class LiveOrchestrator:
             source="manual_start_with_single_image_recognition",
         )
         self.store.append_event(event)
+        self._remember_event(event)
         self.status = "running"
         self._last_monotonic_ms = int(monotonic_ms)
         self._activate_zone(int(monotonic_ms), started_with_clear_zone=True)
+        self._request_advice_if_needed()
         return self._update(event=event)
 
     def ingest_frame(
@@ -164,6 +218,7 @@ class LiveOrchestrator:
         if expected is None:
             return self._require_review("missing_expected_player", monotonic_ms)
         fast = self.recognition_service.recognize_fast_signals(frame, expected)
+        self._apply_fast_signal(fast)
         if self.status == "review_required":
             return self._update(fast_signals=fast)
         if self._zone is None or self._zone.expected_player != expected:
@@ -227,10 +282,12 @@ class LiveOrchestrator:
             evidence_refs=review.evidence_refs,
         )
         self.store.append_event(event)
+        self._remember_event(event)
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._request_advice_if_needed()
         return self._update(event=event)
 
     def confirm_manual_action(
@@ -250,10 +307,12 @@ class LiveOrchestrator:
             source="manual_minimal_editor",
         )
         self.store.append_event(event)
+        self._remember_event(event)
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._request_advice_if_needed()
         return self._update(event=event)
 
     def correct_latest(
@@ -277,10 +336,12 @@ class LiveOrchestrator:
             reason=reason,
         )
         self.store.append_event(event)
+        self._remember_event(event)
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._request_advice_if_needed()
         return self._update(event=event)
 
     def pause(self) -> LiveUpdate:
@@ -301,9 +362,38 @@ class LiveOrchestrator:
         self._create_incident("capture_interrupted:" + str(reason), monotonic_ms)
         return self.pause()
 
+    def ingest_fast_signal(
+        self,
+        *,
+        active_player: Seat | None,
+        self_action_buttons_visible: bool = False,
+    ) -> LiveUpdate:
+        expected = self.snapshot.current_player or "self"
+        fast = FastSignalResult(
+            expected_player=expected,
+            active_player=active_player,
+            pass_visible=False,
+            self_action_buttons_visible=bool(self_action_buttons_visible),
+            effect_visible=False,
+        )
+        self._apply_fast_signal(fast)
+        return self._update(fast_signals=fast)
+
+    def start_self_advice(self) -> AdviceRequestKey | None:
+        return self._request_advice_if_needed()
+
+    def complete_advice(
+        self,
+        key: AdviceRequestKey,
+        advice: LocalAdvice,
+    ) -> None:
+        self._complete_advice_job(_AdviceCompletion(key=key, advice=advice))
+
     def finish(self) -> LiveUpdate:
         if self.status == "sealed":
             return self._update()
+        if self._advice_worker is not None:
+            self._advice_worker.stop(timeout=5.0)
         recording = self.recorder.close()
         self.store.seal(
             frame_count=recording.frame_count,
@@ -326,7 +416,211 @@ class LiveOrchestrator:
             settle_ms=self.settle_ms,
             action_timeout_ms=self.action_timeout_ms,
         )
+        self._self_turn_corroborated = False
         self._clear_burst()
+
+    def _request_advice_if_needed(self) -> AdviceRequestKey | None:
+        if self.advisor is None or self.status != "running":
+            return None
+        snapshot = self.snapshot
+        if snapshot.current_player != "self":
+            return None
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        with self._advice_lock:
+            if key in self._requested_advice:
+                return key
+            state = self.reducer.to_guandan_state()
+            self._requested_advice.add(key)
+            self.latest_advice = LiveAdvice(key=key, status="requested")
+            self.store.append_advice(
+                {
+                    "request_id": key.request_id,
+                    "status": "requested",
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                }
+            )
+            self._append_advice_event(
+                "advice_requested",
+                {
+                    "request_id": key.request_id,
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                },
+            )
+            worker = self._advice_worker
+            assert worker is not None
+            worker.submit(_AdviceJob(key, state))
+            return key
+
+    def _run_advice(self, job: _AdviceJob) -> _AdviceCompletion:
+        try:
+            advice = self.advisor.recommend(
+                job.state,
+                request_id=job.key.request_id,
+            )
+        except Exception as exc:
+            return _AdviceCompletion(job.key, error=str(exc))
+        return _AdviceCompletion(job.key, advice=advice)
+
+    def _complete_advice_job(self, completion: _AdviceCompletion) -> None:
+        key = completion.key
+        with self._advice_lock:
+            snapshot = self.snapshot
+            current_key = AdviceRequestKey(
+                snapshot.session_id,
+                snapshot.turn_id,
+                snapshot.revision,
+            )
+            if snapshot.current_player != "self" or key != current_key:
+                self.store.append_advice(
+                    {
+                        "request_id": key.request_id,
+                        "status": "stale",
+                        "turn_id": key.turn_id,
+                        "state_revision": key.state_revision,
+                        "error": completion.error,
+                    }
+                )
+                self._append_advice_event(
+                    "advice_stale",
+                    {
+                        "request_id": key.request_id,
+                        "turn_id": key.turn_id,
+                        "state_revision": key.state_revision,
+                        "current_state_revision": snapshot.revision,
+                    },
+                )
+                if self.latest_advice is not None and self.latest_advice.key == key:
+                    self.latest_advice = LiveAdvice(
+                        key=key,
+                        status="stale",
+                        advice=completion.advice,
+                        error=completion.error,
+                    )
+                return
+            if completion.error or completion.advice is None:
+                self.latest_advice = LiveAdvice(
+                    key=key,
+                    status="failed",
+                    error=completion.error or "DanZero 未返回建议",
+                )
+                self.store.append_advice(
+                    {
+                        "request_id": key.request_id,
+                        "status": "failed",
+                        "turn_id": key.turn_id,
+                        "state_revision": key.state_revision,
+                        "error": self.latest_advice.error,
+                    }
+                )
+                self._append_advice_event(
+                    "advice_failed",
+                    {
+                        "request_id": key.request_id,
+                        "error": self.latest_advice.error,
+                    },
+                    confidence=0.0,
+                )
+                self._create_incident("advisor_failed", self._last_monotonic_ms)
+                return
+            advice = completion.advice
+            visible = self._self_turn_corroborated
+            self.latest_advice = LiveAdvice(
+                key=key,
+                status="ready",
+                advice=advice,
+                visible=visible,
+            )
+            self.store.append_advice(
+                {
+                    "request_id": key.request_id,
+                    "status": "ready",
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                    "cards": list(advice.cards),
+                    "is_pass": advice.is_pass,
+                    "play_type": advice.play_type,
+                    "strategy": advice.strategy,
+                    "engine_input": advice.engine_input,
+                    "timings": advice.timings,
+                    "elapsed_ms": advice.elapsed_ms,
+                    "visible": visible,
+                }
+            )
+            self._append_advice_event(
+                "advice_ready",
+                {
+                    "request_id": key.request_id,
+                    "cards": list(advice.cards),
+                    "is_pass": advice.is_pass,
+                    "play_type": advice.play_type,
+                    "state_revision": key.state_revision,
+                    "visible": visible,
+                },
+            )
+
+    def _apply_fast_signal(self, fast: FastSignalResult) -> None:
+        if self.snapshot.current_player != "self":
+            return
+        corroborated = (
+            fast.active_player == "self" or fast.self_action_buttons_visible
+        )
+        if not corroborated:
+            return
+        with self._advice_lock:
+            self._self_turn_corroborated = True
+            current = self.latest_advice
+            if current is None or current.status != "ready" or current.visible:
+                return
+            self.latest_advice = LiveAdvice(
+                key=current.key,
+                status=current.status,
+                advice=current.advice,
+                visible=True,
+                error=current.error,
+            )
+            self._append_advice_event(
+                "advice_visible",
+                {"request_id": current.key.request_id},
+            )
+
+    def _append_advice_event(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        confidence: float = 1.0,
+    ) -> LiveEvent:
+        snapshot = self.snapshot
+        self._aux_event_sequence += 1
+        event = LiveEvent(
+            event_id=f"AUX-{self._aux_event_sequence:06d}",
+            event_type=event_type,
+            session_id=snapshot.session_id,
+            seq=len(self._all_events) + 1,
+            monotonic_ms=self._last_monotonic_ms,
+            wall_time=datetime.now().astimezone().isoformat(),
+            trick_id=max(1, snapshot.trick_id),
+            turn_id=max(1, snapshot.turn_id),
+            actor="self",
+            payload=dict(payload),
+            confidence=float(confidence),
+            source="live_advice_coordinator",
+            state_revision_before=snapshot.revision,
+            state_revision_after=snapshot.revision,
+        )
+        self.store.append_event(event)
+        self._all_events.append(event)
+        return event
+
+    def _remember_event(self, event: LiveEvent) -> None:
+        with self._advice_lock:
+            self._all_events.append(event)
 
     def _append_sample(self, result: PlayRegionResult, monotonic_ms: int) -> None:
         self._observation_sequence += 1
@@ -393,7 +687,9 @@ class LiveOrchestrator:
             evidence_refs=result.evidence_refs,
         )
         self.store.append_event(event)
+        self._remember_event(event)
         self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+        self._request_advice_if_needed()
         return event
 
     def _record_action(
@@ -557,6 +853,7 @@ class LiveOrchestrator:
             status=self.status,
             snapshot=self.snapshot,
             event=event,
+            advice=self.latest_advice,
             review=review if review is not None else self.latest_review,
             fast_signals=fast_signals,
         )
