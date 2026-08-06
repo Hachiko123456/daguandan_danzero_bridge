@@ -75,6 +75,42 @@ def read_json_lines(path: Path) -> list[dict[str, object]]:
 class LiveSessionStore:
     """Own all append-only diagnostics for exactly one game session."""
 
+    @classmethod
+    def recover_incomplete_sessions(
+        cls,
+        profiles_root: Path,
+        profile_name: str,
+    ) -> tuple[Path, ...]:
+        """Mark sessions left running by a previous process as aborted.
+
+        Recovery deliberately preserves ``*.part`` and all append-only files so
+        the last readable observations remain available for diagnosis.
+        """
+
+        profile = normalize_profile_name(profile_name)
+        sessions_root = Path(profiles_root) / profile / "sessions"
+        if not sessions_root.is_dir():
+            return ()
+
+        recovered: list[Path] = []
+        for manifest_path in sorted(sessions_root.glob("*/manifest.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(manifest, dict) or manifest.get("status") != "running":
+                continue
+            manifest.update(
+                {
+                    "status": "aborted",
+                    "recovered_at": _now_text(),
+                    "recovery_reason": "previous_process_did_not_seal",
+                }
+            )
+            atomic_write_json(manifest_path, manifest)
+            recovered.append(manifest_path.parent)
+        return tuple(recovered)
+
     def __init__(
         self,
         profiles_root: Path,

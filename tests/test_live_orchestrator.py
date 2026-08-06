@@ -172,3 +172,20 @@ def test_latest_only_worker_replaces_pending_recognition_batch():
     assert processed == [1, 3]
     assert results == [10, 30]
     assert not worker.is_running
+
+
+def test_recording_path_does_not_run_slow_recognition(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S") for _ in range(3)])
+    recognition = orchestrator.recognition_service
+
+    warning = orchestrator.record_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=100,
+        wall_time="record-only",
+    )
+
+    assert warning is None
+    assert orchestrator.recorder.frame_count == 1
+    assert recognition.fast_calls == 0
+    assert recognition.targeted_calls == 0
+    orchestrator.finish()

@@ -37,6 +37,14 @@ class IncidentMedia:
     frame_count: int
 
 
+@dataclass
+class _PendingIncidentMedia:
+    directory: Path
+    trigger_ms: int
+    deadline_ms: int
+    frames: list[tuple[int, np.ndarray]]
+
+
 class SessionRecorder:
     """Record standardized frames and their original capture timestamps."""
 
@@ -72,6 +80,7 @@ class SessionRecorder:
         self._pending_drops = 0
         self._closed = False
         self._lock = RLock()
+        self._pending_incidents: list[_PendingIncidentMedia] = []
 
     @property
     def frame_count(self) -> int:
@@ -126,6 +135,7 @@ class SessionRecorder:
             }
             append_json_line(self.index_path, record)
             self._buffer.append((int(captured_monotonic_ms), frame.copy()))
+            self._advance_pending_incidents(int(captured_monotonic_ms), frame)
             self._frame_count += 1
             self._pending_drops = 0
             return None
@@ -161,31 +171,94 @@ class SessionRecorder:
             ]
             if not selected:
                 raise RuntimeError("环形缓冲中没有事故时间范围内的帧")
-            clip_path = incident_directory / "clip.avi"
-            clip_writer = self._open_writer(clip_path)
-            try:
-                for _, frame in selected:
-                    clip_writer.write(frame)
-            finally:
-                clip_writer.release()
-            _, trigger_frame = min(
-                selected, key=lambda item: abs(item[0] - int(trigger_ms))
+            return self._write_incident_media(
+                incident_directory,
+                int(trigger_ms),
+                selected,
             )
-            frames_directory = incident_directory / "frames"
-            trigger_path = self.save_evidence_frame(
-                frames_directory / "trigger.png", trigger_frame
+
+    def schedule_incident_media(
+        self,
+        incident_directory: Path,
+        *,
+        trigger_ms: int,
+        before_ms: int = 5_000,
+        after_ms: int = 5_000,
+    ) -> None:
+        """Keep pre-trigger frames now and finalize after future frames arrive."""
+
+        with self._lock:
+            self._ensure_open()
+            directory = Path(incident_directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            selected = [
+                (timestamp, frame.copy())
+                for timestamp, frame in self._buffer
+                if trigger_ms - before_ms <= timestamp <= trigger_ms
+            ]
+            pending = _PendingIncidentMedia(
+                directory=directory,
+                trigger_ms=int(trigger_ms),
+                deadline_ms=int(trigger_ms + max(0, after_ms)),
+                frames=selected,
             )
-            contact_sheet_path = incident_directory / "contact_sheet.png"
-            save_image_unicode(
-                contact_sheet_path,
-                self._make_contact_sheet([frame for _, frame in selected]),
-            )
-            return IncidentMedia(
-                clip_path=clip_path,
-                contact_sheet_path=contact_sheet_path,
-                trigger_frame_path=trigger_path,
-                frame_count=len(selected),
-            )
+            if after_ms <= 0:
+                if selected:
+                    self._write_incident_media(directory, int(trigger_ms), selected)
+                return
+            self._pending_incidents.append(pending)
+
+    def _advance_pending_incidents(
+        self,
+        monotonic_ms: int,
+        frame: np.ndarray,
+    ) -> None:
+        completed: list[_PendingIncidentMedia] = []
+        for pending in self._pending_incidents:
+            if pending.trigger_ms < monotonic_ms <= pending.deadline_ms:
+                pending.frames.append((monotonic_ms, frame.copy()))
+            if monotonic_ms >= pending.deadline_ms:
+                completed.append(pending)
+        for pending in completed:
+            if pending.frames:
+                self._write_incident_media(
+                    pending.directory,
+                    pending.trigger_ms,
+                    pending.frames,
+                )
+            self._pending_incidents.remove(pending)
+
+    def _write_incident_media(
+        self,
+        incident_directory: Path,
+        trigger_ms: int,
+        selected: list[tuple[int, np.ndarray]],
+    ) -> IncidentMedia:
+        clip_path = incident_directory / "clip.avi"
+        clip_writer = self._open_writer(clip_path)
+        try:
+            for _, frame in selected:
+                clip_writer.write(frame)
+        finally:
+            clip_writer.release()
+        _, trigger_frame = min(
+            selected, key=lambda item: abs(item[0] - int(trigger_ms))
+        )
+        frames_directory = incident_directory / "frames"
+        trigger_path = self.save_evidence_frame(
+            frames_directory / "trigger.png", trigger_frame
+        )
+        contact_sheet_path = incident_directory / "contact_sheet.png"
+        save_image_unicode(
+            contact_sheet_path,
+            self._make_contact_sheet([frame for _, frame in selected]),
+        )
+        return IncidentMedia(
+            clip_path=clip_path,
+            contact_sheet_path=contact_sheet_path,
+            trigger_frame_path=trigger_path,
+            frame_count=len(selected),
+        )
 
     def _make_contact_sheet(self, frames: list[np.ndarray]) -> np.ndarray:
         sample_count = min(9, len(frames))
@@ -210,6 +283,14 @@ class SessionRecorder:
     def close(self) -> RecordingResult:
         with self._lock:
             if not self._closed:
+                for pending in tuple(self._pending_incidents):
+                    if pending.frames:
+                        self._write_incident_media(
+                            pending.directory,
+                            pending.trigger_ms,
+                            pending.frames,
+                        )
+                self._pending_incidents.clear()
                 self._writer.release()
                 self._closed = True
             return RecordingResult(

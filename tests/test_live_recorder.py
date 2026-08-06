@@ -84,3 +84,36 @@ def test_incident_media_uses_ring_buffer_and_saves_png_evidence(tmp_path):
     assert media.trigger_frame_path.is_file()
     assert evidence.is_file()
     assert cv2.imread(str(media.contact_sheet_path)) is not None
+
+
+def test_scheduled_incident_media_collects_frames_after_trigger(tmp_path):
+    recorder = SessionRecorder(tmp_path, size=(64, 32), fps=10, buffer_seconds=2)
+    for index in range(6):
+        recorder.write_frame(
+            np.full((32, 64, 3), index * 10, np.uint8),
+            captured_monotonic_ms=index * 100,
+            wall_time=f"t{index}",
+        )
+    incident_dir = tmp_path / "incidents" / "INC-0002"
+
+    recorder.schedule_incident_media(
+        incident_dir,
+        trigger_ms=500,
+        before_ms=300,
+        after_ms=300,
+    )
+    assert not (incident_dir / "clip.avi").exists()
+    for index in range(6, 9):
+        recorder.write_frame(
+            np.full((32, 64, 3), index * 10, np.uint8),
+            captured_monotonic_ms=index * 100,
+            wall_time=f"t{index}",
+        )
+    recorder.close()
+
+    capture = cv2.VideoCapture(str(incident_dir / "clip.avi"))
+    try:
+        assert int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) == 7
+    finally:
+        capture.release()
+    assert (incident_dir / "contact_sheet.png").is_file()

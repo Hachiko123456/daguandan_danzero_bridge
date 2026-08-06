@@ -132,3 +132,19 @@ def test_seal_compresses_observations_and_updates_manifest(tmp_path):
     assert not store.observations_part_path.exists()
     with gzip.open(store.observations_gzip_path, "rt", encoding="utf-8") as handle:
         assert json.loads(handle.readline())["id"] == "OBS-1"
+
+
+def test_recovery_marks_unsealed_previous_process_session_aborted(tmp_path):
+    store = _started_store(tmp_path, "crashed-game")
+    store.append_observation({"id": "OBS-before-crash"})
+
+    recovered = LiveSessionStore.recover_incomplete_sessions(
+        tmp_path,
+        "tencent_daguandan",
+    )
+
+    manifest = json.loads(store.manifest_path.read_text("utf-8"))
+    assert recovered == (store.directory,)
+    assert manifest["status"] == "aborted"
+    assert manifest["recovery_reason"] == "previous_process_did_not_seal"
+    assert store.observations_part_path.is_file()

@@ -11,6 +11,7 @@ from ..annotation_service import AnnotationService
 from ..capture_service import CaptureService, FrameSnapshot
 from ..danzero import DanzeroAdvisor
 from ..live.orchestrator import LiveOrchestrator, LiveUpdate
+from ..live.latest_worker import LatestOnlyWorker
 from ..live.recorder import SessionRecorder
 from ..live.reducer import LiveReducer
 from ..live.session_store import LiveSessionStore
@@ -37,6 +38,10 @@ class LiveAssistantController(QObject):
         super().__init__()
         self.capture_service = capture_service or CaptureService()
         self.profile_name = profile_name
+        LiveSessionStore.recover_incomplete_sessions(
+            self.capture_service.profiles_root,
+            self.profile_name,
+        )
         annotation = AnnotationService(
             self.capture_service.profiles_root,
             profile_name,
@@ -49,6 +54,7 @@ class LiveAssistantController(QObject):
         self.orchestrator: LiveOrchestrator | None = None
         self._live_source = None
         self._capture_worker: WorkerHandle | None = None
+        self._analysis_worker: LatestOnlyWorker | None = None
         self._initial_thread: OneShotThread | None = None
 
     @property
@@ -133,8 +139,42 @@ class LiveAssistantController(QObject):
         self.orchestrator = orchestrator
         self._live_source = source
         self.update_ready.emit(update)
+        self._start_analysis_worker()
         self._start_capture_worker()
         return True
+
+    def _start_analysis_worker(self) -> None:
+        if self.orchestrator is None or self._analysis_worker is not None:
+            return
+        worker = LatestOnlyWorker(
+            self._analyze_live_frame,
+            on_result=self.update_ready.emit,
+            on_error=self._accept_analysis_error,
+        )
+        self._analysis_worker = worker
+        worker.start()
+
+    def _analyze_live_frame(self, value: object) -> LiveUpdate:
+        snapshot, monotonic_ms = value  # type: ignore[misc]
+        assert self.orchestrator is not None
+        return self.orchestrator.analyze_frame(
+            snapshot.image,
+            monotonic_ms=monotonic_ms,
+        )
+
+    def _accept_analysis_error(self, exc: Exception) -> None:
+        message = str(exc)
+        if self.orchestrator is not None:
+            try:
+                update = self.orchestrator.analysis_failed(
+                    message,
+                    monotonic_ms=monotonic_ns() // 1_000_000,
+                )
+            except Exception as incident_exc:
+                self.error.emit(f"{message}; 创建识别事故失败：{incident_exc}")
+                return
+            self.update_ready.emit(update)
+        self.error.emit(message)
 
     def _start_capture_worker(self) -> None:
         if self.orchestrator is None or self._live_source is None or self.is_running:
@@ -142,12 +182,16 @@ class LiveAssistantController(QObject):
 
         def operation():
             snapshot: FrameSnapshot = self._live_source.capture()
-            update = self.orchestrator.ingest_frame(
+            captured_ms = monotonic_ns() // 1_000_000
+            self.orchestrator.record_frame(
                 snapshot.image,
-                monotonic_ms=monotonic_ns() // 1_000_000,
+                monotonic_ms=captured_ms,
                 wall_time=snapshot.captured_at.isoformat(),
             )
-            return snapshot, update
+            analysis = self._analysis_worker
+            if analysis is not None:
+                analysis.submit((snapshot, captured_ms))
+            return snapshot
 
         worker = WorkerHandle(operation, 0.1)
         worker.frame_ready.connect(self._accept_live_frame)
@@ -157,11 +201,10 @@ class LiveAssistantController(QObject):
         worker.start()
 
     def _accept_live_frame(self, value: object) -> None:
-        snapshot, update = value  # type: ignore[misc]
-        self.frame_ready.emit(snapshot)
-        self.update_ready.emit(update)
+        self.frame_ready.emit(value)
 
     def _accept_live_error(self, message: str) -> None:
+        self._stop_analysis_worker()
         if self.orchestrator is not None:
             update = self.orchestrator.capture_interrupted(
                 message,
@@ -207,6 +250,7 @@ class LiveAssistantController(QObject):
 
     def pause(self) -> None:
         self._stop_capture_worker()
+        self._stop_analysis_worker()
         self._invoke(lambda value: value.pause())
 
     def resume(self) -> None:
@@ -215,6 +259,7 @@ class LiveAssistantController(QObject):
         self._invoke(
             lambda value: value.resume(monotonic_ms=monotonic_ns() // 1_000_000)
         )
+        self._start_analysis_worker()
         self._start_capture_worker()
 
     def finish(self) -> None:
@@ -222,6 +267,7 @@ class LiveAssistantController(QObject):
         if orchestrator is None:
             return
         self._stop_capture_worker()
+        self._stop_analysis_worker()
         if self._live_source is not None:
             self._live_source.close()
             self._live_source = None
@@ -239,6 +285,11 @@ class LiveAssistantController(QObject):
         if worker is not None:
             worker.stop()
             worker.wait(5_000)
+
+    def _stop_analysis_worker(self) -> None:
+        worker, self._analysis_worker = self._analysis_worker, None
+        if worker is not None:
+            worker.stop(timeout=10.0)
 
     def shutdown(self) -> None:
         self.finish()
