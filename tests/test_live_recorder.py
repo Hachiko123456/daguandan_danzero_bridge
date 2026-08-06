@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import cv2
 import numpy as np
@@ -152,3 +154,40 @@ def test_close_releases_main_recording_and_reports_incident_media_failure(
         assert int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) == 1
     finally:
         capture.release()
+
+
+def test_incident_encoding_does_not_block_capture_path(tmp_path, monkeypatch):
+    recorder = SessionRecorder(tmp_path, size=(64, 32), fps=10, buffer_seconds=2)
+    recorder.write_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        captured_monotonic_ms=100,
+        wall_time="trigger",
+    )
+    recorder.schedule_incident_media(
+        tmp_path / "incidents" / "INC-async",
+        trigger_ms=100,
+        after_ms=100,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_media(*_args, **_kwargs):
+        started.set()
+        assert release.wait(2)
+        return None
+
+    monkeypatch.setattr(recorder, "_write_incident_media", slow_media)
+
+    started_at = time.perf_counter()
+    recorder.write_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        captured_monotonic_ms=200,
+        wall_time="deadline",
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert started.wait(1)
+    assert elapsed < 0.2
+    assert recorder.frame_count == 2
+    release.set()
+    recorder.close()

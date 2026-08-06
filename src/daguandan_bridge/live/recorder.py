@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,6 +100,13 @@ class SessionRecorder:
         self._lock = RLock()
         self._pending_incidents: list[_PendingIncidentMedia] = []
         self._incident_media_failures: list[IncidentMediaFailure] = []
+        self._media_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="incident-media",
+        )
+        self._media_futures: list[
+            tuple[Path, int, Future[IncidentMedia]]
+        ] = []
 
     @property
     def frame_count(self) -> int:
@@ -242,34 +250,46 @@ class SessionRecorder:
             if monotonic_ms >= pending.deadline_ms:
                 completed.append(pending)
         for pending in completed:
-            self._finalize_pending_incident(pending)
+            self._submit_pending_incident(pending)
             self._pending_incidents.remove(pending)
 
-    def _finalize_pending_incident(self, pending: _PendingIncidentMedia) -> None:
+    def _submit_pending_incident(self, pending: _PendingIncidentMedia) -> None:
         if not pending.frames:
             return
-        try:
-            self._write_incident_media(
+        self._media_futures.append(
+            (
                 pending.directory,
                 pending.trigger_ms,
-                pending.frames,
+                self._media_executor.submit(
+                    self._write_incident_media,
+                    pending.directory,
+                    pending.trigger_ms,
+                    pending.frames,
+                ),
             )
-        except Exception as exc:
-            failure = IncidentMediaFailure(
-                reason="incident_media_finalize_failed",
-                incident_directory=pending.directory,
-                trigger_ms=pending.trigger_ms,
-                details=str(exc),
-            )
-            self._incident_media_failures.append(failure)
+        )
+
+    def _collect_media_failures(self) -> None:
+        for directory, trigger_ms, future in self._media_futures:
             try:
-                atomic_write_json(
-                    pending.directory / "media_error.json",
-                    {"schema_version": 1, **failure.to_dict()},
+                future.result()
+            except Exception as exc:
+                failure = IncidentMediaFailure(
+                    reason="incident_media_finalize_failed",
+                    incident_directory=directory,
+                    trigger_ms=trigger_ms,
+                    details=str(exc),
                 )
-            except Exception:
-                # The in-memory failure is still returned to the session manifest.
-                pass
+                self._incident_media_failures.append(failure)
+                try:
+                    atomic_write_json(
+                        directory / "media_error.json",
+                        {"schema_version": 1, **failure.to_dict()},
+                    )
+                except Exception:
+                    # The in-memory failure is still returned to the manifest.
+                    pass
+        self._media_futures.clear()
 
     def _write_incident_media(
         self,
@@ -357,8 +377,10 @@ class SessionRecorder:
                 finally:
                     self._closed = True
                 for pending in tuple(self._pending_incidents):
-                    self._finalize_pending_incident(pending)
+                    self._submit_pending_incident(pending)
                 self._pending_incidents.clear()
+                self._media_executor.shutdown(wait=True, cancel_futures=False)
+                self._collect_media_failures()
             return RecordingResult(
                 video_path=self.video_path,
                 index_path=self.index_path,

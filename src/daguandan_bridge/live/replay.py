@@ -331,6 +331,9 @@ def replay_video_through_live_pipeline(
                 frame_count += 1
             actual_events = runner.events
         finally:
+            close_frames = getattr(frames, "close", None)
+            if close_frames is not None:
+                close_frames()
             runner.finish()
 
     comparison = compare_timelines(expected_events, actual_events)
