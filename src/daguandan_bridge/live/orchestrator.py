@@ -4,6 +4,7 @@ import shutil
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
+from inspect import signature
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
@@ -12,7 +13,7 @@ import cv2
 import numpy as np
 
 from ..annotation_service import AnnotationService
-from ..danzero.advisor import LocalAdvice
+from ..danzero.advisor import LocalAdvice, StrategyExecutionTrace
 from ..danzero.state import GuanDanState, Seat
 from ..recognition_service import (
     PLAY_REGION_TO_SEAT,
@@ -132,6 +133,8 @@ class _AdviceCompletion:
     key: AdviceRequestKey
     advice: LocalAdvice | None = None
     error: str = ""
+    engine_input: dict[str, object] | None = None
+    trace: dict[str, object] | None = None
 
 
 class LiveOrchestrator:
@@ -238,6 +241,7 @@ class LiveOrchestrator:
             raise RuntimeError(
                 f"可用磁盘空间不足：需要 {self.minimum_free_bytes}，实际 {free_bytes}"
             )
+        self._last_monotonic_ms = int(monotonic_ms)
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
             hand=hand,
@@ -246,7 +250,6 @@ class LiveOrchestrator:
         )
         event = self._publish_event(event)
         self.status = "running"
-        self._last_monotonic_ms = int(monotonic_ms)
         self._activate_zone(int(monotonic_ms), started_with_clear_zone=True)
         self._append_lifecycle_event(
             "turn_started",
@@ -402,6 +405,10 @@ class LiveOrchestrator:
         )
         if candidate is None:
             raise ValueError("待确认候选不存在")
+        if not candidate.valid:
+            raise ValueError(
+                "候选未通过自动校验，请使用“不出”或“都不对”手动补录"
+            )
         event = self._record_action(
             review.player,
             candidate.cards,
@@ -661,14 +668,42 @@ class LiveOrchestrator:
             return key
 
     def _run_advice(self, job: _AdviceJob) -> _AdviceCompletion:
+        trace = StrategyExecutionTrace(job.key.request_id)
         try:
-            advice = self.advisor.recommend(
-                job.state,
-                request_id=job.key.request_id,
-            )
+            parameters = signature(self.advisor.recommend).parameters
+            kwargs: dict[str, object] = {"request_id": job.key.request_id}
+            if "trace" in parameters:
+                kwargs["trace"] = trace
+            advice = self.advisor.recommend(job.state, **kwargs)
         except Exception as exc:
-            return _AdviceCompletion(job.key, error=str(exc))
+            trace_snapshot = trace.snapshot()
+            engine_input = trace_snapshot.get("engine_input")
+            if not isinstance(engine_input, dict):
+                engine_input = self._fallback_engine_input(job)
+            return _AdviceCompletion(
+                job.key,
+                error=str(exc),
+                engine_input=engine_input,
+                trace=trace_snapshot,
+            )
         return _AdviceCompletion(job.key, advice=advice)
+
+    @staticmethod
+    def _fallback_engine_input(job: _AdviceJob) -> dict[str, object]:
+        state = job.state
+        return {
+            "request_id": job.key.request_id,
+            "project_snapshot": {
+                "round_level": state.round_level,
+                "wild_rank": state.wild_rank,
+                "current_player": state.current_player,
+                "lead_player": state.lead_player,
+                "my_hand": list(state.my_hand),
+                "trick_plays": [event.to_dict() for event in state.trick_plays],
+                "play_history": [event.to_dict() for event in state.play_history],
+                "revision": state.revision,
+            },
+        }
 
     @_state_synchronized
     def _complete_advice_job(self, completion: _AdviceCompletion) -> None:
@@ -690,6 +725,8 @@ class LiveOrchestrator:
                         "turn_id": key.turn_id,
                         "state_revision": key.state_revision,
                         "error": completion.error,
+                        "engine_input": completion.engine_input,
+                        "trace": completion.trace,
                     }
                 )
                 self._append_advice_event(
@@ -722,6 +759,8 @@ class LiveOrchestrator:
                         "turn_id": key.turn_id,
                         "state_revision": key.state_revision,
                         "error": self.latest_advice.error,
+                        "engine_input": completion.engine_input,
+                        "trace": completion.trace,
                     }
                 )
                 self._append_advice_event(
@@ -732,7 +771,11 @@ class LiveOrchestrator:
                     },
                     confidence=0.0,
                 )
-                self._create_incident("advisor_failed", self._last_monotonic_ms)
+                self._create_incident(
+                    "advisor_failed",
+                    self._last_monotonic_ms,
+                    engine_input=completion.engine_input,
+                )
                 return
             advice = completion.advice
             visible = self._self_turn_corroborated
@@ -828,7 +871,11 @@ class LiveOrchestrator:
     def _publish_event(self, event: LiveEvent) -> LiveEvent:
         with self._advice_lock:
             self._published_sequence += 1
-            published = replace(event, seq=self._published_sequence)
+            published = replace(
+                event,
+                seq=self._published_sequence,
+                monotonic_ms=self._last_monotonic_ms,
+            )
             self.store.append_event(published)
             self._all_events.append(published)
             return published
@@ -1074,7 +1121,13 @@ class LiveOrchestrator:
             rejected_reason=candidate.rejected_reason,
         )
 
-    def _create_incident(self, reason: str, monotonic_ms: int) -> Path:
+    def _create_incident(
+        self,
+        reason: str,
+        monotonic_ms: int,
+        *,
+        engine_input: dict[str, object] | None = None,
+    ) -> Path:
         previous = self._recent_incidents.get(str(reason))
         if previous is not None:
             previous_ms, previous_path = previous
@@ -1097,6 +1150,7 @@ class LiveOrchestrator:
             state_after=state,
             observations=list(self._observations),
             trigger_ms=int(monotonic_ms),
+            engine_input=engine_input,
         )
         try:
             self.recorder.schedule_incident_media(

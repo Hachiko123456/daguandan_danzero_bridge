@@ -57,6 +57,7 @@ class LiveAssistantController(QObject):
         self._capture_worker: WorkerHandle | None = None
         self._analysis_worker: LatestOnlyWorker | None = None
         self._initial_thread: OneShotThread | None = None
+        self._finish_thread: OneShotThread | None = None
         self._deferred_source_close = None
         self._capture_generation = 0
 
@@ -216,7 +217,10 @@ class LiveAssistantController(QObject):
 
     def _accept_live_error(self, message: str) -> None:
         self._stop_analysis_worker()
-        if self.orchestrator is not None:
+        if self.orchestrator is not None and self.orchestrator.status not in {
+            "finalizing",
+            "sealed",
+        }:
             update = self.orchestrator.capture_interrupted(
                 message,
                 monotonic_ms=monotonic_ns() // 1_000_000,
@@ -279,7 +283,9 @@ class LiveAssistantController(QObject):
 
     def finish(self) -> None:
         orchestrator = self.orchestrator
-        if orchestrator is None:
+        if orchestrator is None or (
+            self._finish_thread is not None and self._finish_thread.isRunning()
+        ):
             return
         orchestrator.begin_finalizing()
         capture_stopped = self._stop_capture_worker()
@@ -290,14 +296,27 @@ class LiveAssistantController(QObject):
             else:
                 self._deferred_source_close = self._live_source
             self._live_source = None
-        try:
-            update = orchestrator.finish()
-        except Exception as exc:
-            self.error.emit(str(exc))
-            return
-        self.orchestrator = None
+        thread = OneShotThread(orchestrator.finish, self)
+        thread.result.connect(
+            lambda update, value=orchestrator: self._finish_result(value, update)
+        )
+        thread.error.connect(self.error)
+        thread.finished.connect(self._finish_thread_finished)
+        self._finish_thread = thread
+        thread.start()
+
+    def _finish_result(
+        self,
+        orchestrator: LiveOrchestrator,
+        update: object,
+    ) -> None:
+        if self.orchestrator is orchestrator:
+            self.orchestrator = None
         self.update_ready.emit(update)
         self.session_finished.emit(update)
+
+    def _finish_thread_finished(self) -> None:
+        self._finish_thread = None
 
     def _stop_capture_worker(self) -> bool:
         worker = self._capture_worker
@@ -305,21 +324,23 @@ class LiveAssistantController(QObject):
             return True
         self._capture_generation += 1
         worker.stop()
-        stopped = worker.wait(5_000)
+        stopped = worker.wait(0)
         if stopped:
             self._capture_worker = None
-        else:
-            self.error.emit("采集任务未在 5 秒内停止，已阻止后续写入并等待安全退出")
         return stopped
 
     def _stop_analysis_worker(self) -> None:
         worker, self._analysis_worker = self._analysis_worker, None
         if worker is not None:
-            if not worker.stop(timeout=10.0):
-                self.error.emit("识别任务未在 10 秒内停止，结果已作废")
+            worker.stop(timeout=0.0)
 
     def shutdown(self) -> None:
         self.finish()
+        if self._finish_thread is not None and self._finish_thread.isRunning():
+            self._finish_thread.wait(30_000)
+        if self._capture_worker is not None and self._capture_worker.is_running:
+            self._capture_worker.stop()
+            self._capture_worker.wait(10_000)
         if self._initial_thread is not None and self._initial_thread.isRunning():
             self._initial_thread.wait(10_000)
 

@@ -125,6 +125,33 @@ def test_review_bar_confirms_existing_candidate_with_one_click():
     page.close()
 
 
+def test_review_bar_disables_candidate_that_failed_rule_validation():
+    app = _app()
+    runtime = FakeRuntime()
+    page = LiveAssistantPage(runtime)
+    review = ReviewRequest(
+        reason="does_not_beat_table",
+        player="right",
+        candidates=(
+            ReviewCandidate(
+                "CAND-invalid",
+                ("6S",),
+                False,
+                3,
+                0.95,
+                False,
+                "does_not_beat_table",
+            ),
+        ),
+    )
+
+    page.show_review(review)
+    app.processEvents()
+
+    assert not page.review_candidate_buttons[0].isEnabled()
+    page.close()
+
+
 def test_main_window_registers_live_page_in_fluent_navigation():
     app = _app()
     window = DaguandanBridgeWindow(live_runtime=FakeRuntime())

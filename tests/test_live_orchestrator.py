@@ -5,8 +5,13 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
-from daguandan_bridge.live.orchestrator import LiveOrchestrator
+from daguandan_bridge.live.orchestrator import (
+    LiveOrchestrator,
+    ReviewCandidate,
+    ReviewRequest,
+)
 from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
@@ -357,4 +362,30 @@ def test_pause_and_resume_preserve_pending_review(tmp_path):
 
     assert resumed.status == "review_required"
     assert resumed.review is not None
+    orchestrator.finish()
+
+
+def test_invalid_review_candidate_cannot_be_published_by_one_click(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S") for _ in range(3)])
+    orchestrator.status = "review_required"
+    orchestrator.latest_review = ReviewRequest(
+        reason="does_not_beat_table",
+        player="right",
+        candidates=(
+            ReviewCandidate(
+                candidate_id="CAND-invalid",
+                cards=("6S",),
+                is_pass=False,
+                votes=3,
+                confidence=0.95,
+                valid=False,
+                rejected_reason="does_not_beat_table",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="候选未通过"):
+        orchestrator.confirm_candidate("CAND-invalid")
+
+    assert orchestrator.snapshot.current_player == "right"
     orchestrator.finish()

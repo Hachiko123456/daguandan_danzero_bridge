@@ -69,6 +69,11 @@ class FakeAdvisor:
         )
 
 
+class FailingAdvisor:
+    def recommend(self, _state, *, request_id=""):
+        raise RuntimeError(f"model failed: {request_id}")
+
+
 def _build(tmp_path, advisor):
     store = LiveSessionStore(tmp_path / "profiles", "tencent_daguandan", session_id="advice")
     store.start(
@@ -163,4 +168,20 @@ def test_corrected_state_marks_inflight_advice_stale(tmp_path):
         )
     )
     assert advisor.calls >= 1
+    orchestrator.finish()
+
+
+def test_advisor_failure_incident_contains_reproducible_engine_input(tmp_path):
+    orchestrator = _build(tmp_path, FailingAdvisor())
+    _commit_left_action(orchestrator)
+    _wait_until(
+        lambda: orchestrator.latest_advice is not None
+        and orchestrator.latest_advice.status == "failed"
+    )
+
+    incident = next(orchestrator.store.incidents_directory.iterdir())
+    engine_input = incident / "engine_input.json"
+
+    assert engine_input.is_file()
+    assert "project_snapshot" in engine_input.read_text("utf-8")
     orchestrator.finish()

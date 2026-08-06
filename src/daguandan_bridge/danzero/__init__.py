@@ -1,6 +1,6 @@
 """Manual-state DanZero advice API for Tencent DaGuandan."""
 
-from .advisor import LocalAdvice, LocalGuandanAdvisor
+from .advisor import LocalAdvice, LocalGuandanAdvisor, StrategyExecutionTrace
 from .state import GameStateError, GuanDanState
 
 
@@ -19,10 +19,12 @@ class DanzeroAdvisor:
         state: GuanDanState,
         *,
         request_id: str = "",
+        trace: StrategyExecutionTrace | None = None,
     ) -> LocalAdvice:
         return self._advisor.recommend(
             state.local_snapshot(),
             request_id=request_id,
+            trace=trace,
         )
 
 

@@ -395,6 +395,11 @@ class LiveAssistantPage(ScrollArea):
             button = PrimaryPushButton(
                 f"{text}（{candidate.votes}票 / {candidate.confidence:.0%}）"
             )
+            button.setEnabled(candidate.valid)
+            if not candidate.valid:
+                button.setToolTip(
+                    f"自动校验未通过：{candidate.rejected_reason or review.reason}"
+                )
             button.clicked.connect(
                 lambda _checked=False, value=candidate.candidate_id: self._confirm_candidate(value)
             )

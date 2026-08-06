@@ -224,6 +224,7 @@ def test_video_visual_replay_runs_live_pipeline_and_compares_turns(tmp_path):
     assert result.comparison.identical_turn_ids == (1,)
     assert result.comparison.missing == ()
     assert result.comparison.changed == ()
+    assert abs(result.comparison.metric_deltas[0].latency_delta_ms) < 2_000
     assert result.output_path.is_file()
     assert result.comparison_path.is_file()
 
