@@ -12,8 +12,10 @@ from .storage import atomic_write_json
 from .window_capture import (
     CapturedStandardizedFrame,
     LazyMssCapture,
+    TargetWindowError,
     capture_standardized_client_frame,
     find_target_window,
+    get_client_rect_on_screen,
 )
 
 
@@ -31,6 +33,51 @@ class FrameSnapshot:
 class LoadedProfile:
     paths: ProfilePaths
     config: ProfileConfig
+
+
+class LiveCaptureInterrupted(RuntimeError):
+    """A persistent source can no longer guarantee aligned window frames."""
+
+
+class LiveCaptureSource:
+    def __init__(self, loaded: LoadedProfile) -> None:
+        self.loaded = loaded
+        self.target = find_target_window(loaded.config.window_title_keywords)
+        self.window_lookup_count = 1
+        self._initial_rect = get_client_rect_on_screen(self.target)
+        self._screen_capture = LazyMssCapture()
+        self._closed = False
+
+    def capture(self) -> FrameSnapshot:
+        if self._closed:
+            raise RuntimeError("持续采集源已经关闭")
+        try:
+            current_rect = get_client_rect_on_screen(self.target)
+            if current_rect != self._initial_rect:
+                raise LiveCaptureInterrupted(
+                    "target window geometry changed; reopen live capture source"
+                )
+            frame = capture_standardized_client_frame(
+                self.target,
+                self._screen_capture,
+                self.loaded.config,
+            )
+        except LiveCaptureInterrupted:
+            raise
+        except TargetWindowError as exc:
+            raise LiveCaptureInterrupted(str(exc)) from exc
+        return FrameSnapshot(frame)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._screen_capture.close()
+            self._closed = True
+
+    def __enter__(self) -> "LiveCaptureSource":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 @dataclass
@@ -83,6 +130,9 @@ class CaptureService:
                 loaded.config,
             )
         return FrameSnapshot(frame)
+
+    def open_live_source(self, profile_name: str) -> LiveCaptureSource:
+        return LiveCaptureSource(self.load_profile(profile_name))
 
     @staticmethod
     def _capture_document(
