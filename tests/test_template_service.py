@@ -74,6 +74,33 @@ def test_template_service_deletes_managed_sample_and_metadata(tmp_path):
     assert all(item.get("sample_id") != sample.sample_id for item in payload["templates"])
 
 
+def test_auto_registers_copied_png_and_persists_to_config(tmp_path):
+    import cv2
+
+    service = _service(tmp_path)
+    before = len(service.list_templates())
+    destination = service.templates_root / "rank" / "9_play_auto_001.png"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(destination), np.full((30, 24, 3), 0, np.uint8))
+
+    templates = service.list_templates()
+
+    assert len(templates) == before + 1
+    registered = next(
+        item for item in templates if item.get("sample_id") == "rank_9_play_auto_001"
+    )
+    assert registered["label"] == "9"
+    assert registered["source_role"] == "play"
+    assert registered["abs_box"] == [0, 0, 24, 30]
+    # 已落盘：再次列出不会重复注册
+    payload = json.loads(service.templates_path.read_text(encoding="utf-8"))
+    assert any(
+        item.get("sample_id") == "rank_9_play_auto_001"
+        for item in payload["templates"]
+    )
+    assert len(service.list_templates()) == before + 1
+
+
 def test_template_service_normalizes_rank_to_white_background(tmp_path):
     service = _service(tmp_path)
     image = np.full((720, 1280, 3), 255, dtype=np.uint8)

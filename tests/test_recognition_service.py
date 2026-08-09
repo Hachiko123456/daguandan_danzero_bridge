@@ -5,12 +5,14 @@ from pathlib import Path
 import shutil
 
 import numpy as np
+import pytest
 
 from daguandan_bridge.annotation_service import AnnotationService
 from daguandan_bridge.config import PROFILES_ROOT
 from daguandan_bridge.image_io import read_image_unicode
 from daguandan_bridge.models import Box
 from daguandan_bridge.recognition_service import (
+    OpeningSignal,
     RecognizedEvent,
     ScreenshotRecognitionService,
 )
@@ -24,6 +26,13 @@ def _paste_template(canvas: np.ndarray, relative_file: str, x: int, y: int) -> N
     template = read_image_unicode(PROFILE_ROOT / relative_file)
     height, width = template.shape[:2]
     canvas[y : y + height, x : x + width] = template
+
+
+def _required_screenshot(session: str, filename: str) -> Path:
+    path = PROFILE_ROOT / "screenshots" / session / filename
+    if not path.is_file():
+        pytest.skip(f"缺少真实截图样本：{path}")
+    return path
 
 
 def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
@@ -52,7 +61,114 @@ def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
     assert any(annotation.label == "2S" for annotation in result.annotations)
 
 
-def test_template_recognizer_leaves_unknown_fields_for_manual_confirmation():
+def test_jokers_use_lower_rank_threshold(monkeypatch):
+    import cv2 as cv2_module
+
+    from daguandan_bridge import recognition_service as rs_module
+
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    def fake_match(search, template, method):
+        return np.full((3, 3), 0.62, dtype=np.float32)
+
+    monkeypatch.setattr(rs_module.cv2, "matchTemplate", fake_match)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    result = service.recognize(image)
+
+    assert any(
+        card in {"small_joker", "big_joker"} for card in result.my_hand
+    )
+
+
+def test_joker_color_gate_rejects_a_red_template_on_a_black_joker():
+    """A structural template hit must not turn a black small Joker into a big Joker."""
+    small_template = np.full((24, 18, 3), 255, dtype=np.uint8)
+    small_template[4:20, 4:14] = (20, 20, 20)
+    big_template = np.full((24, 18, 3), 255, dtype=np.uint8)
+    big_template[4:20, 4:14] = (25, 25, 230)
+    black_joker = small_template.copy()
+    red_joker = big_template.copy()
+
+    assert ScreenshotRecognitionService._joker_colors_compatible(
+        small_template,
+        black_joker,
+    )
+    assert not ScreenshotRecognitionService._joker_colors_compatible(
+        big_template,
+        black_joker,
+    )
+    assert ScreenshotRecognitionService._joker_colors_compatible(
+        big_template,
+        red_joker,
+    )
+
+
+def test_regression_black_small_jokers_are_not_labeled_as_big_jokers():
+    """Keep the recorded 2026-08-09 opening hand as a no-write regression case."""
+    import cv2
+
+    video_path = (
+        PROFILE_ROOT
+        / "sessions"
+        / "game_20260809_164356_9abb9a"
+        / "video"
+        / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"缺少本地回归录像：{video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("本地回归录像无法读取首帧")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    result = service.recognize(frame)
+
+    assert result.my_hand.count("small_joker") == 2
+    assert result.my_hand.count("big_joker") == 0
+
+
+def test_first_play_uses_the_matching_seat_region():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/status/first_play.png", 1110, 220)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    assert service.recognize_lead_player(image) == "right"
+
+
+def test_first_play_marker_requires_at_least_080_confidence(monkeypatch):
+    """A sub-0.8 first-play hit must not select a lead seat."""
+    from daguandan_bridge import recognition_service as rs_module
+
+    def fake_match(search, _template, _method):
+        # ``first_play_right`` is 163 x 156 in the Tencent profile.  Make
+        # only that ROI look like the known pre-doubling false positive.
+        score = 0.79 if search.shape[:2] == (156, 163) else 0.0
+        return np.full((1, 1), score, dtype=np.float32)
+
+    monkeypatch.setattr(rs_module.cv2, "matchTemplate", fake_match)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    assert service.recognize_lead_player(np.zeros((720, 1280, 3), dtype=np.uint8)) is None
+
+
+def test_template_recognizer_leaves_unknown_fields_unresolved():
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
@@ -65,8 +181,39 @@ def test_template_recognizer_leaves_unknown_fields_for_manual_confirmation():
     assert result.unresolved_fields
 
 
+def test_opening_signal_collects_marker_timer_and_super_double_without_committing_lead():
+    """Opening recognition exposes raw evidence; the state machine owns the decision."""
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/status/first_play.png", 580, 240)
+    _paste_template(image, "templates/timer/active.png", 450, 220)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signal = service.recognize_opening_signal(image)
+
+    assert isinstance(signal, OpeningSignal)
+    assert signal.marker_player == "self"
+    assert signal.active_player == "self"
+
+    double_image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(double_image, "templates/button/super_double.png", 520, 250)
+    double_signal = service.recognize_opening_signal(double_image)
+
+    assert double_signal.super_double_visible is True
+
+    normal_double_image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(normal_double_image, "templates/button/double.png", 520, 250)
+
+    normal_double_signal = service.recognize_opening_signal(normal_double_image)
+
+    assert normal_double_signal.super_double_visible is True
+    assert service.recognize_super_double_visible(normal_double_image) is True
+
+
 def test_real_screenshot_recognizes_full_hand_and_finds_first_play_marker():
-    image_path = PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000011.png"
+    image_path = _required_screenshot("game_20260804_005737", "000011.png")
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
@@ -85,7 +232,7 @@ def test_real_screenshot_recognizes_full_hand_and_finds_first_play_marker():
 
 
 def test_real_play_screenshot_keeps_spade_four_and_wild_heart_two():
-    image_path = PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000031.png"
+    image_path = _required_screenshot("game_20260804_005737", "000031.png")
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
@@ -97,8 +244,27 @@ def test_real_play_screenshot_keeps_spade_four_and_wild_heart_two():
     assert left_event.cards == ("2S", "3S", "4S", "2H", "6S")
 
 
+def test_real_opposite_big_joker_play_is_recognized():
+    image_path = (
+        PROFILE_ROOT / "screenshots" / "game_20260804_214822" / "000033.png"
+    )
+    if not image_path.is_file():
+        pytest.skip("缺少真实截图样本")
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    result = service.recognize(image_path)
+
+    opposite_event = next(
+        event for event in result.events if event.player == "opposite"
+    )
+    assert opposite_event.cards == ("big_joker",)
+
+
 def test_real_screenshot_adds_boxes_for_all_detected_statuses():
-    image_path = PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000031.png"
+    image_path = _required_screenshot("game_20260804_005737", "000031.png")
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
@@ -127,9 +293,9 @@ def test_level_suit_template_is_used_for_wild_card_in_play_region(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("screenshots"),
+        ignore=shutil.ignore_patterns("screenshots", "sessions"),
     )
-    image_path = PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000031.png"
+    image_path = _required_screenshot("game_20260804_005737", "000031.png")
     image = read_image_unicode(image_path)
     template_service = TemplateService(root)
     template_service.save_template(
@@ -150,6 +316,30 @@ def test_level_suit_template_is_used_for_wild_card_in_play_region(tmp_path):
     assert "2H" in left_event.cards
 
 
+def test_level_card_without_matched_suit_defaults_to_wild_heart(tmp_path):
+    root = tmp_path / "profiles"
+    shutil.copytree(
+        PROFILES_ROOT / "tencent_daguandan",
+        root / "tencent_daguandan",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("screenshots", "sessions"),
+    )
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/rank/2_level.png", 80, 35)
+    _paste_template(image, "templates/rank/2_hand.png", 40, 510)
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(root),
+        TemplateService(root),
+    )
+    result = service.recognize(image)
+
+    assert result.round_level == "2"
+    assert result.wild_rank == "2"
+    assert Counter(result.my_hand) == Counter({"2H"})
+    assert "my_hand" not in result.unresolved_fields
+
+
 def test_first_play_global_fallback_rejects_center_screen_match():
     image = np.full((720, 1280, 3), 255, dtype=np.uint8)
     _paste_template(image, "templates/status/first_play.png", 600, 300)
@@ -165,7 +355,7 @@ def test_first_play_global_fallback_rejects_center_screen_match():
 
 
 def test_real_first_play_screenshot_does_not_create_a_self_play_event():
-    image_path = PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000011.png"
+    image_path = _required_screenshot("game_20260804_005737", "000011.png")
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
@@ -179,7 +369,7 @@ def test_real_first_play_screenshot_does_not_create_a_self_play_event():
 
 
 def test_template_recognizer_reports_image_elapsed_time():
-    image_path = PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000011.png"
+    image_path = _required_screenshot("game_20260804_005737", "000011.png")
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
@@ -268,7 +458,7 @@ def test_templates_are_loaded_once_until_explicit_reload(monkeypatch):
 
 def test_targeted_play_recognition_only_returns_expected_seat():
     image_path = (
-        PROFILE_ROOT / "screenshots" / "game_20260804_005737" / "000031.png"
+        _required_screenshot("game_20260804_005737", "000031.png")
     )
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),

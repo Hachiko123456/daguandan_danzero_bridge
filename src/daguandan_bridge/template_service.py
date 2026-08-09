@@ -39,6 +39,29 @@ class TemplateSample:
     base_size: tuple[int, int]
 
 
+_ROLE_TOKENS = {"hand_partial", "hand", "play", "level", "generic"}
+
+
+def _parse_template_stem(stem: str) -> tuple[str, str] | None:
+    """从模板文件名推断 (label, source_role)，例如 small_joker_play_003。
+
+    序号（003）位于 role 之后，不参与 label；label 本身可以是数字
+    （如 9_hand.png -> label "9"）。
+    """
+    segments = stem.split("_")
+    role_index = None
+    for index in range(len(segments)):
+        if segments[index] in _ROLE_TOKENS:
+            role_index = index
+            break
+    if role_index is None or role_index == 0:
+        return None
+    label = "_".join(segments[:role_index])
+    if not label:
+        return None
+    return label, segments[role_index]
+
+
 class TemplateService:
     def __init__(self, profiles_root: Path = PROFILES_ROOT, profile_name: str = "tencent_daguandan"):
         self.profiles_root = Path(profiles_root)
@@ -55,7 +78,54 @@ class TemplateService:
         raw_templates = document.get("templates", [])
         if not isinstance(raw_templates, list):
             raise ValueError("templates_config.json 缺少 templates 数组")
-        return tuple(item for item in raw_templates if isinstance(item, dict))
+        records = [item for item in raw_templates if isinstance(item, dict)]
+        # 自动注册并落盘：模板目录里直接复制的 rank/suit PNG（文件名
+        # <label>_<role>[_NNN].png，例如 small_joker_play_003.png）首次发现
+        # 时写入 templates_config.json，保证目录与配置两边一致。
+        configured = {str(item.get("file", "")) for item in records}
+        if self.templates_root.is_dir():
+            new_records: list[dict[str, Any]] = []
+            for path in sorted(self.templates_root.rglob("*.png")):
+                relative = path.relative_to(self.profile_root).as_posix()
+                if relative in configured:
+                    continue
+                kind = path.parent.name
+                if kind not in {"rank", "suit"}:
+                    continue
+                parsed = _parse_template_stem(path.stem)
+                if parsed is None:
+                    continue
+                label, source_role = parsed
+                image = cv2.imread(str(path))
+                if image is None:
+                    continue
+                height, width = image.shape[:2]
+                new_records.append(
+                    {
+                        "sample_id": f"{kind}_{path.stem.lower()}",
+                        "kind": kind,
+                        "label": label,
+                        "file": relative,
+                        "source_image": "",
+                        "source_role": source_role,
+                        "abs_box": [0, 0, width, height],
+                        "ratio_box": [
+                            0.0,
+                            0.0,
+                            round(width / 1280, 6),
+                            round(height / 720, 6),
+                        ],
+                        "base_size": [1280, 720],
+                        "auto_registered": True,
+                    }
+                )
+            if new_records:
+                records = records + new_records
+                atomic_write_json(
+                    self.templates_path,
+                    {"schema_version": 2, "templates": records},
+                )
+        return tuple(records)
 
     def delete_templates(self, sample_ids: Iterable[str]) -> tuple[dict[str, Any], ...]:
         requested = tuple(str(sample_id).strip() for sample_id in sample_ids)

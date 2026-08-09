@@ -67,6 +67,36 @@ def test_initial_state_requires_exactly_27_cards():
         )
 
 
+def test_deferred_lead_confirmation_after_initial_state():
+    reducer = LiveReducer("game-lead")
+
+    reducer.confirm_initial_state(
+        round_level="2",
+        hand=INITIAL_HAND,
+        lead_player=None,
+    )
+
+    snapshot = reducer.snapshot()
+    assert snapshot.initialized
+    assert snapshot.current_player is None
+    assert snapshot.lead_player is None
+
+    event = reducer.confirm_lead_player("opposite")
+
+    assert event.event_type == "lead_player_confirmed"
+    snapshot = reducer.snapshot()
+    assert snapshot.current_player == "opposite"
+    assert snapshot.lead_player == "opposite"
+    assert snapshot.trick_id == 1
+    assert snapshot.turn_id == 1
+
+    with pytest.raises(GameStateError, match="已经确认"):
+        reducer.confirm_lead_player("self")
+
+    reducer.record_play("opposite", ("3S", "3H"))
+    assert reducer.snapshot().current_player == "left"
+
+
 def test_confirmed_play_advances_turn_and_decrements_remaining_cards():
     reducer = _started_reducer()
 

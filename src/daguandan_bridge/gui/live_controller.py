@@ -4,7 +4,8 @@ import hashlib
 import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from time import monotonic_ns
+from time import monotonic_ns, perf_counter
+from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
@@ -29,12 +30,14 @@ class LiveAssistantController(QObject):
     frame_ready = Signal(object)
     error = Signal(str)
     session_finished = Signal(object)
+    danzero_warmup_status = Signal(str)
 
     def __init__(
         self,
         capture_service: CaptureService | None = None,
         *,
         profile_name: str = "tencent_daguandan",
+        advisor: Any | None = None,
     ) -> None:
         super().__init__()
         self.capture_service = capture_service or CaptureService()
@@ -52,11 +55,18 @@ class LiveAssistantController(QObject):
             profile_name,
         )
         self.recognition_service = ScreenshotRecognitionService(annotation, templates)
+        # Keep one agent process-wide for this controller: DanZero resets its
+        # per-hand cache before every recommendation, so it is safe to reuse
+        # while avoiding a 10+ second model load on every new game.
+        self.danzero_advisor = advisor or DanzeroAdvisor()
         self.orchestrator: LiveOrchestrator | None = None
         self._live_source = None
         self._capture_worker: WorkerHandle | None = None
         self._analysis_worker: LatestOnlyWorker | None = None
         self._initial_thread: OneShotThread | None = None
+        self._danzero_warmup_thread: OneShotThread | None = None
+        self._danzero_warmup_running = False
+        self._danzero_warmup_complete = False
         self._finish_thread: OneShotThread | None = None
         self._deferred_source_close = None
         self._capture_generation = 0
@@ -67,6 +77,7 @@ class LiveAssistantController(QObject):
         return bool(self._capture_worker and self._capture_worker.is_running)
 
     def recognize_initial(self) -> None:
+        self._start_danzero_warmup()
         if self._initial_thread is not None and self._initial_thread.isRunning():
             return
 
@@ -89,13 +100,55 @@ class LiveAssistantController(QObject):
     def _initial_finished(self) -> None:
         self._initial_thread = None
 
+    def warm_danzero(self) -> None:
+        """Begin the one-time local model warmup without blocking the UI."""
+        self._start_danzero_warmup()
+
+    def _start_danzero_warmup(self) -> None:
+        if self._danzero_warmup_running or self._danzero_warmup_complete:
+            return
+        initializer = getattr(self.danzero_advisor, "initialize", None)
+        if not callable(initializer):
+            return
+        self._danzero_warmup_running = True
+        self.danzero_warmup_status.emit("DanZero 模型预热中")
+
+        def operation() -> float:
+            started = perf_counter()
+            initializer()
+            return (perf_counter() - started) * 1_000
+
+        thread = OneShotThread(operation, self)
+        thread.result.connect(self._danzero_warmup_succeeded)
+        thread.error.connect(self._danzero_warmup_failed)
+        thread.finished.connect(self._danzero_warmup_finished)
+        self._danzero_warmup_thread = thread
+        thread.start()
+
+    def _danzero_warmup_succeeded(self, elapsed_ms: float) -> None:
+        self._danzero_warmup_complete = True
+        self.danzero_warmup_status.emit(
+            f"DanZero 模型已就绪（首次预热 {float(elapsed_ms):.0f} ms）"
+        )
+
+    def _danzero_warmup_failed(self, message: str) -> None:
+        self.danzero_warmup_status.emit(
+            f"DanZero 模型预热失败，首次建议时将自动重试：{message}"
+        )
+
+    def _danzero_warmup_finished(self) -> None:
+        self._danzero_warmup_running = False
+        self._danzero_warmup_thread = None
+
     def start_session(
         self,
         *,
         round_level: str,
         hand: tuple[str, ...],
-        lead_player: str,
+        lead_player: str | None,
+        recognition_strategy: str = "two_valid_streak",
     ) -> bool:
+        self._start_danzero_warmup()
         if self.orchestrator is not None:
             self.error.emit("当前已有实时对局")
             return False
@@ -108,7 +161,11 @@ class LiveAssistantController(QObject):
                 self.capture_service.profiles_root,
                 self.profile_name,
             )
-            store.start(self._manifest(loaded.paths.profile_config_path, loaded.paths.templates_config_path))
+            manifest = self._manifest(
+                loaded.paths.profile_config_path, loaded.paths.templates_config_path
+            )
+            manifest["recognition_strategy"] = recognition_strategy
+            store.start(manifest)
             recorder = SessionRecorder(
                 store.directory,
                 size=loaded.config.base_size,
@@ -119,14 +176,15 @@ class LiveAssistantController(QObject):
                 store=store,
                 recorder=recorder,
                 recognition_service=self.recognition_service,
-                advisor=DanzeroAdvisor(),
+                advisor=self.danzero_advisor,
+                recognition_strategy=recognition_strategy,
             )
             source = self.capture_service.open_live_source(self.profile_name)
             started_ms = monotonic_ns() // 1_000_000
             update = orchestrator.start(
                 round_level=round_level,
                 hand=hand,
-                lead_player=lead_player,  # type: ignore[arg-type]
+                lead_player=lead_player,
                 monotonic_ms=started_ms,
             )
         except Exception as exc:
@@ -203,7 +261,11 @@ class LiveAssistantController(QObject):
             )
             analysis = self._analysis_worker
             if analysis is not None:
-                analysis.submit((snapshot, captured_ms))
+                analysis.submit(
+                    (snapshot, captured_ms),
+                    preserve=orchestrator.needs_first_action_frames,
+                    max_preserved=8,
+                )
             return snapshot
 
         worker = WorkerHandle(operation, 0.1)
@@ -263,6 +325,9 @@ class LiveAssistantController(QObject):
         is_pass: bool,
     ) -> None:
         self._invoke(lambda value: value.correct_latest(cards=cards, is_pass=is_pass))
+
+    def confirm_lead_player(self, seat: str) -> None:
+        self._invoke(lambda value: value.confirm_lead_player(seat))
 
     def _invoke(self, operation) -> None:
         if self.orchestrator is None:
@@ -354,6 +419,11 @@ class LiveAssistantController(QObject):
             self._capture_worker.wait(10_000)
         if self._initial_thread is not None and self._initial_thread.isRunning():
             self._initial_thread.wait(10_000)
+        if (
+            self._danzero_warmup_thread is not None
+            and self._danzero_warmup_thread.isRunning()
+        ):
+            self._danzero_warmup_thread.wait(30_000)
 
     @staticmethod
     def _manifest(config_path: Path, templates_path: Path) -> dict[str, object]:

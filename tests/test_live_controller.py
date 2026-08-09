@@ -21,6 +21,14 @@ class _CaptureServiceStub:
         self.profiles_root = root
 
 
+class _WarmAdvisor:
+    def __init__(self):
+        self.initialize_calls = 0
+
+    def initialize(self):
+        self.initialize_calls += 1
+
+
 class _SlowCaptureWorker:
     is_running = True
 
@@ -131,3 +139,26 @@ def test_finish_runs_sealing_work_outside_gui_thread(tmp_path):
     app.processEvents()
 
     assert controller.orchestrator is None
+
+
+def test_controller_warms_one_reusable_danzero_advisor_in_background(tmp_path):
+    app = _app()
+    advisor = _WarmAdvisor()
+    controller = LiveAssistantController(
+        _CaptureServiceStub(tmp_path),
+        advisor=advisor,
+    )
+    statuses = []
+    controller.danzero_warmup_status.connect(statuses.append)
+
+    controller._start_danzero_warmup()
+
+    assert controller.danzero_advisor is advisor
+    assert controller._danzero_warmup_thread is not None
+    controller._danzero_warmup_thread.wait(2_000)
+    app.processEvents()
+    controller._start_danzero_warmup()
+
+    assert advisor.initialize_calls == 1
+    assert statuses[0] == "DanZero 模型预热中"
+    assert statuses[-1].startswith("DanZero 模型已就绪")

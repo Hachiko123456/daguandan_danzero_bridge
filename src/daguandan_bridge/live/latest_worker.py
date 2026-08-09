@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +23,7 @@ class LatestOnlyWorker:
         self.on_error = on_error
         self._condition = threading.Condition()
         self._pending: Any = self._EMPTY
+        self._priority_pending: deque[Any] = deque()
         self._stop_requested = False
         self._thread: threading.Thread | None = None
 
@@ -42,23 +44,35 @@ class LatestOnlyWorker:
             )
             self._thread.start()
 
-    def submit(self, value: Any) -> None:
+    def submit(self, value: Any, *, preserve: bool = False, max_preserved: int = 0) -> None:
         with self._condition:
             if self._stop_requested:
                 raise RuntimeError("latest-only worker 已停止")
-            self._pending = value
+            if preserve:
+                if max_preserved <= 0:
+                    raise ValueError("保留队列上限必须为正数")
+                while len(self._priority_pending) >= max_preserved:
+                    self._priority_pending.popleft()
+                self._priority_pending.append(value)
+            else:
+                self._pending = value
             self._condition.notify()
 
     def _run(self) -> None:
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop_requested or self._pending is not self._EMPTY
+                    lambda: self._stop_requested
+                    or self._priority_pending
+                    or self._pending is not self._EMPTY
                 )
                 if self._stop_requested:
                     return
-                value = self._pending
-                self._pending = self._EMPTY
+                if self._priority_pending:
+                    value = self._priority_pending.popleft()
+                else:
+                    value = self._pending
+                    self._pending = self._EMPTY
             try:
                 result = self.operation(value)
             except Exception as exc:
@@ -76,6 +90,7 @@ class LatestOnlyWorker:
         with self._condition:
             self._stop_requested = True
             self._pending = self._EMPTY
+            self._priority_pending.clear()
             self._condition.notify_all()
         thread = self._thread
         if thread is None:

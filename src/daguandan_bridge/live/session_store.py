@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from ..profiles import normalize_profile_name
 from ..storage import atomic_write_json
+from .display_text import event_action_text, event_prefix, reasons_text
 from .models import LiveEvent
 
 
@@ -127,6 +128,8 @@ class LiveSessionStore:
             return False
         except PermissionError:
             return True
+        except SystemError:
+            return False
         except OSError:
             return False
         return True
@@ -413,7 +416,7 @@ class LiveSessionStore:
         files.extend(frames)
         return (
             f"# 对局异常报告 {incident_id}\n\n"
-            f"- 异常原因：`{reason}`\n"
+            f"- 异常原因：{reasons_text(reason)}\n"
             f"- 相关观察：{', '.join(observation_ids) or '无'}\n"
             f"- 状态变化字段：{', '.join(changed_keys) or '无（状态未推进）'}\n\n"
             "- 说明：识别不确定时状态机不会推进，因此状态前后相同是预期的安全行为。\n\n"
@@ -430,42 +433,9 @@ class LiveSessionStore:
         elapsed = max(event.monotonic_ms, 0)
         minutes, remainder = divmod(elapsed, 60_000)
         seconds, millis = divmod(remainder, 1_000)
-        prefix = (
-            f"[{minutes:02d}:{seconds:02d}.{millis:03d}]"
-            f"[墩 T{event.trick_id:02d}]"
-            f"[回合 R{event.turn_id:03d}]"
-        )
-        seat = _SEAT_LABELS.get(event.actor or "", event.actor or "系统")
-        cards = event.payload.get("cards", [])
-        if isinstance(cards, (list, tuple)):
-            cards_text = ", ".join(str(card) for card in cards)
-        else:
-            cards_text = str(cards)
+        prefix = f"[{minutes:02d}:{seconds:02d}.{millis:03d}]{event_prefix(event)}"
         details = (
             f"置信度={event.confidence:.0%}，"
             f"证据={', '.join(event.evidence_refs) or '无'}"
         )
-        if event.event_type == "player_played":
-            action = f"{seat}出牌：[{cards_text}]，{details}"
-        elif event.event_type == "player_passed":
-            action = f"{seat}不出，{details}"
-        elif event.event_type == "turn_started":
-            action = f"轮到{seat}"
-        elif event.event_type == "initial_state_confirmed":
-            starter = _SEAT_LABELS.get(
-                str(event.payload.get("starter", event.actor or "")), seat
-            )
-            action = f"初始状态确认，首发：{starter}，{details}"
-        elif event.event_type == "advice_ready":
-            request_id = event.payload.get("request_id", "未知")
-            action = f"DanZero 建议：[{cards_text}]，请求={request_id}，{details}"
-        elif event.event_type == "event_correction":
-            target = event.payload.get("target_event_id", "未知事件")
-            action = f"纠正事件 {target}：{json.dumps(event.payload, ensure_ascii=False)}"
-        else:
-            action = (
-                f"{event.event_type}："
-                f"{json.dumps(event.payload, ensure_ascii=False, separators=(',', ':'))}，"
-                f"{details}"
-            )
-        return f"{prefix} {action}"
+        return f"{prefix} {event_action_text(event)}，{details}"

@@ -72,15 +72,42 @@ def test_cards_over_remaining_count_are_rejected():
     assert "exceeds_remaining_cards" in result.rejected_reasons
 
 
-def test_inferred_pass_is_never_auto_confirmed_in_version_one():
+def test_empty_zone_and_next_turn_signal_do_not_create_a_pass_without_template():
     result = BurstConsensus(min_votes=3).decide(
         [],
         context=_context(region_empty=True, next_turn_evidence=True),
     )
 
-    assert result.status == "needs_confirmation"
-    assert result.is_pass
-    assert result.source == "inferred_pass"
+    assert result.status == "review_required"
+    assert not result.is_pass
+    assert "no_recognition_samples" in result.rejected_reasons
+
+
+def test_candidate_that_would_create_a_third_known_card_is_rejected():
+    result = BurstConsensus(min_votes=3).decide(
+        [_play("big_joker") for _ in range(3)],
+        context=_context(
+            known_cards=("big_joker", "big_joker"),
+            validate_rules=False,
+        ),
+    )
+
+    assert result.status == "review_required"
+    assert "exceeds_double_deck_limit" in result.rejected_reasons
+
+
+def test_self_candidate_already_in_current_hand_is_not_counted_twice():
+    result = BurstConsensus(min_votes=3).decide(
+        [_play("7S") for _ in range(3)],
+        context=_context(
+            known_hand=("7S", "7S"),
+            known_cards=("7S", "7S"),
+            candidate_already_known=True,
+        ),
+    )
+
+    assert result.status == "confirmed"
+    assert result.cards == ("7S",)
 
 
 def test_play_that_does_not_beat_current_table_action_is_rejected():
@@ -93,18 +120,12 @@ def test_play_that_does_not_beat_current_table_action_is_rejected():
     assert "does_not_beat_table" in result.rejected_reasons
 
 
-def test_self_play_requires_three_matching_exact_post_hand_differences():
+def test_self_play_does_not_require_post_hand_reconciliation():
     old_hand = ("6S", "7S", "8S", "9S")
-    expected_post = ("6S", "8S", "9S")
-    accepted = BurstConsensus(min_votes=3).decide(
-        [_play("7S", post_hand=expected_post) for _ in range(3)],
-        context=_context(known_hand=old_hand),
-    )
-    rejected = BurstConsensus(min_votes=3).decide(
+    result = BurstConsensus(min_votes=3).decide(
         [_play("7S", post_hand=old_hand) for _ in range(3)],
         context=_context(known_hand=old_hand),
     )
 
-    assert accepted.status == "confirmed"
-    assert rejected.status == "review_required"
-    assert "self_hand_delta_unverified" in rejected.rejected_reasons
+    assert result.status == "confirmed"
+    assert result.cards == ("7S",)

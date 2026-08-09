@@ -96,6 +96,17 @@ class FastSignalResult:
     pass_visible: bool
     self_action_buttons_visible: bool
     effect_visible: bool
+    super_double_visible: bool = False
+
+
+@dataclass(frozen=True)
+class OpeningSignal:
+    """Raw opening evidence, before the live state machine commits a lead."""
+
+    super_double_visible: bool
+    marker_player: Seat | None
+    active_player: Seat | None
+    self_action_buttons_visible: bool
 
 
 @dataclass(frozen=True)
@@ -130,6 +141,10 @@ class ScreenshotRecognitionService:
 
     _HAND_RANK_THRESHOLD = 0.68
     _HAND_SUIT_THRESHOLD = 0.68
+    # Joker art is distinctive (crown/star), and full-card templates score
+    # ~0.95 on real jokers; the partial (top sliver) templates instead match
+    # ornate card edges at ~0.5, so they are excluded below.
+    _JOKER_RANK_THRESHOLD = 0.60
     # Play regions overlap UI buttons in some Tencent screenshots.  A lower
     # threshold turns button glyphs into fake cards (for example, ``AC``).
     # Real rank/suit templates still score near 1.0 at the native resolution.
@@ -137,11 +152,16 @@ class ScreenshotRecognitionService:
     _PLAY_SUIT_THRESHOLD = 0.60
     _LEVEL_THRESHOLD = 0.60
     _STATUS_THRESHOLD = 0.62
+    # A false first-play confirmation corrupts every later turn.  Require a
+    # stronger, clearly better match than ordinary transient status markers.
+    _FIRST_PLAY_THRESHOLD = 0.80
+    _FIRST_PLAY_MIN_MARGIN = 0.08
     _TIMER_THRESHOLD = 0.45
     # A hand can contain more than four cards of the same suit.  Keep enough
     # candidates for a complete suit while using the centered suppression
     # window below to remove repeated peaks from the same glyph.
     _MAX_MATCHES_PER_TEMPLATE = 16
+    _WILD_HEART_FALLBACK_SCORE = 0.50
 
     def __init__(
         self,
@@ -361,8 +381,14 @@ class ScreenshotRecognitionService:
         seat: Seat,
         *,
         wild_rank: str | None,
+        allow_unknown_suit: bool = False,
+        allow_pass: bool = True,
     ) -> PlayRegionResult:
-        """Run the expensive card matcher only in the expected action zone."""
+        """Run the expensive card matcher only in the expected action zone.
+
+        ``allow_unknown_suit`` keeps a rank-only card (e.g. ``5?``) when the
+        suit glyph is occluded; the live pipeline leaves it disabled.
+        """
 
         if seat not in SEATS_IN_ORDER:
             raise ValueError("待识别座位无效")
@@ -380,28 +406,12 @@ class ScreenshotRecognitionService:
             wild_rank=wild_rank,
             rank_threshold=self._PLAY_RANK_THRESHOLD,
             suit_threshold=self._PLAY_SUIT_THRESHOLD,
+            allow_unknown_suit=allow_unknown_suit,
         )
+        # The play-zone result is authoritative for this action.  Keep the
+        # legacy fields empty for log compatibility; do not re-scan my_hand.
         post_hand: tuple[str, ...] = ()
         post_hand_score = 0.0
-        if seat == "self":
-            (
-                post_hand,
-                post_hand_score,
-                _,
-                hand_diagnostics,
-                _,
-            ) = self._recognize_cards(
-                source_image,
-                regions.get("my_hand"),
-                templates,
-                source_roles={"hand", "hand_partial"},
-                wild_rank=wild_rank,
-                rank_threshold=self._HAND_RANK_THRESHOLD,
-                suit_threshold=self._HAND_SUIT_THRESHOLD,
-            )
-            diagnostics = tuple(diagnostics) + tuple(
-                f"出牌后手牌：{item}" for item in hand_diagnostics
-            )
         if cards:
             return PlayRegionResult(
                 player=seat,
@@ -411,6 +421,18 @@ class ScreenshotRecognitionService:
                 diagnostics=diagnostics,
                 annotations=annotations,
                 source=source,
+                post_hand=post_hand,
+                post_hand_confidence=post_hand_score,
+            )
+        if not allow_pass:
+            return PlayRegionResult(
+                player=seat,
+                cards=(),
+                is_pass=False,
+                confidence=0.0,
+                diagnostics=diagnostics,
+                annotations=(),
+                source="no_play_detected",
                 post_hand=post_hand,
                 post_hand_confidence=post_hand_score,
             )
@@ -442,10 +464,89 @@ class ScreenshotRecognitionService:
             post_hand_confidence=post_hand_score,
         )
 
+    def recognize_lead_player(self, image: np.ndarray | Path) -> Seat | None:
+        """Recognize the first-play marker seat, if it is currently visible."""
+        source_image = self._source_image(image)
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        templates = self._templates()
+        lead, _, _, _ = self._recognize_seat_status(
+            source_image,
+            regions,
+            templates,
+            prefix="first_play",
+            kind="status",
+            label="first_play",
+        )
+        return lead
+
+    def recognize_opening_signal(self, image: np.ndarray | Path) -> OpeningSignal:
+        """Collect the opening-only signals without deciding who leads.
+
+        The pre-game doubling controls can share screen space with seat
+        markers.  Returning raw evidence here lets the orchestrator suppress
+        that transient UI and require consistent seat evidence before it
+        enters the first turn.
+        """
+
+        source_image = self._source_image(image)
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        templates = self._templates()
+        marker_player, _, _, _ = self._recognize_seat_status(
+            source_image,
+            regions,
+            templates,
+            prefix="first_play",
+            kind="status",
+            label="first_play",
+        )
+        active_player, _, _, _ = self._recognize_seat_status(
+            source_image,
+            regions,
+            templates,
+            prefix="timer",
+            kind="timer",
+            label="active",
+        )
+        buttons, _, _, _ = self._recognize_buttons(
+            source_image,
+            regions.get("button_actions"),
+            templates,
+        )
+        button_set = set(buttons)
+        return OpeningSignal(
+            # Either doubling control means the opening screen is still
+            # transient.  Keep the historical field name for callers, but
+            # normal \"加倍×2\" blocks lead commitment just like 超级加倍.
+            super_double_visible=bool(button_set & {"super_double", "double"}),
+            marker_player=marker_player,
+            active_player=active_player,
+            self_action_buttons_visible=bool(
+                button_set & {"play_cards", "hint", "pass", "cannot_beat"}
+            ),
+        )
+
+    def recognize_super_double_visible(self, image: np.ndarray | Path) -> bool:
+        """Check pre-game doubling controls without inspecting any seat.
+
+        The public name is kept for compatibility; both \"超级加倍\" and the
+        normal \"加倍×2\" button report ``True`` because either one means the
+        lead marker must not be committed yet.
+        """
+        source_image = self._source_image(image)
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        buttons, _, _, _ = self._recognize_buttons(
+            source_image,
+            regions.get("button_actions"),
+            self._templates(),
+        )
+        return bool(set(buttons) & {"super_double", "double"})
+
     def recognize_fast_signals(
         self,
         image: np.ndarray | Path,
         expected_player: Seat,
+        *,
+        allow_pass: bool = True,
     ) -> FastSignalResult:
         """Read only turn/pass/button/effect signals for one capture frame."""
 
@@ -462,12 +563,14 @@ class ScreenshotRecognitionService:
             kind="timer",
             label="active",
         )
-        pass_visible, _, _, _ = self._recognize_status(
-            source_image,
-            regions.get(f"passed_{expected_player}"),
-            templates,
-            label="passed",
-        )
+        pass_visible = False
+        if allow_pass:
+            pass_visible, _, _, _ = self._recognize_status(
+                source_image,
+                regions.get(f"passed_{expected_player}"),
+                templates,
+                label="passed",
+            )
         buttons, _, _, _ = self._recognize_buttons(
             source_image,
             regions.get("button_actions"),
@@ -492,6 +595,7 @@ class ScreenshotRecognitionService:
             pass_visible=pass_visible,
             self_action_buttons_visible=expected_player == "self" and bool(buttons),
             effect_visible=bool(effects),
+            super_double_visible="super_double" in buttons,
         )
 
     @staticmethod
@@ -560,7 +664,12 @@ class ScreenshotRecognitionService:
         kind: str,
         label: str,
     ) -> tuple[Seat | None, float, str, _TemplateMatch | None]:
-        best: tuple[Seat, _TemplateMatch] | None = None
+        candidates: list[tuple[Seat, _TemplateMatch]] = []
+        threshold = (
+            self._FIRST_PLAY_THRESHOLD
+            if prefix == "first_play" and label == "first_play"
+            else self._STATUS_THRESHOLD
+        )
         for seat in SEATS_IN_ORDER:
             match = self._recognize_status(
                 image,
@@ -568,41 +677,21 @@ class ScreenshotRecognitionService:
                 templates,
                 kind=kind,
                 label=label,
+                threshold=threshold,
             )
-            if match[0] and match[3] is not None and (
-                best is None or match[1] > best[1].score
-            ):
-                best = (seat, match[3])
-        if best is None:
-            if prefix == "first_play":
-                full_region = RegionRecord(
-                    name="first_play_global_fallback",
-                    role="generic",
-                    abs_box=Box(0, 0, image.shape[1], image.shape[0]),
-                    ratio_box=(0.0, 0.0, 0.0, 0.0),
-                )
-                matches = self._matches_for_region(
-                    image,
-                    full_region,
-                    templates,
-                    predicate=lambda raw: raw.get("kind") == kind
-                    and raw.get("label") == label,
-                    threshold=self._STATUS_THRESHOLD,
-                    limit=1,
-                )
-                if matches:
-                    match = matches[0]
-                    seat = self._infer_seat_from_position(match, image)
-                    if seat is None:
-                        return None, 0.0, "", None
-                    return (
-                        seat,
-                        match.score,
-                        match.source,
-                        match,
-                    )
+            if match[0] and match[3] is not None:
+                candidates.append((seat, match[3]))
+        if not candidates:
             return None, 0.0, "", None
-        return best[0], best[1].score, best[1].source, best[1]
+        candidates.sort(key=lambda item: item[1].score, reverse=True)
+        best_seat, best_match = candidates[0]
+        if (
+            prefix == "first_play"
+            and len(candidates) > 1
+            and best_match.score - candidates[1][1].score < self._FIRST_PLAY_MIN_MARGIN
+        ):
+            return None, 0.0, "", None
+        return best_seat, best_match.score, best_match.source, best_match
 
     @staticmethod
     def _infer_seat_from_position(match: _TemplateMatch, image: np.ndarray) -> Seat | None:
@@ -627,6 +716,7 @@ class ScreenshotRecognitionService:
         *,
         label: str,
         kind: str = "status",
+        threshold: float | None = None,
     ) -> tuple[bool, float, str, _TemplateMatch | None]:
         matches = self._matches_for_region(
             image,
@@ -634,7 +724,9 @@ class ScreenshotRecognitionService:
             templates,
             predicate=lambda raw: raw.get("kind") == kind and raw.get("label") == label,
             threshold=(
-                self._TIMER_THRESHOLD
+                threshold
+                if threshold is not None
+                else self._TIMER_THRESHOLD
                 if kind == "timer"
                 else self._STATUS_THRESHOLD
             ),
@@ -655,6 +747,7 @@ class ScreenshotRecognitionService:
         wild_rank: str | None = None,
         rank_threshold: float,
         suit_threshold: float,
+        allow_unknown_suit: bool = False,
     ) -> tuple[
         tuple[str, ...],
         float,
@@ -663,16 +756,33 @@ class ScreenshotRecognitionService:
         tuple[RecognitionAnnotation, ...],
     ]:
         if region is None:
-            return (), 0.0, "", ("未配置区域",), ()
+            return (), 0.0, "", ("未配置识别区域",), ()
         rank_matches = self._matches_for_region(
             image,
             region,
             templates,
             predicate=lambda raw: raw.get("source_role") in source_roles
-            and raw.get("kind") == "rank",
+            and raw.get("kind") == "rank"
+            and raw.get("label") not in {"small_joker", "big_joker"},
             threshold=rank_threshold,
             limit=self._MAX_MATCHES_PER_TEMPLATE,
         )
+        joker_matches = self._matches_for_region(
+            image,
+            region,
+            templates,
+            predicate=lambda raw: raw.get("source_role") in source_roles
+            and raw.get("kind") == "rank"
+            and raw.get("label") in {"small_joker", "big_joker"}
+            and raw.get("source_role") != "hand_partial",
+            threshold=self._JOKER_RANK_THRESHOLD,
+            limit=self._MAX_MATCHES_PER_TEMPLATE,
+            # 大小王靠颜色区分（小王/大王花色不同），灰度匹配会混淆两者，
+            # 因 joker 模板用彩色匹配。
+            use_color=True,
+        )
+        rank_matches = self._deduplicate(rank_matches)
+        joker_matches = self._deduplicate(joker_matches)
         suit_source_roles = set(source_roles)
         if wild_rank is not None:
             suit_source_roles.add("level")
@@ -685,19 +795,22 @@ class ScreenshotRecognitionService:
             threshold=suit_threshold,
             limit=self._MAX_MATCHES_PER_TEMPLATE,
         )
-        rank_matches = self._deduplicate(rank_matches)
         suit_matches = self._deduplicate(suit_matches)
         diagnostics: list[str] = []
         used_suits: set[int] = set()
         cards: list[
             tuple[float, str, float, str, tuple[int, int, int, int]]
         ] = []
+        joker_cards: list[
+            tuple[float, str, float, str, tuple[int, int, int, int]]
+        ] = []
         category = "hand" if "hand" in source_roles else "play"
+        for joker in joker_matches:
+            card_box = self._box_for_matches((joker,))
+            joker_cards.append(
+                (joker.center_x, joker.label, joker.score, joker.source, card_box)
+            )
         for rank in sorted(rank_matches, key=lambda item: (item.center_x, item.center_y)):
-            if rank.label in {"small_joker", "big_joker"}:
-                card_box = self._box_for_matches((rank,))
-                cards.append((rank.center_x, rank.label, rank.score, rank.source, card_box))
-                continue
             possible = [
                 (index, suit)
                 for index, suit in enumerate(suit_matches)
@@ -714,7 +827,37 @@ class ScreenshotRecognitionService:
                 special_suit = self._infer_special_level_suit(image, rank)
                 if special_suit is not None:
                     possible = [(len(suit_matches), special_suit)]
+                else:
+                    possible = [
+                        (
+                            len(suit_matches),
+                            _TemplateMatch(
+                                label="heart",
+                                kind="suit",
+                                source_role="level",
+                                source="default:wild-heart",
+                                score=self._WILD_HEART_FALLBACK_SCORE,
+                                x=rank.x,
+                                y=rank.y + max(8, int(rank.h * 0.35)),
+                                w=rank.w,
+                                h=max(8, int(rank.h * 0.4)),
+                            ),
+                        )
+                    ]
             if not possible:
+                if allow_unknown_suit:
+                    card_box = self._box_for_matches((rank,))
+                    cards.append(
+                        (
+                            rank.center_x,
+                            f"{rank.label}?",
+                            rank.score,
+                            rank.source,
+                            card_box,
+                        )
+                    )
+                    diagnostics.append(f"{rank.label} 花色被遮挡，按未知花色")
+                    continue
                 diagnostics.append(f"{rank.label} 未匹配到花色")
                 continue
             suit_index, suit = min(
@@ -736,6 +879,42 @@ class ScreenshotRecognitionService:
                 )
             )
         cards.sort(key=lambda item: item[0])
+        if joker_cards:
+            # 大小王图案相似，同一张牌可能同时命中两个模板：按距离分组，
+            # 每组只保留分数最高的候选。
+            competed: list[
+                tuple[float, str, float, str, tuple[int, int, int, int]]
+            ] = []
+            for joker in sorted(joker_cards, key=lambda item: -item[2]):
+                jx, jy, jw, jh = joker[4]
+                jcx, jcy = jx + jw / 2, jy + jh / 2
+                near_kept = False
+                for kept in competed:
+                    kx, ky, kw, kh = kept[4]
+                    kcx, kcy = kx + kw / 2, ky + kh / 2
+                    max_distance = max(10.0, min(jw, kw) * 0.6)
+                    if (
+                        abs(jcx - kcx) <= max_distance
+                        and abs(jcy - kcy) <= max_distance
+                    ):
+                        near_kept = True
+                        break
+                if not near_kept:
+                    competed.append(joker)
+            joker_cards = competed
+            # A relaxed joker threshold also catches ornate regular cards
+            # (wild/level cards with gold art). A real joker never overlaps
+            # another recognized card, so drop joker boxes that sit on one.
+            kept_jokers: list[
+                tuple[float, str, float, str, tuple[int, int, int, int]]
+            ] = []
+            for joker in joker_cards:
+                if any(self._boxes_overlap(joker[4], card[4]) for card in cards):
+                    diagnostics.append(f"{joker[1]} 疑似误报，已忽略重叠候选")
+                    continue
+                kept_jokers.append(joker)
+            cards.extend(kept_jokers)
+            cards.sort(key=lambda item: item[0])
         limited_cards: list[
             tuple[float, str, float, str, tuple[int, int, int, int]]
         ] = []
@@ -759,6 +938,17 @@ class ScreenshotRecognitionService:
                 for item in cards
             ),
         )
+
+    @staticmethod
+    def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+        """Return True when the smaller box is mostly covered by the other."""
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        inter_w = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+        inter_h = max(0, min(ay + ah, by + bh) - max(ay, by))
+        intersection = inter_w * inter_h
+        smaller = min(aw * ah, bw * bh)
+        return smaller > 0 and intersection / smaller >= 0.35
 
     @staticmethod
     def _suit_is_below_rank(rank: _TemplateMatch, suit: _TemplateMatch) -> bool:
@@ -892,22 +1082,43 @@ class ScreenshotRecognitionService:
         predicate,
         threshold: float,
         limit: int,
+        use_color: bool = False,
     ) -> list[_TemplateMatch]:
         if region is None:
             return []
         box = AnnotationService._box_for_image(region, image)
         if not box.fits_within((image.shape[1], image.shape[0])):
             return []
-        search = image[box.y : box.y + box.h, box.x : box.x + box.w]
+        candidates = [
+            (raw, template)
+            for raw, template in templates
+            if predicate(raw)
+            and template.shape[0] <= image.shape[0]
+            and template.shape[1] <= image.shape[1]
+        ]
+        if not candidates:
+            return []
+        # Whole-card templates (jokers, wild cards) can be taller than the
+        # region box; widen the search window to fit them while still
+        # requiring the match CENTER to land inside the region.
+        max_height = max(template.shape[0] for _, template in candidates)
+        max_width = max(template.shape[1] for _, template in candidates)
+        top = max(0, box.y - max(0, max_height - box.h))
+        left = max(0, box.x - max(0, max_width - box.w))
+        bottom = min(image.shape[0], box.y + box.h + max(0, max_height - box.h))
+        right = min(image.shape[1], box.x + box.w + max(0, max_width - box.w))
+        search = image[top:bottom, left:right]
         matches: list[_TemplateMatch] = []
-        for raw, template in templates:
-            if not predicate(raw):
-                continue
+        for raw, template in candidates:
             template_height, template_width = template.shape[:2]
             if template_height > search.shape[0] or template_width > search.shape[1]:
                 continue
-            gray_search = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
-            gray_template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            if use_color:
+                gray_search = search
+                gray_template = template
+            else:
+                gray_search = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+                gray_template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
             scores = cv2.matchTemplate(
                 gray_search,
                 gray_template,
@@ -918,6 +1129,35 @@ class ScreenshotRecognitionService:
                 if score < threshold:
                     break
                 x, y = location
+                candidate = search[y : y + template_height, x : x + template_width]
+                if (
+                    use_color
+                    and str(raw.get("kind", "")) == "rank"
+                    and str(raw.get("label", "")) in {"small_joker", "big_joker"}
+                    and not self._joker_colors_compatible(template, candidate)
+                ):
+                    self._suppress_match_score(
+                        scores,
+                        x,
+                        y,
+                        template_width,
+                        template_height,
+                    )
+                    continue
+                center_x = left + x + template_width / 2
+                center_y = top + y + template_height / 2
+                if not (
+                    box.x <= center_x <= box.x + box.w
+                    and box.y <= center_y <= box.y + box.h
+                ):
+                    self._suppress_match_score(
+                        scores,
+                        x,
+                        y,
+                        template_width,
+                        template_height,
+                    )
+                    continue
                 matches.append(
                     _TemplateMatch(
                         label=str(raw.get("label", "")),
@@ -925,20 +1165,72 @@ class ScreenshotRecognitionService:
                         source_role=str(raw.get("source_role", "")),
                         source=f"template:{raw.get('file', '')}",
                         score=float(score),
-                        x=box.x + x,
-                        y=box.y + y,
+                        x=left + x,
+                        y=top + y,
                         w=template_width,
                         h=template_height,
                     )
                 )
-                radius_x = max(6, min(16, template_width // 3))
-                radius_y = max(6, min(16, template_height // 3))
-                left = max(0, x - radius_x)
-                top = max(0, y - radius_y)
-                right = min(scores.shape[1], x + radius_x + 1)
-                bottom = min(scores.shape[0], y + radius_y + 1)
-                scores[top:bottom, left:right] = -1.0
+                self._suppress_match_score(
+                    scores,
+                    x,
+                    y,
+                    template_width,
+                    template_height,
+                )
         return sorted(matches, key=lambda item: item.score, reverse=True)
+
+    @staticmethod
+    def _suppress_match_score(
+        scores: np.ndarray,
+        x: int,
+        y: int,
+        template_width: int,
+        template_height: int,
+    ) -> None:
+        radius_x = max(6, min(16, template_width // 3))
+        radius_y = max(6, min(16, template_height // 3))
+        sup_left = max(0, x - radius_x)
+        sup_top = max(0, y - radius_y)
+        sup_right = min(scores.shape[1], x + radius_x + 1)
+        sup_bottom = min(scores.shape[0], y + radius_y + 1)
+        scores[sup_top:sup_bottom, sup_left:sup_right] = -1.0
+
+    @staticmethod
+    def _joker_colors_compatible(template: np.ndarray, candidate: np.ndarray) -> bool:
+        """Reject a structurally similar Joker template with the wrong colour class."""
+        if (
+            template.ndim != 3
+            or candidate.ndim != 3
+            or template.shape[2] < 3
+            or candidate.shape[2] < 3
+            or candidate.size == 0
+        ):
+            return True
+
+        def profile(image: np.ndarray) -> tuple[float, float]:
+            blue, green, red = cv2.split(image[:, :, :3])
+            red_pixels = (
+                (red > 80)
+                & (red > green * 1.35)
+                & (red > blue * 1.35)
+            )
+            dark_pixels = np.maximum(np.maximum(blue, green), red) < 100
+            return float(np.mean(red_pixels)), float(np.mean(dark_pixels))
+
+        template_red, template_dark = profile(template)
+        candidate_red, candidate_dark = profile(candidate)
+        if template_red >= 0.04 and template_red > template_dark:
+            return candidate_red >= max(0.02, template_red * 0.25)
+        if template_dark >= 0.04:
+            # Some black Joker artwork contains a small red decorative mark.
+            # Keep darkness as the primary class signal and allow that
+            # decoration, while still rejecting the mostly-red big Joker.
+            return (
+                candidate_red <= 0.10
+                and candidate_dark >= max(0.03, template_dark * 0.25)
+            )
+        return True
 
     @staticmethod
     def _deduplicate(matches: Iterable[_TemplateMatch]) -> list[_TemplateMatch]:

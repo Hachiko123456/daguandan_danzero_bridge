@@ -271,4 +271,6 @@ class GuanDanState:
 def _is_card_code(card: str) -> bool:
     if card in SPECIAL_CARDS:
         return True
+    if card.endswith("?") and card[:-1] in RANKS:
+        return True
     return any(card == f"{rank}{suit}" for rank in RANKS for suit in SUITS)

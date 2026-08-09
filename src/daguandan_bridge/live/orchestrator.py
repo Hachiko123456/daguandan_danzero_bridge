@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import shutil
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
 from inspect import signature
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 from typing import Any, Literal
 
 import cv2
@@ -18,6 +19,7 @@ from ..danzero.state import GuanDanState, Seat
 from ..recognition_service import (
     PLAY_REGION_TO_SEAT,
     FastSignalResult,
+    OpeningSignal,
     PlayRegionResult,
     ScreenshotRecognitionService,
 )
@@ -28,16 +30,25 @@ from .consensus import (
     ConsensusResult,
     RecognitionSample,
 )
+from .recognition_strategy import (
+    RecognitionStrategy,
+    coerce_recognition_strategy,
+    decide_recognition_strategy,
+    has_exhausted_valid_candidates,
+    strategy_spec,
+)
 from .models import LiveEvent, LiveSnapshot
 from .latest_worker import LatestOnlyWorker
 from .recorder import RecorderWarning, SessionRecorder
 from .reducer import LiveReducer
 from .session_store import LiveSessionStore
+from .turns import TURN_ORDER
 from .zone_lifecycle import ZoneFrameMetrics, ZoneLifecycle, ZonePhase
 
 
 LiveStatus = Literal[
     "initializing",
+    "waiting_lead",
     "running",
     "review_required",
     "paused",
@@ -148,11 +159,14 @@ class LiveOrchestrator:
         recorder: SessionRecorder,
         recognition_service: ScreenshotRecognitionService | Any,
         advisor: Any | None = None,
-        settle_ms: int = 400,
-        action_timeout_ms: int = 15_000,
+        settle_ms: int = 0,
+        action_timeout_ms: int = 28_000,
         burst_sample_limit: int = 5,
         burst_sample_interval_ms: int = 100,
         minimum_free_bytes: int = 512 * 1024 * 1024,
+        lead_wait_timeout_ms: int = 30_000,
+        lead_stable_frames: int = 3,
+        recognition_strategy: str | RecognitionStrategy = RecognitionStrategy.TWO_VALID_STREAK,
     ) -> None:
         if burst_sample_limit < 3:
             raise ValueError("突发读取至少需要 3 帧")
@@ -166,6 +180,9 @@ class LiveOrchestrator:
         self.burst_sample_limit = int(burst_sample_limit)
         self.burst_sample_interval_ms = int(burst_sample_interval_ms)
         self.minimum_free_bytes = int(minimum_free_bytes)
+        self.lead_wait_timeout_ms = int(lead_wait_timeout_ms)
+        self.lead_stable_frames = max(2, int(lead_stable_frames))
+        self.recognition_strategy = coerce_recognition_strategy(recognition_strategy)
         self.consensus = BurstConsensus(min_votes=3)
         self._state_lock = RLock()
         self.status: LiveStatus = "initializing"
@@ -178,11 +195,13 @@ class LiveOrchestrator:
         self._last_monotonic_ms = 0
         self._baseline_by_seat: dict[Seat, np.ndarray] = {}
         self._previous_by_seat: dict[Seat, np.ndarray] = {}
+        self._content_prev_by_seat: dict[Seat, np.ndarray] = {}
         self._all_events: list[LiveEvent] = []
         self._aux_event_sequence = 0
         self._published_sequence = 0
         self._advice_lock = RLock()
         self._requested_advice: set[AdviceRequestKey] = set()
+        self._advice_completion_events: dict[AdviceRequestKey, Event] = {}
         self._self_turn_corroborated = False
         self.latest_advice: LiveAdvice | None = None
         self._advice_worker: LatestOnlyWorker | None = None
@@ -192,14 +211,36 @@ class LiveOrchestrator:
         self._accept_advice_results = True
         self._status_before_pause: LiveStatus | None = None
         self._analysis_epoch = 0
-        self._next_turn_evidence_started_ms: int | None = None
         self._recent_incidents: dict[str, tuple[int, Path]] = {}
+        self._lead_wait_started_ms: int | None = None
+        self._deal_complete_recorded = False
+        self._opening_controls_seen = False
+        self._lead_candidate: Seat | None = None
+        self._lead_candidate_frames = 0
+        self._lead_confirmation_frame: tuple[int, np.ndarray] | None = None
+        self._lead_stability_frames: deque[tuple[int, np.ndarray]] = deque(maxlen=3)
+        self._first_action_pending = False
+        self._self_lead_controls_seen = False
+        self._self_lead_controls_cleared = False
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
                 on_result=self._complete_advice_job,
             )
             self._advice_worker.start()
+
+    @property
+    def needs_first_action_frames(self) -> bool:
+        with self._state_lock:
+            snapshot = self.reducer.snapshot()
+            return bool(
+                self.status == "waiting_lead"
+                or (
+                    self.status == "running"
+                    and self._first_action_pending
+                    and snapshot.current_player == snapshot.lead_player
+                )
+            )
 
     @property
     def snapshot(self) -> LiveSnapshot:
@@ -231,7 +272,7 @@ class LiveOrchestrator:
         *,
         round_level: str,
         hand: tuple[str, ...],
-        lead_player: Seat,
+        lead_player: Seat | None,
         monotonic_ms: int,
     ) -> LiveUpdate:
         if self.status != "initializing":
@@ -246,11 +287,23 @@ class LiveOrchestrator:
             round_level=round_level,
             hand=hand,
             lead_player=lead_player,
-            source="manual_start_with_single_image_recognition",
+            source="manual_start_with_initial_metadata",
         )
         event = self._publish_event(event)
+        if lead_player is None:
+            self.status = "waiting_lead"
+            self._lead_wait_started_ms = int(monotonic_ms)
+            self._deal_complete_recorded = False
+            self._opening_controls_seen = False
+            self._lead_candidate = None
+            self._lead_candidate_frames = 0
+            self._append_lifecycle_event("waiting_for_lead", {})
+            return self._update(event=event)
         self.status = "running"
-        self._activate_zone(int(monotonic_ms), started_with_clear_zone=True)
+        self._first_action_pending = True
+        self._self_lead_controls_seen = False
+        self._self_lead_controls_cleared = lead_player != "self"
+        self._activate_zone(int(monotonic_ms))
         self._append_lifecycle_event(
             "turn_started",
             {"player": lead_player},
@@ -308,21 +361,57 @@ class LiveOrchestrator:
             if self.status == "sealed":
                 raise RuntimeError("对局已经结束")
             self._last_monotonic_ms = int(monotonic_ms)
-            if self.status != "running":
+            if self.status == "waiting_lead":
+                job_key = self._analysis_job_key()
+            elif self.status != "running":
                 return self._update()
-            expected = self.reducer.snapshot().current_player
-            if expected is None:
-                return self._require_review("missing_expected_player", monotonic_ms)
-            job_key = self._analysis_job_key()
+            else:
+                expected = self.reducer.snapshot().current_player
+                if expected is None:
+                    return self._require_review("missing_expected_player", monotonic_ms)
+                job_key = self._analysis_job_key()
+
+        if self.status == "waiting_lead":
+            opening = self._recognize_opening_signal(frame)
+            fast = FastSignalResult(
+                expected_player="self",
+                active_player=opening.active_player,
+                pass_visible=False,
+                self_action_buttons_visible=opening.self_action_buttons_visible,
+                effect_visible=False,
+                super_double_visible=opening.super_double_visible,
+            )
+            lead = self._lead_candidate_from_opening(opening)
+            with self._state_lock:
+                if not self._analysis_job_is_current(job_key):
+                    return self._update()
+                lead_frame = (int(monotonic_ms), frame.copy())
+                self._lead_confirmation_frame = lead_frame
+                self._lead_stability_frames.append(lead_frame)
+                return self._analyze_waiting_lead(fast, lead, monotonic_ms)
 
         # Vision runs without the state lock so pause/correction/finalize stay instant.
-        fast = self.recognition_service.recognize_fast_signals(frame, expected)
+        first_action = bool(
+            self._first_action_pending
+            and expected == self.reducer.snapshot().lead_player
+        )
+        fast = self._recognize_fast_signals(
+            frame,
+            expected,
+            allow_pass=not first_action,
+        )
         with self._state_lock:
             if not self._analysis_job_is_current(job_key):
                 return self._update()
+            if fast.super_double_visible:
+                self._clear_burst()
+                return self._update(fast_signals=fast)
             self._apply_fast_signal(fast)
+            if self._self_lead_waiting_for_action(expected, fast):
+                self._reset_waiting_self_lead(monotonic_ms)
+                return self._update(fast_signals=fast)
             if self._zone is None or self._zone.expected_player != expected:
-                self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+                self._activate_zone(monotonic_ms)
             assert self._zone is not None
             if metrics is None:
                 current_metrics = self._extract_metrics(
@@ -333,30 +422,43 @@ class LiveOrchestrator:
                     monotonic_ms=int(monotonic_ms),
                     occupied=metrics.occupied,
                     motion_score=metrics.motion_score,
-                    pass_visible=metrics.pass_visible or fast.pass_visible,
+                    pass_visible=(metrics.pass_visible or fast.pass_visible) and not first_action,
                     effect_visible=metrics.effect_visible or fast.effect_visible,
+                    content_changed=getattr(metrics, "content_changed", False),
+                )
+            if (
+                self._first_action_pending
+                and expected == self.snapshot.lead_player
+                and self._zone.phase == ZonePhase.WAIT_ACTION
+                and current_metrics.occupied
+                and (
+                    expected != "self" or self._self_lead_controls_cleared
+                )
+            ):
+                # 首出动作可能在首出标志消失前就已静止，首回合允许当前
+                # 玩家区域的已有牌面直接打开动作窗口。
+                current_metrics = ZoneFrameMetrics(
+                    monotonic_ms=current_metrics.monotonic_ms,
+                    occupied=current_metrics.occupied,
+                    motion_score=current_metrics.motion_score,
+                    pass_visible=current_metrics.pass_visible,
+                    effect_visible=current_metrics.effect_visible,
+                    content_changed=True,
                 )
             decision = self._zone.observe(current_metrics)
             if decision.discard_burst:
                 self._clear_burst()
-            if decision.phase == ZonePhase.REVIEW_REQUIRED:
+            if decision.timed_out:
                 return self._require_review(decision.reason, monotonic_ms, fast)
-            inferred_pass = self._inferred_pass_if_ready(current_metrics, fast)
-            if inferred_pass is not None:
-                return self._require_review(
-                    "pass_template_missing",
-                    monotonic_ms,
-                    fast,
-                    inferred_pass,
-                )
             if not decision.collect_sample or not self._sample_due(monotonic_ms):
                 return self._update(fast_signals=fast)
             wild_rank = self.reducer.snapshot().wild_rank
 
-        result = self.recognition_service.recognize_play_region(
+        result = self._recognize_play_region(
             frame,
             expected,
             wild_rank=wild_rank,
+            allow_pass=not first_action,
         )
         with self._state_lock:
             if not self._analysis_job_is_current(job_key):
@@ -369,17 +471,22 @@ class LiveOrchestrator:
                 if consensus.status == "confirmed":
                     event = self._commit_consensus(consensus, monotonic_ms)
                     return self._update(event=event, fast_signals=fast)
-                if (
-                    consensus.status == "needs_confirmation"
-                    or len(self._samples) >= self.burst_sample_limit
-                ):
+                if consensus.status == "needs_confirmation":
                     return self._require_review(
                         ",".join(consensus.rejected_reasons) or consensus.status,
                         monotonic_ms,
                         fast,
                         consensus,
                     )
+            retry_reason = self._recognition_retry_reason(current_metrics, fast)
+            if retry_reason is not None:
+                return self._require_review(
+                    retry_reason,
+                    monotonic_ms,
+                    fast,
+                )
             return self._update(fast_signals=fast)
+
 
     def _analysis_job_key(self) -> tuple[object, ...]:
         snapshot = self.reducer.snapshot()
@@ -392,7 +499,201 @@ class LiveOrchestrator:
         )
 
     def _analysis_job_is_current(self, key: tuple[object, ...]) -> bool:
-        return self.status == "running" and key == self._analysis_job_key()
+        return (
+            self.status in {"running", "waiting_lead"}
+            and key == self._analysis_job_key()
+        )
+
+    @_state_synchronized
+    def _analyze_waiting_lead(
+        self,
+        fast: FastSignalResult,
+        lead: Seat | None,
+        monotonic_ms: int,
+    ) -> LiveUpdate:
+        if self.status != "waiting_lead":
+            return self._update()
+        if fast.super_double_visible:
+            self._opening_controls_seen = True
+            self._deal_complete_recorded = False
+            self._lead_candidate = None
+            self._lead_candidate_frames = 0
+            self._lead_stability_frames.clear()
+            self._lead_wait_started_ms = int(monotonic_ms)
+            return self._update(fast_signals=fast)
+        if self._opening_controls_seen and self._deal_complete_recorded is False:
+            self._deal_complete_recorded = True
+            self._append_lifecycle_event(
+                "deal_complete",
+                {"signal": "opening_controls_absent"},
+                actor="self",
+            )
+        if lead is not None:
+            if self._lead_candidate == lead:
+                self._lead_candidate_frames += 1
+            else:
+                self._lead_candidate = lead
+                self._lead_candidate_frames = 1
+                self._lead_stability_frames.clear()
+                self._lead_stability_frames.append(self._lead_confirmation_frame)
+            if self._lead_candidate_frames >= self.lead_stable_frames:
+                self._lead_candidate = None
+                self._lead_candidate_frames = 0
+                return self._complete_lead(lead, monotonic_ms)
+        else:
+            self._lead_candidate = None
+            self._lead_candidate_frames = 0
+            self._lead_stability_frames.clear()
+        started = self._lead_wait_started_ms
+        if started is not None and int(monotonic_ms) - started >= self.lead_wait_timeout_ms:
+            return self._require_lead_review("lead_player_timeout", monotonic_ms, fast)
+        return self._update(fast_signals=fast)
+
+    def _complete_lead(self, lead: Seat, monotonic_ms: int) -> LiveUpdate:
+        event = self.reducer.confirm_lead_player(lead)
+        event = self._publish_event(event)
+        self.status = "running"
+        self._append_lifecycle_event(
+            "turn_started",
+            {"player": lead},
+            actor=lead,
+        )
+        self._clear_burst()
+        self._first_action_pending = True
+        self._self_lead_controls_seen = False
+        self._self_lead_controls_cleared = lead != "self"
+        self._activate_zone(int(monotonic_ms))
+        # Activate first (it clears old per-seat pixels), then retain the
+        # pre-lead opening frames as the first action's empty/reference image.
+        # Seeding before activation silently discarded the baseline and made a
+        # visible first action look static in replay and live capture alike.
+        self._seed_first_action_baseline(lead)
+        self._request_advice_if_needed()
+        return self._update(event=event)
+
+    def _require_lead_review(
+        self,
+        reason: str,
+        monotonic_ms: int,
+        fast: FastSignalResult | None = None,
+    ) -> LiveUpdate:
+        self._review_count += 1
+        self.latest_review = None
+        self._lead_wait_started_ms = int(monotonic_ms)
+        self._lead_candidate = None
+        self._lead_candidate_frames = 0
+        event = self._append_lifecycle_event(
+            "recognition_retry",
+            {"reason": str(reason), "stage": "waiting_lead"},
+        )
+        self._create_incident(reason, monotonic_ms)
+        return self._update(event=event, fast_signals=fast)
+
+    def _recognize_super_double_visible(self, frame: np.ndarray) -> bool:
+        """Pre-lead phase only checks the deal completion control and lead mark."""
+        method = getattr(self.recognition_service, "recognize_super_double_visible", None)
+        if callable(method):
+            return bool(method(frame))
+        # Compatibility for older plug-ins and test doubles.  Production uses
+        # the dedicated method above, which does not inspect a seat/pass ROI.
+        return bool(self.recognition_service.recognize_fast_signals(frame, "self").super_double_visible)
+
+    def _recognize_opening_signal(self, frame: np.ndarray) -> OpeningSignal:
+        """Use one opening recognizer for live play and pipeline replay.
+
+        The compatibility branch keeps external recognizer plug-ins usable,
+        while the project recognizer returns all opening evidence from the
+        same screenshot.
+        """
+
+        method = getattr(self.recognition_service, "recognize_opening_signal", None)
+        if callable(method):
+            return method(frame)
+        super_double_visible = self._recognize_super_double_visible(frame)
+        lead_method = getattr(self.recognition_service, "recognize_lead_player", None)
+        marker_player = None if super_double_visible or not callable(lead_method) else lead_method(frame)
+        fast = self._recognize_fast_signals(frame, "self", allow_pass=False)
+        return OpeningSignal(
+            super_double_visible=super_double_visible,
+            marker_player=marker_player,
+            active_player=fast.active_player,
+            self_action_buttons_visible=fast.self_action_buttons_visible,
+        )
+
+    @staticmethod
+    def _lead_candidate_from_opening(signal: OpeningSignal) -> Seat | None:
+        """Resolve only non-conflicting raw opening evidence.
+
+        A marker and a live timer naming different players is a transient
+        screen state, not a valid lead.  A single source is allowed through
+        the existing consecutive-frame stability gate.
+        """
+
+        if signal.super_double_visible:
+            return None
+        if (
+            signal.marker_player is not None
+            and signal.active_player is not None
+            and signal.marker_player != signal.active_player
+        ):
+            return None
+        if signal.marker_player is not None:
+            return signal.marker_player
+        if signal.active_player is not None:
+            return signal.active_player
+        if signal.self_action_buttons_visible:
+            return "self"
+        return None
+
+    def _recognize_fast_signals(
+        self,
+        frame: np.ndarray,
+        expected: Seat,
+        *,
+        allow_pass: bool,
+    ) -> FastSignalResult:
+        try:
+            return self.recognition_service.recognize_fast_signals(
+                frame, expected, allow_pass=allow_pass
+            )
+        except TypeError as exc:
+            if "allow_pass" not in str(exc):
+                raise
+            return self.recognition_service.recognize_fast_signals(frame, expected)
+
+    def _recognize_play_region(
+        self,
+        frame: np.ndarray,
+        expected: Seat,
+        *,
+        wild_rank: str,
+        allow_pass: bool,
+    ) -> PlayRegionResult:
+        try:
+            return self.recognition_service.recognize_play_region(
+                frame,
+                expected,
+                wild_rank=wild_rank,
+                allow_pass=allow_pass,
+            )
+        except TypeError as exc:
+            if "allow_pass" not in str(exc):
+                raise
+            return self.recognition_service.recognize_play_region(
+                frame, expected, wild_rank=wild_rank
+            )
+
+
+    @_state_synchronized
+    def confirm_lead_player(self, lead_player: Seat) -> LiveUpdate:
+        if self.status not in {"waiting_lead", "review_required"}:
+            raise RuntimeError("当前不在等待首发阶段")
+        snapshot = self.reducer.snapshot()
+        if snapshot.lead_player is not None:
+            raise RuntimeError("首发座位已经确认")
+        if lead_player not in TURN_ORDER:
+            raise RuntimeError("首出座位无效")
+        return self._complete_lead(lead_player, self._last_monotonic_ms)
 
     @_state_synchronized
     def confirm_candidate(self, candidate_id: str) -> LiveUpdate:
@@ -430,7 +731,46 @@ class LiveOrchestrator:
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
-        self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._activate_zone(self._last_monotonic_ms)
+        self._append_current_turn_started()
+        self._request_advice_if_needed()
+        return self._update(event=event)
+
+    @_state_synchronized
+    def commit_trusted_action(
+        self,
+        *,
+        actor: Seat,
+        cards: tuple[str, ...] = (),
+        is_pass: bool,
+        monotonic_ms: int,
+        evidence_refs: tuple[str, ...] = (),
+    ) -> LiveUpdate:
+        """Commit a trusted action through the same post-action live path.
+
+        Trusted replay deliberately bypasses vision and consensus because the
+        source event has already been confirmed.  State advancement, event
+        publication, turn lifecycle, and DanZero scheduling remain the same as
+        a live consensus commit.
+        """
+
+        if self.status != "running":
+            raise RuntimeError("当前不在实时对局进行状态")
+        expected = self.reducer.snapshot().current_player
+        if expected != actor:
+            raise ValueError(f"当前应由 {expected} 行动，不能提交 {actor} 的可信动作")
+        self._last_monotonic_ms = int(monotonic_ms)
+        event = self._record_action(
+            actor,
+            cards,
+            is_pass,
+            confidence=1.0,
+            source="trusted_log_replay",
+            evidence_refs=evidence_refs,
+        )
+        event = self._publish_event(event)
+        self._first_action_pending = False
+        self._activate_zone(int(monotonic_ms))
         self._append_current_turn_started()
         self._request_advice_if_needed()
         return self._update(event=event)
@@ -464,7 +804,7 @@ class LiveOrchestrator:
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
-        self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._activate_zone(self._last_monotonic_ms)
         self._append_current_turn_started()
         self._request_advice_if_needed()
         return self._update(event=event)
@@ -502,13 +842,13 @@ class LiveOrchestrator:
         self.status = "running"
         self.latest_review = None
         self._clear_burst()
-        self._activate_zone(self._last_monotonic_ms, started_with_clear_zone=False)
+        self._activate_zone(self._last_monotonic_ms)
         self._request_advice_if_needed()
         return self._update(event=event)
 
     @_state_synchronized
     def pause(self) -> LiveUpdate:
-        if self.status in {"running", "review_required"}:
+        if self.status in {"running", "review_required", "waiting_lead"}:
             self._status_before_pause = self.status
             self.status = "paused"
             self._analysis_epoch += 1
@@ -525,7 +865,7 @@ class LiveOrchestrator:
         self._status_before_pause = None
         self._analysis_epoch += 1
         if self.status == "running":
-            self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+            self._activate_zone(monotonic_ms)
         self._append_lifecycle_event("session_resumed", {})
         return self._update()
 
@@ -551,6 +891,8 @@ class LiveOrchestrator:
 
     @_state_synchronized
     def analysis_failed(self, reason: str, *, monotonic_ms: int) -> LiveUpdate:
+        if self.status == "waiting_lead":
+            return self._update()
         if self.status == "review_required":
             return self._update()
         return self._require_review(
@@ -579,6 +921,31 @@ class LiveOrchestrator:
     @_state_synchronized
     def start_self_advice(self) -> AdviceRequestKey | None:
         return self._request_advice_if_needed()
+
+    def wait_for_advice(
+        self,
+        key: AdviceRequestKey,
+        *,
+        timeout: float = 60.0,
+    ) -> LiveAdvice | None:
+        """Wait for one advisor job without blocking the GUI thread.
+
+        The trusted replay runs inside its own worker thread.  The event is
+        signalled by the normal advisor completion callback, so this method
+        does not create a second recommendation path.
+        """
+
+        with self._advice_lock:
+            completed = self._advice_completion_events.get(key)
+        if completed is None:
+            return None
+        if not completed.wait(max(0.0, float(timeout))):
+            return None
+        with self._advice_lock:
+            advice = self.latest_advice
+            if advice is None or advice.key != key:
+                return None
+            return advice
 
     def complete_advice(
         self,
@@ -613,16 +980,58 @@ class LiveOrchestrator:
             self._clear_burst()
             return self._update()
 
-    def _activate_zone(self, monotonic_ms: int, *, started_with_clear_zone: bool) -> None:
+    def _self_lead_waiting_for_action(
+        self,
+        expected: Seat,
+        fast: FastSignalResult,
+    ) -> bool:
+        if (
+            not self._first_action_pending
+            or expected != "self"
+            or self.snapshot.lead_player != "self"
+        ):
+            return False
+        if fast.self_action_buttons_visible:
+            self._self_lead_controls_seen = True
+            return True
+        if not self._self_lead_controls_seen:
+            return True
+        self._self_lead_controls_cleared = True
+        return False
+
+    def _reset_waiting_self_lead(self, monotonic_ms: int) -> None:
+        self._clear_burst()
+        self._activate_zone(monotonic_ms)
+
+    def _seed_first_action_baseline(self, player: Seat) -> None:
+        frames = self._lead_stability_frames
+        self._lead_confirmation_frame = None
+        if not frames:
+            return
+        _, frame = frames[0]
+        frames.clear()
+        roi = self._play_roi(frame, player)
+        gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        self._baseline_by_seat[player] = gray.copy()
+        self._previous_by_seat[player] = gray
+
+    def _activate_zone(self, monotonic_ms: int) -> None:
         player = self.snapshot.current_player
         if player is None:
             self._zone = None
             return
+        # Every action window starts from the expected player's current ROI.
+        # Old cards and an earlier animation in this same seat must not count
+        # as a new action after turn ownership changes.
+        self._baseline_by_seat.pop(player, None)
+        self._previous_by_seat.pop(player, None)
+        self._content_prev_by_seat.pop(player, None)
+        spec = strategy_spec(self.recognition_strategy)
         self._zone = ZoneLifecycle(
             expected_player=player,
-            started_with_clear_zone=started_with_clear_zone,
             activated_at_ms=int(monotonic_ms),
-            settle_ms=self.settle_ms,
+            settle_ms=max(self.settle_ms, spec.settle_ms),
+            stable_ms=spec.stable_ms,
             action_timeout_ms=self.action_timeout_ms,
         )
         self._self_turn_corroborated = False
@@ -644,6 +1053,7 @@ class LiveOrchestrator:
                 return key
             state = self.reducer.to_guandan_state()
             self._requested_advice.add(key)
+            self._advice_completion_events[key] = Event()
             self._advice_requested_at_ms[key] = self._last_monotonic_ms
             self.latest_advice = LiveAdvice(key=key, status="requested")
             self.store.append_advice(
@@ -707,9 +1117,10 @@ class LiveOrchestrator:
 
     @_state_synchronized
     def _complete_advice_job(self, completion: _AdviceCompletion) -> None:
-        if not self._accept_advice_results:
-            return
         key = completion.key
+        if not self._accept_advice_results:
+            self._signal_advice_completion(key)
+            return
         with self._advice_lock:
             snapshot = self.snapshot
             current_key = AdviceRequestKey(
@@ -745,6 +1156,7 @@ class LiveOrchestrator:
                         advice=completion.advice,
                         error=completion.error,
                     )
+                self._signal_advice_completion(key)
                 return
             if completion.error or completion.advice is None:
                 error = completion.error or "DanZero 未返回建议"
@@ -781,6 +1193,7 @@ class LiveOrchestrator:
                     },
                     confidence=0.0,
                 )
+                self._signal_advice_completion(key)
                 return
             advice = completion.advice
             visible = self._self_turn_corroborated
@@ -819,6 +1232,13 @@ class LiveOrchestrator:
                     "visible": visible,
                 },
             )
+            self._signal_advice_completion(key)
+
+    def _signal_advice_completion(self, key: AdviceRequestKey) -> None:
+        with self._advice_lock:
+            event = self._advice_completion_events.get(key)
+        if event is not None:
+            event.set()
 
     def _apply_fast_signal(self, fast: FastSignalResult) -> None:
         if self.snapshot.current_player != "self":
@@ -952,6 +1372,14 @@ class LiveOrchestrator:
             "post_hand_confidence": result.post_hand_confidence,
             "diagnostics": list(result.diagnostics),
             "phase": "burst_read",
+            "self_action_controls_seen": self._self_lead_controls_seen,
+            "self_action_controls_cleared": self._self_lead_controls_cleared,
+            "hand_card_count_before": len(self.snapshot.my_hand)
+            if result.player == "self"
+            else None,
+            "hand_card_count_after": len(result.post_hand)
+            if result.player == "self" and result.post_hand
+            else None,
         }
         self._samples.append(sample)
         self._observations.append(record)
@@ -968,12 +1396,36 @@ class LiveOrchestrator:
         metrics: ZoneFrameMetrics,
         fast: FastSignalResult,
     ) -> ConsensusResult | None:
-        if len(self._samples) < 3:
-            return None
+        context = self._consensus_context(metrics, fast)
+        return decide_recognition_strategy(
+            self.recognition_strategy,
+            self._samples,
+            context=context,
+        )
+
+    def _recognition_retry_reason(
+        self,
+        metrics: ZoneFrameMetrics,
+        fast: FastSignalResult,
+    ) -> str | None:
+        context = self._consensus_context(metrics, fast)
+        if has_exhausted_valid_candidates(
+            self._samples,
+            context=context,
+            limit=self.burst_sample_limit,
+        ):
+            return "conflicting_valid_candidates"
+        return None
+
+    def _consensus_context(
+        self,
+        metrics: ZoneFrameMetrics,
+        fast: FastSignalResult,
+    ) -> ConsensusContext:
         snapshot = self.snapshot
         player = snapshot.current_player
         assert player is not None
-        context = ConsensusContext(
+        return ConsensusContext(
             level_rank=snapshot.wild_rank,
             remaining_cards=snapshot.remaining_cards[player],
             allow_pass=bool(snapshot.trick_plays),
@@ -986,52 +1438,21 @@ class LiveOrchestrator:
                 ),
                 (),
             ),
+            known_cards=tuple(snapshot.my_hand) + tuple(
+                card
+                for event in snapshot.play_history
+                if not event.is_pass
+                for card in event.cards
+            ),
+            candidate_already_known=player == "self",
             region_empty=not metrics.occupied,
             next_turn_evidence=(
                 fast.active_player is not None and fast.active_player != player
             ),
+            # 当前手牌仍只用于校验出牌是否属于已知手牌；不再重识别整手牌。
+            # 牌型和压牌规则仍然保留，防止视觉结果直接污染状态机。
+            validate_rules=True,
         )
-        return self.consensus.decide(self._samples, context=context)
-
-    def _inferred_pass_if_ready(
-        self,
-        metrics: ZoneFrameMetrics,
-        fast: FastSignalResult,
-    ) -> ConsensusResult | None:
-        snapshot = self.reducer.snapshot()
-        player = snapshot.current_player
-        independent_next_turn = (
-            player is not None
-            and fast.active_player is not None
-            and fast.active_player != player
-        )
-        eligible = (
-            self._zone is not None
-            and self._zone.phase == ZonePhase.WAIT_ACTION
-            and bool(snapshot.trick_plays)
-            and not metrics.occupied
-            and not metrics.pass_visible
-            and not metrics.effect_visible
-            and independent_next_turn
-        )
-        if not eligible:
-            self._next_turn_evidence_started_ms = None
-            return None
-        now = int(metrics.monotonic_ms)
-        if self._next_turn_evidence_started_ms is None:
-            self._next_turn_evidence_started_ms = now
-            return None
-        if now - self._next_turn_evidence_started_ms < 300:
-            return None
-        context = ConsensusContext(
-            level_rank=snapshot.wild_rank,
-            remaining_cards=snapshot.remaining_cards[player],
-            allow_pass=True,
-            known_hand=snapshot.my_hand if player == "self" else (),
-            region_empty=True,
-            next_turn_evidence=True,
-        )
-        return self.consensus.decide((), context=context)
 
     def _commit_consensus(self, result: ConsensusResult, monotonic_ms: int) -> LiveEvent:
         player = self.snapshot.current_player
@@ -1045,7 +1466,8 @@ class LiveOrchestrator:
             evidence_refs=result.evidence_refs,
         )
         event = self._publish_event(event)
-        self._activate_zone(monotonic_ms, started_with_clear_zone=False)
+        self._first_action_pending = False
+        self._activate_zone(monotonic_ms)
         self._append_current_turn_started()
         self._request_advice_if_needed()
         return event
@@ -1083,36 +1505,40 @@ class LiveOrchestrator:
         consensus: ConsensusResult | None = None,
     ) -> LiveUpdate:
         player = self.snapshot.current_player
-        assert player is not None
-        source_candidates = consensus.candidates if consensus is not None else ()
+        if self._first_action_pending and player == self.snapshot.lead_player:
+            if player == "self" and not self._self_lead_controls_cleared:
+                self._reset_waiting_self_lead(monotonic_ms)
+                return self._update(fast_signals=fast)
+            self._first_action_pending = False
+            if reason in {
+                "empty_play,insufficient_consensus",
+                "no_valid_candidates",
+                "conflicting_valid_candidates",
+            }:
+                reason = "first_action_not_captured"
         candidates = tuple(
-            self._review_candidate(index, candidate)
-            for index, candidate in enumerate(source_candidates, start=1)
-        )
-        evidence = tuple(
-            sample.evidence_ref for sample in self._samples if sample.evidence_ref
-        )
-        self.latest_review = ReviewRequest(
-            reason=str(reason),
-            player=player,
-            candidates=candidates,
-            evidence_refs=evidence,
+            f"CAND-{index}"
+            for index, _candidate in enumerate(
+                consensus.candidates if consensus is not None else (),
+                start=1,
+            )
         )
         self._review_count += 1
-        self.status = "review_required"
-        if self._zone is not None:
-            self._zone.require_review(reason)
-        self._append_lifecycle_event(
-            "review_required",
+        self.latest_review = None
+        self._clear_burst()
+        if player is not None and self.status == "running":
+            self._activate_zone(monotonic_ms)
+        event = self._append_lifecycle_event(
+            "recognition_retry",
             {
                 "reason": str(reason),
-                "candidate_ids": [item.candidate_id for item in candidates],
-                "evidence_refs": list(evidence),
+                "candidate_ids": list(candidates),
             },
             actor=player,
         )
         self._create_incident(reason, monotonic_ms)
-        return self._update(review=self.latest_review, fast_signals=fast)
+        return self._update(event=event, fast_signals=fast)
+
 
     @staticmethod
     def _review_candidate(index: int, candidate: ConsensusCandidate) -> ReviewCandidate:
@@ -1187,6 +1613,25 @@ class LiveOrchestrator:
         )
         return value
 
+    _CONTENT_CHANGE_THRESHOLD = 0.02
+
+    def _content_fingerprint(
+        self,
+        frame: np.ndarray,
+        player: Seat,
+    ) -> np.ndarray:
+        """把该玩家的出牌区域降采样为灰度指纹，用于内容变化判定。"""
+        roi = self._play_roi(frame, player)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape[:2]
+        target_width = 32
+        target_height = max(8, int(round(32 * height / max(1, width))))
+        return cv2.resize(
+            gray,
+            (target_width, target_height),
+            interpolation=cv2.INTER_AREA,
+        )
+
     def _extract_metrics(
         self,
         frame: np.ndarray,
@@ -1212,13 +1657,33 @@ class LiveOrchestrator:
         occupied = fast.pass_visible or occupancy_score >= 0.035
         if not occupied and motion <= 0.01:
             self._baseline_by_seat[player] = gray.copy()
+
+        fingerprint = self._content_fingerprint(frame, player)
+        previous_fingerprint = self._content_prev_by_seat.get(player)
+        content_changed = bool(
+            previous_fingerprint is not None
+            and previous_fingerprint.shape == fingerprint.shape
+            and float(
+                np.mean(
+                    np.abs(
+                        fingerprint.astype(np.int16)
+                        - previous_fingerprint.astype(np.int16)
+                    )
+                )
+                / 255.0
+            )
+            >= self._CONTENT_CHANGE_THRESHOLD
+        )
+        self._content_prev_by_seat[player] = fingerprint
         return ZoneFrameMetrics(
             monotonic_ms=int(monotonic_ms),
             occupied=occupied,
             motion_score=motion,
             pass_visible=fast.pass_visible,
             effect_visible=fast.effect_visible,
+            content_changed=content_changed,
         )
+
 
     def _play_roi(self, frame: np.ndarray, player: Seat) -> np.ndarray:
         annotation_service = getattr(self.recognition_service, "annotation_service", None)
@@ -1240,7 +1705,6 @@ class LiveOrchestrator:
         self._samples.clear()
         self._observations.clear()
         self._last_sample_ms = None
-        self._next_turn_evidence_started_ms = None
 
     def _update(
         self,

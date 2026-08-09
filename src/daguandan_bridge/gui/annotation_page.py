@@ -10,6 +10,7 @@ import cv2
 from PySide6.QtCore import QPoint, QRect, QThread, Qt, Signal
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
+    QLineEdit,
     QComboBox,
     QFormLayout,
     QGridLayout,
@@ -61,6 +62,16 @@ SOURCE_ROLE_LABELS = {
     "generic": "通用样本",
     "level": "级牌 / 逢人配",
 }
+# 裁剪 rank/suit 模板时，按当前选中的区域名自动推断来源角色，
+# 避免手牌/出牌模板分类错误导致识别不到。
+_REGION_ROLE_HINTS = {
+    "my_hand": "hand",
+    "my_play": "play",
+    "left_play": "play",
+    "right_play": "play",
+    "opposite_play": "play",
+    "level_rank": "level",
+}
 TEMPLATE_LABEL_LABELS = {
     "super_double": "超级加倍",
     "double": "加倍",
@@ -107,7 +118,7 @@ TEMPLATE_LABEL_OPTIONS_BY_KIND = {
     "timer": ("active",),
     "anchor": ("game_logo_anchor", "table_anchor_1", "table_anchor_2"),
 }
-TEMPLATE_TABLE_HEADERS = ("模板类型", "模板标签", "来源角色", "绝对坐标", "比例坐标", "文件")
+TEMPLATE_TABLE_HEADERS = ("模板类型", "模板标签", "来源角色", "模板文件")
 REGION_COORDINATE_HEADERS = ("区域", "x", "y", "w", "h")
 
 
@@ -418,6 +429,23 @@ class AnnotationPage(QWidget):
         template_detail_layout.addLayout(template_form)
         self.crop_template_button = QPushButton("裁剪并保存模板")
         self.delete_template_button = QPushButton("删除选中模板")
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("筛选角色"))
+        self.template_filter_combo = ScrollSafeComboBox()
+        self.template_filter_combo.addItem("全部角色", "")
+        for role in sorted(SOURCE_ROLES):
+            self.template_filter_combo.addItem(
+                SOURCE_ROLE_LABELS.get(role, role), role
+            )
+        filter_row.addWidget(self.template_filter_combo)
+        self.template_search_edit = QLineEdit()
+        self.template_search_edit.setPlaceholderText(
+            "搜索模板（标签/类型/角色/文件名，支持中文）"
+        )
+        self.template_search_edit.setClearButtonEnabled(True)
+        filter_row.addWidget(self.template_search_edit, 1)
+        self.template_count_label = QLabel("")
+        filter_row.addWidget(self.template_count_label)
         self.template_table = QTableWidget(0, len(TEMPLATE_TABLE_HEADERS))
         self.template_table.setHorizontalHeaderLabels(TEMPLATE_TABLE_HEADERS)
         self.template_table.setSelectionBehavior(
@@ -431,17 +459,24 @@ class AnnotationPage(QWidget):
         )
         self.template_table.setMinimumHeight(170)
         self.template_table.setWordWrap(False)
-        for column, width in enumerate((90, 110, 90, 145, 175)):
+        for column, width in enumerate((90, 130, 110, 190)):
             self.template_table.setColumnWidth(column, width)
         self.template_table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.Stretch
+            3, QHeaderView.ResizeMode.Stretch
         )
         # Keep the old attribute as a compatibility alias for integrations that
         # only use it to read or select saved templates.
         self.template_list = self.template_table
         template_detail_layout.addWidget(self.crop_template_button)
         template_detail_layout.addWidget(self.delete_template_button)
+        template_detail_layout.addLayout(filter_row)
         template_detail_layout.addWidget(self.template_table)
+        self.template_filter_combo.currentIndexChanged.connect(
+            self._refresh_template_status
+        )
+        self.template_search_edit.textChanged.connect(
+            self._refresh_template_status
+        )
 
         self.mode_detail_stack.addWidget(self.region_detail_widget)
         self.mode_detail_stack.addWidget(self.template_detail_widget)
@@ -608,34 +643,78 @@ class AnnotationPage(QWidget):
         """兼容旧调用方，统一转入 ROI 更新路径。"""
         self._set_roi(box)
 
-    def _refresh_template_status(self) -> None:
+    def _template_matches(
+        self,
+        record: dict[str, object],
+        role_filter: str,
+        keyword: str,
+    ) -> bool:
+        if role_filter and str(record.get("source_role", "")) != role_filter:
+            return False
+        if not keyword:
+            return True
+        kind = str(record.get("kind", ""))
+        label = str(record.get("label", ""))
+        role = str(record.get("source_role", ""))
+        filename = Path(str(record.get("file", ""))).name
+        haystack = " ".join(
+            (
+                kind,
+                TEMPLATE_KIND_LABELS.get(kind, ""),
+                label,
+                TEMPLATE_LABEL_LABELS.get(label, ""),
+                role,
+                SOURCE_ROLE_LABELS.get(role, ""),
+                filename,
+            )
+        ).lower()
+        return keyword.lower() in haystack
+
+    def _refresh_template_status(self, *_args) -> None:
         records = self.template_service.list_templates()
         self._refresh_template_labels(records)
         selected_ids = self._selected_template_ids()
+        role_filter = str(self.template_filter_combo.currentData() or "")
+        keyword = self.template_search_edit.text().strip()
+        filtered = [
+            record
+            for record in records
+            if self._template_matches(record, role_filter, keyword)
+        ]
         self.template_table.setRowCount(0)
-        self.template_table.setToolTip(f"已保存模板：{len(records)} 条")
-        self.template_table.setRowCount(len(records))
-        for row, record in enumerate(records):
+        self.template_table.setToolTip(
+            f"已保存模板：{len(records)} 条（显示 {len(filtered)} 条）"
+        )
+        self.template_table.setRowCount(len(filtered))
+        for row, record in enumerate(filtered):
             sample_id = str(record.get("sample_id", ""))
             kind = str(record.get("kind", ""))
             label = str(record.get("label", ""))
             source_role = str(record.get("source_role", ""))
-            ratio_box = record.get("ratio_box", [])
+            relative = str(record.get("file", ""))
             values = (
                 TEMPLATE_KIND_LABELS.get(kind, kind),
                 TEMPLATE_LABEL_LABELS.get(label, label),
                 SOURCE_ROLE_LABELS.get(source_role, source_role),
-                str(record.get("abs_box", [])),
-                str([round(float(value), 6) for value in ratio_box]),
-                str(record.get("file", "")),
+                Path(relative).name,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, sample_id)
+                    item.setToolTip(sample_id)
+                if column == 1:
+                    item.setToolTip(f"{label}（{sample_id}）")
+                if column == 3:
+                    item.setToolTip(relative)
                 self.template_table.setItem(row, column, item)
             if sample_id in selected_ids:
                 self.template_table.selectRow(row)
+        total = len(records)
+        if len(filtered) == total:
+            self.template_count_label.setText(f"共 {total} 条")
+        else:
+            self.template_count_label.setText(f"显示 {len(filtered)} / {total} 条")
 
     def _selected_template_ids(self) -> set[str]:
         ids: set[str] = set()
@@ -1091,6 +1170,11 @@ class AnnotationPage(QWidget):
         image = self.current_image.copy()
         kind = str(self.template_kind_combo.currentData())
         source_role = str(self.template_source_role_combo.currentData())
+        if source_role == "generic" and kind in ("rank", "suit"):
+            source_role = _REGION_ROLE_HINTS.get(
+                str(self.region_name_combo.currentData() or ""),
+                "generic",
+            )
         operation = lambda: self.template_service.save_template(
             image,
             kind=kind,

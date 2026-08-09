@@ -23,6 +23,14 @@ _ACTION_EVENT_TYPES = {
     "manual_confirmed_event",
 }
 
+# 接风：出完牌的赢家把下一墩的领出权交给队友（桌面正对座位）。
+_PARTNER_SEAT = {
+    "self": "opposite",
+    "opposite": "self",
+    "right": "left",
+    "left": "right",
+}
+
 
 class LiveReducer:
     """Deterministically reduce immutable live events into confirmed game state."""
@@ -96,7 +104,7 @@ class LiveReducer:
         *,
         round_level: str,
         hand: Iterable[str],
-        lead_player: Seat,
+        lead_player: Seat | None = None,
         confidence: float = 1.0,
         source: str = "manual_start",
         evidence_refs: Iterable[str] = (),
@@ -108,7 +116,7 @@ class LiveReducer:
             raise GameStateError("开局时必须确认完整 27 张手牌")
         if round_level not in RANKS:
             raise GameStateError("请选择当前级牌")
-        if lead_player not in TURN_ORDER:
+        if lead_player is not None and lead_player not in TURN_ORDER:
             raise GameStateError("首出座位无效")
         event = self._new_event(
             "initial_state_confirmed",
@@ -122,6 +130,28 @@ class LiveReducer:
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
+        )
+        self.apply(event)
+        return event
+
+    def confirm_lead_player(self, lead_player: Seat) -> LiveEvent:
+        """Confirm the lead player once the first-play marker appears.
+
+        The doubling phase shows no first-play marker, so a session can start
+        with an unresolved lead and be finalized automatically (or manually).
+        """
+        if not self._initialized:
+            raise GameStateError("牌局尚未初始化")
+        if self._lead_player is not None:
+            raise GameStateError("首发座位已经确认")
+        if lead_player not in TURN_ORDER:
+            raise GameStateError("首出座位无效")
+        event = self._new_event(
+            "lead_player_confirmed",
+            actor=lead_player,
+            payload={"lead_player": lead_player},
+            confidence=1.0,
+            source="manual_or_auto_lead_confirmation",
         )
         self.apply(event)
         return event
@@ -255,6 +285,9 @@ class LiveReducer:
         if event.event_type == "initial_state_confirmed":
             self._apply_initial(event)
             return
+        if event.event_type == "lead_player_confirmed":
+            self._apply_lead_confirmed(event)
+            return
         if event.event_type in _ACTION_EVENT_TYPES:
             self._apply_action(event)
             return
@@ -266,10 +299,10 @@ class LiveReducer:
             raise GameStateError("开局时必须确认完整 27 张手牌")
         round_level = str(event.payload.get("round_level", ""))
         wild_rank = str(event.payload.get("wild_rank", round_level))
-        lead = event.payload.get("lead_player")
         if round_level not in RANKS or wild_rank not in RANKS:
             raise GameStateError("开局级牌无效")
-        if lead not in TURN_ORDER:
+        lead = event.payload.get("lead_player")
+        if lead is not None and lead not in TURN_ORDER:
             raise GameStateError("开局首出座位无效")
         self._round_level = round_level
         self._wild_rank = wild_rank
@@ -279,6 +312,19 @@ class LiveReducer:
         self._trick_id = 1
         self._turn_id = 1
         self._initialized = True
+
+    def _apply_lead_confirmed(self, event: LiveEvent) -> None:
+        if not self._initialized:
+            raise GameStateError("牌局尚未初始化")
+        if self._lead_player is not None:
+            raise GameStateError("首发座位已经确认")
+        lead = event.payload.get("lead_player")
+        if lead not in TURN_ORDER:
+            raise GameStateError("首发座位无效")
+        self._lead_player = lead
+        self._current_player = lead
+        self._trick_id = 1
+        self._turn_id = 1
 
     def _apply_action(self, event: LiveEvent) -> None:
         if not self._initialized:
@@ -350,7 +396,8 @@ class LiveReducer:
         passed = {event.player for event in later if event.is_pass}
         if required_passes and required_passes.issubset(passed):
             if leader in self._finished_seats:
-                leader = next_active_seat(leader, frozenset(self._finished_seats))
+                # 赢家已出完：接风给队友，而不是按轮转给下一家
+                leader = _PARTNER_SEAT.get(leader, leader)
             self._trick_plays.clear()
             self._lead_player = leader
             self._current_player = leader

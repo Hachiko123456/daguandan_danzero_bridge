@@ -17,6 +17,8 @@ class RecognitionSample:
     confidence: float
     source: str
     evidence_ref: str = ""
+    # Kept as a compatibility field for old logs.  It is no longer used to
+    # confirm or reject an action.
     post_hand: tuple[str, ...] = ()
 
 
@@ -27,8 +29,16 @@ class ConsensusContext:
     allow_pass: bool
     known_hand: tuple[str, ...] = ()
     table_cards: tuple[str, ...] = ()
+    # Known physical cards include the current self hand plus every confirmed
+    # non-pass action.  Opponents' hidden hands intentionally stay unknown.
+    known_cards: tuple[str, ...] = ()
+    # A self action is selected from ``known_hand``.  Its cards must therefore
+    # not be added a second time when checking the global double-deck bound.
+    candidate_already_known: bool = False
     region_empty: bool = False
     next_turn_evidence: bool = False
+    # The live path keeps card-in-hand and play-rule checks enabled.
+    validate_rules: bool = True
 
 
 @dataclass(frozen=True)
@@ -55,11 +65,11 @@ class ConsensusResult:
 
 
 class BurstConsensus:
-    """Vote on 3–5 stable reads, then apply card/deck constraints."""
+    """Vote on stable reads, then apply card/deck constraints."""
 
     def __init__(self, *, min_votes: int = 3) -> None:
         if min_votes <= 0:
-            raise ValueError("min_votes 必须为正数")
+            raise ValueError("min_votes must be positive")
         self.min_votes = int(min_votes)
 
     def decide(
@@ -70,24 +80,6 @@ class BurstConsensus:
     ) -> ConsensusResult:
         items = tuple(samples)
         if not items:
-            if context.region_empty and context.next_turn_evidence and context.allow_pass:
-                inferred = ConsensusCandidate(
-                    cards=(),
-                    is_pass=True,
-                    votes=0,
-                    mean_confidence=0.0,
-                    valid=True,
-                )
-                return ConsensusResult(
-                    status="needs_confirmation",
-                    cards=(),
-                    is_pass=True,
-                    confidence=0.0,
-                    source="inferred_pass",
-                    vote_count=0,
-                    candidates=(inferred,),
-                    rejected_reasons=("pass_template_missing",),
-                )
             return self._review((), ("no_recognition_samples",))
 
         grouped: dict[tuple[bool, tuple[str, ...]], list[RecognitionSample]] = defaultdict(list)
@@ -99,19 +91,7 @@ class BurstConsensus:
         candidates: list[ConsensusCandidate] = []
         evidence_by_key: dict[tuple[bool, tuple[str, ...]], tuple[str, ...]] = {}
         for (is_pass, cards), votes in grouped.items():
-            rejected_reason = self._validate_candidate(is_pass, cards, context)
-            if not rejected_reason and context.known_hand:
-                expected = Counter(context.known_hand)
-                if not is_pass:
-                    expected.subtract(Counter(cards))
-                expected_post_hand = Counter(+expected)
-                verified_votes = sum(
-                    bool(item.post_hand)
-                    and Counter(item.post_hand) == expected_post_hand
-                    for item in votes
-                )
-                if verified_votes < self.min_votes:
-                    rejected_reason = "self_hand_delta_unverified"
+            rejected_reason = self.validate_candidate(is_pass, cards, context)
             candidates.append(
                 ConsensusCandidate(
                     cards=cards,
@@ -157,7 +137,7 @@ class BurstConsensus:
         return self._review(tuple(candidates), tuple(dict.fromkeys(reasons)))
 
     @staticmethod
-    def _validate_candidate(
+    def validate_candidate(
         is_pass: bool,
         cards: tuple[str, ...],
         context: ConsensusContext,
@@ -170,8 +150,15 @@ class BurstConsensus:
             return "exceeds_remaining_cards"
         if any(count > 2 for count in Counter(cards).values()):
             return "exceeds_double_deck_limit"
+        known_counts = Counter(context.known_cards)
+        if not context.candidate_already_known:
+            known_counts.update(cards)
+        if any(count > 2 for count in known_counts.values()):
+            return "exceeds_double_deck_limit"
         if context.known_hand and Counter(cards) - Counter(context.known_hand):
             return "cards_not_in_known_hand"
+        if not context.validate_rules:
+            return ""
         try:
             if action_for_cards(cards, context.level_rank) is None:
                 return "illegal_pattern"
@@ -184,6 +171,8 @@ class BurstConsensus:
         except (ImportError, ModuleNotFoundError, ValueError):
             return "illegal_pattern"
         return ""
+
+    _validate_candidate = validate_candidate
 
     @staticmethod
     def _review(

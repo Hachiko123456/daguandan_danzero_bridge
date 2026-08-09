@@ -149,6 +149,32 @@ def test_advice_starts_when_reducer_predicts_self_before_timer(tmp_path):
     orchestrator.finish()
 
 
+def test_trusted_action_uses_live_turn_transition_and_waits_for_advice(tmp_path):
+    advisor = FakeAdvisor()
+    orchestrator = _build(tmp_path, advisor)
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("7S", "7H"),
+        is_pass=False,
+        monotonic_ms=100,
+        evidence_refs=("TRUTH-000001",),
+    )
+
+    assert update.event is not None
+    assert update.event.event_type == "player_played"
+    assert update.event.source == "trusted_log_replay"
+    assert update.event.evidence_refs == ("TRUTH-000001",)
+    assert orchestrator.snapshot.current_player == "self"
+    assert update.advice is not None
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advice.advice is not None
+    assert advisor.calls == 1
+    orchestrator.finish()
+
+
 def test_corrected_state_marks_inflight_advice_stale(tmp_path):
     gate = threading.Event()
     advisor = FakeAdvisor(gate)

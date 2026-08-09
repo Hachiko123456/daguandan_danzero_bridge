@@ -7,13 +7,9 @@ from ..danzero.state import Seat
 
 
 class ZonePhase(StrEnum):
-    WAIT_CLEAR = "wait_clear"
     WAIT_ACTION = "wait_action"
-    CHANGING = "changing"
     SETTLING = "settling"
     BURST_READ = "burst_read"
-    VALIDATE = "validate"
-    REVIEW_REQUIRED = "review_required"
 
 
 @dataclass(frozen=True)
@@ -23,6 +19,7 @@ class ZoneFrameMetrics:
     motion_score: float
     pass_visible: bool
     effect_visible: bool
+    content_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -31,107 +28,92 @@ class ZoneDecision:
     collect_sample: bool = False
     discard_burst: bool = False
     reason: str = ""
+    timed_out: bool = False
 
 
 class ZoneLifecycle:
-    """Gate one expected player's ROI using timestamps and motion hysteresis."""
+    """Gate only the currently expected player's action region.
+
+    A new turn activates one player's ROI.  The gate does not wait for that
+    region to become empty and never inspects other seats.  A static region is
+    ignored until its content changes, a pass marker appears, or a clear
+    movement starts the action.  The action is then sampled after one fixed
+    settle delay.  Visible effects restart that delay so cards are never read
+    from an in-flight animation frame.
+    """
+
+    _ACTION_START_MOTION = 0.060
 
     def __init__(
         self,
         *,
         expected_player: Seat,
-        started_with_clear_zone: bool,
         activated_at_ms: int,
-        settle_ms: int = 400,
-        action_timeout_ms: int = 15_000,
-        low_motion_threshold: float = 0.015,
-        high_motion_threshold: float = 0.060,
+        settle_ms: int = 1_000,
+        stable_ms: int = 0,
+        action_timeout_ms: int = 22_000,
     ) -> None:
-        if settle_ms < 0 or action_timeout_ms <= 0:
-            raise ValueError("沉降与超时参数无效")
-        if not 0 <= low_motion_threshold < high_motion_threshold:
-            raise ValueError("运动迟滞阈值必须满足 0 <= low < high")
+        if settle_ms < 0 or stable_ms < 0 or action_timeout_ms <= 0:
+            raise ValueError("settle_ms and action_timeout_ms must be valid")
         self.expected_player = expected_player
-        self.phase = (
-            ZonePhase.WAIT_ACTION
-            if started_with_clear_zone
-            else ZonePhase.WAIT_CLEAR
-        )
+        self.phase = ZonePhase.WAIT_ACTION
         self.activated_at_ms = int(activated_at_ms)
         self.settle_ms = int(settle_ms)
+        self.stable_ms = int(stable_ms)
         self.action_timeout_ms = int(action_timeout_ms)
-        self.low_motion_threshold = float(low_motion_threshold)
-        self.high_motion_threshold = float(high_motion_threshold)
         self._settle_started_ms: int | None = None
+        self._stable_since_ms: int | None = None
 
     def observe(self, metrics: ZoneFrameMetrics) -> ZoneDecision:
         now = int(metrics.monotonic_ms)
         if now < self.activated_at_ms:
-            raise ValueError("帧时间不能早于区域激活时间")
-        if self.phase not in {ZonePhase.VALIDATE, ZonePhase.REVIEW_REQUIRED} and (
-            now - self.activated_at_ms >= self.action_timeout_ms
-        ):
-            self.phase = ZonePhase.REVIEW_REQUIRED
-            return ZoneDecision(self.phase, discard_burst=True, reason="action_timeout")
+            raise ValueError("frame timestamp cannot precede zone activation")
+        if now - self.activated_at_ms >= self.action_timeout_ms:
+            return ZoneDecision(
+                self.phase,
+                discard_burst=True,
+                reason="action_timeout",
+                timed_out=True,
+            )
 
         action_visible = bool(metrics.occupied or metrics.pass_visible)
-        high_or_effect = bool(
-            metrics.effect_visible
-            or metrics.motion_score >= self.high_motion_threshold
+        changed = bool(
+            metrics.content_changed
+            or metrics.pass_visible
+            or metrics.motion_score >= self._ACTION_START_MOTION
         )
-        low_motion = metrics.motion_score <= self.low_motion_threshold
-
-        if self.phase == ZonePhase.WAIT_CLEAR:
-            if not action_visible and not metrics.effect_visible:
-                self.phase = ZonePhase.WAIT_ACTION
-                return ZoneDecision(self.phase, reason="previous_content_cleared")
-            return ZoneDecision(self.phase)
 
         if self.phase == ZonePhase.WAIT_ACTION:
-            if action_visible or high_or_effect:
-                self.phase = ZonePhase.CHANGING
-                self._settle_started_ms = None
-                return ZoneDecision(self.phase, reason="action_zone_changed")
-            return ZoneDecision(self.phase)
-
-        if self.phase == ZonePhase.CHANGING:
-            if high_or_effect:
-                self._settle_started_ms = None
+            if not changed:
                 return ZoneDecision(self.phase)
-            if not action_visible:
-                self.phase = ZonePhase.WAIT_ACTION
-                self._settle_started_ms = None
-                return ZoneDecision(self.phase, discard_burst=True, reason="action_disappeared")
-            if low_motion:
-                self.phase = ZonePhase.SETTLING
-                self._settle_started_ms = now
-                return ZoneDecision(self.phase, reason="low_motion_started")
-            return ZoneDecision(self.phase)
+            self.phase = ZonePhase.SETTLING
+            self._settle_started_ms = now
+            self._stable_since_ms = now
 
         if self.phase == ZonePhase.SETTLING:
-            if high_or_effect:
-                self.phase = ZonePhase.CHANGING
-                self._settle_started_ms = None
-                return ZoneDecision(
-                    self.phase,
-                    discard_burst=True,
-                    reason="effect_or_high_motion",
-                )
             if not action_visible:
                 self.phase = ZonePhase.WAIT_ACTION
                 self._settle_started_ms = None
-                return ZoneDecision(self.phase, discard_burst=True, reason="action_disappeared")
-            if not low_motion:
-                self.phase = ZonePhase.CHANGING
-                self._settle_started_ms = None
+                self._stable_since_ms = None
                 return ZoneDecision(
                     self.phase,
                     discard_burst=True,
-                    reason="settling_interrupted",
+                    reason="action_disappeared",
                 )
             if self._settle_started_ms is None:
                 self._settle_started_ms = now
-            if now - self._settle_started_ms >= self.settle_ms:
+            if metrics.effect_visible:
+                self._settle_started_ms = now
+                self._stable_since_ms = now
+                return ZoneDecision(self.phase, reason="effect_visible")
+            if metrics.content_changed or metrics.motion_score >= self._ACTION_START_MOTION:
+                self._stable_since_ms = now
+            if self._stable_since_ms is None:
+                self._stable_since_ms = now
+            if (
+                now - self._settle_started_ms >= self.settle_ms
+                and now - self._stable_since_ms >= self.stable_ms
+            ):
                 self.phase = ZonePhase.BURST_READ
                 return ZoneDecision(
                     self.phase,
@@ -141,24 +123,24 @@ class ZoneLifecycle:
             return ZoneDecision(self.phase)
 
         if self.phase == ZonePhase.BURST_READ:
-            if high_or_effect or not action_visible:
-                self.phase = ZonePhase.CHANGING
+            if not action_visible:
+                self.phase = ZonePhase.WAIT_ACTION
                 self._settle_started_ms = None
+                self._stable_since_ms = None
                 return ZoneDecision(
                     self.phase,
                     discard_burst=True,
                     reason="burst_invalidated",
                 )
-            return ZoneDecision(self.phase, collect_sample=low_motion)
+            if metrics.effect_visible:
+                self.phase = ZonePhase.SETTLING
+                self._settle_started_ms = now
+                self._stable_since_ms = now
+                return ZoneDecision(
+                    self.phase,
+                    discard_burst=True,
+                    reason="effect_visible",
+                )
+            return ZoneDecision(self.phase, collect_sample=True)
 
         return ZoneDecision(self.phase)
-
-    def begin_validation(self) -> ZoneDecision:
-        if self.phase != ZonePhase.BURST_READ:
-            raise RuntimeError("只有突发读取阶段可以进入校验")
-        self.phase = ZonePhase.VALIDATE
-        return ZoneDecision(self.phase, reason="burst_complete")
-
-    def require_review(self, reason: str) -> ZoneDecision:
-        self.phase = ZonePhase.REVIEW_REQUIRED
-        return ZoneDecision(self.phase, discard_burst=True, reason=str(reason))

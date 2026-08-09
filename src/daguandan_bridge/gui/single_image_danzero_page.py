@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from ..danzero.state import GameStateError, GuanDanState, RANKS, SEATS
 from ..image_io import read_image_unicode
+from ..live.truth_log import card_code_to_text
 from ..recognition_service import BUTTON_LABELS, RecognitionAnnotation, RecognitionResult
 
 
@@ -113,12 +114,17 @@ class CopyablePlainTextEdit(QPlainTextEdit):
 class CardBadge(QFrame):
     """A compact, readable card with a colored suit symbol and rank."""
 
-    def __init__(self, card_code: str, parent=None):
+    def __init__(self, card_code: str, parent=None, *, compact: bool = False):
         super().__init__(parent)
         self.card_code = str(card_code)
         self.setObjectName("cardBadge")
-        self.setToolTip(self.card_code)
-        self.setMinimumSize(52, 72)
+        self.setToolTip(card_code_to_text(self.card_code))
+        width, height = (36, 50) if compact else (52, 72)
+        suit_size, rank_size = (16, 13) if compact else (22, 18)
+        margin = 3 if compact else 7
+        self.setMinimumSize(width, height)
+        if compact:
+            self.setMaximumSize(width, height)
         self.setStyleSheet(
             "QFrame#cardBadge { background: #ffffff; border: 1px solid #c8cdd3; "
             "border-radius: 6px; }"
@@ -126,17 +132,18 @@ class CardBadge(QFrame):
 
         rank, suit, color = self._display_parts(self.card_code)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(7, 4, 7, 4)
+        vertical_margin = 3 if compact else 4
+        layout.setContentsMargins(margin, vertical_margin, margin, vertical_margin)
         layout.setSpacing(0)
         self.suit_label = QLabel(suit)
         self.suit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.suit_label.setStyleSheet(
-            f"color: {color}; font-size: 22px; font-weight: 700;"
+            f"color: {color}; font-size: {suit_size}px; font-weight: 700;"
         )
         self.rank_label = QLabel(rank)
         self.rank_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rank_label.setStyleSheet(
-            f"color: {color}; font-size: 18px; font-weight: 700;"
+            f"color: {color}; font-size: {rank_size}px; font-weight: 700;"
         )
         layout.addWidget(self.suit_label)
         layout.addWidget(self.rank_label)
@@ -147,6 +154,8 @@ class CardBadge(QFrame):
             return "小王", "★", "#c47f00"
         if card_code == "big_joker":
             return "大王", "★", "#c47f00"
+        if card_code.endswith("?"):
+            return card_code[:-1], "？", "#b42318"
         rank, suit_code = card_code[:-1], card_code[-1:]
         suit, color = SUIT_DISPLAY.get(suit_code, (suit_code, "#20252b"))
         return rank, suit, color
@@ -372,6 +381,15 @@ class SingleImageDanzeroPage(QDialog):
         self._refresh_events()
         self._refresh_image_info()
         self._refresh_image_preview()
+
+    def set_frame_image(self, image_bgr: np.ndarray, info_text: str) -> None:
+        """Show an in-memory frame (BGR) instead of a file on disk."""
+        self.image_path = None
+        self._source_image = image_bgr
+        self.image_info_label.setText(info_text)
+        self._events.clear()
+        self._reset_recognition_inputs()
+        self._refresh_events()
 
     def _refresh_image_info(self) -> None:
         if self.image_path is None:

@@ -71,7 +71,7 @@ def test_timeline_markdown_is_llm_readable(tmp_path):
     store.append_event(_event("game-a"))
 
     text = store.timeline_markdown_path.read_text(encoding="utf-8")
-    assert "右家出牌：[7S, 7H]" in text
+    assert "[第6手] 右家出牌：黑桃7、红桃7" in text
     assert "置信度=94%" in text
     assert "证据=OBS-0183, frame:344" in text
 
@@ -109,7 +109,7 @@ def test_incident_contains_state_observations_and_llm_report(tmp_path):
     assert json.loads((path / "state_before.json").read_text("utf-8"))["revision"] == 4
     assert json.loads((path / "engine_input.json").read_text("utf-8"))["request_id"] == "ADV-3"
     report = (path / "llm_report.md").read_text("utf-8")
-    assert "candidate_conflict" in report
+    assert "候选动作相互冲突" in report
     assert "OBS-4" in report
 
 

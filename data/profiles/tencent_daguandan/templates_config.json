@@ -338,30 +338,6 @@
       ]
     },
     {
-      "sample_id": "rank_big_joker_001",
-      "kind": "rank",
-      "label": "big_joker",
-      "file": "templates/rank/big_joker_play.png",
-      "source_image": "shot_20260730_230847_001.png",
-      "source_role": "play",
-      "abs_box": [
-        586,
-        100,
-        110,
-        128
-      ],
-      "ratio_box": [
-        0.457813,
-        0.138889,
-        0.085938,
-        0.177778
-      ],
-      "base_size": [
-        1280,
-        720
-      ]
-    },
-    {
       "sample_id": "rank_6_002",
       "kind": "rank",
       "label": "6",
@@ -722,30 +698,6 @@
       ]
     },
     {
-      "sample_id": "rank_big_joker_002",
-      "kind": "rank",
-      "label": "big_joker",
-      "file": "templates/rank/big_joker_play_002.png",
-      "source_image": "shot_20260730_230847_001.png",
-      "source_role": "play",
-      "abs_box": [
-        576,
-        92,
-        125,
-        145
-      ],
-      "ratio_box": [
-        0.45,
-        0.127778,
-        0.097656,
-        0.201389
-      ],
-      "base_size": [
-        1280,
-        720
-      ]
-    },
-    {
       "sample_id": "anchor_table_anchor_1_001",
       "kind": "anchor",
       "label": "table_anchor_1",
@@ -811,54 +763,6 @@
         0.718056,
         0.025781,
         0.055556
-      ],
-      "base_size": [
-        1280,
-        720
-      ]
-    },
-    {
-      "sample_id": "rank_small_joker_001",
-      "kind": "rank",
-      "label": "small_joker",
-      "file": "templates/rank/small_joker_play.png",
-      "source_image": "shot_20260730_231012_001.png",
-      "source_role": "play",
-      "abs_box": [
-        1033,
-        186,
-        107,
-        132
-      ],
-      "ratio_box": [
-        0.807031,
-        0.258333,
-        0.083594,
-        0.183333
-      ],
-      "base_size": [
-        1280,
-        720
-      ]
-    },
-    {
-      "sample_id": "rank_small_joker_002",
-      "kind": "rank",
-      "label": "small_joker",
-      "file": "templates/rank/small_joker_play_002.png",
-      "source_image": "shot_20260730_231012_001.png",
-      "source_role": "play",
-      "abs_box": [
-        1046,
-        198,
-        82,
-        108
-      ],
-      "ratio_box": [
-        0.817187,
-        0.275,
-        0.064062,
-        0.15
       ],
       "base_size": [
         1280,
@@ -2275,6 +2179,151 @@
         0.319444,
         0.155469,
         0.123611
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_001",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_play.png",
+      "source_image": "game_20260806_231123_e5ec3c/frame_01139.png",
+      "source_role": "play",
+      "abs_box": [
+        581,
+        230,
+        36,
+        106
+      ],
+      "ratio_box": [
+        0.453906,
+        0.319444,
+        0.028125,
+        0.147222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_002",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_play.png",
+      "source_image": "game_20260806_231123_e5ec3c/frame_01139.png",
+      "source_role": "play",
+      "abs_box": [
+        581,
+        230,
+        36,
+        106
+      ],
+      "ratio_box": [
+        0.453906,
+        0.319444,
+        0.028125,
+        0.147222
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_small_joker_play_002",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_play_002.png",
+      "source_image": "",
+      "source_role": "play",
+      "abs_box": [
+        0,
+        0,
+        82,
+        108
+      ],
+      "ratio_box": [
+        0.0,
+        0.0,
+        0.064062,
+        0.15
+      ],
+      "base_size": [
+        1280,
+        720
+      ],
+      "auto_registered": true
+    },
+    {
+      "sample_id": "rank_small_joker_005",
+      "kind": "rank",
+      "label": "small_joker",
+      "file": "templates/rank/small_joker_play_003.png",
+      "source_image": "game_20260806_231123_e5ec3c/frame_01139.png",
+      "source_role": "play",
+      "abs_box": [
+        581,
+        226,
+        39,
+        108
+      ],
+      "ratio_box": [
+        0.453906,
+        0.313889,
+        0.030469,
+        0.15
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_001",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_play.png",
+      "source_image": "game_20260807_002323_616108/frame_01141.png",
+      "source_role": "play",
+      "abs_box": [
+        598,
+        108,
+        86,
+        108
+      ],
+      "ratio_box": [
+        0.467187,
+        0.15,
+        0.067187,
+        0.15
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "rank_big_joker_002",
+      "kind": "rank",
+      "label": "big_joker",
+      "file": "templates/rank/big_joker_play_002.png",
+      "source_image": "game_20260807_002323_616108/frame_01141.png",
+      "source_role": "play",
+      "abs_box": [
+        596,
+        106,
+        50,
+        108
+      ],
+      "ratio_box": [
+        0.465625,
+        0.147222,
+        0.039062,
+        0.15
       ],
       "base_size": [
         1280,
