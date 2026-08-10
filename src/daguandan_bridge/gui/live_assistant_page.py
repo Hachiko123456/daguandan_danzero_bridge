@@ -511,12 +511,7 @@ class LiveAssistantPage(ScrollArea):
     def _show_advice(self, raw: object | None) -> None:
         if not isinstance(raw, LiveAdvice):
             return
-        if raw.status == "requested":
-            self._append_advice_timeline_entry(
-                raw,
-                f"DanZero 正在计算建议（请求 {raw.key.request_id}）。",
-            )
-        elif raw.status == "ready" and raw.advice is not None and not raw.visible:
+        if raw.status == "ready" and raw.advice is not None and not raw.visible:
             suggestion = (
                 "建议：不出"
                 if raw.advice.is_pass
@@ -525,7 +520,7 @@ class LiveAssistantPage(ScrollArea):
             self._append_advice_timeline_entry(
                 raw,
                 f"{suggestion}；耗时 {raw.advice.elapsed_ms:.0f} ms；"
-                f"请求 {raw.key.request_id}；待画面确认。",
+                f"请求 {raw.key.request_id}",
             )
         elif raw.status == "ready" and raw.advice is not None:
             suggestion = (
@@ -590,10 +585,10 @@ class LiveAssistantPage(ScrollArea):
             return
         self._last_advice_timeline_key = key
         cards_html = self._cards_html(cards) if cards else ""
-        confirmed = raw.status == "ready" and raw.visible
-        accent = "#0F766E" if confirmed else "#B45309"
-        background = "#e7f6f2" if confirmed else "#fff7ed"
-        title = "DanZero 建议" if confirmed else "DanZero 待确认"
+        if raw.status == "failed":
+            accent, background, title = "#B91C1C", "#FEF2F2", "DanZero 计算失败"
+        else:
+            accent, background, title = "#0F766E", "#E7F6F2", "DanZero 建议"
         if raw.suit_uncertain:
             agreement = "建议一致" if raw.advice_agrees_across_variants else "建议存在分歧"
             detail += f"；花色遮挡：已评估 {raw.variant_count} 个可行分支，{agreement}"
@@ -623,6 +618,12 @@ class LiveAssistantPage(ScrollArea):
             return "#B45309", "⟳ 花色修正"
         if event.event_type == "game_end_detected":
             return "#B45309", "■ 自动封存"
+        if event.event_type == "recognition_retry":
+            reason = str(event.payload.get("reason", ""))
+            if reason == "conflicting_valid_candidates":
+                return "#B45309", "↻ 继续识别"
+            if reason == "action_timeout":
+                return "#64748B", "⌛ 等待动作"
         if event.event_type in {"recognition_retry", "review_required"}:
             return "#B91C1C", "! 识别提示"
         if event.event_type == "turn_started":
@@ -662,9 +663,9 @@ class LiveAssistantPage(ScrollArea):
                 title += f"（候选：{candidates}）"
             cells.append(
                 "<td title='{title}' style='background:#ffffff; border:1px solid #c8cdd3; "
-                "border-radius:4px; min-width:26px; text-align:center; padding:1px 3px;'>"
-                "<span style='color:{color}; font-weight:700;'>{suit}</span><br>"
-                "<span style='color:{color}; font-weight:700;'>{rank}</span></td>".format(
+                "border-radius:5px; min-width:36px; text-align:center; padding:3px 5px;'>"
+                "<span style='color:{color}; font-size:21px; font-weight:700;'>{suit}</span>"
+                "<span style='color:{color}; font-size:18px; font-weight:700;'> {rank}</span></td>".format(
                     title=html.escape(title),
                     color=color,
                     suit=html.escape(suit),

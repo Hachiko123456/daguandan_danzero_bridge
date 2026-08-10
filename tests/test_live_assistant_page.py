@@ -310,7 +310,10 @@ def test_live_page_timeline_is_selectable_and_distinguishes_visible_advice():
     assert "2S 2H" not in timeline_text
     assert "左家出牌：" in timeline_text
     assert "♥" in timeline_text
-    assert "min-width:26px" in page._cards_html(("QC", "QH", "QS", "QS"))
+    cards_html = page._cards_html(("QC", "QH", "QS", "QS"))
+    assert "<br>" not in cards_html
+    assert "min-width:36px" in cards_html
+    assert "font-size:21px" in cards_html
     assert "#0f766e" in timeline_html
     assert page.timeline.verticalScrollBar().value() == page.timeline.verticalScrollBar().maximum()
     page.close()
@@ -346,8 +349,9 @@ def test_live_page_shows_unconfirmed_pass_advice_instead_of_hiding_it():
     app.processEvents()
 
     assert "建议：不出" in page.timeline.toPlainText()
-    assert "待画面确认" in page.timeline.toPlainText()
-    assert "#b45309" in page.timeline.toHtml().lower()
+    assert "待确认" not in page.timeline.toPlainText()
+    assert "DanZero 建议" in page.timeline.toPlainText()
+    assert "#0f766e" in page.timeline.toHtml().lower()
     page.close()
 
 
@@ -409,6 +413,7 @@ def test_live_page_puts_played_cards_on_the_same_timeline_line():
     timeline_html = page.timeline.toHtml().lower()
     timeline_text = page.timeline.toPlainText()
     assert "左家出牌：" in timeline_text
+    assert "♥ 3" in timeline_text
     assert "vertical-align:middle" in timeline_html
     assert "候选：♠/♣" in page._cards_html(
         ("3H", "3S", "4D", "4S", "5?", "7H"),
@@ -459,7 +464,8 @@ def test_live_page_shows_automatic_retry_without_review_panel():
     app.processEvents()
 
     assert not page.review_bar.isVisible()
-    assert "自动重试" in page.timeline.toPlainText()
+    assert "尚未捕获对家的新动作，继续等待" in page.timeline.toPlainText()
+    assert "⌛ 等待动作" in page.timeline.toPlainText()
     page.close()
 
 

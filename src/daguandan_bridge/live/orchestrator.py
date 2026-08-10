@@ -510,9 +510,17 @@ class LiveOrchestrator:
                     content_changed=True,
                 )
             decision = self._zone.observe(current_metrics)
+            had_observations = bool(self._observations)
             if decision.discard_burst:
                 self._clear_burst()
             if decision.timed_out:
+                # A previous transient candidate may already have reset this
+                # window.  If the new window has not produced one observation,
+                # there is no failed action to report: keep listening for the
+                # player instead of emitting a red timeout every 28 seconds.
+                if not had_observations:
+                    self._activate_zone(monotonic_ms)
+                    return self._update(fast_signals=fast)
                 return self._require_review(decision.reason, monotonic_ms, fast)
             if not decision.collect_sample or not self._sample_due(monotonic_ms):
                 return self._update(fast_signals=fast)

@@ -344,6 +344,36 @@ def test_empty_samples_wait_for_a_later_valid_action_without_emitting_retry(tmp_
     orchestrator.finish()
 
 
+def test_empty_action_window_timeout_rearms_silently(tmp_path):
+    """A reset window without a single new sample is not a failed action."""
+
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        action_timeout_ms=500,
+    )
+    update = orchestrator.ingest_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=600,
+        wall_time="empty-window-timeout",
+        metrics=ZoneFrameMetrics(
+            monotonic_ms=600,
+            occupied=False,
+            motion_score=0.0,
+            pass_visible=False,
+            effect_visible=False,
+        ),
+    )
+
+    assert update.status == "running"
+    assert update.event is None
+    assert update.snapshot.current_player == "right"
+    assert not any(
+        event.event_type == "recognition_retry" for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
 def test_new_action_window_ignores_stale_pixels_from_the_same_player_region(tmp_path):
     recognition = FakeRecognitionService([_play("7S")] * 4)
     orchestrator = _orchestrator(tmp_path, [], recognition=recognition)

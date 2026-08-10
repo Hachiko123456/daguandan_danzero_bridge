@@ -146,10 +146,20 @@ def decide_recognition_strategy(
             )
             if not has_unknown_suit:
                 winner = [valid[-2], valid[-1]]
-            elif len(valid) >= 3 and all(
-                _key(sample) == _key(valid[-1]) for sample in valid[-3:]
-            ):
-                winner = valid[-3:]
+        # An occluded suit can change from ``?`` to a temporary clear glyph
+        # between adjacent frames, so this deliberately does not require two
+        # byte-for-byte equal candidates.  Three rank-equivalent legal reads
+        # are enough to preserve the play and its uncertainty.
+        if (
+            winner is None
+            and len(valid) >= 3
+            and any(is_unknown_suit_card(card) for card in valid[-1].cards)
+            and all(
+                _rank_key(sample) == _rank_key(valid[-1])
+                for sample in valid[-3:]
+            )
+        ):
+            winner = valid[-3:]
     else:
         grouped: dict[tuple[bool, tuple[str, ...]], list[RecognitionSample]] = defaultdict(list)
         for sample in valid:
@@ -160,7 +170,7 @@ def decide_recognition_strategy(
 
     if winner is None:
         return None
-    sample = winner[-1]
+    sample = _conservative_unknown_sample(winner)
     candidate = ConsensusCandidate(
         cards=sample.cards,
         is_pass=sample.is_pass,
@@ -202,7 +212,7 @@ def has_exhausted_valid_candidates(
 ) -> bool:
     """Only conflicting *valid* reads can exhaust an action window early."""
 
-    count = 0
+    valid: list[RecognitionSample] = []
     for sample in samples:
         cards, suit_options = canonical_candidate(
             sample.cards,
@@ -215,8 +225,22 @@ def has_exhausted_valid_candidates(
             context,
             suit_options=suit_options,
         ):
-            count += 1
-    return count >= limit
+            valid.append(
+                RecognitionSample(
+                    cards=cards,
+                    suit_options=suit_options,
+                    is_pass=sample.is_pass,
+                    confidence=sample.confidence,
+                    source=sample.source,
+                    evidence_ref=sample.evidence_ref,
+                    post_hand=sample.post_hand,
+                )
+            )
+    # Varying only between ``10?`` and ``10♦`` is an in-flight suit read,
+    # not two conflicting actions.  A real conflict must disagree on the
+    # pass/play choice or on the rank multiset, otherwise the valid burst can
+    # wait for the rank-consensus path above without emitting a false alarm.
+    return len(valid) >= limit and len({_rank_key(sample) for sample in valid}) > 1
 
 
 def has_no_valid_candidates(
@@ -248,3 +272,68 @@ def has_no_valid_candidates(
 
 def _key(sample: RecognitionSample) -> tuple[bool, tuple[str, ...]]:
     return bool(sample.is_pass), tuple(sample.cards)
+
+
+def _rank_key(sample: RecognitionSample) -> tuple[bool, tuple[str, ...]]:
+    """Compare action shape without turning an uncertain suit into a fact."""
+
+    ranks = tuple(_card_rank(card) for card in sample.cards)
+    return bool(sample.is_pass), tuple(sorted(ranks))
+
+
+def _card_rank(card: str) -> str:
+    if card in {"small_joker", "big_joker"}:
+        return card
+    return card[:-1] if len(card) >= 2 else card
+
+
+def _conservative_unknown_sample(
+    samples: list[RecognitionSample],
+) -> RecognitionSample:
+    """Keep rank consensus usable while retaining any unresolved suit as ``?``.
+
+    One transient clear glyph does not prove a suit.  Choose the sample with
+    the fewest concrete suits, then merge all observed candidates for each
+    unknown position.  This is deliberately more conservative than choosing
+    the last frame and lets the reducer advance on a stable five-card shape
+    without inventing a physical card.
+    """
+
+    if not any(is_unknown_suit_card(card) for sample in samples for card in sample.cards):
+        return samples[-1]
+    base = min(
+        samples,
+        key=lambda sample: sum(
+            not is_unknown_suit_card(card) for card in sample.cards
+        ),
+    )
+    unknown_occurrences: dict[str, int] = defaultdict(int)
+    merged_options: list[tuple[str, ...]] = []
+    for index, card in enumerate(base.cards):
+        if not is_unknown_suit_card(card):
+            merged_options.append(base.suit_options[index])
+            continue
+        rank = card[:-1]
+        occurrence = unknown_occurrences[rank]
+        unknown_occurrences[rank] += 1
+        candidates: list[str] = []
+        for sample in samples:
+            same_rank = [
+                position
+                for position, other in enumerate(sample.cards)
+                if _card_rank(other) == rank
+            ]
+            if occurrence >= len(same_rank):
+                continue
+            matched_index = same_rank[occurrence]
+            candidates.extend(sample.suit_options[matched_index])
+        merged_options.append(tuple(dict.fromkeys(candidates)) or base.suit_options[index])
+    return RecognitionSample(
+        cards=base.cards,
+        is_pass=base.is_pass,
+        confidence=sum(sample.confidence for sample in samples) / len(samples),
+        source=base.source,
+        evidence_ref=base.evidence_ref,
+        suit_options=tuple(merged_options),
+        post_hand=base.post_hand,
+    )

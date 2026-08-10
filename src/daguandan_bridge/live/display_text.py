@@ -23,6 +23,7 @@ _STATUS_LABELS = {
 _REASON_LABELS = {
     "action_timeout": "等待动作超时",
     "candidate_conflict": "候选动作相互冲突",
+    "conflicting_valid_candidates": "多帧牌面候选不一致",
     "cards_not_in_known_hand": "出牌不在已确认手牌中",
     "does_not_beat_table": "出牌未压过当前牌型",
     "empty_play": "未识别到出牌",
@@ -123,6 +124,11 @@ def event_action_text(event: LiveEvent) -> str:
         return f"识别暂停，请确认{seat}动作：{reasons_text(event.payload.get('reason'))}"
     if event.event_type == "recognition_retry":
         stage = "等待首出" if event.payload.get("stage") == "waiting_lead" else "当前行动"
+        reason = str(event.payload.get("reason", ""))
+        if reason == "conflicting_valid_candidates":
+            return f"{stage}画面短暂不一致，已清空候选并继续识别"
+        if reason == "action_timeout":
+            return f"尚未捕获{seat}的新动作，继续等待"
         return f"{stage}识别未完成，自动重试：{reasons_text(event.payload.get('reason'))}"
     if event.event_type == "advice_requested":
         return "DanZero 开始计算建议"
