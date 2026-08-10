@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
@@ -60,6 +60,20 @@ LiveStatus = Literal[
     "finalizing",
     "sealed",
 ]
+
+
+def _card_rank_counts(cards: tuple[str, ...]) -> Counter[str]:
+    """Compare action shapes while deliberately ignoring suit corrections."""
+
+    ranks = (
+        card
+        if card in {"small_joker", "big_joker"}
+        else card[:-1]
+        if len(card) >= 2
+        else card
+        for card in cards
+    )
+    return Counter(ranks)
 
 
 def _state_synchronized(method):
@@ -238,6 +252,9 @@ class LiveOrchestrator:
         self._self_lead_controls_cleared = False
         self._game_end_detected = False
         self._finish_order: list[Seat] = []
+        # A post-self-finish read may improve only a previously obscured left
+        # action.  It is deliberately kept outside the reducer history.
+        self._suit_corrected_event_ids: set[str] = set()
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -375,6 +392,8 @@ class LiveOrchestrator:
         monotonic_ms: int,
         metrics: ZoneFrameMetrics | None = None,
     ) -> LiveUpdate:
+        round_finished = False
+        terminal_expected: Seat = "self"
         with self._state_lock:
             if self.status == "sealed":
                 raise RuntimeError("对局已经结束")
@@ -384,10 +403,19 @@ class LiveOrchestrator:
             elif self.status != "running":
                 return self._update()
             else:
-                expected = self.reducer.snapshot().current_player
+                snapshot = self.reducer.snapshot()
+                expected = snapshot.current_player
                 if expected is None:
-                    return self._require_review("missing_expected_player", monotonic_ms)
-                job_key = self._analysis_job_key()
+                    # Three places are known as soon as the third player has
+                    # gone out.  Keep polling only terminal controls so the
+                    # controller can seal the recording; never create a
+                    # fictional fourth-player action or a review request.
+                    terminal_expected = snapshot.lead_player or "self"
+                    job_key = self._analysis_job_key()
+                    round_finished = True
+                else:
+                    round_finished = False
+                    job_key = self._analysis_job_key()
 
         if self.status == "waiting_lead":
             opening = self._recognize_opening_signal(frame)
@@ -408,6 +436,20 @@ class LiveOrchestrator:
                 self._lead_confirmation_frame = lead_frame
                 self._lead_stability_frames.append(lead_frame)
                 return self._analyze_waiting_lead(fast, lead, monotonic_ms)
+
+        if round_finished:
+            fast = self._recognize_fast_signals(
+                frame,
+                terminal_expected,
+                allow_pass=False,
+            )
+            with self._state_lock:
+                if not self._analysis_job_is_current(job_key):
+                    return self._update()
+                game_end = self._handle_game_end_control(fast)
+                if game_end is not None:
+                    return game_end
+                return self._update(fast_signals=fast)
 
         # Vision runs without the state lock so pause/correction/finalize stay instant.
         first_action = bool(
@@ -474,8 +516,24 @@ class LiveOrchestrator:
                 return self._require_review(decision.reason, monotonic_ms, fast)
             if not decision.collect_sample or not self._sample_due(monotonic_ms):
                 return self._update(fast_signals=fast)
-            wild_rank = self.reducer.snapshot().wild_rank
+            snapshot = self.reducer.snapshot()
+            wild_rank = snapshot.wild_rank
+            left_correction_target = self._left_suit_correction_target(snapshot)
 
+        # Once our own cards are gone, one frame is used for two independent
+        # purposes: the expected player remains the sole action-commit path;
+        # the left area is only a sidecar that can fill in suits on its most
+        # recent obscured action.  The sidecar never mutates game state.
+        left_correction_result = (
+            self._recognize_play_region(
+                frame,
+                "left",
+                wild_rank=wild_rank,
+                allow_pass=False,
+            )
+            if left_correction_target is not None
+            else None
+        )
         result = self._recognize_play_region(
             frame,
             expected,
@@ -487,11 +545,17 @@ class LiveOrchestrator:
                 return self._update()
             if self._zone is None or self._zone.expected_player != expected:
                 return self._update()
+            suit_correction = self._apply_left_suit_correction(
+                left_correction_target,
+                left_correction_result,
+            )
             self._append_sample(result, monotonic_ms)
             consensus = self._decide_if_ready(current_metrics, fast)
             if consensus is not None:
                 if consensus.status == "confirmed":
                     event, events = self._commit_consensus(consensus, monotonic_ms)
+                    if suit_correction is not None:
+                        events = (suit_correction, *events)
                     return self._update(
                         event=event,
                         events=events,
@@ -510,6 +574,11 @@ class LiveOrchestrator:
                     retry_reason,
                     monotonic_ms,
                     fast,
+                )
+            if suit_correction is not None:
+                return self._update(
+                    event=suit_correction,
+                    fast_signals=fast,
                 )
             return self._update(fast_signals=fast)
 
@@ -1117,11 +1186,84 @@ class LiveOrchestrator:
         self._self_turn_corroborated = False
         self._clear_burst()
 
+    def _left_suit_correction_target(
+        self,
+        snapshot: LiveSnapshot,
+    ) -> LiveEvent | None:
+        """Return the one safe visual-only correction target, if any.
+
+        After the local player has finished, the left play area can be partly
+        covered by action controls.  We read it again only when its newest
+        confirmed action contains an unknown suit.  In particular, an exact
+        left action is never re-read and the left-side result can never enter
+        the reducer as a new play or pass.
+        """
+
+        if "self" not in snapshot.finished_seats or snapshot.current_player == "left":
+            return None
+        latest_left_play = next(
+            (
+                play
+                for play in reversed(snapshot.play_history)
+                if play.player == "left" and not play.is_pass
+            ),
+            None,
+        )
+        if latest_left_play is None or not any(
+            is_unknown_suit_card(card) for card in latest_left_play.cards
+        ):
+            return None
+        cards = tuple(latest_left_play.cards)
+        for event in reversed(self._all_events):
+            if (
+                event.event_type == "player_played"
+                and event.actor == "left"
+                and tuple(str(card) for card in event.payload.get("cards", ())) == cards
+                and event.event_id not in self._suit_corrected_event_ids
+            ):
+                return event
+        return None
+
+    def _apply_left_suit_correction(
+        self,
+        target: LiveEvent | None,
+        result: PlayRegionResult | None,
+    ) -> LiveEvent | None:
+        """Publish a display correction without changing confirmed state."""
+
+        if target is None or result is None or result.is_pass:
+            return None
+        corrected_cards = tuple(sorted(str(card) for card in result.cards))
+        target_cards = tuple(str(card) for card in target.payload.get("cards", ()))
+        if (
+            not corrected_cards
+            or any(is_unknown_suit_card(card) for card in corrected_cards)
+            or len(corrected_cards) != len(target_cards)
+            or _card_rank_counts(corrected_cards) != _card_rank_counts(target_cards)
+        ):
+            return None
+        self._suit_corrected_event_ids.add(target.event_id)
+        return self._append_lifecycle_event(
+            "suit_corrected",
+            {
+                "target_event_id": target.event_id,
+                "cards": list(corrected_cards),
+                "reason": "post_self_finish_left_probe",
+            },
+            actor="left",
+            confidence=result.confidence,
+            source="post_self_finish_left_suit_probe",
+        )
+
     def _request_advice_if_needed(self) -> AdviceRequestKey | None:
         if self.advisor is None or self.status != "running":
             return None
         snapshot = self.snapshot
-        if snapshot.current_player != "self":
+        if (
+            snapshot.current_player != "self"
+            or "self" in snapshot.finished_seats
+            or not snapshot.my_hand
+        ):
             return None
         key = AdviceRequestKey(
             snapshot.session_id,
@@ -1532,6 +1674,8 @@ class LiveOrchestrator:
         payload: dict[str, object],
         *,
         actor: Seat | None = None,
+        confidence: float = 1.0,
+        source: str = "live_orchestrator",
     ) -> LiveEvent:
         snapshot = self.reducer.snapshot()
         self._aux_event_sequence += 1
@@ -1546,8 +1690,8 @@ class LiveOrchestrator:
             turn_id=max(1, snapshot.turn_id),
             actor=actor,
             payload=dict(payload),
-            confidence=1.0,
-            source="live_orchestrator",
+            confidence=float(confidence),
+            source=source,
             state_revision_before=snapshot.revision,
             state_revision_after=snapshot.revision,
         )

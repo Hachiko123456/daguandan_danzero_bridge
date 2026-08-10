@@ -134,6 +134,8 @@ def event_action_text(event: LiveEvent) -> str:
         return "DanZero 建议计算失败"
     if event.event_type == "event_correction":
         return "已更正最近一条动作记录"
+    if event.event_type == "suit_corrected":
+        return f"{seat}花色修正：{cards or '未识别到牌面'}（不影响已确认对局流程）"
     return f"其他事件（内部码：{event.event_type}）"
 
 

@@ -13,6 +13,7 @@ from .consensus import (
     ConsensusResult,
     RecognitionSample,
 )
+from .card_uncertainty import is_unknown_suit_card
 
 
 class RecognitionStrategy(StrEnum):
@@ -44,7 +45,7 @@ _SPECS: tuple[RecognitionStrategySpec, ...] = (
     RecognitionStrategySpec(
         RecognitionStrategy.TWO_VALID_STREAK,
         "两次有效牌型一致（推荐）",
-        "忽略空结果和非法牌型；两次相同的有效结果即确认。",
+        "忽略空结果和非法牌型；两次相同的有效结果即确认。含未知花色时多取一帧，避免特效未退场时过早固化花色。",
         settle_ms=0,
         stable_ms=0,
     ),
@@ -136,7 +137,19 @@ def decide_recognition_strategy(
         winner = [valid[-1]]
     elif selected == RecognitionStrategy.TWO_VALID_STREAK:
         if len(valid) >= 2 and _key(valid[-1]) == _key(valid[-2]):
-            winner = [valid[-2], valid[-1]]
+            # 花色字样最容易被按钮、特效或动画边缘短暂遮住。此时仍然
+            # 保留牌的点数以保证流程不断，但比纯花色明确的牌多等一帧：
+            # 遮挡消退后通常会立即读到完整花色；若遮挡持续，也会在第三
+            # 个一致结果后照常提交 ``?``，不会无限等待。
+            has_unknown_suit = any(
+                is_unknown_suit_card(card) for card in valid[-1].cards
+            )
+            if not has_unknown_suit:
+                winner = [valid[-2], valid[-1]]
+            elif len(valid) >= 3 and all(
+                _key(sample) == _key(valid[-1]) for sample in valid[-3:]
+            ):
+                winner = valid[-3:]
     else:
         grouped: dict[tuple[bool, tuple[str, ...]], list[RecognitionSample]] = defaultdict(list)
         for sample in valid:

@@ -308,8 +308,9 @@ def test_live_page_timeline_is_selectable_and_distinguishes_visible_advice():
     assert page.timeline.textInteractionFlags() & Qt.TextSelectableByMouse
     assert "QC QH QS QS" not in timeline_text
     assert "2S 2H" not in timeline_text
-    assert "左家出牌：Q♣ Q♥ Q♠ Q♠" in timeline_text
+    assert "左家出牌：" in timeline_text
     assert "♥" in timeline_text
+    assert "min-width:26px" in page._cards_html(("QC", "QH", "QS", "QS"))
     assert "#0f766e" in timeline_html
     assert page.timeline.verticalScrollBar().value() == page.timeline.verticalScrollBar().maximum()
     page.close()
@@ -405,8 +406,14 @@ def test_live_page_puts_played_cards_on_the_same_timeline_line():
     )
     app.processEvents()
 
-    line = next(line for line in page.timeline.toPlainText().splitlines() if "左家出牌：" in line)
-    assert "3♥ 3♠ 4♦ 4♠ 5?〔♠/♣〕 7♥" in line
+    timeline_html = page.timeline.toHtml().lower()
+    timeline_text = page.timeline.toPlainText()
+    assert "左家出牌：" in timeline_text
+    assert "vertical-align:middle" in timeline_html
+    assert "候选：♠/♣" in page._cards_html(
+        ("3H", "3S", "4D", "4S", "5?", "7H"),
+        (("H",), ("S",), ("D",), ("S",), ("S", "C"), ("H",)),
+    )
     page.close()
 
 

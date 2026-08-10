@@ -109,6 +109,27 @@ def test_confirmed_play_advances_turn_and_decrements_remaining_cards():
     assert snapshot.trick_plays[-1].cards == ("10H", "10S")
 
 
+def test_third_finish_ends_the_round_without_creating_a_fourth_turn():
+    reducer = _started_reducer()
+    almost_all_cards = INITIAL_HAND[:-1]
+
+    # Bring three non-local players to one card through the public event API;
+    # the reducer deliberately rebuilds from that immutable history.
+    reducer.record_play("right", almost_all_cards)
+    reducer.record_play("opposite", almost_all_cards)
+    reducer.record_play("left", almost_all_cards)
+    reducer.record_pass("self")
+
+    reducer.record_play("right", ("7S",))
+    reducer.record_play("opposite", ("7S",))
+    reducer.record_play("left", ("7S",))
+
+    snapshot = reducer.snapshot()
+    assert snapshot.finished_seats == frozenset({"left", "opposite", "right"})
+    assert snapshot.current_player is None
+    assert snapshot.trick_plays == ()
+
+
 def test_correction_rebuild_matches_clean_history():
     corrected = _started_reducer()
     original = corrected.record_play("right", ("7S", "7H"))

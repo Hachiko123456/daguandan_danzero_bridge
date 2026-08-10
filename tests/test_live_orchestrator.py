@@ -13,6 +13,7 @@ from daguandan_bridge.live.orchestrator import (
     ReviewCandidate,
     ReviewRequest,
 )
+from daguandan_bridge.live.models import LiveEvent
 from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
@@ -577,6 +578,71 @@ def test_finished_player_and_wind_catch_are_emitted_to_the_timeline(tmp_path):
         and event.payload == {"from_player": "right", "to_player": "left"}
         for event in latest
     )
+    orchestrator.finish()
+
+
+def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S")])
+    target = LiveEvent(
+        event_id="EVT-LEFT-UNKNOWN",
+        event_type="player_played",
+        session_id="game",
+        seq=1,
+        monotonic_ms=1,
+        wall_time="2026-08-10T00:00:00+08:00",
+        trick_id=1,
+        turn_id=1,
+        actor="left",
+        payload={"cards": ["3?", "3?", "4?", "4?", "5?", "5?"]},
+        confidence=0.7,
+        source="test",
+        state_revision_before=1,
+        state_revision_after=1,
+    )
+    probe = PlayRegionResult(
+        player="left",
+        cards=("3H", "3C", "4H", "4C", "5H", "5C"),
+        is_pass=False,
+        confidence=0.93,
+        diagnostics=(),
+        annotations=(),
+        source="left-probe",
+    )
+    before = orchestrator.snapshot.semantic_dict()
+
+    correction = orchestrator._apply_left_suit_correction(target, probe)
+
+    assert correction is not None
+    assert correction.event_type == "suit_corrected"
+    assert correction.payload["target_event_id"] == target.event_id
+    assert correction.payload["cards"] == ["3C", "3H", "4C", "4H", "5C", "5H"]
+    assert orchestrator.snapshot.semantic_dict() == before
+    orchestrator.finish()
+
+
+def test_known_three_places_wait_for_game_end_control_without_review_or_advice(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S")])
+    orchestrator.reducer._finished_seats.update({"self", "opposite", "right"})
+    orchestrator.reducer._current_player = None
+    orchestrator.advisor = object()
+
+    update = orchestrator.ingest_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=100,
+        wall_time="round-complete",
+        metrics=ZoneFrameMetrics(
+            monotonic_ms=100,
+            occupied=False,
+            motion_score=0.0,
+            pass_visible=False,
+            effect_visible=False,
+        ),
+    )
+
+    assert update.status == "running"
+    assert update.review is None
+    assert not any(event.event_type == "advice_requested" for event in orchestrator.events)
+    assert orchestrator.start_self_advice() is None
     orchestrator.finish()
 
 

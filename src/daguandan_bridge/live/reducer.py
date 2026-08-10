@@ -391,6 +391,15 @@ class LiveReducer:
             if self._remaining_cards[player] == 0:
                 self._finished_seats.add(player)
 
+        # 产生第三名即已能确定四个名次：尚未出完者自然为末游。
+        # 不再把不存在的第四名强行排入下一回合，否则会伪造“不出”、
+        # 接风和一个无效的 DanZero 请求。
+        if len(self._finished_seats) >= 3:
+            self._trick_plays.clear()
+            self._current_player = None
+            self._turn_id += 1
+            return
+
         self._current_player = next_active_seat(
             player,
             frozenset(self._finished_seats),

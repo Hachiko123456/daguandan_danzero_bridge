@@ -484,10 +484,13 @@ class LiveAssistantPage(ScrollArea):
         else:
             self.live_status.setText(f"状态：{live_status_text(update.status)}")
             player = update.snapshot.current_player
-            self.turn_status.setText(
-                f"当前行动：{seat_text(player, unknown='等待确认')}"
-                f"　|　第 {update.snapshot.turn_id} 手"
-            )
+            if player is None and len(getattr(update.snapshot, "finished_seats", ())) >= 3:
+                self.turn_status.setText("赛果已确定，等待结算界面自动封存本局")
+            else:
+                self.turn_status.setText(
+                    f"当前行动：{seat_text(player, unknown='等待确认')}"
+                    f"　|　第 {update.snapshot.turn_id} 手"
+                )
         events = tuple(getattr(update, "events", ()))
         if not events and update.event is not None:
             events = (update.event,)
@@ -552,8 +555,15 @@ class LiveAssistantPage(ScrollArea):
         }:
             return
         prefix = html.escape(event_prefix(event))
-        action = html.escape(event_action_text(event))
         accent, marker = self._event_accent(event)
+        if event.event_type == "player_played":
+            cards = tuple(str(card) for card in event.payload.get("cards", ()))
+            action = (
+                f"{html.escape(seat_text(event.actor, unknown='系统'))}出牌："
+                f"{self._cards_html(cards, event.payload.get('suit_options', ()))}"
+            )
+        else:
+            action = html.escape(event_action_text(event))
         self._append_timeline_html(
             "<div style='margin:3px 0 7px 0; padding-left:7px; "
             f"border-left:3px solid {accent};'>"
@@ -609,6 +619,8 @@ class LiveAssistantPage(ScrollArea):
             }.get(placement, ("#B45309", "出完牌"))
         if event.event_type == "wind_caught":
             return "#7C3AED", "↪ 接风"
+        if event.event_type == "suit_corrected":
+            return "#B45309", "⟳ 花色修正"
         if event.event_type == "game_end_detected":
             return "#B45309", "■ 自动封存"
         if event.event_type in {"recognition_retry", "review_required"}:
@@ -618,24 +630,48 @@ class LiveAssistantPage(ScrollArea):
         return "#0F766E", "● 对局"
 
     @staticmethod
-    def _cards_html(cards: tuple[str, ...]) -> str:
+    def _cards_html(
+        cards: tuple[str, ...],
+        suit_options: object = (),
+    ) -> str:
         if not cards:
             return ""
+        raw_options = (
+            tuple(
+                tuple(str(suit) for suit in choices)
+                for choices in suit_options
+            )
+            if isinstance(suit_options, (tuple, list))
+            else ()
+        )
         cells: list[str] = []
-        for card in cards:
+        for index, card in enumerate(cards):
             rank, suit, color = CardBadge._display_parts(card)
+            candidates = (
+                "/".join(
+                    dict.fromkeys(
+                        {"S": "♠", "H": "♥", "C": "♣", "D": "♦"}.get(value, value)
+                        for value in raw_options[index]
+                    )
+                )
+                if card.endswith("?") and index < len(raw_options)
+                else ""
+            )
+            title = card_code_to_text(card)
+            if candidates:
+                title += f"（候选：{candidates}）"
             cells.append(
                 "<td title='{title}' style='background:#ffffff; border:1px solid #c8cdd3; "
                 "border-radius:4px; min-width:26px; text-align:center; padding:1px 3px;'>"
                 "<span style='color:{color}; font-weight:700;'>{suit}</span><br>"
                 "<span style='color:{color}; font-weight:700;'>{rank}</span></td>".format(
-                    title=html.escape(card_code_to_text(card)),
+                    title=html.escape(title),
                     color=color,
                     suit=html.escape(suit),
                     rank=html.escape(rank),
                 )
             )
-        return "<br><table cellspacing='2' cellpadding='0'><tr>{}</tr></table>".format(
+        return "<table cellspacing='2' cellpadding='0' style='display:inline-table; vertical-align:middle;'><tr>{}</tr></table>".format(
             "".join(cells)
         )
 
