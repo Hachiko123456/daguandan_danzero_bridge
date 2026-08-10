@@ -39,7 +39,7 @@ def test_annotation_page_displays_regions_and_supports_multi_select():
     page.region_config_button.click()
     config = page.region_config_page
 
-    assert config.region_table.rowCount() == 21
+    assert config.region_table.rowCount() == 22
     assert config.region_table.selectionMode() == QAbstractItemView.SelectionMode.ExtendedSelection
     assert page.show_selected_button.text() == "标注选中区域"
     assert config.preview_selected_button.text() == "标注选中区域"
@@ -84,7 +84,7 @@ def test_annotation_page_loads_first_recorded_image(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -107,7 +107,7 @@ def test_annotation_page_does_not_repeat_preview_path_in_status(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -127,7 +127,7 @@ def test_template_label_is_an_editable_dropdown(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
 
@@ -149,7 +149,7 @@ def test_template_editor_uses_coordinate_table_and_selectable_button_values(tmp_
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
 
@@ -211,7 +211,7 @@ def test_template_label_options_follow_template_kind_and_expose_level_suit_crop(
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
 
@@ -239,6 +239,19 @@ def test_template_label_options_follow_template_kind_and_expose_level_suit_crop(
         page.template_source_role_combo.findData("level")
     ) == "级牌 / 逢人配"
 
+    page.template_kind_combo.setCurrentIndex(page.template_kind_combo.findData("effect"))
+    effect_labels = {
+        page.template_label_edit.itemData(index)
+        for index in range(page.template_label_edit.count())
+    }
+    assert {
+        "straight", "straight_flush", "bomb", "joker_bomb",
+        "three_with_two", "two_trips", "triple_pair", "consecutive_pairs",
+    }.issubset(effect_labels)
+    assert page.template_label_edit.itemText(
+        page.template_label_edit.findData("straight_flush")
+    ) == "同花顺特效"
+
     page.close()
     app.processEvents()
 
@@ -249,7 +262,7 @@ def test_region_mode_hides_template_editor_and_shows_selected_region_coordinates
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
 
@@ -294,7 +307,7 @@ def test_region_mode_supports_choose_drag_and_save_region_annotation(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
 
@@ -327,7 +340,7 @@ def test_region_mode_canvas_drag_updates_region_coordinates_before_save(tmp_path
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -366,7 +379,7 @@ def test_template_roi_updates_coordinates_and_remains_visible_in_status(tmp_path
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -516,6 +529,29 @@ def test_single_image_page_displays_colored_cards_and_annotation_boxes():
     app.processEvents()
 
 
+def test_single_image_page_exposes_hand_as_copyable_danzero_code():
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QGuiApplication
+    from daguandan_bridge.gui.single_image_danzero_page import SingleImageDanzeroPage
+
+    app = QApplication.instance() or QApplication([])
+    page = SingleImageDanzeroPage()
+    page.my_hand_edit.setText("3S 4H small_joker")
+    page.copy_hand_code_button.click()
+
+    assert "DanZero" in page.copy_hand_code_button.toolTip()
+    assert QGuiApplication.clipboard().text() == "3S 4H small_joker"
+    assert "mono" in page.my_hand_edit.font().family().lower()
+    assert page.form_splitter.orientation() == Qt.Orientation.Horizontal
+
+    page.resize(900, 800)
+    page.show()
+    app.processEvents()
+    assert page.form_splitter.orientation() == Qt.Orientation.Vertical
+    page.close()
+    app.processEvents()
+
+
 def test_single_image_page_displays_detected_button_values():
     from daguandan_bridge.gui.single_image_danzero_page import SingleImageDanzeroPage
     from daguandan_bridge.recognition_service import (
@@ -612,7 +648,7 @@ def test_annotation_page_drops_stale_recognition_result_after_image_switch(tmp_p
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -675,7 +711,7 @@ def test_annotation_page_opens_single_image_danzero_test_page(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -704,7 +740,7 @@ def test_annotation_page_auto_fills_single_image_from_template_recognition(tmp_p
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -775,7 +811,7 @@ def test_single_image_danzero_test_runs_async_and_shows_advice(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -830,7 +866,7 @@ def test_annotation_page_preloads_danzero_in_background(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
 
@@ -858,7 +894,7 @@ def test_single_image_danzero_test_shows_error_and_restores_button(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -895,7 +931,7 @@ def test_annotation_page_navigates_images_with_previous_and_next_buttons(tmp_pat
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -924,7 +960,7 @@ def test_annotation_page_opens_standalone_region_config_and_places_arrows_around
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -955,7 +991,7 @@ def test_region_config_selection_updates_preview_regions(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -969,7 +1005,8 @@ def test_region_config_selection_updates_preview_regions(tmp_path):
     app.processEvents()
 
     assert [region.name for region in page.preview_regions] == ["first_play_left"]
-    assert "已标注 1 个区域" in page.status.text()
+    assert page.overlay_visible is False
+    assert page.show_selected_button.text() == "标注选中区域"
 
     config.close()
     page.close()
@@ -982,7 +1019,7 @@ def test_region_mode_roi_is_visible_and_syncs_config_editor(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -1025,7 +1062,7 @@ def test_annotation_page_crops_template_from_recorded_image(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -1060,7 +1097,7 @@ def test_template_crop_runs_without_blocking_the_gui(tmp_path, monkeypatch):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     image_dir = root / "tencent_daguandan" / "screenshots" / "game_test"
     image_dir.mkdir(parents=True)
@@ -1103,7 +1140,7 @@ def test_region_config_page_displays_chinese_fields_and_emits_selection(tmp_path
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
     service = AnnotationService(root)
@@ -1142,7 +1179,7 @@ def test_region_config_page_save_emits_updated_record(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     app = QApplication.instance() or QApplication([])
     service = AnnotationService(root)
@@ -1162,5 +1199,58 @@ def test_region_config_page_save_emits_updated_record(tmp_path):
     assert updated[-1][1].abs_box == Box(25, 35, 45, 55)
     assert service.list_regions()[0].abs_box == Box(25, 35, 45, 55)
 
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_page_browses_any_local_image_folder_with_arrow_navigation(tmp_path):
+    image_dir = tmp_path / "external_samples" / "nested"
+    image_dir.mkdir(parents=True)
+    cv2.imwrite(str(image_dir / "01.png"), np.zeros((720, 1280, 3), dtype=np.uint8))
+    cv2.imwrite(str(image_dir / "02.png"), np.full((720, 1280, 3), 255, dtype=np.uint8))
+    app = QApplication.instance() or QApplication([])
+
+    page = AnnotationPage(AnnotationService())
+    page.set_image_folder(image_dir.parent)
+
+    assert page.image_folder == image_dir.parent.resolve()
+    assert page.image_combo.count() == 2
+    assert page.current_image_path.name == "01.png"
+    assert page.previous_image_button.isEnabled() is False
+    assert page.next_image_button.isEnabled() is True
+    assert page.image_position_label.text() == "1 / 2"
+
+    page.next_image_button.click()
+    assert page.current_image_path.name == "02.png"
+    assert page.image_position_label.text() == "2 / 2"
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_region_overlay_button_toggles_selected_boxes(tmp_path):
+    image_dir = tmp_path / "samples"
+    image_dir.mkdir()
+    cv2.imwrite(str(image_dir / "sample.png"), np.zeros((720, 1280, 3), dtype=np.uint8))
+    app = QApplication.instance() or QApplication([])
+
+    page = AnnotationPage(AnnotationService())
+    page.set_image_folder(image_dir)
+    page.region_config_button.click()
+    config = page.region_config_page
+    config.region_table.selectRow(0)
+    app.processEvents()
+
+    assert page.overlay_visible is False
+    config.preview_selected_button.click()
+    assert page.overlay_visible is True
+    assert page.show_selected_button.text() == "隐藏选中区域"
+    assert config.preview_selected_button.text() == "隐藏选中区域"
+
+    config.preview_selected_button.click()
+    assert page.overlay_visible is False
+    assert page.show_selected_button.text() == "标注选中区域"
+    assert config.preview_selected_button.text() == "标注选中区域"
+
+    config.close()
     page.close()
     app.processEvents()

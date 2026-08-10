@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QSplitter,
     QVBoxLayout,
 )
+from qfluentwidgets import CardWidget, CaptionLabel, PrimaryPushButton, PushButton, StrongBodyLabel
 
 from ..annotation_service import (
     REGION_DISPLAY_NAMES,
@@ -49,23 +51,39 @@ class RegionConfigPage(QDialog):
         self.regions = list(regions)
         self.setObjectName("regionConfigPage")
         self.setWindowTitle("区域配置")
-        self.resize(820, 560)
+        self.resize(920, 640)
+        self.setMinimumSize(720, 520)
         self._build_ui()
         self._refresh_regions()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.addWidget(QLabel("区域名称和标准化坐标"))
+        root.setContentsMargins(20, 18, 20, 20)
+        root.setSpacing(14)
+        header_card = CardWidget(self)
+        header = QVBoxLayout(header_card)
+        header.setContentsMargins(18, 14, 18, 14)
+        header.addWidget(StrongBodyLabel("区域配置"))
+        header.addWidget(CaptionLabel("多选区域后可在主页面切换标注显示；编辑坐标时请只选择一项。"))
+        root.addWidget(header_card)
 
-        body = QHBoxLayout()
+        self.body_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.body_splitter.setChildrenCollapsible(False)
+        table_card = CardWidget(self.body_splitter)
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(16, 16, 16, 16)
+        table_layout.addWidget(StrongBodyLabel("已配置区域"))
         self.region_table = QTableWidget(0, len(self.HEADERS))
         self.region_table.setHorizontalHeaderLabels(self.HEADERS)
         self.region_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.region_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.region_table.itemSelectionChanged.connect(self._load_selected_region)
-        body.addWidget(self.region_table, 3)
+        table_layout.addWidget(self.region_table, 1)
 
-        editor = QVBoxLayout()
+        editor_card = CardWidget(self.body_splitter)
+        editor = QVBoxLayout(editor_card)
+        editor.setContentsMargins(18, 16, 18, 16)
+        editor.addWidget(StrongBodyLabel("坐标编辑"))
         form = QFormLayout()
         self.name_combo = QComboBox()
         for name, label in REGION_DISPLAY_NAMES.items():
@@ -93,14 +111,15 @@ class RegionConfigPage(QDialog):
             coordinates.addWidget(spin, 1, column)
         editor.addLayout(coordinates)
 
-        self.status = QLabel("请选择一个区域")
+        self.status = CaptionLabel("请选择一个区域")
         self.status.setWordWrap(True)
         editor.addWidget(self.status)
 
         actions = QHBoxLayout()
-        self.preview_selected_button = QPushButton("标注选中区域")
-        self.save_button = QPushButton("保存修改")
-        self.close_button = QPushButton("关闭")
+        self.preview_selected_button = PushButton("标注选中区域")
+        self.preview_selected_button.setToolTip("再次点击可隐藏当前选中区域的标记框")
+        self.save_button = PrimaryPushButton("保存修改")
+        self.close_button = PushButton("关闭")
         actions.addWidget(self.preview_selected_button)
         actions.addWidget(self.save_button)
         actions.addWidget(self.close_button)
@@ -111,8 +130,28 @@ class RegionConfigPage(QDialog):
         self.save_button.clicked.connect(self._save_selected_region)
         self.close_button.clicked.connect(self.close)
 
-        body.addLayout(editor, 2)
-        root.addLayout(body, 1)
+        self.body_splitter.addWidget(table_card)
+        self.body_splitter.addWidget(editor_card)
+        self.body_splitter.setStretchFactor(0, 3)
+        self.body_splitter.setStretchFactor(1, 2)
+        self.body_splitter.setSizes((550, 350))
+        root.addWidget(self.body_splitter, 1)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "body_splitter"):
+            orientation = (
+                Qt.Orientation.Vertical
+                if self.width() < 860
+                else Qt.Orientation.Horizontal
+            )
+            if self.body_splitter.orientation() != orientation:
+                self.body_splitter.setOrientation(orientation)
+
+    def set_preview_visible(self, visible: bool) -> None:
+        self.preview_selected_button.setText(
+            "隐藏选中区域" if visible else "标注选中区域"
+        )
 
     def _refresh_regions(self) -> None:
         self.region_table.setRowCount(len(self.regions))

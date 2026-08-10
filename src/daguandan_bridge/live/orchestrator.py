@@ -8,7 +8,7 @@ from functools import wraps
 from inspect import signature
 from pathlib import Path
 from threading import Event, RLock
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import cv2
 import numpy as np
@@ -29,6 +29,11 @@ from .consensus import (
     ConsensusContext,
     ConsensusResult,
     RecognitionSample,
+)
+from .card_uncertainty import (
+    is_unknown_suit_card,
+    normalized_suit_options,
+    state_variants_for_unknown_suits,
 )
 from .recognition_strategy import (
     RecognitionStrategy,
@@ -90,6 +95,7 @@ class LiveUpdate:
     status: LiveStatus
     snapshot: LiveSnapshot
     event: LiveEvent | None = None
+    events: tuple[LiveEvent, ...] = ()
     advice: object | None = None
     review: ReviewRequest | None = None
     fast_signals: FastSignalResult | None = None
@@ -113,6 +119,9 @@ class LiveAdvice:
     advice: LocalAdvice | None = None
     visible: bool = False
     error: str = ""
+    suit_uncertain: bool = False
+    variant_count: int = 1
+    advice_agrees_across_variants: bool = True
 
 
 @dataclass(frozen=True)
@@ -146,6 +155,9 @@ class _AdviceCompletion:
     error: str = ""
     engine_input: dict[str, object] | None = None
     trace: dict[str, object] | None = None
+    suit_uncertain: bool = False
+    variant_count: int = 1
+    advice_agrees_across_variants: bool = True
 
 
 class LiveOrchestrator:
@@ -167,6 +179,7 @@ class LiveOrchestrator:
         lead_wait_timeout_ms: int = 30_000,
         lead_stable_frames: int = 3,
         recognition_strategy: str | RecognitionStrategy = RecognitionStrategy.TWO_VALID_STREAK,
+        on_update: Callable[[LiveUpdate], None] | None = None,
     ) -> None:
         if burst_sample_limit < 3:
             raise ValueError("突发读取至少需要 3 帧")
@@ -183,6 +196,7 @@ class LiveOrchestrator:
         self.lead_wait_timeout_ms = int(lead_wait_timeout_ms)
         self.lead_stable_frames = max(2, int(lead_stable_frames))
         self.recognition_strategy = coerce_recognition_strategy(recognition_strategy)
+        self._update_listener = on_update
         self.consensus = BurstConsensus(min_votes=3)
         self._state_lock = RLock()
         self.status: LiveStatus = "initializing"
@@ -222,6 +236,8 @@ class LiveOrchestrator:
         self._first_action_pending = False
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = False
+        self._game_end_detected = False
+        self._finish_order: list[Seat] = []
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -283,6 +299,8 @@ class LiveOrchestrator:
                 f"可用磁盘空间不足：需要 {self.minimum_free_bytes}，实际 {free_bytes}"
             )
         self._last_monotonic_ms = int(monotonic_ms)
+        self._game_end_detected = False
+        self._finish_order = []
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
             hand=hand,
@@ -297,20 +315,20 @@ class LiveOrchestrator:
             self._opening_controls_seen = False
             self._lead_candidate = None
             self._lead_candidate_frames = 0
-            self._append_lifecycle_event("waiting_for_lead", {})
-            return self._update(event=event)
+            waiting = self._append_lifecycle_event("waiting_for_lead", {})
+            return self._update(event=event, events=(event, waiting))
         self.status = "running"
         self._first_action_pending = True
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = lead_player != "self"
         self._activate_zone(int(monotonic_ms))
-        self._append_lifecycle_event(
+        turn_started = self._append_lifecycle_event(
             "turn_started",
             {"player": lead_player},
             actor=lead_player,
         )
         self._request_advice_if_needed()
-        return self._update(event=event)
+        return self._update(event=event, events=(event, turn_started))
 
     def ingest_frame(
         self,
@@ -380,6 +398,7 @@ class LiveOrchestrator:
                 self_action_buttons_visible=opening.self_action_buttons_visible,
                 effect_visible=False,
                 super_double_visible=opening.super_double_visible,
+                game_end_control=opening.game_end_control,
             )
             lead = self._lead_candidate_from_opening(opening)
             with self._state_lock:
@@ -403,6 +422,9 @@ class LiveOrchestrator:
         with self._state_lock:
             if not self._analysis_job_is_current(job_key):
                 return self._update()
+            game_end = self._handle_game_end_control(fast)
+            if game_end is not None:
+                return game_end
             if fast.super_double_visible:
                 self._clear_burst()
                 return self._update(fast_signals=fast)
@@ -469,8 +491,12 @@ class LiveOrchestrator:
             consensus = self._decide_if_ready(current_metrics, fast)
             if consensus is not None:
                 if consensus.status == "confirmed":
-                    event = self._commit_consensus(consensus, monotonic_ms)
-                    return self._update(event=event, fast_signals=fast)
+                    event, events = self._commit_consensus(consensus, monotonic_ms)
+                    return self._update(
+                        event=event,
+                        events=events,
+                        fast_signals=fast,
+                    )
                 if consensus.status == "needs_confirmation":
                     return self._require_review(
                         ",".join(consensus.rejected_reasons) or consensus.status,
@@ -513,6 +539,9 @@ class LiveOrchestrator:
     ) -> LiveUpdate:
         if self.status != "waiting_lead":
             return self._update()
+        game_end = self._handle_game_end_control(fast)
+        if game_end is not None:
+            return game_end
         if fast.super_double_visible:
             self._opening_controls_seen = True
             self._deal_complete_recorded = False
@@ -553,7 +582,7 @@ class LiveOrchestrator:
         event = self.reducer.confirm_lead_player(lead)
         event = self._publish_event(event)
         self.status = "running"
-        self._append_lifecycle_event(
+        turn_started = self._append_lifecycle_event(
             "turn_started",
             {"player": lead},
             actor=lead,
@@ -569,7 +598,7 @@ class LiveOrchestrator:
         # visible first action look static in replay and live capture alike.
         self._seed_first_action_baseline(lead)
         self._request_advice_if_needed()
-        return self._update(event=event)
+        return self._update(event=event, events=(event, turn_started))
 
     def _require_lead_review(
         self,
@@ -675,13 +704,30 @@ class LiveOrchestrator:
                 expected,
                 wild_rank=wild_rank,
                 allow_pass=allow_pass,
+                allow_unknown_suit=True,
             )
         except TypeError as exc:
-            if "allow_pass" not in str(exc):
-                raise
-            return self.recognition_service.recognize_play_region(
-                frame, expected, wild_rank=wild_rank
-            )
+            # Test doubles and external integrations built against the old
+            # recognizer may not know the new kwarg.  They remain compatible;
+            # the shipped service always preserves rank-only cards.
+            if "allow_unknown_suit" not in str(exc):
+                if "allow_pass" not in str(exc):
+                    raise
+            try:
+                return self.recognition_service.recognize_play_region(
+                    frame,
+                    expected,
+                    wild_rank=wild_rank,
+                    allow_pass=allow_pass,
+                )
+            except TypeError as fallback_exc:
+                if "allow_pass" not in str(fallback_exc):
+                    raise
+                return self.recognition_service.recognize_play_region(
+                    frame,
+                    expected,
+                    wild_rank=wild_rank,
+                )
 
 
     @_state_synchronized
@@ -710,6 +756,7 @@ class LiveOrchestrator:
             raise ValueError(
                 "候选未通过自动校验，请使用“不出”或“都不对”手动补录"
             )
+        before = self.reducer.snapshot()
         event = self._record_action(
             review.player,
             candidate.cards,
@@ -718,7 +765,7 @@ class LiveOrchestrator:
             source="manual_one_click_confirmation",
             evidence_refs=review.evidence_refs,
         )
-        event = self._publish_event(event)
+        event, outcomes = self._publish_action_with_outcomes(event, before)
         self._append_lifecycle_event(
             "review_resolved",
             {
@@ -732,9 +779,10 @@ class LiveOrchestrator:
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms)
-        self._append_current_turn_started()
+        turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
-        return self._update(event=event)
+        events = (event, *outcomes) + ((turn_started,) if turn_started else ())
+        return self._update(event=event, events=events)
 
     @_state_synchronized
     def commit_trusted_action(
@@ -745,6 +793,7 @@ class LiveOrchestrator:
         is_pass: bool,
         monotonic_ms: int,
         evidence_refs: tuple[str, ...] = (),
+        suit_options: tuple[tuple[str, ...], ...] = (),
     ) -> LiveUpdate:
         """Commit a trusted action through the same post-action live path.
 
@@ -760,6 +809,7 @@ class LiveOrchestrator:
         if expected != actor:
             raise ValueError(f"当前应由 {expected} 行动，不能提交 {actor} 的可信动作")
         self._last_monotonic_ms = int(monotonic_ms)
+        before = self.reducer.snapshot()
         event = self._record_action(
             actor,
             cards,
@@ -767,13 +817,15 @@ class LiveOrchestrator:
             confidence=1.0,
             source="trusted_log_replay",
             evidence_refs=evidence_refs,
+            suit_options=suit_options,
         )
-        event = self._publish_event(event)
+        event, outcomes = self._publish_action_with_outcomes(event, before)
         self._first_action_pending = False
         self._activate_zone(int(monotonic_ms))
-        self._append_current_turn_started()
+        turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
-        return self._update(event=event)
+        events = (event, *outcomes) + ((turn_started,) if turn_started else ())
+        return self._update(event=event, events=events)
 
     @_state_synchronized
     def confirm_manual_action(
@@ -785,6 +837,7 @@ class LiveOrchestrator:
         if self.status != "review_required" or self.latest_review is None:
             raise RuntimeError("当前没有待补录动作")
         player = self.latest_review.player
+        before = self.reducer.snapshot()
         event = self._record_action(
             player,
             cards,
@@ -792,7 +845,7 @@ class LiveOrchestrator:
             confidence=1.0,
             source="manual_minimal_editor",
         )
-        event = self._publish_event(event)
+        event, outcomes = self._publish_action_with_outcomes(event, before)
         self._append_lifecycle_event(
             "review_resolved",
             {
@@ -805,9 +858,10 @@ class LiveOrchestrator:
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms)
-        self._append_current_turn_started()
+        turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
-        return self._update(event=event)
+        events = (event, *outcomes) + ((turn_started,) if turn_started else ())
+        return self._update(event=event, events=events)
 
     @_state_synchronized
     def correct_latest(
@@ -906,6 +960,7 @@ class LiveOrchestrator:
         *,
         active_player: Seat | None,
         self_action_buttons_visible: bool = False,
+        game_end_control: str | None = None,
     ) -> LiveUpdate:
         expected = self.snapshot.current_player or "self"
         fast = FastSignalResult(
@@ -914,9 +969,34 @@ class LiveOrchestrator:
             pass_visible=False,
             self_action_buttons_visible=bool(self_action_buttons_visible),
             effect_visible=False,
+            game_end_control=game_end_control,
         )
+        game_end = self._handle_game_end_control(fast)
+        if game_end is not None:
+            return game_end
         self._apply_fast_signal(fast)
         return self._update(fast_signals=fast)
+
+    def _handle_game_end_control(
+        self,
+        fast: FastSignalResult,
+    ) -> LiveUpdate | None:
+        """Publish one terminal-screen signal without sealing in the worker thread."""
+
+        control = fast.game_end_control
+        if control not in {"continue_game", "change_table"}:
+            return None
+        if self.status not in {"waiting_lead", "running", "review_required"}:
+            return None
+        if self._game_end_detected:
+            return self._update(fast_signals=fast)
+        self._game_end_detected = True
+        self._clear_burst()
+        event = self._append_lifecycle_event(
+            "game_end_detected",
+            {"control": control},
+        )
+        return self._update(event=event, fast_signals=fast)
 
     @_state_synchronized
     def start_self_advice(self) -> AdviceRequestKey | None:
@@ -1078,25 +1158,74 @@ class LiveOrchestrator:
             return key
 
     def _run_advice(self, job: _AdviceJob) -> _AdviceCompletion:
-        trace = StrategyExecutionTrace(job.key.request_id)
-        try:
-            parameters = signature(self.advisor.recommend).parameters
-            kwargs: dict[str, object] = {"request_id": job.key.request_id}
-            if "trace" in parameters:
-                kwargs["trace"] = trace
-            advice = self.advisor.recommend(job.state, **kwargs)
-        except Exception as exc:
-            trace_snapshot = trace.snapshot()
-            engine_input = trace_snapshot.get("engine_input")
-            if not isinstance(engine_input, dict):
-                engine_input = self._fallback_engine_input(job)
+        variants = state_variants_for_unknown_suits(job.state)
+        has_unknown_suit = any(
+            is_unknown_suit_card(card)
+            for event in job.state.play_history
+            for card in event.cards
+        )
+        if not variants:
             return _AdviceCompletion(
                 job.key,
-                error=str(exc),
-                engine_input=engine_input,
-                trace=trace_snapshot,
+                error="未知花色与已知双副牌数量冲突",
+                engine_input=self._fallback_engine_input(job),
+                suit_uncertain=has_unknown_suit,
+                variant_count=0,
+                advice_agrees_across_variants=False,
             )
-        return _AdviceCompletion(job.key, advice=advice)
+
+        advice_groups: dict[tuple[bool, tuple[str, ...], str], list[LocalAdvice]] = {}
+        first_trace: dict[str, object] | None = None
+        first_engine_input: dict[str, object] | None = None
+        errors: list[str] = []
+        parameters = signature(self.advisor.recommend).parameters
+        for index, state in enumerate(variants, start=1):
+            request_id = (
+                job.key.request_id
+                if len(variants) == 1
+                else f"{job.key.request_id}/suit-{index}"
+            )
+            trace = StrategyExecutionTrace(request_id)
+            try:
+                kwargs: dict[str, object] = {"request_id": request_id}
+                if "trace" in parameters:
+                    kwargs["trace"] = trace
+                advice = self.advisor.recommend(state, **kwargs)
+            except Exception as exc:
+                errors.append(str(exc))
+                trace_snapshot = trace.snapshot()
+                if first_trace is None:
+                    first_trace = trace_snapshot
+                    candidate_input = trace_snapshot.get("engine_input")
+                    if isinstance(candidate_input, dict):
+                        first_engine_input = candidate_input
+                continue
+            key = (advice.is_pass, tuple(advice.cards), advice.play_type)
+            advice_groups.setdefault(key, []).append(advice)
+            if first_trace is None:
+                first_trace = trace.snapshot()
+                candidate_input = first_trace.get("engine_input")
+                if isinstance(candidate_input, dict):
+                    first_engine_input = candidate_input
+
+        if not advice_groups:
+            return _AdviceCompletion(
+                job.key,
+                error=errors[0] if errors else "DanZero 未返回建议",
+                engine_input=first_engine_input or self._fallback_engine_input(job),
+                trace=first_trace,
+                suit_uncertain=has_unknown_suit,
+                variant_count=len(variants),
+                advice_agrees_across_variants=False,
+            )
+        winner = max(advice_groups.values(), key=len)
+        return _AdviceCompletion(
+            job.key,
+            advice=winner[0],
+            suit_uncertain=has_unknown_suit,
+            variant_count=len(variants),
+            advice_agrees_across_variants=len(advice_groups) == 1,
+        )
 
     @staticmethod
     def _fallback_engine_input(job: _AdviceJob) -> dict[str, object]:
@@ -1194,6 +1323,7 @@ class LiveOrchestrator:
                     confidence=0.0,
                 )
                 self._signal_advice_completion(key)
+                self._notify_update_listener()
                 return
             advice = completion.advice
             visible = self._self_turn_corroborated
@@ -1204,6 +1334,9 @@ class LiveOrchestrator:
                 status="ready",
                 advice=advice,
                 visible=visible,
+                suit_uncertain=completion.suit_uncertain,
+                variant_count=completion.variant_count,
+                advice_agrees_across_variants=completion.advice_agrees_across_variants,
             )
             self.store.append_advice(
                 {
@@ -1219,6 +1352,9 @@ class LiveOrchestrator:
                     "timings": advice.timings,
                     "elapsed_ms": advice.elapsed_ms,
                     "visible": visible,
+                    "suit_uncertain": completion.suit_uncertain,
+                    "suit_variant_count": completion.variant_count,
+                    "advice_agrees_across_suit_variants": completion.advice_agrees_across_variants,
                 }
             )
             self._append_advice_event(
@@ -1230,9 +1366,20 @@ class LiveOrchestrator:
                     "play_type": advice.play_type,
                     "state_revision": key.state_revision,
                     "visible": visible,
+                    "suit_uncertain": completion.suit_uncertain,
+                    "suit_variant_count": completion.variant_count,
+                    "advice_agrees_across_suit_variants": completion.advice_agrees_across_variants,
                 },
             )
             self._signal_advice_completion(key)
+            self._notify_update_listener()
+
+    def _notify_update_listener(self) -> None:
+        """Expose an advice transition immediately instead of waiting for a frame."""
+
+        listener = self._update_listener
+        if listener is not None:
+            listener(self._update())
 
     def _signal_advice_completion(self, key: AdviceRequestKey) -> None:
         with self._advice_lock:
@@ -1259,6 +1406,9 @@ class LiveOrchestrator:
                 advice=current.advice,
                 visible=True,
                 error=current.error,
+                suit_uncertain=current.suit_uncertain,
+                variant_count=current.variant_count,
+                advice_agrees_across_variants=current.advice_agrees_across_variants,
             )
             self._set_advice_visible_latency(current.key)
             self._append_advice_event(
@@ -1305,6 +1455,77 @@ class LiveOrchestrator:
             self._all_events.append(published)
             return published
 
+    def _publish_action_with_outcomes(
+        self,
+        event: LiveEvent,
+        before: LiveSnapshot,
+    ) -> tuple[LiveEvent, tuple[LiveEvent, ...]]:
+        """Persist the action first, then append its non-semantic outcomes."""
+
+        published = self._publish_event(event)
+        outcomes = self._append_action_outcomes(before, self.reducer.snapshot())
+        return published, outcomes
+
+    def _append_action_outcomes(
+        self,
+        before: LiveSnapshot,
+        after: LiveSnapshot,
+    ) -> tuple[LiveEvent, ...]:
+        outcomes: list[LiveEvent] = []
+        newly_finished = sorted(
+            after.finished_seats - before.finished_seats,
+            key=TURN_ORDER.index,
+        )
+        placement_names = ("head", "second", "third")
+        for player in newly_finished:
+            if player in self._finish_order:
+                continue
+            self._finish_order.append(player)
+            position = len(self._finish_order) - 1
+            if position >= len(placement_names):
+                continue
+            outcomes.append(
+                self._append_lifecycle_event(
+                    "player_finished",
+                    {"placement": placement_names[position]},
+                    actor=player,
+                )
+            )
+            if position == 2:
+                last_players = [
+                    seat
+                    for seat in TURN_ORDER
+                    if seat not in after.finished_seats and seat not in self._finish_order
+                ]
+                if len(last_players) == 1:
+                    last_player = last_players[0]
+                    self._finish_order.append(last_player)
+                    outcomes.append(
+                        self._append_lifecycle_event(
+                            "player_finished",
+                            {"placement": "last"},
+                            actor=last_player,
+                        )
+                    )
+
+        if (
+            before.trick_id != after.trick_id
+            and before.lead_player in before.finished_seats
+            and after.lead_player is not None
+            and after.lead_player != before.lead_player
+        ):
+            outcomes.append(
+                self._append_lifecycle_event(
+                    "wind_caught",
+                    {
+                        "from_player": before.lead_player,
+                        "to_player": after.lead_player,
+                    },
+                    actor=after.lead_player,
+                )
+            )
+        return tuple(outcomes)
+
     def _append_lifecycle_event(
         self,
         event_type: str,
@@ -1332,14 +1553,15 @@ class LiveOrchestrator:
         )
         return self._publish_event(event)
 
-    def _append_current_turn_started(self) -> None:
+    def _append_current_turn_started(self) -> LiveEvent | None:
         player = self.reducer.snapshot().current_player
         if player is not None:
-            self._append_lifecycle_event(
+            return self._append_lifecycle_event(
                 "turn_started",
                 {"player": player},
                 actor=player,
             )
+        return None
 
     def _set_advice_visible_latency(self, key: AdviceRequestKey) -> None:
         requested_at = self._advice_requested_at_ms.get(key)
@@ -1358,6 +1580,7 @@ class LiveOrchestrator:
             confidence=result.confidence,
             source=result.source,
             evidence_ref=observation_id,
+            suit_options=result.suit_options,
             post_hand=result.post_hand,
         )
         record: dict[str, object] = {
@@ -1365,6 +1588,7 @@ class LiveOrchestrator:
             "monotonic_ms": int(monotonic_ms),
             "player": result.player,
             "cards": list(result.cards),
+            "suit_options": [list(options) for options in result.suit_options],
             "is_pass": result.is_pass,
             "confidence": result.confidence,
             "source": result.source,
@@ -1425,24 +1649,36 @@ class LiveOrchestrator:
         snapshot = self.snapshot
         player = snapshot.current_player
         assert player is not None
+        table_event = next(
+            (play for play in reversed(snapshot.trick_plays) if not play.is_pass),
+            None,
+        )
+        historical_cards = tuple(
+            card
+            for event in snapshot.play_history
+            if not event.is_pass
+            for card in event.cards
+        )
+        historical_options = tuple(
+            option
+            for event in snapshot.play_history
+            if not event.is_pass
+            for option in normalized_suit_options(event.cards, event.suit_options)
+        )
         return ConsensusContext(
             level_rank=snapshot.wild_rank,
             remaining_cards=snapshot.remaining_cards[player],
             allow_pass=bool(snapshot.trick_plays),
             known_hand=snapshot.my_hand if player == "self" else (),
-            table_cards=next(
-                (
-                    play.cards
-                    for play in reversed(snapshot.trick_plays)
-                    if not play.is_pass
-                ),
-                (),
+            table_cards=table_event.cards if table_event is not None else (),
+            table_suit_options=(
+                normalized_suit_options(table_event.cards, table_event.suit_options)
+                if table_event is not None
+                else ()
             ),
-            known_cards=tuple(snapshot.my_hand) + tuple(
-                card
-                for event in snapshot.play_history
-                if not event.is_pass
-                for card in event.cards
+            known_cards=tuple(snapshot.my_hand) + historical_cards,
+            known_suit_options=(
+                normalized_suit_options(snapshot.my_hand) + historical_options
             ),
             candidate_already_known=player == "self",
             region_empty=not metrics.occupied,
@@ -1454,23 +1690,36 @@ class LiveOrchestrator:
             validate_rules=True,
         )
 
-    def _commit_consensus(self, result: ConsensusResult, monotonic_ms: int) -> LiveEvent:
+    def _commit_consensus(
+        self,
+        result: ConsensusResult,
+        monotonic_ms: int,
+    ) -> tuple[LiveEvent, tuple[LiveEvent, ...]]:
         player = self.snapshot.current_player
         assert player is not None
+        before = self.reducer.snapshot()
+        commit_cards = result.resolved_cards if not result.is_pass else result.cards
         event = self._record_action(
             player,
-            result.cards,
+            commit_cards,
             result.is_pass,
             confidence=result.confidence,
             source=result.source,
             evidence_refs=result.evidence_refs,
+            # A reconciled self action is now an exact physical hand action;
+            # do not retain stale visual suit alternatives on the event.
+            suit_options=(
+                () if commit_cards != result.cards else result.suit_options
+            ),
+            integrity_warnings=result.integrity_warnings,
         )
-        event = self._publish_event(event)
+        event, outcomes = self._publish_action_with_outcomes(event, before)
         self._first_action_pending = False
         self._activate_zone(monotonic_ms)
-        self._append_current_turn_started()
+        turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
-        return event
+        events = (event, *outcomes) + ((turn_started,) if turn_started else ())
+        return event, events
 
     def _record_action(
         self,
@@ -1481,6 +1730,8 @@ class LiveOrchestrator:
         confidence: float,
         source: str,
         evidence_refs: tuple[str, ...] = (),
+        suit_options: tuple[tuple[str, ...], ...] = (),
+        integrity_warnings: tuple[str, ...] = (),
     ) -> LiveEvent:
         if is_pass:
             return self.reducer.record_pass(
@@ -1495,6 +1746,8 @@ class LiveOrchestrator:
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
+            suit_options=suit_options,
+            integrity_warnings=integrity_warnings,
         )
 
     def _require_review(
@@ -1525,6 +1778,10 @@ class LiveOrchestrator:
         )
         self._review_count += 1
         self.latest_review = None
+        # Preserve the rejected burst before resetting the action window.
+        # Otherwise a timeout incident says "no observations" precisely when
+        # the user needs to inspect the cards that were seen under an effect.
+        incident_observations = list(self._observations)
         self._clear_burst()
         if player is not None and self.status == "running":
             self._activate_zone(monotonic_ms)
@@ -1536,7 +1793,11 @@ class LiveOrchestrator:
             },
             actor=player,
         )
-        self._create_incident(reason, monotonic_ms)
+        self._create_incident(
+            reason,
+            monotonic_ms,
+            observations=incident_observations,
+        )
         return self._update(event=event, fast_signals=fast)
 
 
@@ -1558,6 +1819,7 @@ class LiveOrchestrator:
         monotonic_ms: int,
         *,
         engine_input: dict[str, object] | None = None,
+        observations: list[dict[str, object]] | None = None,
     ) -> Path:
         previous = self._recent_incidents.get(str(reason))
         if previous is not None:
@@ -1579,7 +1841,7 @@ class LiveOrchestrator:
             reason=str(reason),
             state_before=state,
             state_after=state,
-            observations=list(self._observations),
+            observations=list(self._observations if observations is None else observations),
             trigger_ms=int(monotonic_ms),
             engine_input=engine_input,
         )
@@ -1710,13 +1972,17 @@ class LiveOrchestrator:
         self,
         *,
         event: LiveEvent | None = None,
+        events: tuple[LiveEvent, ...] = (),
         review: ReviewRequest | None = None,
         fast_signals: FastSignalResult | None = None,
     ) -> LiveUpdate:
+        if event is not None and not events:
+            events = (event,)
         return LiveUpdate(
             status=self.status,
             snapshot=self.snapshot,
             event=event,
+            events=events,
             advice=self.latest_advice,
             review=review if review is not None else self.latest_review,
             fast_signals=fast_signals,

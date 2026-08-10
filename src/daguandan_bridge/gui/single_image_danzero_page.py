@@ -6,26 +6,33 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QResizeEvent
+from PySide6.QtGui import QFontDatabase, QGuiApplication, QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
-    QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMenu,
-    QPlainTextEdit,
-    QPushButton,
-    QScrollArea,
     QSizePolicy,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+from qfluentwidgets import (
+    CardWidget,
+    CaptionLabel,
+    LineEdit,
+    PlainTextEdit,
+    PrimaryPushButton,
+    PushButton,
+    ScrollArea,
+    StrongBodyLabel,
+    SubtitleLabel,
+    TableWidget,
 )
 
 from ..danzero.state import GameStateError, GuanDanState, RANKS, SEATS
@@ -91,7 +98,7 @@ class CopyableLabel(QLabel):
             event.accept()
 
 
-class CopyableLineEdit(QLineEdit):
+class CopyableLineEdit(LineEdit):
     """Select and copy the complete value instead of only one word."""
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -101,7 +108,7 @@ class CopyableLineEdit(QLineEdit):
             event.accept()
 
 
-class CopyablePlainTextEdit(QPlainTextEdit):
+class CopyablePlainTextEdit(PlainTextEdit):
     """Select and copy all diagnostic/result text on double-click."""
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -111,7 +118,7 @@ class CopyablePlainTextEdit(QPlainTextEdit):
             event.accept()
 
 
-class CardBadge(QFrame):
+class CardBadge(CardWidget):
     """A compact, readable card with a colored suit symbol and rank."""
 
     def __init__(self, card_code: str, parent=None, *, compact: bool = False):
@@ -126,7 +133,7 @@ class CardBadge(QFrame):
         if compact:
             self.setMaximumSize(width, height)
         self.setStyleSheet(
-            "QFrame#cardBadge { background: #ffffff; border: 1px solid #c8cdd3; "
+            "CardWidget#cardBadge { background: #ffffff; border: 1px solid #c8cdd3; "
             "border-radius: 6px; }"
         )
 
@@ -185,8 +192,8 @@ class SingleImageDanzeroPage(QDialog):
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-        self.content_scroll = QScrollArea()
+        outer.setContentsMargins(18, 16, 18, 18)
+        self.content_scroll = ScrollArea()
         self.content_scroll.setObjectName("singleImageContentScroll")
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setHorizontalScrollBarPolicy(
@@ -196,29 +203,39 @@ class SingleImageDanzeroPage(QDialog):
         self.content_scroll.setWidget(content)
         outer.addWidget(self.content_scroll)
         root = QVBoxLayout(content)
-        root.setContentsMargins(10, 10, 10, 16)
-        root.setSpacing(10)
+        root.setContentsMargins(0, 0, 0, 4)
+        root.setSpacing(14)
 
-        header = QHBoxLayout()
+        header_card = CardWidget(content)
+        header = QHBoxLayout(header_card)
+        header.setContentsMargins(20, 16, 20, 16)
+        header.setSpacing(12)
+        heading = QVBoxLayout()
+        heading.setSpacing(3)
+        heading.addWidget(SubtitleLabel("单图标注与 DanZero"))
         self.image_info_label = CopyableLabel()
         self.image_info_label.setWordWrap(True)
-        header.addWidget(self.image_info_label, 1)
-        self.recognize_button = QPushButton("重新识别")
+        heading.addWidget(self.image_info_label)
+        header.addLayout(heading, 1)
+        self.recognize_button = PushButton("重新识别")
         header.addWidget(self.recognize_button)
-        root.addLayout(header)
+        root.addWidget(header_card)
 
-        image_group = QGroupBox("图片与识别标注")
-        image_layout = QVBoxLayout(image_group)
+        image_card = CardWidget(content)
+        image_layout = QVBoxLayout(image_card)
+        image_layout.setContentsMargins(18, 16, 18, 16)
+        image_layout.setSpacing(8)
+        image_layout.addWidget(StrongBodyLabel("图片预览与识别标注"))
         self.image_preview = QLabel()
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_preview.setMinimumSize(640, 360)
-        self.image_preview.setMaximumHeight(405)
+        self.image_preview.setMinimumSize(600, 360)
+        self.image_preview.setMaximumHeight(480)
         self.image_preview.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
         self.image_preview.setStyleSheet(
-            "background: #20252b; border: 1px solid #505862;"
+            "background: rgba(0, 0, 0, 0.06); border: 1px dashed rgba(120, 120, 120, 0.45); border-radius: 10px;"
         )
         self.image_preview.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
@@ -233,15 +250,20 @@ class SingleImageDanzeroPage(QDialog):
         self.button_detection_label = CopyableLabel("按钮检测：尚未识别")
         self.button_detection_label.setWordWrap(True)
         image_layout.addWidget(self.button_detection_label)
-        root.addWidget(image_group)
-
         self.recognition_status = CopyableLabel("模板识别尚未运行")
         self.recognition_status.setWordWrap(True)
-        root.addWidget(self.recognition_status)
+        image_layout.addWidget(self.recognition_status)
+        root.addWidget(image_card)
 
-        hand_group = QGroupBox("我的手牌 · 模板识别结果")
-        hand_layout = QVBoxLayout(hand_group)
-        self.hand_card_scroll = QScrollArea()
+        self.form_splitter = QSplitter(Qt.Orientation.Horizontal, content)
+        self.form_splitter.setChildrenCollapsible(False)
+        hand_card = CardWidget(self.form_splitter)
+        hand_layout = QVBoxLayout(hand_card)
+        hand_layout.setContentsMargins(18, 16, 18, 16)
+        hand_layout.setSpacing(8)
+        hand_layout.addWidget(StrongBodyLabel("我方手牌"))
+        hand_layout.addWidget(CaptionLabel("上方是识别结果预览；DanZero 实际使用下方的标准牌面代码。"))
+        self.hand_card_scroll = ScrollArea()
         self.hand_card_scroll.setWidgetResizable(True)
         self.hand_card_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
@@ -257,13 +279,30 @@ class SingleImageDanzeroPage(QDialog):
         self.hand_card_scroll.setMinimumHeight(96)
         self.hand_card_scroll.setMaximumHeight(116)
         hand_layout.addWidget(self.hand_card_scroll)
-        self.hand_hint = QLabel("识别到的牌会以花色图案展示；不完整时可在下方参数框修正。")
+        code_header = QHBoxLayout()
+        code_header.addWidget(StrongBodyLabel("DanZero 手牌代码"))
+        code_header.addStretch(1)
+        self.copy_hand_code_button = PushButton("复制代码")
+        self.copy_hand_code_button.setToolTip("复制当前 DanZero 手牌参数")
+        code_header.addWidget(self.copy_hand_code_button)
+        hand_layout.addLayout(code_header)
+        self.my_hand_edit = CopyableLineEdit()
+        self.my_hand_edit.setObjectName("handCodeEdit")
+        self.my_hand_edit.setPlaceholderText("例如：3S 4H 5D small_joker（红桃 5 为 5H）")
+        self.my_hand_edit.setFont(
+            QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        )
+        hand_layout.addWidget(self.my_hand_edit)
+        self.hand_hint = CaptionLabel("代码规则：S=黑桃、H=红桃、C=梅花、D=方块；使用空格分隔。")
         self.hand_hint.setWordWrap(True)
         hand_layout.addWidget(self.hand_hint)
-        root.addWidget(hand_group)
 
-        parameter_group = QGroupBox("DanZero 必需参数 · 识别后可手动修正")
-        parameter_layout = QVBoxLayout(parameter_group)
+        parameter_card = CardWidget(self.form_splitter)
+        parameter_layout = QVBoxLayout(parameter_card)
+        parameter_layout.setContentsMargins(18, 16, 18, 16)
+        parameter_layout.setSpacing(8)
+        parameter_layout.addWidget(StrongBodyLabel("DanZero 参数"))
+        parameter_layout.addWidget(CaptionLabel("模板识别会自动填入；请在运行前确认。"))
         context_form = QFormLayout()
         self.round_level_combo = self._rank_combo()
         self.wild_rank_combo = self._rank_combo()
@@ -274,41 +313,45 @@ class SingleImageDanzeroPage(QDialog):
         context_form.addRow("当前行动者", self.current_player_combo)
         context_form.addRow("本轮首出者", self.lead_player_combo)
         parameter_layout.addLayout(context_form)
-
-        hand_form = QFormLayout()
-        self.my_hand_edit = CopyableLineEdit()
-        self.my_hand_edit.setPlaceholderText(
-            "无法识别时修正，例如：3S 4H 5D；红桃5对应 5H"
-        )
-        hand_form.addRow("手牌参数", self.my_hand_edit)
-        parameter_layout.addLayout(hand_form)
         self.incomplete_status = CopyableLabel()
         self.incomplete_status.setWordWrap(True)
         parameter_layout.addWidget(self.incomplete_status)
-        root.addWidget(parameter_group)
+        parameter_layout.addStretch(1)
+        self.form_splitter.addWidget(hand_card)
+        self.form_splitter.addWidget(parameter_card)
+        self.form_splitter.setStretchFactor(0, 1)
+        self.form_splitter.setStretchFactor(1, 1)
+        self.form_splitter.setSizes((470, 470))
+        root.addWidget(self.form_splitter)
 
-        event_group = QGroupBox("本轮出牌事件 · 可删除或补充")
-        event_layout = QVBoxLayout(event_group)
+        event_card = CardWidget(content)
+        event_layout = QVBoxLayout(event_card)
+        event_layout.setContentsMargins(18, 16, 18, 16)
+        event_layout.setSpacing(8)
+        event_layout.addWidget(StrongBodyLabel("本轮出牌事件"))
+        event_layout.addWidget(CaptionLabel("可补充或删除事件；出牌使用与手牌相同的代码格式。"))
         event_form = QGridLayout()
         self.event_player_combo = self._seat_combo()
         self.event_action_combo = ScrollSafeComboBox()
         for value, label in ACTION_LABELS.items():
             self.event_action_combo.addItem(label, value)
-        self.event_cards_edit = QLineEdit()
+        self.event_cards_edit = LineEdit()
         self.event_cards_edit.setPlaceholderText("出牌时填写，例如：5H 6H；不出时留空")
-        self.add_event_button = QPushButton("添加事件")
-        self.remove_event_button = QPushButton("删除选中")
-        event_form.addWidget(QLabel("玩家"), 0, 0)
+        self.add_event_button = PrimaryPushButton("添加事件")
+        self.remove_event_button = PushButton("删除选中")
+        event_form.addWidget(CaptionLabel("玩家"), 0, 0)
         event_form.addWidget(self.event_player_combo, 1, 0)
-        event_form.addWidget(QLabel("动作"), 0, 1)
+        event_form.addWidget(CaptionLabel("动作"), 0, 1)
         event_form.addWidget(self.event_action_combo, 1, 1)
-        event_form.addWidget(QLabel("牌面"), 0, 2)
+        event_form.addWidget(CaptionLabel("牌面代码"), 0, 2)
         event_form.addWidget(self.event_cards_edit, 1, 2)
         event_form.addWidget(self.add_event_button, 1, 3)
         event_form.addWidget(self.remove_event_button, 1, 4)
         event_layout.addLayout(event_form)
 
-        self.event_table = QTableWidget(0, 3)
+        self.event_table = TableWidget()
+        self.event_table.setColumnCount(3)
+        self.event_table.setRowCount(0)
         self.event_table.setHorizontalHeaderLabels(("玩家", "动作", "牌面"))
         self.event_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -316,10 +359,13 @@ class SingleImageDanzeroPage(QDialog):
         self.event_table.setMinimumHeight(110)
         self.event_table.horizontalHeader().setStretchLastSection(True)
         event_layout.addWidget(self.event_table)
-        root.addWidget(event_group)
+        root.addWidget(event_card)
 
-        diagnostic_group = QGroupBox("识别与参数状态")
-        diagnostic_layout = QVBoxLayout(diagnostic_group)
+        diagnostic_card = CardWidget(content)
+        diagnostic_layout = QVBoxLayout(diagnostic_card)
+        diagnostic_layout.setContentsMargins(18, 16, 18, 16)
+        diagnostic_layout.setSpacing(8)
+        diagnostic_layout.addWidget(StrongBodyLabel("识别与参数状态"))
         self.status = CopyableLabel("请确认牌局状态")
         self.status.setWordWrap(True)
         diagnostic_layout.addWidget(self.status)
@@ -329,26 +375,28 @@ class SingleImageDanzeroPage(QDialog):
         self.state_summary.setMinimumHeight(70)
         self.state_summary.setMaximumHeight(110)
         diagnostic_layout.addWidget(self.state_summary)
-        root.addWidget(diagnostic_group)
-
         actions = QHBoxLayout()
-        self.build_button = QPushButton("构建参数")
-        self.test_button = QPushButton("测试 DanZero")
-        self.close_button = QPushButton("关闭")
+        self.build_button = PushButton("构建参数")
+        self.test_button = PrimaryPushButton("测试 DanZero")
+        self.close_button = PushButton("关闭")
         actions.addWidget(self.build_button)
         actions.addWidget(self.test_button)
         actions.addStretch(1)
         actions.addWidget(self.close_button)
-        root.addLayout(actions)
+        diagnostic_layout.addLayout(actions)
+        root.addWidget(diagnostic_card)
 
-        result_group = QGroupBox("DanZero 返回值")
-        result_layout = QVBoxLayout(result_group)
+        result_card = CardWidget(content)
+        result_layout = QVBoxLayout(result_card)
+        result_layout.setContentsMargins(18, 16, 18, 16)
+        result_layout.setSpacing(8)
+        result_layout.addWidget(StrongBodyLabel("DanZero 返回值"))
         self.result_text = CopyablePlainTextEdit()
         self.result_text.setReadOnly(True)
         self.result_text.setPlaceholderText("DanZero 返回值会显示在这里")
         self.result_text.setMinimumHeight(140)
         result_layout.addWidget(self.result_text)
-        root.addWidget(result_group)
+        root.addWidget(result_card)
 
         self._refresh_image_info()
         self._refresh_image_preview()
@@ -357,6 +405,7 @@ class SingleImageDanzeroPage(QDialog):
 
         self.add_event_button.clicked.connect(self._add_event)
         self.remove_event_button.clicked.connect(self._remove_selected_event)
+        self.copy_hand_code_button.clicked.connect(self._copy_hand_code)
         self.build_button.clicked.connect(self._build_and_report)
         self.test_button.clicked.connect(self._request_test)
         self.close_button.clicked.connect(self.close)
@@ -522,7 +571,25 @@ class SingleImageDanzeroPage(QDialog):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        if hasattr(self, "form_splitter"):
+            compact = self.width() < 1100
+            orientation = (
+                Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
+            )
+            if self.form_splitter.orientation() != orientation:
+                self.form_splitter.setOrientation(orientation)
+                self.form_splitter.setSizes(
+                    (420, 400) if compact else (500, 500)
+                )
         self._fit_image_preview()
+
+    def _copy_hand_code(self) -> None:
+        hand_code = self.my_hand_edit.text().strip()
+        if not hand_code:
+            self.status.setText("暂无可复制的手牌代码")
+            return
+        QGuiApplication.clipboard().setText(hand_code)
+        self.status.setText("DanZero 手牌代码已复制到剪贴板")
 
     @staticmethod
     def _rank_combo() -> ScrollSafeComboBox:

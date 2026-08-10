@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -33,12 +34,16 @@ class FakeRuntime(QObject):
     def __init__(self):
         super().__init__()
         self.started = None
+        self.listening_started = 0
         self.confirmed_candidate_id = None
         self.manual_action = None
         self.correction = None
 
     def recognize_initial(self):
         pass
+
+    def start_listening(self):
+        self.listening_started += 1
 
     def start_session(
         self,
@@ -98,49 +103,21 @@ def test_live_page_requires_exactly_27_cards_before_start():
     page.apply_initial_recognition(_recognition(("3S",)), None)
     app.processEvents()
 
-    assert not page.start_session_button.isEnabled()
+    assert not hasattr(page, "start_session_button")
     assert "27" in page.initialization_status.text()
     page.close()
 
 
-def test_live_page_uses_single_image_only_for_round_and_hand_not_for_lead_commitment():
+def test_live_page_starts_persistent_listener_without_manual_start_button():
     app = _app()
     runtime = FakeRuntime()
     page = LiveAssistantPage(runtime)
-    hand = tuple(
-        f"{rank}{suit}"
-        for rank in ("2", "3", "4", "5", "6", "7")
-        for suit in "SHCD"
-    ) + ("8S", "8H", "8C")
-    page.apply_initial_recognition(_recognition(hand), None)
+
+    page.recognize_initial_button.click()
     app.processEvents()
 
-    assert page.start_session_button.isEnabled()
-    page.start_session_button.click()
-
-    assert runtime.started == ("2", hand, None, "two_valid_streak")
-    page.close()
-
-
-def test_live_page_can_start_with_deferred_lead_player():
-    app = _app()
-    runtime = FakeRuntime()
-    page = LiveAssistantPage(runtime)
-    hand = tuple(
-        f"{rank}{suit}"
-        for rank in ("2", "3", "4", "5", "6", "7")
-        for suit in "SHCD"
-    ) + ("8S", "8H", "8C")
-
-    assert page.lead_player_combo.currentData() == ""
-    page.apply_initial_recognition(_recognition(hand), None)
-    page.lead_player_combo.setCurrentIndex(0)
-    app.processEvents()
-
-    assert page.start_session_button.isEnabled()
-    page.start_session_button.click()
-
-    assert runtime.started == ("2", hand, None, "two_valid_streak")
+    assert runtime.listening_started == 1
+    assert not hasattr(page, "start_session_button")
     page.close()
 
 
@@ -173,6 +150,28 @@ def test_live_page_does_not_reuse_a_stale_single_image_lead_candidate():
             my_hand=("3S",),
             diagnostics=(),
             buttons=(),
+        ),
+        None,
+    )
+    app.processEvents()
+
+    assert page.lead_player_combo.currentData() == ""
+    page.close()
+
+
+def test_live_page_does_not_show_a_lead_candidate_during_normal_double():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+
+    page.apply_initial_recognition(
+        SimpleNamespace(
+            round_level="2",
+            wild_rank="2",
+            lead_player="opposite",
+            current_player="opposite",
+            my_hand=("3S",),
+            diagnostics=(),
+            buttons=("double",),
         ),
         None,
     )
@@ -309,10 +308,105 @@ def test_live_page_timeline_is_selectable_and_distinguishes_visible_advice():
     assert page.timeline.textInteractionFlags() & Qt.TextSelectableByMouse
     assert "QC QH QS QS" not in timeline_text
     assert "2S 2H" not in timeline_text
-    assert "♣" in timeline_text
+    assert "左家出牌：Q♣ Q♥ Q♠ Q♠" in timeline_text
     assert "♥" in timeline_text
     assert "#0f766e" in timeline_html
     assert page.timeline.verticalScrollBar().value() == page.timeline.verticalScrollBar().maximum()
+    page.close()
+
+
+def test_live_page_shows_unconfirmed_pass_advice_instead_of_hiding_it():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    advice = LiveAdvice(
+        key=AdviceRequestKey("session", 5, 6),
+        status="ready",
+        visible=False,
+        advice=LocalAdvice(
+            strategy="test",
+            cards=(),
+            play_type="PASS",
+            is_pass=True,
+            state_revision=6,
+            elapsed_ms=11.0,
+            request_id="ADV-0005-0006",
+            engine_input={},
+            timings={},
+        ),
+    )
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self", trick_id=1, turn_id=5),
+            advice=advice,
+        )
+    )
+    app.processEvents()
+
+    assert "建议：不出" in page.timeline.toPlainText()
+    assert "待画面确认" in page.timeline.toPlainText()
+    assert "#b45309" in page.timeline.toHtml().lower()
+    page.close()
+
+
+def test_live_page_renders_all_action_and_outcome_events_from_one_update():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    played = _event("player_played", actor="right", payload={"cards": ["7S"]})
+    finished = _event("player_finished", actor="right", payload={"placement": "head"})
+    wind = _event(
+        "wind_caught",
+        actor="left",
+        payload={"from_player": "right", "to_player": "left"},
+    )
+    # The helper uses deliberately repeated ids; make the update mirror real
+    # state-machine output where every auxiliary event has its own id.
+    finished = replace(finished, event_id="AUX-000001")
+    wind = replace(wind, event_id="AUX-000002")
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="opposite", trick_id=1, turn_id=2),
+            event=played,
+            events=(played, finished, wind),
+        )
+    )
+    app.processEvents()
+
+    text = page.timeline.toPlainText()
+    assert "头游" in text
+    assert "接风：右家 → 左家" in text
+    assert "7S" not in text
+    page.close()
+
+
+def test_live_page_puts_played_cards_on_the_same_timeline_line():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    played = _event(
+        "player_played",
+        actor="left",
+        payload={
+            "cards": ["3H", "3S", "4D", "4S", "5?", "7H"],
+            "suit_options": [
+                ["H"], ["S"], ["D"], ["S"], ["S", "C"], ["H"],
+            ],
+        },
+    )
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="opposite", trick_id=1, turn_id=2),
+            event=played,
+        )
+    )
+    app.processEvents()
+
+    line = next(line for line in page.timeline.toPlainText().splitlines() if "左家出牌：" in line)
+    assert "3♥ 3♠ 4♦ 4♠ 5?〔♠/♣〕 7♥" in line
     page.close()
 
 
@@ -379,18 +473,26 @@ def test_live_page_clears_only_transient_timeline_when_a_new_session_starts():
             event=_event("player_played", actor="right", payload={"cards": ["9S"]}),
         )
     )
-    page.correction_cards_edit.setText("9S")
     page.error_status.setText("old error")
     app.processEvents()
     assert page.timeline.toPlainText()
 
-    page.start_session_button.click()
+    page._reset_transient_session_ui()
 
-    assert runtime.started == ("2", hand, None, "two_valid_streak")
     assert page.timeline.toPlainText() == ""
-    assert page.correction_cards_edit.text() == "9S"
     assert page.error_status.text() == "old error"
     assert page.lead_player_combo.currentData() == ""
+    page.close()
+
+
+def test_live_page_uses_compact_hand_strip_and_has_no_quick_correction_controls():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+
+    assert page.initial_hand_scroll.height() <= 52
+    assert not hasattr(page, "correct_cards_button")
+    assert not hasattr(page, "correct_pass_button")
+    assert page.timeline_title.text() == "对局动态"
     page.close()
 
 
@@ -448,7 +550,7 @@ def test_main_window_registers_live_page_in_fluent_navigation():
     window = DaguandanBridgeWindow(live_runtime=FakeRuntime())
 
     assert isinstance(window, FluentWindow)
-    assert window.capture_page.objectName() == "capturePage"
+    assert not hasattr(window, "capture_page")
     assert window.annotation_page.objectName() == "annotationPage"
     assert window.live_assistant_page.objectName() == "liveAssistantPage"
 

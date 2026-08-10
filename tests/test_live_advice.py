@@ -74,7 +74,26 @@ class FailingAdvisor:
         raise RuntimeError(f"model failed: {request_id}")
 
 
-def _build(tmp_path, advisor):
+class SuitAwareAdvisor(FakeAdvisor):
+    def recommend(self, state, *, request_id=""):
+        self.calls += 1
+        self.called.set()
+        observed = state.play_history[-1].cards
+        cards = ("2S",) if observed == ("8S",) else ("2H",)
+        return LocalAdvice(
+            strategy="suit-aware",
+            cards=cards,
+            play_type="Single",
+            is_pass=False,
+            state_revision=state.revision,
+            elapsed_ms=1.0,
+            request_id=request_id,
+            engine_input={"request_id": request_id},
+            timings={},
+        )
+
+
+def _build(tmp_path, advisor, *, on_update=None):
     store = LiveSessionStore(tmp_path / "profiles", "tencent_daguandan", session_id="advice")
     store.start(
         {
@@ -94,6 +113,7 @@ def _build(tmp_path, advisor):
         settle_ms=100,
         burst_sample_interval_ms=50,
         minimum_free_bytes=0,
+        on_update=on_update,
     )
     orchestrator.start(
         round_level="2",
@@ -120,6 +140,8 @@ def _commit_left_action(orchestrator):
                 effect_visible=False,
             ),
         )
+        if orchestrator.snapshot.current_player != "left":
+            break
 
 
 def _wait_until(predicate, timeout=2.0):
@@ -149,6 +171,25 @@ def test_advice_starts_when_reducer_predicts_self_before_timer(tmp_path):
     orchestrator.finish()
 
 
+def test_ready_advice_notifies_ui_without_waiting_for_another_capture_frame(tmp_path):
+    updates = []
+    orchestrator = _build(tmp_path, FakeAdvisor(), on_update=updates.append)
+
+    _commit_left_action(orchestrator)
+    _wait_until(
+        lambda: any(
+            update.advice is not None and update.advice.status == "ready"
+            for update in updates
+        )
+    )
+
+    latest = updates[-1]
+    assert latest.advice is not None
+    assert latest.advice.status == "ready"
+    assert latest.advice.visible is False
+    orchestrator.finish()
+
+
 def test_trusted_action_uses_live_turn_transition_and_waits_for_advice(tmp_path):
     advisor = FakeAdvisor()
     orchestrator = _build(tmp_path, advisor)
@@ -172,6 +213,33 @@ def test_trusted_action_uses_live_turn_transition_and_waits_for_advice(tmp_path)
     assert advice.status == "ready"
     assert advice.advice is not None
     assert advisor.calls == 1
+    orchestrator.finish()
+
+
+def test_advice_expands_occluded_suit_only_in_temporary_variants(tmp_path):
+    advisor = SuitAwareAdvisor()
+    orchestrator = _build(tmp_path, advisor)
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("8?",),
+        suit_options=(("S", "C"),),
+        is_pass=False,
+        monotonic_ms=100,
+    )
+
+    assert update.event is not None
+    assert update.event.payload["cards"] == ["8?"]
+    assert update.event.payload["suit_options"] == [["S", "C"]]
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advice.suit_uncertain is True
+    assert advice.variant_count == 2
+    assert advice.advice_agrees_across_variants is False
+    assert advisor.calls == 2
+    assert orchestrator.snapshot.play_history[-1].cards == ("8?",)
     orchestrator.finish()
 
 

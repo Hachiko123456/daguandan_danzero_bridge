@@ -1,1 +1,1 @@
-"""Qt application for screenshot recording only."""
+"""Qt application for the DanZero assistant and annotation tools."""

@@ -155,7 +155,7 @@ def test_trusted_truth_replay_rejects_wrong_actor(tmp_path):
         )
 
 
-def test_trusted_truth_replay_resolves_unknown_suits_only_for_advisor_input(tmp_path):
+def test_trusted_truth_replay_uses_temporary_variants_for_unknown_suits(tmp_path):
     source = tmp_path / "source-session"
     source.mkdir()
     truth = TruthLog(
@@ -177,15 +177,16 @@ def test_trusted_truth_replay_resolves_unknown_suits_only_for_advisor_input(tmp_
         advice_timeout_sec=2.0,
     )
 
-    assert result.unknown_card_resolutions == 1
-    assert advisor.calls == 1
-    state = advisor.states[0]
-    assert all("?" not in card for card in state.my_hand)
-    assert all("?" not in card for event in state.play_history for card in event.cards)
+    assert result.unknown_card_resolutions == 0
+    assert advisor.calls == 4
+    assert all(
+        all("?" not in card for card in state.my_hand)
+        and all("?" not in card for event in state.play_history for card in event.cards)
+        for state in advisor.states
+    )
     summary = json.loads(result.summary_path.read_text("utf-8"))
-    assert summary["unknown_card_resolutions"] == [
-        {"original": "8?", "resolved": "8D"}
-    ]
+    assert summary["unknown_card_resolutions"] == []
+    assert summary["unknown_card_policy"] == "temporary_suit_variants"
 
 
 def test_persisted_timeline_round_trips_into_deterministic_replay(tmp_path):

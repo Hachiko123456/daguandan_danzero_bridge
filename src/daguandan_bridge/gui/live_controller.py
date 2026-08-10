@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, Signal
 from ..annotation_service import AnnotationService
 from ..capture_service import CaptureService, FrameSnapshot
 from ..danzero import DanzeroAdvisor
+from ..danzero.state import GuanDanState, RANKS
 from ..live.orchestrator import LiveOrchestrator, LiveUpdate
 from ..live.latest_worker import LatestOnlyWorker
 from ..live.recorder import SessionRecorder
@@ -31,6 +32,8 @@ class LiveAssistantController(QObject):
     error = Signal(str)
     session_finished = Signal(object)
     danzero_warmup_status = Signal(str)
+    _waiting_recognized = Signal(object, object)
+    _waiting_capture_stopped = Signal(object)
 
     def __init__(
         self,
@@ -71,6 +74,18 @@ class LiveAssistantController(QObject):
         self._deferred_source_close = None
         self._capture_generation = 0
         self._resume_requested = False
+        self._listening_enabled = False
+        self._waiting_source = None
+        self._waiting_capture_worker: WorkerHandle | None = None
+        self._waiting_analysis_worker: LatestOnlyWorker | None = None
+        self._waiting_generation = 0
+        self._waiting_candidate: tuple[str, tuple[str, ...]] | None = None
+        self._pending_auto_session: tuple[str, tuple[str, ...]] | None = None
+        self._recognition_strategy = "two_valid_streak"
+        self._auto_finish_requested = False
+        self._waiting_recognized.connect(self._consume_waiting_recognition)
+        self._waiting_capture_stopped.connect(self._waiting_capture_finished)
+        self.update_ready.connect(self._auto_finish_on_game_end)
 
     @property
     def is_running(self) -> bool:
@@ -92,6 +107,155 @@ class LiveAssistantController(QObject):
         thread.finished.connect(self._initial_finished)
         self._initial_thread = thread
         thread.start()
+
+    def set_recognition_strategy(self, strategy: str) -> None:
+        """Use the selected live recognition strategy for future auto sessions."""
+
+        self._recognition_strategy = str(strategy)
+
+    def start_listening(self) -> None:
+        """Continuously inspect the current page and start only on a stable deal."""
+
+        self._listening_enabled = True
+        self._start_danzero_warmup()
+        if self.orchestrator is None and self._finish_thread is None:
+            self._start_waiting_workers()
+
+    def stop_listening(self) -> None:
+        self._listening_enabled = False
+        self._waiting_candidate = None
+        self._pending_auto_session = None
+        self._stop_waiting_workers()
+
+    def _start_waiting_workers(self) -> None:
+        if (
+            not self._listening_enabled
+            or self.orchestrator is not None
+            or self._waiting_capture_worker is not None
+        ):
+            return
+        try:
+            source = self.capture_service.open_live_source(self.profile_name)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        self._waiting_source = source
+        generation = self._waiting_generation
+        analysis = LatestOnlyWorker(
+            self._recognize_waiting_frame,
+            on_result=lambda value: self._waiting_recognized.emit(value[0], value[1]),
+            on_error=lambda exc: self.error.emit(str(exc)),
+        )
+        self._waiting_analysis_worker = analysis
+        analysis.start()
+
+        def operation() -> FrameSnapshot:
+            snapshot: FrameSnapshot = source.capture()
+            if generation != self._waiting_generation:
+                return snapshot
+            active_analysis = self._waiting_analysis_worker
+            if active_analysis is not None:
+                active_analysis.submit(snapshot)
+            return snapshot
+
+        worker = WorkerHandle(operation, 0.2)
+        worker.frame_ready.connect(self._accept_waiting_frame)
+        worker.error.connect(self._accept_waiting_error)
+        worker.finished.connect(lambda: self._waiting_capture_stopped.emit(worker))
+        self._waiting_capture_worker = worker
+        worker.start()
+
+    def _recognize_waiting_frame(
+        self,
+        snapshot: FrameSnapshot,
+    ) -> tuple[object, FrameSnapshot]:
+        return self.recognition_service.recognize(snapshot.image), snapshot
+
+    def _accept_waiting_frame(self, snapshot: object) -> None:
+        self.frame_ready.emit(snapshot)
+
+    def _accept_waiting_error(self, message: str) -> None:
+        self.error.emit(message)
+
+    def _consume_waiting_recognition(self, result: object, snapshot: object) -> None:
+        """Require two identical normalized 27-card results before starting."""
+
+        self.initial_recognized.emit(result, snapshot)
+        if not self._listening_enabled or self.orchestrator is not None:
+            return
+        hand = tuple(str(card) for card in getattr(result, "my_hand", ()))
+        round_level = str(getattr(result, "round_level", ""))
+        if round_level not in RANKS or len(hand) != 27:
+            self._waiting_candidate = None
+            return
+        try:
+            normalizer = GuanDanState()
+            normalizer.confirm_hand(hand)
+        except Exception:
+            self._waiting_candidate = None
+            return
+        candidate = (round_level, normalizer.my_hand)
+        if candidate != self._waiting_candidate:
+            self._waiting_candidate = candidate
+            return
+        self._waiting_candidate = None
+        self._start_detected_session(result)
+
+    def _start_detected_session(self, result: object) -> None:
+        self._pending_auto_session = (
+            str(getattr(result, "round_level")),
+            tuple(str(card) for card in getattr(result, "my_hand", ())),
+        )
+        if self._stop_waiting_workers():
+            self._start_pending_auto_session()
+
+    def _start_pending_auto_session(self) -> None:
+        pending, self._pending_auto_session = self._pending_auto_session, None
+        if (
+            pending is None
+            or not self._listening_enabled
+            or self.orchestrator is not None
+        ):
+            return
+        round_level, hand = pending
+        if not self.start_session(
+            round_level=round_level,
+            hand=hand,
+            lead_player=None,
+            recognition_strategy=self._recognition_strategy,
+        ):
+            self._start_waiting_workers()
+
+    def _stop_waiting_workers(self) -> bool:
+        worker = self._waiting_capture_worker
+        self._waiting_generation += 1
+        self._stop_waiting_analysis_worker()
+        if worker is None:
+            self._close_waiting_source()
+            return True
+        worker.stop()
+        stopped = worker.wait(0)
+        if stopped:
+            self._waiting_capture_worker = None
+            self._close_waiting_source()
+        return stopped
+
+    def _stop_waiting_analysis_worker(self) -> None:
+        worker, self._waiting_analysis_worker = self._waiting_analysis_worker, None
+        if worker is not None:
+            worker.stop(timeout=0.0)
+
+    def _close_waiting_source(self) -> None:
+        source, self._waiting_source = self._waiting_source, None
+        if source is not None:
+            source.close()
+
+    def _waiting_capture_finished(self, worker: WorkerHandle) -> None:
+        if self._waiting_capture_worker is worker:
+            self._waiting_capture_worker = None
+        self._close_waiting_source()
+        if self._pending_auto_session is not None:
+            self._start_pending_auto_session()
 
     def _initial_result(self, value: object) -> None:
         result, snapshot = value  # type: ignore[misc]
@@ -178,6 +342,7 @@ class LiveAssistantController(QObject):
                 recognition_service=self.recognition_service,
                 advisor=self.danzero_advisor,
                 recognition_strategy=recognition_strategy,
+                on_update=self.update_ready.emit,
             )
             source = self.capture_service.open_live_source(self.profile_name)
             started_ms = monotonic_ns() // 1_000_000
@@ -205,6 +370,7 @@ class LiveAssistantController(QObject):
             return False
         self.orchestrator = orchestrator
         self._live_source = source
+        self._auto_finish_requested = False
         self.update_ready.emit(update)
         self._start_analysis_worker()
         self._start_capture_worker()
@@ -393,6 +559,24 @@ class LiveAssistantController(QObject):
 
     def _finish_thread_finished(self) -> None:
         self._finish_thread = None
+        self._auto_finish_requested = False
+        if self._listening_enabled and self.orchestrator is None:
+            self._start_waiting_workers()
+
+    def _auto_finish_on_game_end(self, update: object) -> None:
+        event = getattr(update, "event", None)
+        events = tuple(getattr(update, "events", ()) or ())
+        game_end_detected = getattr(event, "event_type", None) == "game_end_detected" or any(
+            getattr(item, "event_type", None) == "game_end_detected"
+            for item in events
+        )
+        if (
+            not game_end_detected
+            or self._auto_finish_requested
+        ):
+            return
+        self._auto_finish_requested = True
+        self.finish()
 
     def _stop_capture_worker(self) -> bool:
         worker = self._capture_worker
@@ -411,12 +595,21 @@ class LiveAssistantController(QObject):
             worker.stop(timeout=0.0)
 
     def shutdown(self) -> None:
+        self.stop_listening()
         self.finish()
         if self._finish_thread is not None and self._finish_thread.isRunning():
             self._finish_thread.wait(30_000)
         if self._capture_worker is not None and self._capture_worker.is_running:
             self._capture_worker.stop()
             self._capture_worker.wait(10_000)
+        if (
+            self._waiting_capture_worker is not None
+            and self._waiting_capture_worker.is_running
+        ):
+            self._waiting_capture_worker.stop()
+            self._waiting_capture_worker.wait(10_000)
+            self._waiting_capture_worker = None
+            self._close_waiting_source()
         if self._initial_thread is not None and self._initial_thread.isRunning():
             self._initial_thread.wait(10_000)
         if (

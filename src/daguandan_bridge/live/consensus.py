@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from typing import Iterable, Literal
 
 from ..danzero.rules import action_for_cards, play_beats_table
+from .card_uncertainty import (
+    feasible_action_variants,
+    feasible_self_hand_variants,
+    historical_suit_constraints_relaxed,
+    is_unknown_suit_card,
+    normalized_suit_options,
+)
 
 
 ConsensusStatus = Literal["confirmed", "needs_confirmation", "review_required"]
@@ -17,6 +24,9 @@ class RecognitionSample:
     confidence: float
     source: str
     evidence_ref: str = ""
+    # Candidate suits are aligned with ``cards``.  Exact cards use one suit;
+    # rank-only cards preserve a colour-constrained candidate set.
+    suit_options: tuple[tuple[str, ...], ...] = ()
     # Kept as a compatibility field for old logs.  It is no longer used to
     # confirm or reject an action.
     post_hand: tuple[str, ...] = ()
@@ -32,6 +42,8 @@ class ConsensusContext:
     # Known physical cards include the current self hand plus every confirmed
     # non-pass action.  Opponents' hidden hands intentionally stay unknown.
     known_cards: tuple[str, ...] = ()
+    known_suit_options: tuple[tuple[str, ...], ...] = ()
+    table_suit_options: tuple[tuple[str, ...], ...] = ()
     # A self action is selected from ``known_hand``.  Its cards must therefore
     # not be added a second time when checking the global double-deck bound.
     candidate_already_known: bool = False
@@ -60,8 +72,15 @@ class ConsensusResult:
     source: str
     vote_count: int
     candidates: tuple[ConsensusCandidate, ...]
+    # ``cards`` keeps the normalized visual evidence.  A self action with an
+    # unknown suit also carries the exact physical cards to remove from the
+    # confirmed hand when it is committed.
+    resolved_cards: tuple[str, ...] = ()
     rejected_reasons: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
+    suit_options: tuple[tuple[str, ...], ...] = ()
+    # Audit-only warnings which never alter canonical cards or turn flow.
+    integrity_warnings: tuple[str, ...] = ()
 
 
 class BurstConsensus:
@@ -85,13 +104,35 @@ class BurstConsensus:
         grouped: dict[tuple[bool, tuple[str, ...]], list[RecognitionSample]] = defaultdict(list)
         for sample in items:
             is_pass = bool(sample.is_pass)
-            cards = () if is_pass else tuple(sorted(str(card) for card in sample.cards))
-            grouped[(is_pass, cards)].append(sample)
+            cards, suit_options = canonical_candidate(
+                sample.cards,
+                sample.suit_options,
+                is_pass=is_pass,
+            )
+            grouped[(is_pass, cards)].append(
+                RecognitionSample(
+                    cards=cards,
+                    is_pass=is_pass,
+                    confidence=sample.confidence,
+                    source=sample.source,
+                    evidence_ref=sample.evidence_ref,
+                    suit_options=suit_options,
+                    post_hand=sample.post_hand,
+                )
+            )
 
         candidates: list[ConsensusCandidate] = []
         evidence_by_key: dict[tuple[bool, tuple[str, ...]], tuple[str, ...]] = {}
+        suit_options_by_key: dict[tuple[bool, tuple[str, ...]], tuple[tuple[str, ...], ...]] = {}
+        resolved_by_key: dict[tuple[bool, tuple[str, ...]], tuple[str, ...]] = {}
+        warnings_by_key: dict[tuple[bool, tuple[str, ...]], tuple[str, ...]] = {}
         for (is_pass, cards), votes in grouped.items():
-            rejected_reason = self.validate_candidate(is_pass, cards, context)
+            rejected_reason = self.validate_candidate(
+                is_pass,
+                cards,
+                context,
+                suit_options=votes[-1].suit_options,
+            )
             candidates.append(
                 ConsensusCandidate(
                     cards=cards,
@@ -106,6 +147,20 @@ class BurstConsensus:
             evidence_by_key[(is_pass, cards)] = tuple(
                 item.evidence_ref for item in votes if item.evidence_ref
             )
+            suit_options_by_key[(is_pass, cards)] = votes[-1].suit_options
+            if not rejected_reason:
+                resolved_by_key[(is_pass, cards)] = self.resolve_commit_cards(
+                    is_pass,
+                    cards,
+                    context,
+                    suit_options=votes[-1].suit_options,
+                )
+                warnings_by_key[(is_pass, cards)] = self.integrity_warnings(
+                    is_pass,
+                    cards,
+                    context,
+                    suit_options=votes[-1].suit_options,
+                )
         candidates.sort(
             key=lambda item: (item.votes, item.mean_confidence), reverse=True
         )
@@ -128,9 +183,16 @@ class BurstConsensus:
                 confidence=winner.mean_confidence,
                 source="multi_frame_consensus",
                 vote_count=winner.votes,
+                resolved_cards=resolved_by_key.get(
+                    (winner.is_pass, winner.cards), winner.cards
+                ),
                 candidates=tuple(candidates),
                 rejected_reasons=rejected,
                 evidence_refs=evidence_by_key[(winner.is_pass, winner.cards)],
+                suit_options=suit_options_by_key[(winner.is_pass, winner.cards)],
+                integrity_warnings=warnings_by_key.get(
+                    (winner.is_pass, winner.cards), ()
+                ),
             )
         reasons = list(rejected)
         reasons.append("candidate_conflict" if len(accepted) > 1 else "insufficient_consensus")
@@ -141,6 +203,8 @@ class BurstConsensus:
         is_pass: bool,
         cards: tuple[str, ...],
         context: ConsensusContext,
+        *,
+        suit_options: tuple[tuple[str, ...], ...] = (),
     ) -> str:
         if is_pass:
             return "" if context.allow_pass else "pass_not_allowed"
@@ -148,31 +212,121 @@ class BurstConsensus:
             return "empty_play"
         if len(cards) > context.remaining_cards:
             return "exceeds_remaining_cards"
-        if any(count > 2 for count in Counter(cards).values()):
+        if any(
+            count > 2
+            for card, count in Counter(cards).items()
+            if not is_unknown_suit_card(card)
+        ):
             return "exceeds_double_deck_limit"
-        known_counts = Counter(context.known_cards)
-        if not context.candidate_already_known:
-            known_counts.update(cards)
-        if any(count > 2 for count in known_counts.values()):
+        variants = feasible_action_variants(
+            cards=cards,
+            suit_options=suit_options,
+            known_cards=context.known_cards,
+            known_suit_options=context.known_suit_options,
+            candidate_already_known=context.candidate_already_known,
+        )
+        if not variants:
             return "exceeds_double_deck_limit"
-        if context.known_hand and Counter(cards) - Counter(context.known_hand):
-            return "cards_not_in_known_hand"
+        if context.known_hand:
+            # ``A?`` is visual evidence, not a physical card code.  Resolve
+            # it against the confirmed self hand before applying membership
+            # and rule checks; a raw Counter comparison would reject every
+            # legitimate unknown-suit self card.
+            variants = feasible_self_hand_variants(
+                cards=cards,
+                suit_options=suit_options,
+                known_hand=context.known_hand,
+            )
+            if not variants:
+                return "cards_not_in_known_hand"
         if not context.validate_rules:
             return ""
         try:
-            if action_for_cards(cards, context.level_rank) is None:
+            legal_variants = [
+                variant
+                for variant in variants
+                if action_for_cards(variant, context.level_rank) is not None
+            ]
+            if not legal_variants:
                 return "illegal_pattern"
-            if context.table_cards and not play_beats_table(
-                cards,
-                context.table_cards,
-                context.level_rank,
+            # A previous table play with an obscured suit must not stop the
+            # live flow.  Its exact suit remains explicit in history and the
+            # advisor will evaluate every concrete branch later.
+            if context.table_cards and not any(
+                is_unknown_suit_card(card) for card in context.table_cards
+            ) and not any(
+                play_beats_table(
+                    variant,
+                    context.table_cards,
+                    context.level_rank,
+                )
+                for variant in legal_variants
             ):
                 return "does_not_beat_table"
         except (ImportError, ModuleNotFoundError, ValueError):
             return "illegal_pattern"
         return ""
 
+    @staticmethod
+    def resolve_commit_cards(
+        is_pass: bool,
+        cards: tuple[str, ...],
+        context: ConsensusContext,
+        *,
+        suit_options: tuple[tuple[str, ...], ...] = (),
+    ) -> tuple[str, ...]:
+        """Return the concrete self-hand variant that will reach reducer."""
+
+        if is_pass or not context.known_hand:
+            return cards
+        variants = feasible_self_hand_variants(
+            cards=cards,
+            suit_options=suit_options,
+            known_hand=context.known_hand,
+        )
+        for variant in variants:
+            try:
+                if action_for_cards(variant, context.level_rank) is None:
+                    continue
+                if context.table_cards and not any(
+                    is_unknown_suit_card(card) for card in context.table_cards
+                ) and not play_beats_table(
+                    variant,
+                    context.table_cards,
+                    context.level_rank,
+                ):
+                    continue
+            except (ImportError, ModuleNotFoundError, ValueError):
+                continue
+            return variant
+        # ``validate_candidate`` has already established that at least one
+        # concrete variant is legal.  Keep this defensive fallback for callers
+        # that use the public helper directly.
+        return variants[0] if variants else cards
+
     _validate_candidate = validate_candidate
+
+    @staticmethod
+    def integrity_warnings(
+        is_pass: bool,
+        cards: tuple[str, ...],
+        context: ConsensusContext,
+        *,
+        suit_options: tuple[tuple[str, ...], ...] = (),
+    ) -> tuple[str, ...]:
+        """Return audit warnings for a candidate that has already validated."""
+
+        if is_pass:
+            return ()
+        if historical_suit_constraints_relaxed(
+            cards=cards,
+            suit_options=suit_options,
+            known_cards=context.known_cards,
+            known_suit_options=context.known_suit_options,
+            candidate_already_known=context.candidate_already_known,
+        ):
+            return ("historical_suit_constraints_relaxed",)
+        return ()
 
     @staticmethod
     def _review(
@@ -190,3 +344,22 @@ class BurstConsensus:
             candidates=candidates,
             rejected_reasons=reasons,
         )
+
+
+def canonical_candidate(
+    cards: Iterable[str],
+    suit_options: Iterable[Iterable[str]] = (),
+    *,
+    is_pass: bool = False,
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Sort cards and their suit metadata as inseparable pairs."""
+
+    if is_pass:
+        return (), ()
+    values = tuple(str(card) for card in cards)
+    options = normalized_suit_options(values, suit_options)
+    pairs = sorted(zip(values, options), key=lambda item: item[0])
+    return (
+        tuple(card for card, _options in pairs),
+        tuple(options for _card, options in pairs),
+    )

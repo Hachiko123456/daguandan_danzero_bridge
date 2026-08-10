@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -80,6 +81,7 @@ def _orchestrator(
     *,
     recognition=None,
     lead_player="right",
+    round_level="2",
     settle_ms=100,
     **options,
 ):
@@ -106,7 +108,7 @@ def _orchestrator(
         **options,
     )
     orchestrator.start(
-        round_level="2",
+        round_level=round_level,
         hand=HAND,
         lead_player=lead_player,
         monotonic_ms=0,
@@ -524,6 +526,89 @@ def test_uncertain_action_retries_without_pausing_reducer(tmp_path):
     orchestrator.finish()
 
 
+def test_continue_game_control_emits_one_game_end_event(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S")])
+
+    first = orchestrator.ingest_fast_signal(
+        active_player="right",
+        game_end_control="continue_game",
+    )
+    second = orchestrator.ingest_fast_signal(
+        active_player="right",
+        game_end_control="continue_game",
+    )
+
+    assert first.event is not None
+    assert first.event.event_type == "game_end_detected"
+    assert first.event.payload["control"] == "continue_game"
+    assert second.event is None
+    orchestrator.finish()
+
+
+def test_finished_player_and_wind_catch_are_emitted_to_the_timeline(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S")])
+    before = replace(
+        orchestrator.snapshot,
+        remaining_cards={"self": 27, "left": 27, "opposite": 27, "right": 1},
+        lead_player="right",
+        trick_id=1,
+        finished_seats=frozenset(),
+    )
+    after_finish = replace(
+        before,
+        remaining_cards={"self": 27, "left": 27, "opposite": 27, "right": 0},
+        finished_seats=frozenset({"right"}),
+    )
+    finished = orchestrator._append_action_outcomes(before, after_finish)
+    assert any(
+        event.event_type == "player_finished"
+        and event.payload["placement"] == "head"
+        and event.actor == "right"
+        for event in finished
+    )
+    after_wind = replace(
+        after_finish,
+        lead_player="left",
+        trick_id=2,
+    )
+    latest = orchestrator._append_action_outcomes(after_finish, after_wind)
+    assert any(
+        event.event_type == "wind_caught"
+        and event.payload == {"from_player": "right", "to_player": "left"}
+        for event in latest
+    )
+    orchestrator.finish()
+
+
+def test_live_consensus_keeps_a_rank_when_its_suit_is_occluded(tmp_path):
+    obscured = PlayRegionResult(
+        player="right",
+        cards=("3H", "3S", "4D", "4S", "5?", "7H"),
+        suit_options=(("H",), ("S",), ("D",), ("S",), ("H", "D"), ("H",)),
+        is_pass=False,
+        confidence=0.94,
+        diagnostics=("5 花色被遮挡，按未知花色保留",),
+        annotations=(),
+        source="fake:occluded-suit",
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [obscured] * 8,
+        round_level="7",
+        recognition_strategy="two_valid_streak",
+    )
+
+    _feed_visible_action(orchestrator)
+
+    event = next(
+        event for event in orchestrator.events if event.event_type == "player_played"
+    )
+    assert event.payload["cards"] == ["3H", "3S", "4D", "4S", "5?", "7H"]
+    assert event.payload["suit_options"][4] == ["H", "D"]
+    assert orchestrator.snapshot.remaining_cards["right"] == 21
+    orchestrator.finish()
+
+
 def test_pass_marker_commits_for_current_player_without_clear_gate(tmp_path):
     recognition = FakeRecognitionService(
         [_play("7S") for _ in range(2)] + [_pass("opposite") for _ in range(5)]
@@ -720,7 +805,9 @@ def test_pause_does_not_wait_for_slow_vision_and_stale_analysis_is_discarded(tmp
     paused = orchestrator.pause()
     elapsed = time.perf_counter() - started_at
     assert paused.status == "paused"
-    assert elapsed < 0.2
+    # The recognizer is blocked for two seconds.  Keep a generous scheduler
+    # margin while still proving pause does not wait for vision/that timeout.
+    assert elapsed < 0.5
     release.set()
     analysis.join(2)
 
@@ -1028,10 +1115,17 @@ class FakeDeferredLeadPlayRecognitionService(FakeLeadRecognitionService):
 
 
 class FakeSelfLeadRecognitionService(FakeLeadRecognitionService):
-    def __init__(self, *, cards: tuple[str, ...], post_hand: tuple[str, ...] | None = None):
+    def __init__(
+        self,
+        *,
+        cards: tuple[str, ...],
+        post_hand: tuple[str, ...] | None = None,
+        suit_options: tuple[tuple[str, ...], ...] = (),
+    ):
         super().__init__(lead_seat="self")
         self.cards = cards
         self.post_hand = post_hand
+        self.suit_options = suit_options
         self.controls_visible = True
         self.targeted_calls = 0
 
@@ -1063,6 +1157,7 @@ class FakeSelfLeadRecognitionService(FakeLeadRecognitionService):
             source="fake_self_lead_play",
             post_hand=post_hand,
             post_hand_confidence=0.95,
+            suit_options=self.suit_options,
         )
 
 
@@ -1195,6 +1290,39 @@ def test_self_play_commits_when_post_hand_template_is_wrong(tmp_path):
         "self_hand_delta_unverified" in str(event.payload)
         for event in orchestrator.events
     )
+    orchestrator.finish()
+
+
+def test_unknown_suit_self_play_advances_with_a_hand_constrained_card(tmp_path):
+    recognition = FakeSelfLeadRecognitionService(
+        cards=("7?",),
+        suit_options=(("S", "C"),),
+    )
+    orchestrator, _update = _lead_orchestrator(tmp_path, recognition)
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    for timestamp in (100, 200, 300):
+        orchestrator.ingest_frame(frame, monotonic_ms=timestamp, wall_time=f"lead-{timestamp}")
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=400,
+        wall_time="controls-visible",
+        metrics=ZoneFrameMetrics(400, True, 0.2, False, False),
+    )
+    recognition.controls_visible = False
+    for timestamp in (500, 600, 700, 800, 900, 1000, 1100, 1200):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"unknown-suit-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.001, False, False),
+        )
+
+    event = next(event for event in orchestrator.events if event.event_type == "player_played")
+    assert event.actor == "self"
+    assert event.payload["cards"] == ["7S"]
+    assert orchestrator.snapshot.current_player == "right"
+    assert "7S" not in orchestrator.snapshot.my_hand
     orchestrator.finish()
 
 

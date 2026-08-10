@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from .models import LiveEvent
-from .truth_log import card_code_to_text
 
 
 _SEAT_LABELS = {
@@ -36,6 +35,18 @@ _REASON_LABELS = {
     "insufficient_consensus": "多帧结果不一致",
     "lead_player_timeout": "等待首出标志超时",
     "pass_not_allowed": "首出不能不出",
+}
+_PLACEMENT_LABELS = {
+    "head": "头游",
+    "second": "二游",
+    "third": "三游",
+    "last": "末游",
+}
+_SUIT_GLYPHS = {
+    "S": "♠",
+    "H": "♥",
+    "C": "♣",
+    "D": "♦",
 }
 
 
@@ -71,8 +82,10 @@ def reasons_text(value: object | None) -> str:
 
 def event_action_text(event: LiveEvent) -> str:
     seat = seat_text(event.actor, unknown="系统")
-    cards = "、".join(
-        card_code_to_text(str(card)) for card in event.payload.get("cards", ())
+    raw_cards = tuple(str(card) for card in event.payload.get("cards", ()))
+    cards = compact_cards_text(
+        raw_cards,
+        event.payload.get("suit_options", ()),
     )
     if event.event_type == "waiting_for_lead":
         return "等待加倍结束与首出标志"
@@ -90,6 +103,22 @@ def event_action_text(event: LiveEvent) -> str:
         return f"{seat}出牌：{cards or '未识别到牌面'}"
     if event.event_type == "player_passed":
         return f"{seat}不出"
+    if event.event_type == "player_finished":
+        placement = _PLACEMENT_LABELS.get(
+            str(event.payload.get("placement", "")),
+            "出完牌",
+        )
+        return f"{seat}出完牌：{placement}"
+    if event.event_type == "wind_caught":
+        from_player = seat_text(event.payload.get("from_player"))
+        to_player = seat_text(event.payload.get("to_player"))
+        return f"接风：{from_player} → {to_player}"
+    if event.event_type == "game_end_detected":
+        control = {
+            "continue_game": "再来一局",
+            "change_table": "换桌",
+        }.get(str(event.payload.get("control", "")), "结算界面")
+        return f"检测到{control}，正在自动结束并封存本局"
     if event.event_type == "review_required":
         return f"识别暂停，请确认{seat}动作：{reasons_text(event.payload.get('reason'))}"
     if event.event_type == "recognition_retry":
@@ -106,6 +135,47 @@ def event_action_text(event: LiveEvent) -> str:
     if event.event_type == "event_correction":
         return "已更正最近一条动作记录"
     return f"其他事件（内部码：{event.event_type}）"
+
+
+def compact_cards_text(
+    cards: object,
+    suit_options: object = (),
+) -> str:
+    """Format visible card faces as one readable, single-line token.
+
+    The timeline must not throw away physical suit information just to be
+    compact.  An occluded suit remains an explicit ``?〔候选〕`` on that one
+    card instead of making an entire action look uncertain.
+    """
+
+    values: list[str] = []
+    raw_cards = cards if isinstance(cards, Iterable) and not isinstance(cards, str) else ()
+    card_values = tuple(str(raw) for raw in raw_cards)
+    raw_options = (
+        tuple(tuple(str(suit) for suit in choices) for choices in suit_options)
+        if isinstance(suit_options, Iterable) and not isinstance(suit_options, str)
+        else ()
+    )
+    for index, card in enumerate(card_values):
+        if card == "small_joker":
+            values.append("小王")
+        elif card == "big_joker":
+            values.append("大王")
+        elif card.endswith("?"):
+            candidates = tuple(
+                dict.fromkeys(
+                    _SUIT_GLYPHS[suit]
+                    for suit in raw_options[index] if index < len(raw_options)
+                    if suit in _SUIT_GLYPHS
+                )
+            )
+            suffix = f"〔{'/'.join(candidates)}〕" if candidates else ""
+            values.append(f"{card}{suffix}")
+        elif len(card) >= 2 and card[-1] in _SUIT_GLYPHS:
+            values.append(f"{card[:-1]}{_SUIT_GLYPHS[card[-1]]}")
+        else:
+            values.append(card)
+    return " ".join(values)
 
 
 def event_prefix(event: LiveEvent) -> str:

@@ -9,7 +9,6 @@
     720
   ],
   "auto_capture_interval_sec": 5.0,
-  "recording_interval_sec": 1.5,
   "schema_version": 2,
   "aspect_ratio_tolerance": 0.03,
   "capture_backend": "gdi_screen",

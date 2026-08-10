@@ -39,11 +39,14 @@ class ScriptedRecognition:
 
     def recognize_play_region(self, _image, seat, *, wild_rank):
         del wild_rank
+        while self.actions and self.actions[0]["player"] != seat:
+            # The state machine owns commitment timing.  This fixture keeps a
+            # visible action available through effects/retries and advances
+            # only when turn ownership has actually changed.
+            self.actions.pop(0)
         action = self.actions[0]
         assert action["player"] == seat
         self.sample_counts[seat] = self.sample_counts.get(seat, 0) + 1
-        if self.sample_counts[seat] == 3:
-            self.actions.pop(0)
         return PlayRegionResult(
             player=seat,
             cards=tuple(action["cards"]),
@@ -157,9 +160,12 @@ def test_golden_session_produces_exact_events_advice_and_replay_data(tmp_path):
     feed(occupied=False)              # clear old left-zone residue
     feed(occupied=True, motion=0.2)   # animation starts
     feed(occupied=True)               # false settle begins
-    feed(occupied=True, effect=True)  # effect is ignored by the minimal gate
+    feed(occupied=True, effect=True)  # effect invalidates the premature burst
     assert recognition.sample_counts.get("left", 0) >= 1
-    feed(occupied=True)               # continue the same settle/read window
+    feed(occupied=True)               # effect cool-down
+    feed(occupied=True)               # effect cool-down
+    feed(occupied=True)               # effect cool-down
+    feed(occupied=True)               # effect cool-down completes
     feed(occupied=True)               # burst sample 1
     feed(occupied=True)               # burst sample 2
     feed(occupied=True)               # burst sample 3 / commit
@@ -189,7 +195,7 @@ def test_golden_session_produces_exact_events_advice_and_replay_data(tmp_path):
     assert runner.metrics.advice_visible_latency_ms <= 3_000
     assert len(read_json_lines(store.advice_path)) >= 2
     timeline = store.timeline_markdown_path.read_text("utf-8")
-    assert "右家出牌：7H 7S" in timeline
+    assert "右家出牌：7♥ 7♠" in timeline
     assert "对家不出" in timeline
     assert "DanZero 建议已就绪" in timeline
 

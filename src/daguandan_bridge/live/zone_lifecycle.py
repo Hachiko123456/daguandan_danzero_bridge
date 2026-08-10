@@ -43,6 +43,11 @@ class ZoneLifecycle:
     """
 
     _ACTION_START_MOTION = 0.060
+    # The recommended two-valid-streak strategy normally starts immediately.
+    # After a *confirmed* card-type animation it still needs a short quiet
+    # window; otherwise the first disappearing effect frame is mistaken for a
+    # playable card crop.
+    _EFFECT_SETTLE_MS = 450
 
     def __init__(
         self,
@@ -63,6 +68,7 @@ class ZoneLifecycle:
         self.action_timeout_ms = int(action_timeout_ms)
         self._settle_started_ms: int | None = None
         self._stable_since_ms: int | None = None
+        self._effect_last_seen_ms: int | None = None
 
     def observe(self, metrics: ZoneFrameMetrics) -> ZoneDecision:
         now = int(metrics.monotonic_ms)
@@ -103,9 +109,12 @@ class ZoneLifecycle:
             if self._settle_started_ms is None:
                 self._settle_started_ms = now
             if metrics.effect_visible:
+                self._effect_last_seen_ms = now
                 self._settle_started_ms = now
                 self._stable_since_ms = now
                 return ZoneDecision(self.phase, reason="effect_visible")
+            if self._effect_is_settling(now):
+                return ZoneDecision(self.phase, reason="effect_settling")
             if metrics.content_changed or metrics.motion_score >= self._ACTION_START_MOTION:
                 self._stable_since_ms = now
             if self._stable_since_ms is None:
@@ -134,6 +143,7 @@ class ZoneLifecycle:
                 )
             if metrics.effect_visible:
                 self.phase = ZonePhase.SETTLING
+                self._effect_last_seen_ms = now
                 self._settle_started_ms = now
                 self._stable_since_ms = now
                 return ZoneDecision(
@@ -144,3 +154,9 @@ class ZoneLifecycle:
             return ZoneDecision(self.phase, collect_sample=True)
 
         return ZoneDecision(self.phase)
+
+    def _effect_is_settling(self, now: int) -> bool:
+        if self._effect_last_seen_ms is None:
+            return False
+        required = max(self.settle_ms, self._EFFECT_SETTLE_MS)
+        return now - self._effect_last_seen_ms < required

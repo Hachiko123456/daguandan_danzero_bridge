@@ -10,6 +10,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.gui.live_controller import LiveAssistantController
+from daguandan_bridge.live.models import LiveEvent
+from daguandan_bridge.live.orchestrator import LiveUpdate
 
 
 def _app():
@@ -162,3 +164,131 @@ def test_controller_warms_one_reusable_danzero_advisor_in_background(tmp_path):
     assert advisor.initialize_calls == 1
     assert statuses[0] == "DanZero 模型预热中"
     assert statuses[-1].startswith("DanZero 模型已就绪")
+
+
+def _initial_recognition(hand, *, round_level="2"):
+    return SimpleNamespace(my_hand=hand, round_level=round_level)
+
+
+def test_listener_starts_session_after_two_identical_complete_hands(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    hand = tuple(f"{rank}{suit}" for rank in ("3", "4", "5", "6", "7", "8", "9") for suit in "SHCD")[:27]
+    started = []
+    controller._listening_enabled = True
+    monkeypatch.setattr(
+        controller,
+        "_start_detected_session",
+        lambda result: started.append((result.round_level, result.my_hand)),
+    )
+
+    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+
+    assert started == [("2", hand)]
+
+
+def test_listener_does_not_start_session_when_complete_hand_changes(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    first = tuple(f"{rank}{suit}" for rank in ("3", "4", "5", "6", "7", "8", "9") for suit in "SHCD")[:27]
+    second = first[:-1] + ("10S",)
+    started = []
+    controller._listening_enabled = True
+    monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
+
+    controller._consume_waiting_recognition(_initial_recognition(first), None)
+    controller._consume_waiting_recognition(_initial_recognition(second), None)
+
+    assert started == []
+
+
+def test_listener_treats_different_recognition_order_as_the_same_hand(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    first = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    started = []
+    controller._listening_enabled = True
+    monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
+
+    controller._consume_waiting_recognition(_initial_recognition(first), None)
+    controller._consume_waiting_recognition(_initial_recognition(tuple(reversed(first))), None)
+
+    assert len(started) == 1
+
+
+def test_controller_auto_finishes_once_when_game_end_is_detected(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    calls = []
+    monkeypatch.setattr(controller, "finish", lambda: calls.append("finish"))
+    event = LiveEvent(
+        event_id="AUX-000001",
+        event_type="game_end_detected",
+        session_id="session",
+        seq=1,
+        monotonic_ms=0,
+        wall_time="2026-08-09T00:00:00+08:00",
+        trick_id=1,
+        turn_id=1,
+        actor=None,
+        payload={"control": "continue_game"},
+        confidence=1.0,
+        source="test",
+        state_revision_before=1,
+        state_revision_after=1,
+    )
+    update = LiveUpdate(status="running", snapshot=SimpleNamespace(), event=event)
+
+    controller._auto_finish_on_game_end(update)
+    controller._auto_finish_on_game_end(update)
+
+    assert calls == ["finish"]
+
+
+def test_controller_auto_finishes_when_terminal_event_is_in_update_events(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    calls = []
+    monkeypatch.setattr(controller, "finish", lambda: calls.append("finish"))
+    event = LiveEvent(
+        event_id="AUX-000001",
+        event_type="game_end_detected",
+        session_id="session",
+        seq=1,
+        monotonic_ms=0,
+        wall_time="2026-08-09T00:00:00+08:00",
+        trick_id=1,
+        turn_id=1,
+        actor=None,
+        payload={"control": "change_table"},
+        confidence=1.0,
+        source="test",
+        state_revision_before=1,
+        state_revision_after=1,
+    )
+    update = LiveUpdate(
+        status="running",
+        snapshot=SimpleNamespace(),
+        events=(event,),
+    )
+
+    controller._auto_finish_on_game_end(update)
+
+    assert calls == ["finish"]
+
+
+def test_controller_resumes_waiting_listener_after_sealing_when_enabled(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    resumed = []
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: resumed.append(True))
+
+    controller._finish_thread_finished()
+
+    assert resumed == [True]

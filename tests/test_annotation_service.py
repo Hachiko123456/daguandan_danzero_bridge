@@ -22,7 +22,7 @@ def _temp_service(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     return AnnotationService(root)
 
@@ -31,7 +31,7 @@ def test_migrated_profile_contains_all_named_regions():
     service = AnnotationService()
     regions = service.list_regions()
 
-    assert len(regions) == 21
+    assert len(regions) == 22
     assert {region.name for region in regions} >= {
         "my_hand",
         "my_play",
@@ -58,6 +58,18 @@ def test_recorded_image_discovery_is_recursive_and_root_limited(tmp_path):
     assert all(path.is_relative_to(root) for path in images)
 
 
+def test_selected_image_folder_is_recursive_and_not_limited_to_legacy_root(tmp_path):
+    service = _temp_service(tmp_path)
+    selected = tmp_path / "anywhere" / "nested"
+    selected.mkdir(parents=True)
+    image = np.zeros((20, 30, 3), dtype=np.uint8)
+    cv2.imwrite(str(selected / "sample.png"), image)
+
+    images = service.list_images_in_folder(selected.parent)
+
+    assert images == ((selected / "sample.png").resolve(),)
+
+
 def test_update_region_persists_absolute_and_ratio_boxes(tmp_path):
     service = _temp_service(tmp_path)
     original = service.list_regions()[0]
@@ -82,6 +94,7 @@ def test_region_and_role_labels_are_chinese_but_keep_internal_keys():
     assert REGION_DISPLAY_NAMES["my_hand"] == "我的手牌"
     assert REGION_DISPLAY_NAMES["table_anchor_1"] == "牌桌锚点一"
     assert REGION_DISPLAY_NAMES["button_actions"] == "按钮区域"
+    assert REGION_DISPLAY_NAMES["game_end_controls"] == "换桌 / 再来一局区域"
     assert ROLE_DISPLAY_NAMES == {
         "hand": "手牌",
         "play": "出牌",
@@ -95,7 +108,7 @@ def test_profile_region_config_has_no_source_image_field():
     payload = json.loads(service.regions_path.read_text(encoding="utf-8"))
 
     assert payload["schema_version"] == 2
-    assert len(payload["regions"]) == 21
+    assert len(payload["regions"]) == 22
     assert all("source_image" not in item for item in payload["regions"])
 
 

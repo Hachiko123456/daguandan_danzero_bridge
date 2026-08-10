@@ -146,7 +146,6 @@ class ProfileConfig:
     window_title_keywords: tuple[str, ...]
     base_size: tuple[int, int] = DEFAULT_BASE_SIZE
     auto_capture_interval_sec: float = DEFAULT_AUTO_CAPTURE_INTERVAL_SEC
-    recording_interval_sec: float = 1.0
     schema_version: int = 2
     aspect_ratio_tolerance: float = 0.03
     capture_backend: str = "auto"
@@ -164,13 +163,6 @@ class ProfileConfig:
         interval = float(self.auto_capture_interval_sec)
         if not math.isfinite(interval) or interval <= 0:
             raise ProfileConfigError("auto_capture_interval_sec 必须大于 0")
-        recording_interval = float(self.recording_interval_sec)
-        if (
-            not math.isfinite(recording_interval)
-            or recording_interval < 0.1
-            or recording_interval > 60
-        ):
-            raise ProfileConfigError("recording_interval_sec 必须在 0.1 到 60 秒之间")
         tolerance = float(self.aspect_ratio_tolerance)
         if not math.isfinite(tolerance) or tolerance < 0 or tolerance > 0.25:
             raise ProfileConfigError("aspect_ratio_tolerance 必须在 0 到 0.25 之间")
@@ -203,7 +195,6 @@ class ProfileConfig:
             window_title_keywords=keywords,
             base_size=base_size,
             auto_capture_interval_sec=interval,
-            recording_interval_sec=recording_interval,
             schema_version=2,
             aspect_ratio_tolerance=tolerance,
             capture_backend=backend,
@@ -223,7 +214,6 @@ class ProfileConfig:
             "window_title_keywords": list(normalized.window_title_keywords),
             "base_size": list(normalized.base_size),
             "auto_capture_interval_sec": normalized.auto_capture_interval_sec,
-            "recording_interval_sec": normalized.recording_interval_sec,
             "schema_version": normalized.schema_version,
             "aspect_ratio_tolerance": normalized.aspect_ratio_tolerance,
             "capture_backend": normalized.capture_backend,
@@ -336,7 +326,6 @@ def load_profile_config(paths: ProfilePaths) -> ProfileConfig:
             auto_capture_interval_sec=float(
                 data.get("auto_capture_interval_sec", DEFAULT_AUTO_CAPTURE_INTERVAL_SEC)
             ),
-            recording_interval_sec=float(data.get("recording_interval_sec", 1.0)),
             schema_version=schema_version,
             aspect_ratio_tolerance=float(data.get("aspect_ratio_tolerance", 0.03)),
             capture_backend=str(data.get("capture_backend", "auto")),

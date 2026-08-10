@@ -34,6 +34,7 @@ REGION_DISPLAY_NAMES = {
     "timer_right": "右侧计时器",
     "timer_self": "己方计时器",
     "button_actions": "按钮区域",
+    "game_end_controls": "换桌 / 再来一局区域",
 }
 ROLE_DISPLAY_NAMES = {
     "hand": "手牌",
@@ -131,15 +132,21 @@ class AnnotationService:
             raise ValueError("区域名称不能重复")
         return regions
 
-    def list_recorded_images(self) -> tuple[Path, ...]:
-        if not self.screenshots_root.is_dir():
+    def list_images_in_folder(self, folder: Path) -> tuple[Path, ...]:
+        """递归列出用户选择的图片文件夹，供标注与模板裁剪共用。"""
+        root = Path(folder).expanduser()
+        if not root.is_dir():
             return ()
         paths = (
             path.resolve()
-            for path in self.screenshots_root.rglob("*")
+            for path in root.rglob("*")
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
         )
-        return tuple(sorted(paths, key=lambda path: path.relative_to(self.screenshots_root).as_posix().lower()))
+        return tuple(sorted(paths, key=lambda path: path.relative_to(root).as_posix().lower()))
+
+    def list_recorded_images(self) -> tuple[Path, ...]:
+        """兼容旧资料目录；新界面由用户明确选择图片文件夹。"""
+        return self.list_images_in_folder(self.screenshots_root)
 
     def update_region(
         self,

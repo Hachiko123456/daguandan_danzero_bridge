@@ -4,17 +4,21 @@ from collections import Counter
 from pathlib import Path
 import shutil
 
+import cv2
 import numpy as np
 import pytest
 
 from daguandan_bridge.annotation_service import AnnotationService
 from daguandan_bridge.config import PROFILES_ROOT
 from daguandan_bridge.image_io import read_image_unicode
+from daguandan_bridge.live.card_uncertainty import normalized_suit_options
+from daguandan_bridge.live.consensus import BurstConsensus, ConsensusContext
 from daguandan_bridge.models import Box
 from daguandan_bridge.recognition_service import (
     OpeningSignal,
     RecognizedEvent,
     ScreenshotRecognitionService,
+    _TemplateMatch,
 )
 from daguandan_bridge.template_service import TemplateService
 
@@ -105,6 +109,68 @@ def test_joker_color_gate_rejects_a_red_template_on_a_black_joker():
         big_template,
         red_joker,
     )
+
+
+def test_black_suit_shape_resolver_overrides_a_tied_gray_template_match():
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    cases = (
+        ("spade_play.png", "S"),
+        ("club_play.png", "C"),
+    )
+    for filename, expected in cases:
+        image = read_image_unicode(PROFILE_ROOT / "templates" / "suit" / filename)
+        selected = _TemplateMatch(
+            label="club" if expected == "S" else "spade",
+            kind="suit",
+            source_role="play",
+            source="synthetic:tied-gray-match",
+            score=0.90,
+            x=0,
+            y=0,
+            w=image.shape[1],
+            h=image.shape[0],
+        )
+
+        assert service._black_suit_shape_code(image, selected) == expected
+
+
+def test_latest_game_clear_black_suits_do_not_downgrade_to_unknown():
+    """Regression for game_20260810_011602_61367b frame 82, if retained locally."""
+    video_path = (
+        PROFILE_ROOT
+        / "sessions"
+        / "game_20260810_011602_61367b"
+        / "video"
+        / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"missing local regression video: {video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 82)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("unable to decode latest local regression frame")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    result = service.recognize_play_region(
+        frame,
+        "self",
+        wild_rank="10",
+        allow_unknown_suit=True,
+        allow_pass=False,
+    )
+
+    assert result.cards == ("AS", "2H", "3C", "4C", "5S")
+    assert result.suit_options == (("S",), ("H",), ("C",), ("C",), ("S",))
 
 
 def test_regression_black_small_jokers_are_not_labeled_as_big_jokers():
@@ -210,6 +276,147 @@ def test_opening_signal_collects_marker_timer_and_super_double_without_committin
 
     assert normal_double_signal.super_double_visible is True
     assert service.recognize_super_double_visible(normal_double_image) is True
+
+
+def test_fast_signals_recognize_continue_game_as_an_end_control():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/button/continue_game.png", 520, 250)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signals = service.recognize_fast_signals(image, "self")
+
+    assert signals.game_end_control == "continue_game"
+
+
+def test_fast_signals_recognize_change_table_as_an_end_control():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/button/change_table.png", 520, 250)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signals = service.recognize_fast_signals(image, "self")
+
+    assert signals.game_end_control == "change_table"
+
+
+@pytest.mark.parametrize(
+    ("template", "position", "expected"),
+    (
+        ("templates/button/continue_game.png", (698, 586), "continue_game"),
+        ("templates/button/change_table.png", (355, 577), "change_table"),
+    ),
+)
+def test_fast_signals_recognize_bottom_end_controls(template, position, expected):
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, template, *position)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signals = service.recognize_fast_signals(image, "self")
+
+    assert signals.game_end_control == expected
+
+
+def test_latest_first_play_recovers_clear_black_suits_and_keeps_occluded_rank():
+    video_path = (
+        PROFILE_ROOT
+        / "sessions"
+        / "game_20260810_000418_3ccf81"
+        / "video"
+        / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"缺少最新对局录像：{video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 72)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("无法读取最新对局的首手帧")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    result = service.recognize_play_region(
+        frame,
+        "left",
+        wild_rank="7",
+        allow_unknown_suit=True,
+        allow_pass=False,
+    )
+
+    assert result.cards == ("3H", "3S", "4D", "4S", "5?", "7H")
+    assert len(result.cards) == 6
+    assert result.suit_options[1] == ("S",)
+    assert result.suit_options[3] == ("S",)
+    assert result.suit_options[4] == ("H", "D")
+    initial_hand = (
+        "10D", "2D", "2H", "2S", "3C", "3C", "3H", "3S", "4H", "4S",
+        "5D", "5H", "6D", "6H", "6S", "7D", "8H", "8S", "9C", "AC", "JC",
+        "JH", "KS", "KS", "QH", "big_joker", "big_joker",
+    )
+    assert BurstConsensus.validate_candidate(
+        False,
+        result.cards,
+        ConsensusContext(
+            level_rank="7",
+            remaining_cards=27,
+            allow_pass=False,
+            known_cards=initial_hand,
+            known_suit_options=normalized_suit_options(initial_hand),
+        ),
+        suit_options=result.suit_options,
+    ) == ""
+
+
+def test_latest_final_screen_recognizes_bottom_end_control():
+    video_path = (
+        PROFILE_ROOT
+        / "sessions"
+        / "game_20260810_000418_3ccf81"
+        / "video"
+        / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"缺少最新对局录像：{video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 1312)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("无法读取最新对局的结算帧")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    assert service.recognize_fast_signals(frame, "self").game_end_control == "continue_game"
+
+
+def test_opening_signal_carries_change_table_end_control():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/button/change_table.png", 520, 250)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signal = service.recognize_opening_signal(image)
+
+    assert signal.game_end_control == "change_table"
 
 
 def test_real_screenshot_recognizes_full_hand_and_finds_first_play_marker():

@@ -88,6 +88,7 @@ class LiveAssistantPage(ScrollArea):
         self.runtime = runtime or LiveAssistantController()
         self.review_candidate_buttons: list[PushButton] = []
         self._last_event_id = ""
+        self._shown_event_ids: set[str] = set()
         self._last_advice_timeline_key: tuple[object, ...] | None = None
         self._session_active = False
         self.setObjectName("liveAssistantPage")
@@ -140,7 +141,7 @@ class LiveAssistantPage(ScrollArea):
         root.setSpacing(16)
         root.addWidget(TitleLabel("实时 DanZero 助手"))
         subtitle = BodyLabel(
-            "半自动模式：程序只观察与建议，不会点击游戏；开始前请确认 27 张手牌、级牌和首发座位。"
+            "持续监听页面：程序只观察与建议，不会点击游戏；稳定识别两次相同的 27 张手牌后自动开始。"
         )
         subtitle.setWordWrap(True)
         root.addWidget(subtitle)
@@ -149,7 +150,7 @@ class LiveAssistantPage(ScrollArea):
         initial_layout = QVBoxLayout(self.initial_card)
         initial_layout.setContentsMargins(18, 16, 18, 16)
         initial_layout.setSpacing(10)
-        initial_layout.addWidget(StrongBodyLabel("1. 单图识别与开局确认"))
+        initial_layout.addWidget(StrongBodyLabel("1. 当前页面识别"))
         form = QFormLayout()
         self.round_level_combo = ComboBox()
         for rank in RANKS:
@@ -175,7 +176,7 @@ class LiveAssistantPage(ScrollArea):
         self.initial_hand_scroll = ScrollArea()
         self.initial_hand_scroll.setObjectName("liveInitialHandCards")
         self.initial_hand_scroll.setWidgetResizable(False)
-        self.initial_hand_scroll.setFixedHeight(62)
+        self.initial_hand_scroll.setFixedHeight(50)
         self.initial_hand_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
@@ -195,11 +196,9 @@ class LiveAssistantPage(ScrollArea):
         form.addRow("初始手牌（点击牌面可修改）", self.initial_hand_scroll)
         initial_layout.addLayout(form)
         initial_actions = QHBoxLayout()
-        self.recognize_initial_button = PushButton("识别当前画面")
-        self.start_session_button = PrimaryPushButton("开始实时对局")
+        self.recognize_initial_button = PushButton("识别当前页面（持续监听）")
         initial_actions.addWidget(self.recognize_initial_button)
         initial_actions.addStretch(1)
-        initial_actions.addWidget(self.start_session_button)
         initial_layout.addLayout(initial_actions)
         self.initialization_status = CaptionLabel()
         self.initialization_status.setWordWrap(True)
@@ -227,7 +226,8 @@ class LiveAssistantPage(ScrollArea):
         state_card = CardWidget()
         state_layout = QVBoxLayout(state_card)
         state_layout.setContentsMargins(16, 14, 16, 16)
-        state_layout.addWidget(StrongBodyLabel("状态、对局时间线与 DanZero 建议"))
+        self.timeline_title = StrongBodyLabel("对局动态")
+        state_layout.addWidget(self.timeline_title)
         self.live_status = BodyLabel("状态：等待开局")
         self.turn_status = BodyLabel("当前回合：—")
         state_layout.addWidget(self.live_status)
@@ -240,7 +240,7 @@ class LiveAssistantPage(ScrollArea):
         self.timeline.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.timeline.setMinimumHeight(280)
         self.timeline.setPlaceholderText(
-            "确认动作、DanZero 建议、纠错和异常会依次显示在这里；可直接框选并复制。"
+            "动作、DanZero 建议与异常会依次显示在这里；可直接框选并复制。"
         )
         state_layout.addWidget(self.timeline, 1)
         control_row = QHBoxLayout()
@@ -281,38 +281,24 @@ class LiveAssistantPage(ScrollArea):
         self.review_bar.hide()
         root.addWidget(self.review_bar)
 
-        correction_card = CardWidget()
-        correction_layout = QHBoxLayout(correction_card)
-        correction_layout.setContentsMargins(16, 12, 16, 12)
-        correction_layout.addWidget(StrongBodyLabel("最近动作快速纠错"))
-        self.correction_cards_edit = LineEdit()
-        self.correction_cards_edit.setPlaceholderText("正确牌面，例如黑桃7、红桃7")
-        self.correct_cards_button = PushButton("改为该牌组")
-        self.correct_pass_button = PushButton("改为不出")
-        correction_layout.addWidget(self.correction_cards_edit, 1)
-        correction_layout.addWidget(self.correct_cards_button)
-        correction_layout.addWidget(self.correct_pass_button)
-        root.addWidget(correction_card)
-
         self.error_status = CaptionLabel()
         self.error_status.setWordWrap(True)
         root.addWidget(self.error_status)
         root.addStretch(1)
 
-        self.recognize_initial_button.clicked.connect(self.runtime.recognize_initial)
-        self.start_session_button.clicked.connect(self._start_session)
+        self.recognize_initial_button.clicked.connect(self._start_listening)
         self.pause_button.clicked.connect(self.runtime.pause)
         self.resume_button.clicked.connect(self.runtime.resume)
         self.finish_button.clicked.connect(self.runtime.finish)
         self.manual_confirm_button.clicked.connect(self._confirm_manual)
-        self.correct_cards_button.clicked.connect(self._correct_cards)
-        self.correct_pass_button.clicked.connect(
-            lambda: self.runtime.correct_latest(cards=(), is_pass=True)
-        )
         self.hand_edit.textChanged.connect(self._refresh_initialization)
         self.initial_hand_cards.clicked.connect(self._edit_initial_hand)
         self.round_level_combo.currentIndexChanged.connect(self._refresh_initialization)
         self.lead_player_combo.currentIndexChanged.connect(self._refresh_initialization)
+        self.recognition_strategy_combo.currentIndexChanged.connect(
+            self._update_recognition_strategy
+        )
+        self._update_recognition_strategy()
         self._set_live_controls(False)
 
     def _connect_runtime(self) -> None:
@@ -342,16 +328,36 @@ class LiveAssistantPage(ScrollArea):
 
     def _refresh_initialization(self, *_args) -> None:
         cards = self._parse_cards(self.hand_edit.text())
-        ready = len(cards) == 27 and not self._session_active
-        self.start_session_button.setEnabled(ready)
         if self._session_active:
             self.initialization_status.setText("实时对局已开始；初始字段已锁定。")
         elif len(cards) == 27:
-            self.initialization_status.setText("已确认 27 张初始手牌，可以开始。")
+            self.initialization_status.setText(
+                "已识别 27 张初始手牌；连续两次识别一致后会自动开始。"
+            )
         else:
             self.initialization_status.setText(
-                f"必须准确确认 27 张初始手牌；当前为 {len(cards)} 张。"
+                f"持续监听页面中；需要稳定识别 27 张初始手牌，当前为 {len(cards)} 张。"
             )
+
+    def _start_listening(self) -> None:
+        setter = getattr(self.runtime, "set_recognition_strategy", None)
+        if callable(setter):
+            setter(str(self.recognition_strategy_combo.currentData()))
+        start = getattr(self.runtime, "start_listening", None)
+        if callable(start):
+            start()
+            self.initialization_status.setText(
+                "正在持续监听页面；稳定识别两次相同的 27 张手牌后自动开始。"
+            )
+            return
+        # Compatibility only for an older embedded controller.  The shipped
+        # controller always exposes persistent listening.
+        self.runtime.recognize_initial()
+
+    def _update_recognition_strategy(self, *_args) -> None:
+        setter = getattr(self.runtime, "set_recognition_strategy", None)
+        if callable(setter):
+            setter(str(self.recognition_strategy_combo.currentData()))
 
     def apply_initial_recognition(self, result: object, snapshot: object | None) -> None:
         level = getattr(result, "round_level", None)
@@ -365,7 +371,7 @@ class LiveAssistantPage(ScrollArea):
         # silently reuse the previous game's candidate.
         self.lead_player_combo.setCurrentIndex(0)
         buttons = set(getattr(result, "buttons", ()))
-        if "super_double" not in buttons:
+        if not (buttons & {"super_double", "double"}):
             self._set_combo_data(self.lead_player_combo, lead)
         self.hand_edit.setText(" ".join(getattr(result, "my_hand", ())))
         self._render_initial_hand_cards(self._parse_cards(self.hand_edit.text()))
@@ -381,32 +387,12 @@ class LiveAssistantPage(ScrollArea):
         if index >= 0:
             combo.setCurrentIndex(index)
 
-    def _start_session(self) -> None:
-        cards = self._parse_cards(self.hand_edit.text())
-        if len(cards) != 27:
-            self._refresh_initialization()
-            return
-        # This is deliberately UI-only.  SessionStore is never touched here,
-        # so prior recordings, timelines, and truth logs remain available.
-        self._reset_transient_session_ui()
-        started = self.runtime.start_session(
-            round_level=str(self.round_level_combo.currentData()),
-            hand=cards,
-            # The combo is only a single-image candidate.  Starting with None
-            # forces the same opening state machine in live play and replay.
-            lead_player=None,
-            recognition_strategy=str(self.recognition_strategy_combo.currentData()),
-        )
-        if started is False:
-            return
-        self._session_active = True
-        self.hand_edit.setEnabled(False)
-        self.initial_hand_scroll.setEnabled(False)
-        self.round_level_combo.setEnabled(False)
-        self.lead_player_combo.setEnabled(False)
-        self.recognition_strategy_combo.setEnabled(False)
-        self._set_live_controls(True)
-        self._refresh_initialization()
+    def _set_initial_fields_enabled(self, enabled: bool) -> None:
+        self.hand_edit.setEnabled(enabled)
+        self.initial_hand_scroll.setEnabled(enabled)
+        self.round_level_combo.setEnabled(enabled)
+        self.lead_player_combo.setEnabled(enabled)
+        self.recognition_strategy_combo.setEnabled(enabled)
 
     def _render_initial_hand_cards(self, cards: tuple[str, ...]) -> None:
         while self.initial_hand_cards_layout.count():
@@ -423,11 +409,12 @@ class LiveAssistantPage(ScrollArea):
             return
         for card in cards:
             badge = CardBadge(card, compact=True)
+            badge.setFixedSize(27, 40)
             badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self.initial_hand_badges.append(badge)
             self.initial_hand_cards_layout.addWidget(badge)
         self.initial_hand_cards_layout.addStretch(1)
-        self.initial_hand_cards.setMinimumWidth(max(240, len(cards) * 40 + 12))
+        self.initial_hand_cards.setMinimumWidth(max(240, len(cards) * 30 + 12))
         self.initial_hand_cards.setToolTip("、".join(card_code_to_text(card) for card in cards))
 
     def _edit_initial_hand(self) -> None:
@@ -442,6 +429,7 @@ class LiveAssistantPage(ScrollArea):
         """Forget only the previous live-page view before a fresh game."""
 
         self._last_event_id = ""
+        self._shown_event_ids.clear()
         self._last_advice_timeline_key = None
         self.timeline.clear()
         self.review_bar.hide()
@@ -451,8 +439,6 @@ class LiveAssistantPage(ScrollArea):
         self.pause_button.setEnabled(active)
         self.resume_button.setEnabled(active)
         self.finish_button.setEnabled(active)
-        self.correct_cards_button.setEnabled(active)
-        self.correct_pass_button.setEnabled(active)
 
     def show_frame(self, snapshot: object) -> None:
         image = getattr(snapshot, "image", None)
@@ -476,6 +462,17 @@ class LiveAssistantPage(ScrollArea):
         )
 
     def apply_update(self, update: LiveUpdate) -> None:
+        if (
+            update.status in {"waiting_lead", "running", "review_required", "paused"}
+            and not self._session_active
+        ):
+            # A controller-started automatic session must reset only the
+            # transient view.  Historical session folders and logs are never
+            # touched here.
+            self._reset_transient_session_ui()
+            self._session_active = True
+            self._set_initial_fields_enabled(False)
+            self._set_live_controls(True)
         if update.fast_signals is not None and update.fast_signals.super_double_visible:
             self.live_status.setText("状态：正在决定是否加倍")
             self.turn_status.setText("加倍按钮显示期间不进行首出或出牌识别")
@@ -491,9 +488,15 @@ class LiveAssistantPage(ScrollArea):
                 f"当前行动：{seat_text(player, unknown='等待确认')}"
                 f"　|　第 {update.snapshot.turn_id} 手"
             )
-        if update.event is not None and update.event.event_id != self._last_event_id:
-            self._last_event_id = update.event.event_id
-            self._append_event_to_timeline(update.event)
+        events = tuple(getattr(update, "events", ()))
+        if not events and update.event is not None:
+            events = (update.event,)
+        for event in events:
+            if event.event_id in self._shown_event_ids:
+                continue
+            self._shown_event_ids.add(event.event_id)
+            self._last_event_id = event.event_id
+            self._append_event_to_timeline(event)
         if update.review is not None:
             self.show_review(update.review)
         else:
@@ -510,15 +513,26 @@ class LiveAssistantPage(ScrollArea):
                 raw,
                 f"DanZero 正在计算建议（请求 {raw.key.request_id}）。",
             )
-        elif raw.status == "ready" and not raw.visible:
+        elif raw.status == "ready" and raw.advice is not None and not raw.visible:
+            suggestion = (
+                "建议：不出"
+                if raw.advice.is_pass
+                else f"建议：{self._play_type_text(raw.advice.play_type)}"
+            )
             self._append_advice_timeline_entry(
                 raw,
-                "DanZero 建议已算好，等待我方回合旁证。",
+                f"{suggestion}；耗时 {raw.advice.elapsed_ms:.0f} ms；"
+                f"请求 {raw.key.request_id}；待画面确认。",
             )
         elif raw.status == "ready" and raw.advice is not None:
+            suggestion = (
+                "建议：不出"
+                if raw.advice.is_pass
+                else f"建议：{self._play_type_text(raw.advice.play_type)}"
+            )
             self._append_advice_timeline_entry(
                 raw,
-                f"{self._play_type_text(raw.advice.play_type)}；耗时 {raw.advice.elapsed_ms:.0f} ms；"
+                f"{suggestion}；耗时 {raw.advice.elapsed_ms:.0f} ms；"
                 f"请求 {raw.key.request_id}",
             )
         elif raw.status == "stale":
@@ -538,41 +552,70 @@ class LiveAssistantPage(ScrollArea):
         }:
             return
         prefix = html.escape(event_prefix(event))
-        cards = tuple(str(card) for card in event.payload.get("cards", ()))
-        if event.event_type == "player_played":
-            action = html.escape(f"{seat_text(event.actor)}出牌：")
-            cards_html = self._cards_html(cards)
-        else:
-            action = html.escape(event_action_text(event))
-            cards_html = ""
+        action = html.escape(event_action_text(event))
+        accent, marker = self._event_accent(event)
         self._append_timeline_html(
-            "<div style='margin:3px 0 7px 0;'>"
-            f"<span style='color:#6b7280;'>{prefix}</span><br>"
-            f"<span>{action}</span>{cards_html}"
+            "<div style='margin:3px 0 7px 0; padding-left:7px; "
+            f"border-left:3px solid {accent};'>"
+            f"<span style='color:#6b7280;'>{prefix}</span> "
+            f"<span style='color:{accent}; font-weight:600;'>{marker}</span> "
+            f"<span>{action}</span>"
             "</div>"
         )
 
     def _append_advice_timeline_entry(self, raw: LiveAdvice, detail: str) -> None:
         advice = raw.advice
-        cards = tuple(advice.cards) if advice is not None and raw.visible else ()
+        cards = tuple(advice.cards) if advice is not None else ()
         key = (
             raw.key.request_id,
             raw.status,
             raw.visible,
             cards,
             raw.error,
+            raw.suit_uncertain,
+            raw.variant_count,
+            raw.advice_agrees_across_variants,
         )
         if key == self._last_advice_timeline_key:
             return
         self._last_advice_timeline_key = key
         cards_html = self._cards_html(cards) if cards else ""
+        confirmed = raw.status == "ready" and raw.visible
+        accent = "#0F766E" if confirmed else "#B45309"
+        background = "#e7f6f2" if confirmed else "#fff7ed"
+        title = "DanZero 建议" if confirmed else "DanZero 待确认"
+        if raw.suit_uncertain:
+            agreement = "建议一致" if raw.advice_agrees_across_variants else "建议存在分歧"
+            detail += f"；花色遮挡：已评估 {raw.variant_count} 个可行分支，{agreement}"
         self._append_timeline_html(
             "<div style='margin:5px 0 9px 0; padding:6px; "
-            "background:#e7f6f2; border-left:4px solid #0F766E;'>"
-            "<span style='color:#0F766E; font-weight:600;'>DanZero 建议</span><br>"
-            f"<span style='color:#0F766E;'>{html.escape(detail)}</span>{cards_html}"
+            f"background:{background}; border-left:4px solid {accent};'>"
+            f"<span style='color:{accent}; font-weight:600;'>{title}</span><br>"
+            f"<span style='color:{accent};'>{html.escape(detail)}</span>{cards_html}"
             "</div>"
         )
+
+    @staticmethod
+    def _event_accent(event: LiveEvent) -> tuple[str, str]:
+        if event.event_type == "player_passed":
+            return "#7C3AED", "⏭ 不出"
+        if event.event_type == "player_finished":
+            placement = str(event.payload.get("placement", ""))
+            return {
+                "head": ("#B45309", "★ 头游"),
+                "second": ("#2563EB", "◆ 二游"),
+                "third": ("#6B7280", "◇ 三游"),
+                "last": ("#B91C1C", "● 末游"),
+            }.get(placement, ("#B45309", "出完牌"))
+        if event.event_type == "wind_caught":
+            return "#7C3AED", "↪ 接风"
+        if event.event_type == "game_end_detected":
+            return "#B45309", "■ 自动封存"
+        if event.event_type in {"recognition_retry", "review_required"}:
+            return "#B91C1C", "! 识别提示"
+        if event.event_type == "turn_started":
+            return "#2563EB", "▶ 回合"
+        return "#0F766E", "● 对局"
 
     @staticmethod
     def _cards_html(cards: tuple[str, ...]) -> str:
@@ -686,11 +729,6 @@ class LiveAssistantPage(ScrollArea):
         self.runtime.confirm_manual_action(cards=cards, is_pass=is_pass)
         self.review_bar.hide()
 
-    def _correct_cards(self) -> None:
-        cards = self._parse_cards(self.correction_cards_edit.text())
-        if cards:
-            self.runtime.correct_latest(cards=cards, is_pass=False)
-
     def show_error(self, message: str) -> None:
         self.error_status.setText(f"错误：{message}")
 
@@ -699,14 +737,12 @@ class LiveAssistantPage(ScrollArea):
 
     def _session_finished(self, _value: object) -> None:
         self._session_active = False
-        self.hand_edit.setEnabled(True)
-        self.initial_hand_scroll.setEnabled(True)
-        self.round_level_combo.setEnabled(True)
-        self.lead_player_combo.setEnabled(True)
-        self.recognition_strategy_combo.setEnabled(True)
+        self._set_initial_fields_enabled(True)
         self._set_live_controls(False)
         self.review_bar.hide()
-        self._refresh_initialization()
+        self.initialization_status.setText(
+            "本局已封存；持续监听页面会在识别到下一局的 27 张手牌后自动开始。"
+        )
 
     def shutdown(self) -> None:
         self.runtime.shutdown()

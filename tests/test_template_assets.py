@@ -7,5 +7,5 @@ def test_tencent_daguandan_profile_and_templates_are_packaged():
     config = load_profile_config(paths)
 
     assert config.name == "tencent_daguandan"
-    assert config.recording_interval_sec == 1.5
+    assert config.auto_capture_interval_sec == 5.0
     assert len(list(paths.templates_dir.rglob("*"))) >= 93

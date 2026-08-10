@@ -26,6 +26,9 @@ class PlayEvent:
     is_pass: bool
     observed_at: datetime
     source: str = "manual"
+    # A rank-only observation such as ``8?`` retains colour/suit candidates
+    # here.  It is deliberately not resolved in the canonical history.
+    suit_options: tuple[tuple[str, ...], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -34,6 +37,7 @@ class PlayEvent:
             "is_pass": self.is_pass,
             "observed_at": self.observed_at.isoformat(),
             "source": self.source,
+            "suit_options": [list(options) for options in self.suit_options],
         }
 
 
@@ -160,15 +164,25 @@ class GuanDanState:
         cards: Iterable[str],
         *,
         source: str = "recognition_confirmed",
+        suit_options: Iterable[Iterable[str]] = (),
     ) -> PlayEvent:
         seat = self._validate_seat(player, "出牌座位")
-        normalized = self._normalize_cards(cards)
+        raw_cards = tuple(str(card) for card in cards)
+        raw_options = tuple(
+            tuple(str(suit) for suit in options) for options in suit_options
+        )
+        aligned = sorted(
+            zip(raw_cards, raw_options + ((),) * max(0, len(raw_cards) - len(raw_options))),
+            key=lambda item: item[0],
+        )
+        normalized = self._normalize_cards(card for card, _options in aligned)
         event = PlayEvent(
             player=seat,
             cards=normalized,
             is_pass=False,
             observed_at=datetime.now().astimezone(),
             source=source,
+            suit_options=tuple(options for _card, options in aligned),
         )
         self.trick_plays.append(event)
         self.play_history.append(event)

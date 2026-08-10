@@ -15,7 +15,7 @@ from daguandan_bridge.dpi import enable_windows_dpi_awareness
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="腾讯大掼蛋截图录制与 DanZero 手动状态桥接器。",
+        description="腾讯大掼蛋图片标记、模板管理与 DanZero 桥接器。",
     )
     parser.parse_args(argv)
     dpi_status = enable_windows_dpi_awareness()

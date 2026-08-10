@@ -96,6 +96,26 @@ def test_candidate_that_would_create_a_third_known_card_is_rejected():
     assert "exceeds_double_deck_limit" in result.rejected_reasons
 
 
+def test_historical_effect_suit_uncertainty_does_not_reject_a_clear_straight_flush():
+    cards = ("3H", "4H", "5H", "6H", "7H")
+    result = BurstConsensus(min_votes=3).decide(
+        [_play(*cards) for _ in range(3)],
+        context=_context(
+            level_rank="10",
+            remaining_cards=17,
+            known_cards=("6D", "6D", "6H", "6S", "6C", "6?"),
+            known_suit_options=(
+                ("D",), ("D",), ("H",), ("S",), ("C",), ("H", "D"),
+            ),
+            table_cards=("10C", "10S", "QC", "QD", "QH"),
+        ),
+    )
+
+    assert result.status == "confirmed"
+    assert result.cards == cards
+    assert result.integrity_warnings == ("historical_suit_constraints_relaxed",)
+
+
 def test_self_candidate_already_in_current_hand_is_not_counted_twice():
     result = BurstConsensus(min_votes=3).decide(
         [_play("7S") for _ in range(3)],
@@ -108,6 +128,37 @@ def test_self_candidate_already_in_current_hand_is_not_counted_twice():
 
     assert result.status == "confirmed"
     assert result.cards == ("7S",)
+
+
+def test_unknown_suit_self_action_is_reconciled_to_the_confirmed_hand():
+    hand = ("AS", "2H", "2H", "3C", "4C", "5S")
+    cards = ("A?", "2H", "3?", "4?", "5?")
+    suit_options = (("S", "C"), ("H",), ("S", "C"), ("S", "C"), ("S", "C"))
+    samples = [
+        RecognitionSample(
+            cards=cards,
+            suit_options=suit_options,
+            is_pass=False,
+            confidence=0.86,
+            source="latest-game-regression",
+        )
+        for _ in range(3)
+    ]
+
+    result = BurstConsensus(min_votes=3).decide(
+        samples,
+        context=_context(
+            level_rank="10",
+            allow_pass=False,
+            known_hand=hand,
+            known_cards=hand,
+            candidate_already_known=True,
+        ),
+    )
+
+    assert result.status == "confirmed"
+    assert result.cards == ("2H", "3?", "4?", "5?", "A?")
+    assert result.resolved_cards == ("2H", "3C", "4C", "5S", "AS")
 
 
 def test_play_that_does_not_beat_current_table_action_is_rejected():

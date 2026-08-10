@@ -7,6 +7,7 @@ from typing import Iterable
 
 from .consensus import (
     BurstConsensus,
+    canonical_candidate,
     ConsensusCandidate,
     ConsensusContext,
     ConsensusResult,
@@ -97,8 +98,17 @@ def decide_recognition_strategy(
     valid: list[RecognitionSample] = []
     rejected: list[str] = []
     for sample in items:
-        cards = () if sample.is_pass else tuple(sorted(str(card) for card in sample.cards))
-        reason = BurstConsensus.validate_candidate(sample.is_pass, cards, context)
+        cards, suit_options = canonical_candidate(
+            sample.cards,
+            sample.suit_options,
+            is_pass=sample.is_pass,
+        )
+        reason = BurstConsensus.validate_candidate(
+            sample.is_pass,
+            cards,
+            context,
+            suit_options=suit_options,
+        )
         if reason:
             rejected.append(reason)
         else:
@@ -109,6 +119,7 @@ def decide_recognition_strategy(
                     confidence=sample.confidence,
                     source=sample.source,
                     evidence_ref=sample.evidence_ref,
+                    suit_options=suit_options,
                     post_hand=sample.post_hand,
                 )
             )
@@ -152,8 +163,21 @@ def decide_recognition_strategy(
         source=source,
         vote_count=candidate.votes,
         candidates=(candidate,),
+        resolved_cards=BurstConsensus.resolve_commit_cards(
+            sample.is_pass,
+            sample.cards,
+            context,
+            suit_options=sample.suit_options,
+        ),
         rejected_reasons=tuple(dict.fromkeys(rejected)),
         evidence_refs=tuple(item.evidence_ref for item in winner if item.evidence_ref),
+        suit_options=sample.suit_options,
+        integrity_warnings=BurstConsensus.integrity_warnings(
+            sample.is_pass,
+            sample.cards,
+            context,
+            suit_options=sample.suit_options,
+        ),
     )
 
 
@@ -167,8 +191,17 @@ def has_exhausted_valid_candidates(
 
     count = 0
     for sample in samples:
-        cards = () if sample.is_pass else tuple(sorted(str(card) for card in sample.cards))
-        if not BurstConsensus.validate_candidate(sample.is_pass, cards, context):
+        cards, suit_options = canonical_candidate(
+            sample.cards,
+            sample.suit_options,
+            is_pass=sample.is_pass,
+        )
+        if not BurstConsensus.validate_candidate(
+            sample.is_pass,
+            cards,
+            context,
+            suit_options=suit_options,
+        ):
             count += 1
     return count >= limit
 
@@ -184,14 +217,20 @@ def has_no_valid_candidates(
     items = tuple(samples)
     if len(items) < limit:
         return False
-    return all(
-        BurstConsensus.validate_candidate(
-            sample.is_pass,
-            () if sample.is_pass else tuple(sorted(str(card) for card in sample.cards)),
-            context,
+    for sample in items:
+        cards, suit_options = canonical_candidate(
+            sample.cards,
+            sample.suit_options,
+            is_pass=sample.is_pass,
         )
-        for sample in items
-    )
+        if not BurstConsensus.validate_candidate(
+            sample.is_pass,
+            cards,
+            context,
+            suit_options=suit_options,
+        ):
+            return False
+    return True
 
 
 def _key(sample: RecognitionSample) -> tuple[bool, tuple[str, ...]]:

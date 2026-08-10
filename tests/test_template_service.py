@@ -15,7 +15,7 @@ def _service(tmp_path):
         PROFILES_ROOT / "tencent_daguandan",
         root / "tencent_daguandan",
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("templates", "screenshots"),
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
     )
     return TemplateService(root)
 

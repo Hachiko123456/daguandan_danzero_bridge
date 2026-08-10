@@ -69,6 +69,25 @@ def test_effect_visibility_restarts_the_settle_delay():
     assert decision.collect_sample
 
 
+def test_effect_has_a_short_post_effect_cooldown_even_for_immediate_strategy():
+    zone = ZoneLifecycle(
+        expected_player="right",
+        activated_at_ms=0,
+        settle_ms=0,
+    )
+
+    assert zone.observe(
+        _metrics(100, occupied=True, motion=0.20, content_changed=True)
+    ).phase == ZonePhase.BURST_READ
+    decision = zone.observe(_metrics(120, occupied=True, effect=True))
+    assert decision.discard_burst
+    assert decision.phase == ZonePhase.SETTLING
+    assert zone.observe(_metrics(400, occupied=True)).phase == ZonePhase.SETTLING
+    decision = zone.observe(_metrics(570, occupied=True))
+    assert decision.phase == ZonePhase.BURST_READ
+    assert decision.collect_sample
+
+
 def test_action_disappearance_discards_burst_and_waits_for_next_change():
     zone = ZoneLifecycle(
         expected_player="right",

@@ -87,6 +87,9 @@ class PlayRegionResult:
     source: str = ""
     post_hand: tuple[str, ...] = ()
     post_hand_confidence: float = 0.0
+    # One candidate suit sequence per card.  Exact cards carry one option;
+    # e.g. an occluded red 5 keeps ``("H", "D")`` for ``5?``.
+    suit_options: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,7 @@ class FastSignalResult:
     self_action_buttons_visible: bool
     effect_visible: bool
     super_double_visible: bool = False
+    game_end_control: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,7 @@ class OpeningSignal:
     marker_player: Seat | None
     active_player: Seat | None
     self_action_buttons_visible: bool
+    game_end_control: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +155,17 @@ class ScreenshotRecognitionService:
     # Real rank/suit templates still score near 1.0 at the native resolution.
     _PLAY_RANK_THRESHOLD = 0.60
     _PLAY_SUIT_THRESHOLD = 0.60
+    # Spade/club and heart/diamond glyphs can be close under partial
+    # occlusion.  Preserve colour-constrained uncertainty when their template
+    # scores are effectively tied instead of committing one exact suit.
+    _SUIT_AMBIGUITY_MARGIN = 0.06
+    # Gray-scale correlation gives black spades and clubs similarly high
+    # scores because both are compact black glyphs.  When that first pass is
+    # tied, compare their normalized silhouettes with HOG instead of turning
+    # a clear card into ``?`` solely because of a fixed score margin.
+    _BLACK_SUIT_HOG_SIZE = 32
+    _BLACK_SUIT_HOG_MIN_SCORE = 0.82
+    _BLACK_SUIT_HOG_MIN_MARGIN = 0.06
     _LEVEL_THRESHOLD = 0.60
     _STATUS_THRESHOLD = 0.62
     # A false first-play confirmation corrupts every later turn.  Require a
@@ -177,6 +193,7 @@ class ScreenshotRecognitionService:
         self._template_cache: tuple[
             tuple[dict[str, object], np.ndarray], ...
         ] | None = None
+        self._black_suit_hog_cache: tuple[tuple[str, np.ndarray], ...] | None = None
 
     def recognize(self, image: np.ndarray | Path) -> RecognitionResult:
         started = perf_counter()
@@ -213,7 +230,7 @@ class ScreenshotRecognitionService:
         else:
             diagnostics.append("未识别到当前级牌")
 
-        hand, hand_score, hand_source, hand_diagnostics, hand_annotations = self._recognize_cards(
+        hand, hand_score, hand_source, hand_diagnostics, hand_annotations, _hand_suit_options = self._recognize_cards(
             source_image,
             regions.get("my_hand"),
             templates,
@@ -276,7 +293,7 @@ class ScreenshotRecognitionService:
         events_need_review = False
         for region_name, seat in PLAY_REGION_TO_SEAT.items():
             region = regions.get(region_name)
-            cards, score, card_source, card_diagnostics, card_annotations = self._recognize_cards(
+            cards, score, card_source, card_diagnostics, card_annotations, _event_suit_options = self._recognize_cards(
                 source_image,
                 region,
                 templates,
@@ -330,9 +347,9 @@ class ScreenshotRecognitionService:
             confidences["events"] = min(event.confidence for event in events)
             sources["events"] = "template:play/status"
 
-        buttons, button_score, button_source, button_annotations = self._recognize_buttons(
+        buttons, button_score, button_source, button_annotations = self._recognize_buttons_in_regions(
             source_image,
-            regions.get("button_actions"),
+            (regions.get("button_actions"), regions.get("game_end_controls")),
             templates,
         )
         annotations.extend(button_annotations)
@@ -387,7 +404,8 @@ class ScreenshotRecognitionService:
         """Run the expensive card matcher only in the expected action zone.
 
         ``allow_unknown_suit`` keeps a rank-only card (e.g. ``5?``) when the
-        suit glyph is occluded; the live pipeline leaves it disabled.
+        suit glyph is occluded.  Live play uses it so card count/state flow is
+        preserved without inventing a permanent exact suit.
         """
 
         if seat not in SEATS_IN_ORDER:
@@ -398,7 +416,7 @@ class ScreenshotRecognitionService:
         region_name = next(
             name for name, mapped_seat in PLAY_REGION_TO_SEAT.items() if mapped_seat == seat
         )
-        cards, score, source, diagnostics, annotations = self._recognize_cards(
+        cards, score, source, diagnostics, annotations, suit_options = self._recognize_cards(
             source_image,
             regions.get(region_name),
             templates,
@@ -423,6 +441,7 @@ class ScreenshotRecognitionService:
                 source=source,
                 post_hand=post_hand,
                 post_hand_confidence=post_hand_score,
+                suit_options=suit_options,
             )
         if not allow_pass:
             return PlayRegionResult(
@@ -435,6 +454,7 @@ class ScreenshotRecognitionService:
                 source="no_play_detected",
                 post_hand=post_hand,
                 post_hand_confidence=post_hand_score,
+                suit_options=suit_options,
             )
         passed, pass_score, pass_source, pass_match = self._recognize_status(
             source_image,
@@ -462,6 +482,7 @@ class ScreenshotRecognitionService:
             source=pass_source,
             post_hand=post_hand,
             post_hand_confidence=post_hand_score,
+            suit_options=suit_options,
         )
 
     def recognize_lead_player(self, image: np.ndarray | Path) -> Seat | None:
@@ -507,12 +528,20 @@ class ScreenshotRecognitionService:
             kind="timer",
             label="active",
         )
-        buttons, _, _, _ = self._recognize_buttons(
+        buttons, _, _, _ = self._recognize_buttons_in_regions(
             source_image,
-            regions.get("button_actions"),
+            (regions.get("button_actions"), regions.get("game_end_controls")),
             templates,
         )
         button_set = set(buttons)
+        game_end_control = next(
+            (
+                label
+                for label in ("continue_game", "change_table")
+                if label in button_set
+            ),
+            None,
+        )
         return OpeningSignal(
             # Either doubling control means the opening screen is still
             # transient.  Keep the historical field name for callers, but
@@ -523,6 +552,7 @@ class ScreenshotRecognitionService:
             self_action_buttons_visible=bool(
                 button_set & {"play_cards", "hint", "pass", "cannot_beat"}
             ),
+            game_end_control=game_end_control,
         )
 
     def recognize_super_double_visible(self, image: np.ndarray | Path) -> bool:
@@ -571,10 +601,18 @@ class ScreenshotRecognitionService:
                 templates,
                 label="passed",
             )
-        buttons, _, _, _ = self._recognize_buttons(
+        buttons, _, _, _ = self._recognize_buttons_in_regions(
             source_image,
-            regions.get("button_actions"),
+            (regions.get("button_actions"), regions.get("game_end_controls")),
             templates,
+        )
+        game_end_control = next(
+            (
+                label
+                for label in ("continue_game", "change_table")
+                if label in buttons
+            ),
+            None,
         )
         play_region_name = next(
             name
@@ -596,6 +634,7 @@ class ScreenshotRecognitionService:
             self_action_buttons_visible=expected_player == "self" and bool(buttons),
             effect_visible=bool(effects),
             super_double_visible="super_double" in buttons,
+            game_end_control=game_end_control,
         )
 
     @staticmethod
@@ -754,9 +793,10 @@ class ScreenshotRecognitionService:
         str,
         tuple[str, ...],
         tuple[RecognitionAnnotation, ...],
+        tuple[tuple[str, ...], ...],
     ]:
         if region is None:
-            return (), 0.0, "", ("未配置识别区域",), ()
+            return (), 0.0, "", ("未配置识别区域",), (), ()
         rank_matches = self._matches_for_region(
             image,
             region,
@@ -786,7 +826,7 @@ class ScreenshotRecognitionService:
         suit_source_roles = set(source_roles)
         if wild_rank is not None:
             suit_source_roles.add("level")
-        suit_matches = self._matches_for_region(
+        raw_suit_matches = self._matches_for_region(
             image,
             region,
             templates,
@@ -795,20 +835,20 @@ class ScreenshotRecognitionService:
             threshold=suit_threshold,
             limit=self._MAX_MATCHES_PER_TEMPLATE,
         )
-        suit_matches = self._deduplicate(suit_matches)
+        suit_matches = self._deduplicate(raw_suit_matches)
         diagnostics: list[str] = []
         used_suits: set[int] = set()
         cards: list[
-            tuple[float, str, float, str, tuple[int, int, int, int]]
+            tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
         ] = []
         joker_cards: list[
-            tuple[float, str, float, str, tuple[int, int, int, int]]
+            tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
         ] = []
         category = "hand" if "hand" in source_roles else "play"
         for joker in joker_matches:
             card_box = self._box_for_matches((joker,))
             joker_cards.append(
-                (joker.center_x, joker.label, joker.score, joker.source, card_box)
+                (joker.center_x, joker.label, joker.score, joker.source, card_box, ())
             )
         for rank in sorted(rank_matches, key=lambda item: (item.center_x, item.center_y)):
             possible = [
@@ -854,6 +894,7 @@ class ScreenshotRecognitionService:
                             rank.score,
                             rank.source,
                             card_box,
+                            self._unknown_suit_options(image, rank),
                         )
                     )
                     diagnostics.append(f"{rank.label} 花色被遮挡，按未知花色")
@@ -868,14 +909,42 @@ class ScreenshotRecognitionService:
                 ),
             )
             used_suits.add(suit_index)
-            card_code = f"{rank.label}{self._suit_code(suit.label)}"
+            uncertain_options = (
+                self._uncertain_suit_options(
+                    image,
+                    rank,
+                    suit,
+                    raw_suit_matches,
+                )
+                if category == "play"
+                else ()
+            )
+            shape_suit_code = (
+                self._black_suit_shape_code(image, suit)
+                if uncertain_options == ("S", "C")
+                else None
+            )
+            if shape_suit_code is not None:
+                uncertain_options = ()
+            if uncertain_options:
+                card_code = f"{rank.label}?"
+                diagnostics.append(
+                    f"{rank.label} 花色模板相近，按未知花色保留"
+                )
+            else:
+                card_code = f"{rank.label}{shape_suit_code or self._suit_code(suit.label)}"
             cards.append(
                 (
                     rank.center_x,
                     card_code,
                     min(rank.score, suit.score),
-                    f"{rank.source}+{suit.source}",
+                    (
+                        f"{rank.source}+{suit.source}"
+                        + (f"+shape:{shape_suit_code}" if shape_suit_code else "")
+                    ),
                     self._box_for_matches((rank, suit)),
+                    uncertain_options
+                    or (shape_suit_code or self._suit_code(suit.label),),
                 )
             )
         cards.sort(key=lambda item: item[0])
@@ -883,7 +952,7 @@ class ScreenshotRecognitionService:
             # 大小王图案相似，同一张牌可能同时命中两个模板：按距离分组，
             # 每组只保留分数最高的候选。
             competed: list[
-                tuple[float, str, float, str, tuple[int, int, int, int]]
+                tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
             ] = []
             for joker in sorted(joker_cards, key=lambda item: -item[2]):
                 jx, jy, jw, jh = joker[4]
@@ -906,7 +975,7 @@ class ScreenshotRecognitionService:
             # (wild/level cards with gold art). A real joker never overlaps
             # another recognized card, so drop joker boxes that sit on one.
             kept_jokers: list[
-                tuple[float, str, float, str, tuple[int, int, int, int]]
+                tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
             ] = []
             for joker in joker_cards:
                 if any(self._boxes_overlap(joker[4], card[4]) for card in cards):
@@ -916,7 +985,7 @@ class ScreenshotRecognitionService:
             cards.extend(kept_jokers)
             cards.sort(key=lambda item: item[0])
         limited_cards: list[
-            tuple[float, str, float, str, tuple[int, int, int, int]]
+            tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
         ] = []
         counts: Counter[str] = Counter()
         for item in cards:
@@ -927,7 +996,7 @@ class ScreenshotRecognitionService:
             limited_cards.append(item)
         cards = limited_cards
         if not cards:
-            return (), 0.0, "", tuple(diagnostics), ()
+            return (), 0.0, "", tuple(diagnostics), (), ()
         return (
             tuple(item[1] for item in cards),
             min(item[2] for item in cards),
@@ -937,7 +1006,165 @@ class ScreenshotRecognitionService:
                 RecognitionAnnotation(item[1], item[4], item[2], category)
                 for item in cards
             ),
+            tuple(item[5] for item in cards),
         )
+
+    @staticmethod
+    def _unknown_suit_options(
+        image: np.ndarray,
+        rank: _TemplateMatch,
+    ) -> tuple[str, str]:
+        """Use the visible rank glyph to retain red/black suit candidates."""
+
+        left = max(0, rank.x)
+        top = max(0, rank.y)
+        right = min(image.shape[1], rank.x + rank.w)
+        bottom = min(image.shape[0], rank.y + rank.h)
+        if right <= left or bottom <= top:
+            return "S", "C"
+        roi = image[top:bottom, left:right]
+        if roi.ndim != 3:
+            return "S", "C"
+        blue, green, red = cv2.split(roi)
+        red_pixels = (red.astype(np.int16) - np.maximum(blue, green).astype(np.int16) >= 35) & (red >= 90)
+        return ("H", "D") if int(np.count_nonzero(red_pixels)) >= 4 else ("S", "C")
+
+    def _uncertain_suit_options(
+        self,
+        image: np.ndarray,
+        rank: _TemplateMatch,
+        selected: _TemplateMatch,
+        raw_matches: Iterable[_TemplateMatch],
+    ) -> tuple[str, ...]:
+        """Return colour candidates when a same-colour suit match is tied."""
+
+        color_candidates = self._unknown_suit_options(image, rank)
+        selected_code = self._suit_code(selected.label)
+        if selected_code not in color_candidates:
+            return color_candidates
+        scores: dict[str, float] = {}
+        for candidate in raw_matches:
+            code = self._suit_code(candidate.label)
+            if code not in color_candidates:
+                continue
+            if (
+                abs(candidate.center_x - rank.center_x)
+                > max(24.0, rank.w * 0.8, candidate.w * 0.8)
+                or not self._suit_is_below_rank(rank, candidate)
+            ):
+                continue
+            scores[code] = max(scores.get(code, 0.0), candidate.score)
+        selected_score = scores.get(selected_code, selected.score)
+        competing = [
+            score for code, score in scores.items() if code != selected_code
+        ]
+        if competing and max(competing) >= selected_score - self._SUIT_AMBIGUITY_MARGIN:
+            return color_candidates
+        return ()
+
+    @staticmethod
+    def _normalized_dark_suit_mask(image: np.ndarray) -> np.ndarray | None:
+        """Center a suit silhouette and remove its card background."""
+
+        if image.ndim == 2:
+            gray = image
+        elif image.ndim == 3 and image.shape[2] >= 3:
+            gray = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2GRAY)
+        else:
+            return None
+        _threshold, mask = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+        )
+        points = cv2.findNonZero(mask)
+        if points is None:
+            return None
+        x, y, width, height = cv2.boundingRect(points)
+        if width < 4 or height < 4:
+            return None
+        glyph = mask[y : y + height, x : x + width]
+        side = max(width, height) + 6
+        canvas = np.zeros((side, side), dtype=np.uint8)
+        top = (side - height) // 2
+        left = (side - width) // 2
+        canvas[top : top + height, left : left + width] = glyph
+        return cv2.resize(
+            canvas,
+            (ScreenshotRecognitionService._BLACK_SUIT_HOG_SIZE,) * 2,
+            interpolation=cv2.INTER_AREA,
+        )
+
+    @staticmethod
+    def _black_suit_hog(mask: np.ndarray) -> np.ndarray:
+        size = ScreenshotRecognitionService._BLACK_SUIT_HOG_SIZE
+        descriptor = cv2.HOGDescriptor(
+            (size, size),
+            (16, 16),
+            (8, 8),
+            (8, 8),
+            9,
+        )
+        return descriptor.compute(mask).reshape(-1)
+
+    def _black_suit_template_descriptors(self) -> tuple[tuple[str, np.ndarray], ...]:
+        with self._template_lock:
+            if self._black_suit_hog_cache is not None:
+                return self._black_suit_hog_cache
+            descriptors: list[tuple[str, np.ndarray]] = []
+            for raw, template in self._templates():
+                if (
+                    raw.get("kind") != "suit"
+                    or raw.get("source_role") != "play"
+                    or raw.get("label") not in {"spade", "club"}
+                ):
+                    continue
+                mask = self._normalized_dark_suit_mask(template)
+                if mask is None:
+                    continue
+                descriptors.append((self._suit_code(str(raw["label"])), self._black_suit_hog(mask)))
+            self._black_suit_hog_cache = tuple(descriptors)
+            return self._black_suit_hog_cache
+
+    def _black_suit_shape_code(
+        self,
+        image: np.ndarray,
+        selected: _TemplateMatch,
+    ) -> str | None:
+        """Confirm a tied black suit with normalized silhouette features."""
+
+        # Match locations already cover the suit glyph.  Expanding upward can
+        # pull the descender of an adjacent rank (notably ``A``) into the
+        # silhouette and erase the very shape distinction we need.
+        padding = 0
+        left = max(0, selected.x - padding)
+        top = max(0, selected.y - padding)
+        right = min(image.shape[1], selected.x + selected.w + padding)
+        bottom = min(image.shape[0], selected.y + selected.h + padding)
+        if right <= left or bottom <= top:
+            return None
+        mask = self._normalized_dark_suit_mask(image[top:bottom, left:right])
+        if mask is None:
+            return None
+        query = self._black_suit_hog(mask)
+        scores: dict[str, float] = {}
+        for code, template in self._black_suit_template_descriptors():
+            denominator = float(np.linalg.norm(query) * np.linalg.norm(template))
+            if denominator <= 0:
+                continue
+            score = float(np.dot(query, template) / denominator)
+            scores[code] = max(scores.get(code, -1.0), score)
+        if set(scores) != {"S", "C"}:
+            return None
+        winner, winner_score = max(scores.items(), key=lambda item: item[1])
+        runner_score = scores["C" if winner == "S" else "S"]
+        if (
+            winner_score < self._BLACK_SUIT_HOG_MIN_SCORE
+            or winner_score - runner_score < self._BLACK_SUIT_HOG_MIN_MARGIN
+        ):
+            return None
+        return winner
 
     @staticmethod
     def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
@@ -1053,6 +1280,35 @@ class ScreenshotRecognitionService:
                 )
                 for match in selected
             ),
+        )
+
+    def _recognize_buttons_in_regions(
+        self,
+        image: np.ndarray,
+        regions: Iterable[RegionRecord | None],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...],
+    ) -> tuple[tuple[str, ...], float, str, tuple[RecognitionAnnotation, ...]]:
+        """Merge normal action buttons with the bottom terminal controls."""
+
+        best: dict[str, tuple[float, str, RecognitionAnnotation]] = {}
+        for region in regions:
+            labels, score, source, annotations = self._recognize_buttons(
+                image,
+                region,
+                templates,
+            )
+            for label, annotation in zip(labels, annotations):
+                existing = best.get(label)
+                if existing is None or annotation.confidence > existing[0]:
+                    best[label] = (annotation.confidence, source, annotation)
+        if not best:
+            return (), 0.0, "", ()
+        selected = sorted(best.items(), key=lambda item: (item[1][2].box[0], item[1][2].box[1]))
+        return (
+            tuple(label for label, _value in selected),
+            min(value[0] for _label, value in selected),
+            "template:buttons",
+            tuple(value[2] for _label, value in selected),
         )
 
     @staticmethod

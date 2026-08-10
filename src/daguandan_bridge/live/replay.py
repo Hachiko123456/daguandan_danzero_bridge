@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from ..storage import append_json_line, atomic_write_json
-from ..danzero.state import GuanDanState, PlayEvent, RANKS
+from ..danzero.state import GuanDanState
 from .models import LiveEvent, LiveSnapshot
 from .orchestrator import LiveOrchestrator
 from .recorder import SessionRecorder
@@ -111,86 +111,11 @@ _TURN_SEARCH_WINDOW = 500
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 
 
-def _resolve_unknown_cards(
-    state: GuanDanState,
-) -> tuple[GuanDanState, list[dict[str, str]]]:
-    """Resolve ``8?``-style truth-log cards only in the advisor copy.
+class _ReplayAdvisorAdapter:
+    """Preserve the orchestrator's temporary unknown-suit branching in replay."""
 
-    Truth logs may preserve a trusted rank while leaving a suit unknown.  The
-    reducer keeps that evidence intact, but the DanZero engine requires a
-    concrete card code.  Pick the first still-available suit from the two-deck
-    inventory and report every substitution to the replay summary.
-    """
-
-    counts = Counter()
-    replacements: list[dict[str, str]] = []
-
-    known_card_groups: list[tuple[str, ...]] = [tuple(state.my_hand)]
-    known_card_groups.extend(
-        tuple(event.cards)
-        for event in state.play_history
-    )
-    history_ids = {id(event) for event in state.play_history}
-    known_card_groups.extend(
-        tuple(event.cards)
-        for event in state.trick_plays
-        if id(event) not in history_ids
-    )
-    for cards in known_card_groups:
-        for card in cards:
-            if not str(card).endswith("?"):
-                counts[str(card)] += 1
-
-    def resolve_cards(cards: tuple[str, ...]) -> tuple[str, ...]:
-        resolved: list[str] = []
-        for raw in cards:
-            card = str(raw)
-            if card.endswith("?") and card[:-1] in RANKS:
-                rank = card[:-1]
-                candidates = [
-                    f"{rank}{suit}" for suit in ("S", "H", "C", "D")
-                ]
-                candidate = next(
-                    (item for item in candidates if counts[item] == 0),
-                    next((item for item in candidates if counts[item] < 2), None),
-                )
-                if candidate is None:
-                    raise ValueError(f"可信日志中的未知牌无法补全：{card}")
-                counts[candidate] += 1
-                resolved.append(candidate)
-                replacements.append({"original": card, "resolved": candidate})
-            else:
-                resolved.append(card)
-        return tuple(resolved)
-
-    resolved_hand = resolve_cards(tuple(state.my_hand))
-    resolved_by_id: dict[int, PlayEvent] = {}
-    resolved_history: list[PlayEvent] = []
-    for event in state.play_history:
-        resolved = replace(event, cards=resolve_cards(tuple(event.cards)))
-        resolved_by_id[id(event)] = resolved
-        resolved_history.append(resolved)
-    resolved_trick: list[PlayEvent] = []
-    for event in state.trick_plays:
-        resolved = resolved_by_id.get(id(event))
-        if resolved is None:
-            resolved = replace(event, cards=resolve_cards(tuple(event.cards)))
-        resolved_trick.append(resolved)
-    return (
-        replace(
-            state,
-            my_hand=resolved_hand,
-            trick_plays=resolved_trick,
-            play_history=resolved_history,
-        ),
-        replacements,
-    )
-
-
-class _UnknownCardResolvingAdvisor:
     def __init__(self, advisor: Any) -> None:
         self._advisor = advisor
-        self.resolutions: list[dict[str, str]] = []
 
     def recommend(
         self,
@@ -199,12 +124,10 @@ class _UnknownCardResolvingAdvisor:
         request_id: str = "",
         trace: Any | None = None,
     ) -> Any:
-        resolved, replacements = _resolve_unknown_cards(state)
-        self.resolutions.extend(replacements)
         kwargs: dict[str, object] = {"request_id": request_id}
         if trace is not None and "trace" in signature(self._advisor.recommend).parameters:
             kwargs["trace"] = trace
-        return self._advisor.recommend(resolved, **kwargs)
+        return self._advisor.recommend(state, **kwargs)
 
 
 def replay_truth_through_live_advisor(
@@ -263,7 +186,7 @@ def replay_truth_through_live_advisor(
     processed_turn_count = 0
     started = False
     orchestrator: LiveOrchestrator | None = None
-    advisor_adapter = _UnknownCardResolvingAdvisor(advisor)
+    advisor_adapter = _ReplayAdvisorAdapter(advisor)
 
     def consume_advice(update: object, store: LiveSessionStore) -> None:
         nonlocal advice_timeout_count
@@ -399,7 +322,9 @@ def replay_truth_through_live_advisor(
             "advice_stale": statuses.get("stale", 0),
             "advice_timeouts": advice_timeout_count,
             "advice_statuses": dict(statuses),
-            "unknown_card_resolutions": list(advisor_adapter.resolutions),
+            # Compatibility field: no irreversible replacement is made.
+            "unknown_card_resolutions": [],
+            "unknown_card_policy": "temporary_suit_variants",
         }
         summary_path = run_directory / "summary.json"
         atomic_write_json(summary_path, summary)
@@ -417,7 +342,7 @@ def replay_truth_through_live_advisor(
         advice_failed=int(statuses.get("failed", 0)),
         advice_stale=int(statuses.get("stale", 0)),
         advice_timeouts=advice_timeout_count,
-        unknown_card_resolutions=len(advisor_adapter.resolutions),
+        unknown_card_resolutions=0,
     )
 
 

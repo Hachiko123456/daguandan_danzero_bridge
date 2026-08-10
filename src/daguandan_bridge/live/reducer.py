@@ -14,6 +14,7 @@ from ..danzero.state import (
     Seat,
 )
 from .models import LiveEvent, LiveSnapshot
+from .card_uncertainty import normalized_suit_options
 from .turns import TURN_ORDER, next_active_seat
 
 
@@ -164,13 +165,28 @@ class LiveReducer:
         confidence: float = 1.0,
         source: str = "multi_frame_consensus",
         evidence_refs: Iterable[str] = (),
+        suit_options: Iterable[Iterable[str]] = (),
+        integrity_warnings: Iterable[str] = (),
     ) -> LiveEvent:
         self._require_expected_player(player)
-        normalized = self._normalize_cards(cards)
+        raw_cards = tuple(str(card) for card in cards)
+        aligned = sorted(
+            zip(raw_cards, normalized_suit_options(raw_cards, suit_options)),
+            key=lambda item: item[0],
+        )
+        normalized = self._normalize_cards(card for card, _options in aligned)
+        payload: dict[str, object] = {
+            "cards": list(normalized),
+            "is_pass": False,
+            "suit_options": [list(options) for _card, options in aligned],
+        }
+        warnings = tuple(dict.fromkeys(str(item) for item in integrity_warnings if str(item)))
+        if warnings:
+            payload["integrity_warnings"] = list(warnings)
         event = self._new_event(
             "player_played",
             actor=player,
-            payload={"cards": list(normalized), "is_pass": False},
+            payload=payload,
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
@@ -275,6 +291,7 @@ class LiveReducer:
             payload={
                 "cards": list(correction.payload.get("cards", ())),
                 "is_pass": is_pass,
+                "suit_options": [],
             },
             confidence=correction.confidence,
             source=correction.source,
@@ -361,6 +378,11 @@ class LiveReducer:
             is_pass=is_pass,
             observed_at=observed_at,
             source=event.source,
+            suit_options=tuple(
+                tuple(str(suit) for suit in options)
+                for options in event.payload.get("suit_options", ())
+                if isinstance(options, (list, tuple))
+            ),
         )
         self._trick_plays.append(play)
         self._play_history.append(play)
