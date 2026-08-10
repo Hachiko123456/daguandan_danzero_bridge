@@ -114,7 +114,9 @@ def test_replay_page_can_load_recorded_session(tmp_path):
     assert page.play_button.isEnabled()
     assert page.rewind_button.isEnabled()
     assert page.forward_button.isEnabled()
-    assert page.frame_spin.maximum() == 3
+    assert page.frame_spin.maximum() == 2
+    assert page.playback_toolbar.play_button is page.play_button
+    assert page.playback_toolbar.rewind_button is page.rewind_button
     assert "game-test" in page.session_summary.text()
     assert "3" in page.session_summary.text()
     page.shutdown()

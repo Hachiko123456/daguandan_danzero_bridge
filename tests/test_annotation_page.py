@@ -18,6 +18,7 @@ from PySide6.QtTest import QTest
 from daguandan_bridge.annotation_service import AnnotationService
 from daguandan_bridge.config import PROFILES_ROOT
 from daguandan_bridge.gui.annotation_page import AnnotationPage
+from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.models import Box
 
 
@@ -139,6 +140,30 @@ def test_template_label_is_an_editable_dropdown(tmp_path):
     page.template_label_edit.setText("new_manual_label")
     assert page.template_label_edit.currentText() == "new_manual_label"
 
+    page.close()
+    app.processEvents()
+
+
+def test_template_filter_uses_template_folder_kinds_and_label_field_opens_popup():
+    app = QApplication.instance() or QApplication([])
+    page = AnnotationPage(AnnotationService())
+    page.resize(1200, 800)
+    page.show()
+    page.mode_combo.setCurrentIndex(page.mode_combo.findData("template"))
+    page.template_kind_combo.setCurrentIndex(page.template_kind_combo.findData("effect"))
+    app.processEvents()
+
+    assert [
+        page.template_filter_combo.itemData(index)
+        for index in range(page.template_filter_combo.count())
+    ] == ["", "anchor", "button", "effect", "rank", "suit", "status", "timer"]
+    QTest.mouseClick(
+        page.template_label_edit.lineEdit(), Qt.MouseButton.LeftButton
+    )
+    app.processEvents()
+    assert page.template_label_edit.view().isVisible()
+
+    page.template_label_edit.hidePopup()
     page.close()
     app.processEvents()
 
@@ -747,8 +772,11 @@ def test_annotation_page_auto_fills_single_image_from_template_recognition(tmp_p
     cv2.imwrite(str(image_dir / "000001.png"), np.zeros((720, 1280, 3), dtype=np.uint8))
     app = QApplication.instance() or QApplication([])
 
+    recognition_options = []
+
     class FakeRecognition:
-        def recognize(self, image):
+        def recognize(self, image, *, allow_unknown_suit=False):
+            recognition_options.append(allow_unknown_suit)
             return RecognitionResult(
                 round_level="2",
                 wild_rank="2",
@@ -770,6 +798,7 @@ def test_annotation_page_auto_fills_single_image_from_template_recognition(tmp_p
     assert _wait_until(lambda: dialog.recognition_status.text().startswith("模板识别完成"))
     assert dialog.my_hand_edit.text() == "3S 4H"
     assert dialog.current_player_combo.currentData() == "self"
+    assert recognition_options == [True]
 
     dialog.close()
     page.close()
@@ -1223,6 +1252,155 @@ def test_annotation_page_browses_any_local_image_folder_with_arrow_navigation(tm
     page.next_image_button.click()
     assert page.current_image_path.name == "02.png"
     assert page.image_position_label.text() == "2 / 2"
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_page_can_step_a_recorded_session_without_saving_a_screenshot(tmp_path):
+    root = tmp_path / "profiles"
+    profile_root = root / "tencent_daguandan"
+    shutil.copytree(
+        PROFILES_ROOT / "tencent_daguandan",
+        profile_root,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
+    )
+    session = profile_root / "sessions" / "game_annotation_test"
+    session.mkdir(parents=True)
+    (session / "manifest.json").write_text(
+        json.dumps(
+            {
+                "session_id": session.name,
+                "status": "sealed",
+                "frame_count": 2,
+                "dropped_frames": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorder = SessionRecorder(session, size=(64, 32), fps=10)
+    recorder.write_frame(
+        np.zeros((32, 64, 3), dtype=np.uint8),
+        captured_monotonic_ms=100,
+        wall_time="t0",
+    )
+    recorder.write_frame(
+        np.full((32, 64, 3), 255, dtype=np.uint8),
+        captured_monotonic_ms=200,
+        wall_time="t1",
+    )
+    recorder.close()
+    app = QApplication.instance() or QApplication([])
+
+    page = AnnotationPage(AnnotationService(root))
+    assert not hasattr(page, "source_mode_combo")
+    session_index = page.session_combo.findData(str(session.resolve()))
+    assert session_index >= 0
+    page.session_combo.setCurrentIndex(session_index)
+    page.session_step_button.click()
+
+    assert _wait_until(lambda: page._session_record is not None)
+    assert page.current_image is not None
+    assert page.current_image_path is None
+    assert page._session_record.frame_index == 0
+    assert page._session_frame_source().endswith("game.avi#frame=0")
+    assert page.session_play_button.isEnabled()
+    assert page.session_step_button.isEnabled()
+    assert page.session_rewind_button.isEnabled()
+    assert page.session_forward_button.isEnabled()
+    assert page.session_frame_spin.minimumWidth() >= 156
+    assert page.session_playback_toolbar.play_button is page.session_play_button
+    assert page.session_playback_toolbar.frame_spin is page.session_frame_spin
+
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_template_kind_filters_saved_templates_and_backlinks(tmp_path):
+    root = tmp_path / "profiles"
+    shutil.copytree(
+        PROFILES_ROOT / "tencent_daguandan",
+        root / "tencent_daguandan",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
+    )
+    app = QApplication.instance() or QApplication([])
+    page = AnnotationPage(AnnotationService(root))
+
+    effect_index = page.template_kind_combo.findData("effect")
+    page.template_kind_combo.setCurrentIndex(effect_index)
+    app.processEvents()
+
+    assert page.template_filter_combo.currentData() == "effect"
+    page.mode_combo.setCurrentIndex(page.mode_combo.findData("template"))
+    assert all(
+        page.template_table.item(row, 0).text() == "牌型特效"
+        for row in range(page.template_table.rowCount())
+    )
+    assert page.template_source_role_combo.currentData() == "generic"
+
+    anchor_index = page.template_filter_combo.findData("anchor")
+    page.template_filter_combo.setCurrentIndex(anchor_index)
+    app.processEvents()
+    assert page.template_kind_combo.currentData() == "anchor"
+
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_page_captures_one_effect_key_frame(tmp_path):
+    root = tmp_path / "profiles"
+    profile_root = root / "tencent_daguandan"
+    shutil.copytree(
+        PROFILES_ROOT / "tencent_daguandan",
+        profile_root,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("templates", "screenshots", "sessions"),
+    )
+    session = profile_root / "sessions" / "game_effect_capture"
+    session.mkdir(parents=True)
+    (session / "manifest.json").write_text(
+        json.dumps(
+            {
+                "session_id": session.name,
+                "status": "sealed",
+                "frame_count": 2,
+                "dropped_frames": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorder = SessionRecorder(session, size=(64, 32), fps=10)
+    for index, value in enumerate((40, 180)):
+        recorder.write_frame(
+            np.full((32, 64, 3), value, dtype=np.uint8),
+            captured_monotonic_ms=(index + 1) * 100,
+            wall_time=f"t{index}",
+        )
+    recorder.close()
+    app = QApplication.instance() or QApplication([])
+    page = AnnotationPage(AnnotationService(root))
+    session_index = page.session_combo.findData(str(session.resolve()))
+    page.session_combo.setCurrentIndex(session_index)
+    page.session_step_button.click()
+    assert _wait_until(lambda: page.current_image is not None)
+
+    page.mode_combo.setCurrentIndex(page.mode_combo.findData("template"))
+    page.template_kind_combo.setCurrentIndex(page.template_kind_combo.findData("effect"))
+    page.template_label_edit.setText("royal_flush")
+    page._set_template_roi(Box(12, 6, 28, 20))
+    page.crop_template_button.click()
+
+    assert _wait_until(lambda: page.crop_template_button.isEnabled())
+    saved = [
+        record
+        for record in page.template_service.list_templates()
+        if record.get("kind") == "effect" and record.get("label") == "royal_flush"
+    ]
+    assert len(saved) == 1
+    assert saved[0]["source_image"] == "sessions/game_effect_capture/video/game.avi#frame=0"
+    assert "模板已保存" in page.status.text()
+
     page.close()
     app.processEvents()
 

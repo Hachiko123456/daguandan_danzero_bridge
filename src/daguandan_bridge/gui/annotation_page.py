@@ -6,6 +6,7 @@ from time import perf_counter
 import uuid
 
 import cv2
+import numpy as np
 
 from PySide6.QtCore import QPoint, QRect, QThread, Qt, Signal
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QRubberBand,
-    QSpinBox,
     QStackedWidget,
     QSplitter,
     QTableWidget,
@@ -35,6 +35,8 @@ from qfluentwidgets import (
     CaptionLabel,
     PrimaryPushButton,
     PushButton,
+    SearchLineEdit,
+    SpinBox,
     StrongBodyLabel,
     SubtitleLabel,
     ToolButton,
@@ -50,11 +52,14 @@ from ..annotation_service import (
 from ..danzero import DanzeroAdvisor
 from ..danzero.advisor import format_engine_input_summary
 from ..image_io import read_image_unicode
+from ..live.replay import FrameIndexRecord, VideoReplaySource
+from ..live.session_store import read_json_lines
 from ..models import Box
 from ..recognition_service import RecognitionResult, ScreenshotRecognitionService
 from ..template_service import SOURCE_ROLES, TEMPLATE_KINDS, TemplateService
 from .region_config_page import RegionConfigPage
 from .single_image_danzero_page import SingleImageDanzeroPage
+from .video_playback import ReplayDecodeThread, SessionPlaybackToolbar
 from .workers import OneShotThread
 
 TEMPLATE_KIND_LABELS = {
@@ -175,8 +180,29 @@ def _format_danzero_timings(timings: object) -> str:
     return "；".join(parts) or "暂无分段计时"
 
 
+class _PopupLineEdit(QLineEdit):
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
 class EditableTemplateLabelComboBox(QComboBox):
     """Editable history combo with the old line-edit ``setText`` API."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        line_edit = _PopupLineEdit(self)
+        self.setLineEdit(line_edit)
+        line_edit.clicked.connect(self.showPopup)
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.showPopup()
 
     def setText(self, value: str) -> None:
         index = self.findData(str(value))
@@ -296,6 +322,12 @@ class AnnotationPage(QWidget):
             if self.service.screenshots_root.is_dir()
             else None
         )
+        self.sessions_root = self.service.profile_root / "sessions"
+        self.current_session: Path | None = None
+        self._session_decode_thread: ReplayDecodeThread | None = None
+        self._session_record = None
+        self._session_start_frame: int | None = None
+        self._session_playing = False
         self.current_image_path: Path | None = None
         self.current_image = None
         self.current_roi: Box | None = None
@@ -317,7 +349,12 @@ class AnnotationPage(QWidget):
         )
         self.setObjectName("annotationPage")
         self._build_ui()
-        self._refresh_images()
+        # A fresh installation without recordings still supports the legacy
+        # programmatic image API.  Normal profiles begin with the focused
+        # session workflow and do not preload an unrelated screenshot.
+        if not self._has_playable_session():
+            self._refresh_images()
+        self._refresh_sessions()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -331,7 +368,7 @@ class AnnotationPage(QWidget):
         heading = QVBoxLayout()
         heading.setSpacing(3)
         heading.addWidget(SubtitleLabel("标记与模板"))
-        heading.addWidget(CaptionLabel("选择本地图片文件夹，配置识别区域并裁剪可复用模板。"))
+        heading.addWidget(CaptionLabel("从已录制对局定位单帧，配置识别区域并裁剪可复用模板。"))
         header.addLayout(heading, 1)
         self.region_config_button = PushButton("查看区域配置")
         self.region_config_button.setToolTip("查看、编辑并多选区域配置")
@@ -344,6 +381,12 @@ class AnnotationPage(QWidget):
         self.single_image_test_button = PrimaryPushButton("单图标注 / 测试 DanZero")
         self.single_image_test_button.setEnabled(False)
         self.single_image_test_button.clicked.connect(self._open_single_image_danzero)
+        for control in (
+            self.region_config_button,
+            self.show_selected_button,
+            self.single_image_test_button,
+        ):
+            control.setMinimumHeight(34)
         header.addWidget(self.single_image_test_button)
         root.addWidget(header_card)
 
@@ -351,7 +394,15 @@ class AnnotationPage(QWidget):
         source_layout = QVBoxLayout(source_card)
         source_layout.setContentsMargins(20, 14, 20, 14)
         source_layout.setSpacing(8)
-        source_layout.addWidget(StrongBodyLabel("图片来源"))
+        source_layout.addWidget(StrongBodyLabel("已录制对局"))
+        source_layout.addWidget(
+            CaptionLabel("从 tencent_daguandan/sessions 选择对局，播放或定位到单帧后直接框选。")
+        )
+
+        self.folder_source_widget = QWidget(self)
+        folder_source_layout = QVBoxLayout(self.folder_source_widget)
+        folder_source_layout.setContentsMargins(0, 0, 0, 0)
+        folder_source_layout.setSpacing(8)
         folder_row = QHBoxLayout()
         self.folder_path_label = CaptionLabel("未选择图片文件夹")
         self.folder_path_label.setWordWrap(True)
@@ -367,7 +418,7 @@ class AnnotationPage(QWidget):
         self.refresh_images_button.setToolTip("刷新当前文件夹")
         self.refresh_images_button.clicked.connect(self._refresh_images)
         folder_row.addWidget(self.refresh_images_button)
-        source_layout.addLayout(folder_row)
+        folder_source_layout.addLayout(folder_row)
         image_selector = QHBoxLayout()
         image_selector.addWidget(CaptionLabel("当前图片"))
         self.image_combo = QComboBox()
@@ -376,7 +427,51 @@ class AnnotationPage(QWidget):
         image_selector.addWidget(self.image_combo, 1)
         self.image_position_label = CaptionLabel("0 / 0")
         image_selector.addWidget(self.image_position_label)
-        source_layout.addLayout(image_selector)
+        folder_source_layout.addLayout(image_selector)
+        # Keep the legacy image-folder controls alive for programmatic callers,
+        # but do not expose a second source in the focused session workflow.
+        self.folder_source_widget.hide()
+
+        session_selector = QHBoxLayout()
+        session_selector.addWidget(CaptionLabel("对局"))
+        self.session_combo = ScrollSafeComboBox()
+        self.session_combo.setToolTip("来自 tencent_daguandan/sessions 的已录制对局")
+        self.session_combo.setMinimumHeight(34)
+        self.session_combo.currentIndexChanged.connect(self._session_changed)
+        session_selector.addWidget(self.session_combo, 1)
+        self.refresh_sessions_button = ToolButton()
+        self.refresh_sessions_button.setText("↻")
+        self.refresh_sessions_button.setToolTip("刷新对局列表")
+        self.refresh_sessions_button.setFixedSize(34, 34)
+        self.refresh_sessions_button.clicked.connect(self._refresh_sessions)
+        session_selector.addWidget(self.refresh_sessions_button)
+        source_layout.addLayout(session_selector)
+
+        self.session_playback_toolbar = SessionPlaybackToolbar(self)
+        # Stable aliases keep the older page API working while both pages now
+        # render and signal through the exact same toolbar component.
+        self.session_play_button = self.session_playback_toolbar.play_button
+        self.session_step_button = self.session_playback_toolbar.step_button
+        self.session_rewind_button = self.session_playback_toolbar.rewind_button
+        self.session_forward_button = self.session_playback_toolbar.forward_button
+        self.session_frame_spin = self.session_playback_toolbar.frame_spin
+        self.session_jump_button = self.session_playback_toolbar.frame_jump_button
+        self.session_speed_combo = self.session_playback_toolbar.speed_combo
+        self.session_status = CaptionLabel("选择对局后，可播放、逐帧定位并直接框选模板。")
+        self.session_status.setWordWrap(True)
+        self.session_playback_toolbar.play_pause_requested.connect(
+            self._toggle_session_playback
+        )
+        self.session_playback_toolbar.step_requested.connect(self._step_session_frame)
+        self.session_playback_toolbar.seek_requested.connect(
+            self._jump_to_session_frame
+        )
+        self.session_playback_toolbar.seek_seconds_requested.connect(
+            self._seek_session_by_seconds
+        )
+        self.session_playback_toolbar.speed_changed.connect(self._session_speed_changed)
+        source_layout.addWidget(self.session_playback_toolbar)
+        source_layout.addWidget(self.session_status)
         root.addWidget(source_card)
 
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -401,7 +496,7 @@ class AnnotationPage(QWidget):
         self.next_image_button.setFixedSize(40, 56)
         self.next_image_button.clicked.connect(self._select_next_image)
         self.canvas = RoiCanvas()
-        self.canvas.setText("请选择图片文件夹")
+        self.canvas.setText("请选择已录制对局并定位到一帧")
         self.canvas.setMinimumSize(400, 260)
         self.canvas.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -415,7 +510,7 @@ class AnnotationPage(QWidget):
         self.image_navigation_layout.addWidget(self.canvas, 1)
         self.image_navigation_layout.addWidget(self.next_image_button)
         preview_layout.addLayout(self.image_navigation_layout, 1)
-        self.status = CaptionLabel("请选择一个图片文件夹以开始标记。")
+        self.status = CaptionLabel("请选择已录制对局，播放或定位到单帧后开始标记。")
         self.status.setWordWrap(True)
         self.status.setMinimumHeight(32)
         preview_layout.addWidget(self.status)
@@ -429,6 +524,7 @@ class AnnotationPage(QWidget):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("区域配置", "region")
         self.mode_combo.addItem("模板裁剪", "template")
+        self.mode_combo.setMinimumHeight(34)
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode_combo, 1)
         right.addLayout(mode_row)
@@ -475,7 +571,7 @@ class AnnotationPage(QWidget):
         template_detail_layout = QVBoxLayout(self.template_detail_widget)
         template_detail_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.x_spin, self.y_spin, self.w_spin, self.h_spin = (QSpinBox() for _ in range(4))
+        self.x_spin, self.y_spin, self.w_spin, self.h_spin = (SpinBox() for _ in range(4))
         for spin, maximum in (
             (self.x_spin, 1279),
             (self.y_spin, 719),
@@ -483,6 +579,7 @@ class AnnotationPage(QWidget):
             (self.h_spin, 720),
         ):
             spin.setRange(0, maximum)
+            spin.setMinimumHeight(34)
 
         grid = QGridLayout()
         for column, (label, spin) in enumerate(
@@ -501,9 +598,8 @@ class AnnotationPage(QWidget):
             self._template_kind_changed
         )
         self.template_label_edit = EditableTemplateLabelComboBox()
-        self.template_label_edit.setEditable(True)
         self.template_label_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.template_label_edit.setToolTip("可从下拉列表选择常用标签，也可输入一个新标签")
+        self.template_label_edit.setToolTip("点击输入框空白处即可展开标签；也可直接输入新标签")
         self.template_source_role_combo = ScrollSafeComboBox()
         for role in sorted(SOURCE_ROLES):
             self.template_source_role_combo.addItem(SOURCE_ROLE_LABELS.get(role, role), role)
@@ -514,17 +610,17 @@ class AnnotationPage(QWidget):
         self.crop_template_button = PrimaryPushButton("裁剪并保存模板")
         self.delete_template_button = PushButton("删除选中模板")
         filter_row = QHBoxLayout()
-        filter_row.addWidget(CaptionLabel("筛选角色"))
+        filter_row.addWidget(CaptionLabel("模板类型"))
         self.template_filter_combo = ScrollSafeComboBox()
-        self.template_filter_combo.addItem("全部角色", "")
-        for role in sorted(SOURCE_ROLES):
+        self.template_filter_combo.addItem("全部类型", "")
+        for kind in ("anchor", "button", "effect", "rank", "suit", "status", "timer"):
             self.template_filter_combo.addItem(
-                SOURCE_ROLE_LABELS.get(role, role), role
+                TEMPLATE_KIND_LABELS.get(kind, kind), kind
             )
         filter_row.addWidget(self.template_filter_combo)
-        self.template_search_edit = QLineEdit()
+        self.template_search_edit = SearchLineEdit()
         self.template_search_edit.setPlaceholderText(
-            "搜索模板（标签/类型/角色/文件名，支持中文）"
+            "搜索标签或文件名"
         )
         self.template_search_edit.setClearButtonEnabled(True)
         filter_row.addWidget(self.template_search_edit, 1)
@@ -551,12 +647,22 @@ class AnnotationPage(QWidget):
         # Keep the old attribute as a compatibility alias for integrations that
         # only use it to read or select saved templates.
         self.template_list = self.template_table
+        for control in (
+            self.template_kind_combo,
+            self.template_label_edit,
+            self.template_source_role_combo,
+            self.template_filter_combo,
+            self.template_search_edit,
+            self.crop_template_button,
+            self.delete_template_button,
+        ):
+            control.setMinimumHeight(34)
         template_detail_layout.addWidget(self.crop_template_button)
         template_detail_layout.addWidget(self.delete_template_button)
         template_detail_layout.addLayout(filter_row)
         template_detail_layout.addWidget(self.template_table)
         self.template_filter_combo.currentIndexChanged.connect(
-            self._refresh_template_status
+            self._template_filter_changed
         )
         self.template_search_edit.textChanged.connect(
             self._refresh_template_status
@@ -574,9 +680,266 @@ class AnnotationPage(QWidget):
         self.content_splitter.setStretchFactor(1, 1)
         root.addWidget(self.content_splitter, 1)
         self._mode_changed()
-        self._refresh_template_status()
+        self._template_kind_changed()
         self._update_image_folder_label()
         self._update_responsive_layout()
+
+    def _refresh_sessions(self) -> None:
+        selected = self.current_session
+        self.session_combo.blockSignals(True)
+        self.session_combo.clear()
+        self.session_combo.addItem("请选择已录制对局", None)
+        sessions = ()
+        if self.sessions_root.is_dir():
+            sessions = tuple(
+                sorted(
+                    (
+                        path
+                        for path in self.sessions_root.iterdir()
+                        if path.is_dir()
+                        and (path / "manifest.json").is_file()
+                        and (path / "video" / "game.avi").is_file()
+                        and (path / "video" / "frame_index.jsonl").is_file()
+                    ),
+                    reverse=True,
+                )
+            )
+        for session in sessions:
+            self.session_combo.addItem(session.name, str(session))
+        self.session_combo.blockSignals(False)
+        self.refresh_sessions_button.setEnabled(True)
+        if selected is not None:
+            index = self.session_combo.findData(str(selected))
+            if index >= 0:
+                self.session_combo.setCurrentIndex(index)
+                self._select_session(selected)
+                return
+        self.current_session = None
+        self._set_session_actions(False)
+        self.session_status.setText(
+            "请选择一个已录制对局；随后可播放、逐帧定位并直接框选模板。"
+            if self.session_combo.count() > 1
+            else "sessions 中没有可播放的对局录像。"
+        )
+
+    def _has_playable_session(self) -> bool:
+        if not self.sessions_root.is_dir():
+            return False
+        return any(
+            path.is_dir()
+            and (path / "manifest.json").is_file()
+            and (path / "video" / "game.avi").is_file()
+            and (path / "video" / "frame_index.jsonl").is_file()
+            for path in self.sessions_root.iterdir()
+        )
+
+    def _session_changed(self, _index: int) -> None:
+        value = self.session_combo.currentData()
+        if value:
+            self._select_session(Path(str(value)))
+        else:
+            self._stop_session_decode()
+            self.current_session = None
+            self._session_record = None
+            self._clear_session_frame()
+            self._set_session_actions(False)
+
+    def _select_session(self, session: Path) -> None:
+        session = Path(session).resolve()
+        self._stop_session_decode()
+        self.current_session = session
+        self._session_record = None
+        self._session_start_frame = None
+        self._clear_session_frame()
+        try:
+            manifest = json.loads((session / "manifest.json").read_text("utf-8"))
+        except Exception as exc:
+            self._set_session_actions(False)
+            self.session_status.setText(f"对局信息读取失败：{exc}")
+            return
+        frame_count = max(0, int(manifest.get("frame_count", 0) or 0))
+        self.session_playback_toolbar.set_frame_count(frame_count)
+        self.session_frame_spin.setValue(0)
+        self._set_session_actions(True)
+        self.session_status.setText(
+            f"{session.name}｜录像 {frame_count} 帧｜选择播放或单帧后即可在左侧框选。"
+        )
+
+    def _clear_session_frame(self) -> None:
+        self.current_image_path = None
+        self.current_image = None
+        self.current_roi = None
+        self._show_draft_roi = False
+        self.single_image_test_button.setEnabled(False)
+        self.canvas.clear()
+        self.canvas.setText("请选择已录制对局并定位到一帧")
+        self._update_image_navigation()
+
+    def _set_session_actions(self, enabled: bool) -> None:
+        for widget in (
+            self.session_play_button,
+            self.session_step_button,
+            self.session_rewind_button,
+            self.session_forward_button,
+            self.session_frame_spin,
+            self.session_jump_button,
+            self.session_speed_combo,
+        ):
+            widget.setEnabled(enabled)
+        self._update_session_play_button()
+
+    def _ensure_session_decode(self) -> ReplayDecodeThread | None:
+        if self.current_session is None:
+            return None
+        if self._session_decode_thread is None:
+            thread = ReplayDecodeThread(
+                self.current_session / "video" / "game.avi",
+                self.current_session / "video" / "frame_index.jsonl",
+                self,
+                start_frame=self._session_start_frame,
+            )
+            self._session_start_frame = None
+            thread.set_speed(float(self.session_speed_combo.currentData() or 1.0))
+            thread.frame_ready.connect(self._show_session_frame)
+            thread.failed.connect(self._show_session_error)
+            thread.finished.connect(lambda: self._session_decode_finished(thread))
+            self._session_decode_thread = thread
+            thread.start()
+        return self._session_decode_thread
+
+    def _toggle_session_playback(self) -> None:
+        if self._session_playing:
+            self._pause_session_playback()
+            return
+        thread = self._ensure_session_decode()
+        if thread is not None:
+            thread.play()
+            self._session_playing = True
+            self._update_session_play_button()
+
+    def _pause_session_playback(self) -> None:
+        if self._session_decode_thread is not None:
+            self._session_decode_thread.pause()
+        self._session_playing = False
+        self._update_session_play_button()
+
+    def _step_session_frame(self) -> None:
+        thread = self._ensure_session_decode()
+        if thread is not None:
+            thread.pause()
+            thread.step()
+            self._session_playing = False
+            self._update_session_play_button()
+
+    def _jump_to_session_frame(self, target: int | None = None) -> None:
+        if self.current_session is None:
+            return
+        self._stop_session_decode()
+        self._session_start_frame = (
+            self.session_frame_spin.value() if target is None else int(target)
+        )
+        self._step_session_frame()
+
+    def _session_index_records(self) -> tuple[FrameIndexRecord, ...]:
+        if self.current_session is None:
+            return ()
+        try:
+            return tuple(
+                FrameIndexRecord.from_dict(raw)
+                for raw in read_json_lines(
+                    self.current_session / "video" / "frame_index.jsonl"
+                )
+            )
+        except Exception:
+            return ()
+
+    def _seek_session_by_seconds(self, delta_seconds: float) -> None:
+        if self.current_session is None:
+            return
+        records = self._session_index_records()
+        if not records:
+            self.session_status.setText("帧索引不可读，无法前进或后退")
+            return
+        current_ms = int(getattr(self._session_record, "monotonic_ms", 0))
+        target_ms = max(0, current_ms + int(float(delta_seconds) * 1000))
+        record = next(
+            (item for item in records if item.monotonic_ms >= target_ms),
+            records[-1],
+        )
+        self._stop_session_decode()
+        self._session_start_frame = record.frame_index
+        self._step_session_frame()
+
+    def _session_speed_changed(self, speed: float | int = 1.0) -> None:
+        if self._session_decode_thread is not None:
+            self._session_decode_thread.set_speed(
+                float(speed if isinstance(speed, float) else self.session_speed_combo.currentData() or 1.0)
+            )
+
+    def _show_session_frame(self, record: object, image: QImage) -> None:
+        self._session_record = record
+        self.current_image_path = None
+        self.current_image = self._qimage_to_bgr(image)
+        self.current_roi = None
+        self._show_draft_roi = False
+        self.canvas.set_source_size(self.current_image)
+        self.single_image_test_button.setEnabled(True)
+        frame_text = (
+            f"帧 {getattr(record, 'frame_index', '—')}　"
+            f"{getattr(record, 'monotonic_ms', 0)} ms　"
+            f"此前丢帧 {getattr(record, 'dropped_before', 0)}"
+        )
+        self.session_playback_toolbar.set_current_frame(
+            int(getattr(record, "frame_index", 0))
+        )
+        self.session_playback_toolbar.frame_status.setText(frame_text)
+        self.session_status.setText(f"当前{frame_text}；可直接在左侧框选模板。")
+        self._update_image_navigation()
+        self._refresh_preview()
+        if self.single_image_danzero_page is not None:
+            self.single_image_danzero_page.set_frame_image(
+                self.current_image.copy(), self._session_frame_source(),
+            )
+            self._start_template_recognition()
+
+    def _show_session_error(self, message: str) -> None:
+        self._pause_session_playback()
+        self.session_status.setText(f"录像播放失败：{message}")
+
+    def _session_decode_finished(self, thread: ReplayDecodeThread) -> None:
+        if thread is not self._session_decode_thread:
+            return
+        self._session_decode_thread = None
+        self._session_playing = False
+        self._update_session_play_button()
+
+    def _stop_session_decode(self) -> None:
+        thread, self._session_decode_thread = self._session_decode_thread, None
+        self._session_playing = False
+        self._update_session_play_button()
+        if thread is not None and thread.isRunning():
+            thread.stop()
+            thread.wait(5_000)
+
+    def _update_session_play_button(self) -> None:
+        if hasattr(self, "session_playback_toolbar"):
+            self.session_playback_toolbar.set_playing(self._session_playing)
+
+    def _session_frame_source(self) -> str:
+        if self.current_session is None:
+            return "session-frame"
+        frame = getattr(self._session_record, "frame_index", None)
+        suffix = f"#frame={frame}" if frame is not None else ""
+        return f"sessions/{self.current_session.name}/video/game.avi{suffix}"
+
+    @staticmethod
+    def _qimage_to_bgr(image: QImage) -> np.ndarray:
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        height, width = rgba.height(), rgba.width()
+        bits = rgba.constBits()
+        raw = bits.tobytes() if hasattr(bits, "tobytes") else bytes(bits)
+        pixels = np.frombuffer(raw, np.uint8).reshape((height, width, 4))
+        return cv2.cvtColor(pixels, cv2.COLOR_RGBA2BGR)
 
     def _mode_changed(self, *_args) -> None:
         is_template = self.mode_combo.currentData() == "template"
@@ -622,6 +985,10 @@ class AnnotationPage(QWidget):
         super().resizeEvent(event)
         if hasattr(self, "content_splitter"):
             self._update_responsive_layout()
+            # A session frame can arrive before Qt finishes laying out the
+            # split panes.  Always rescale from the source image on resize so
+            # the preview never stays at its early, undersized pixmap.
+            self._refresh_preview()
 
     def _update_image_folder_label(self) -> None:
         if self.image_folder is None:
@@ -816,10 +1183,10 @@ class AnnotationPage(QWidget):
     def _template_matches(
         self,
         record: dict[str, object],
-        role_filter: str,
+        kind_filter: str,
         keyword: str,
     ) -> bool:
-        if role_filter and str(record.get("source_role", "")) != role_filter:
+        if kind_filter and str(record.get("kind", "")) != kind_filter:
             return False
         if not keyword:
             return True
@@ -844,12 +1211,12 @@ class AnnotationPage(QWidget):
         records = self.template_service.list_templates()
         self._refresh_template_labels(records)
         selected_ids = self._selected_template_ids()
-        role_filter = str(self.template_filter_combo.currentData() or "")
+        kind_filter = str(self.template_filter_combo.currentData() or "")
         keyword = self.template_search_edit.text().strip()
         filtered = [
             record
             for record in records
-            if self._template_matches(record, role_filter, keyword)
+            if self._template_matches(record, kind_filter, keyword)
         ]
         self.template_table.setRowCount(0)
         self.template_table.setToolTip(
@@ -926,7 +1293,31 @@ class AnnotationPage(QWidget):
         self.template_label_edit.blockSignals(False)
 
     def _template_kind_changed(self, *_args) -> None:
-        self._refresh_template_labels(self.template_service.list_templates())
+        kind = str(self.template_kind_combo.currentData() or "")
+        if kind == "effect":
+            generic_index = self.template_source_role_combo.findData("generic")
+            if generic_index >= 0:
+                self.template_source_role_combo.setCurrentIndex(generic_index)
+        filter_index = self.template_filter_combo.findData(kind)
+        if filter_index >= 0 and self.template_filter_combo.currentIndex() != filter_index:
+            self.template_filter_combo.blockSignals(True)
+            self.template_filter_combo.setCurrentIndex(filter_index)
+            self.template_filter_combo.blockSignals(False)
+        records = self.template_service.list_templates()
+        self._refresh_template_labels(records)
+        self._refresh_template_status()
+
+    def _template_filter_changed(self, *_args) -> None:
+        """Keep saved-template browsing and the crop kind in one context."""
+
+        kind = str(self.template_filter_combo.currentData() or "")
+        kind_index = self.template_kind_combo.findData(kind)
+        if kind and kind_index >= 0 and self.template_kind_combo.currentIndex() != kind_index:
+            self.template_kind_combo.blockSignals(True)
+            self.template_kind_combo.setCurrentIndex(kind_index)
+            self.template_kind_combo.blockSignals(False)
+            self._refresh_template_labels(self.template_service.list_templates())
+        self._refresh_template_status()
 
     def _template_label_value(self) -> str:
         data = self.template_label_edit.currentData()
@@ -962,6 +1353,14 @@ class AnnotationPage(QWidget):
             self._image_changed(-1)
 
     def _update_image_navigation(self) -> None:
+        if self.current_image_path is None and self.current_session is not None:
+            self.previous_image_button.setEnabled(False)
+            self.next_image_button.setEnabled(False)
+            frame = getattr(self._session_record, "frame_index", None)
+            self.image_position_label.setText(
+                f"帧 {frame}" if frame is not None else "帧 —"
+            )
+            return
         index = self.image_combo.currentIndex()
         count = self.image_combo.count()
         self.previous_image_button.setEnabled(index > 0)
@@ -1096,7 +1495,7 @@ class AnnotationPage(QWidget):
         self._preview_selected_regions(regions)
 
     def _open_single_image_danzero(self) -> None:
-        if self.current_image_path is None or self.current_image is None:
+        if self.current_image is None:
             self.status.setText("请先选择一张截图")
             return
         if self.single_image_danzero_page is None:
@@ -1109,7 +1508,13 @@ class AnnotationPage(QWidget):
                 self._start_template_recognition
             )
         else:
-            self.single_image_danzero_page.set_image_path(self.current_image_path)
+            if self.current_image_path is not None:
+                self.single_image_danzero_page.set_image_path(self.current_image_path)
+        if self.current_image_path is None:
+            self.single_image_danzero_page.set_frame_image(
+                self.current_image.copy(),
+                self._session_frame_source(),
+            )
         self.single_image_danzero_page.show()
         self.single_image_danzero_page.raise_()
         self.single_image_danzero_page.activateWindow()
@@ -1158,10 +1563,7 @@ class AnnotationPage(QWidget):
         image_path = self.current_image_path
         request_id = self._recognition_request_id
         self._recognition_restart_pending = False
-        thread = OneShotThread(
-            lambda: self.recognition_service.recognize(image),
-            self,
-        )
+        thread = OneShotThread(lambda: self._recognize_single_image(image), self)
         thread.result.connect(
             lambda result, request_id=request_id, image_path=image_path: self._template_recognition_succeeded(
                 result,
@@ -1184,6 +1586,20 @@ class AnnotationPage(QWidget):
         )
         self._recognition_thread = thread
         thread.start()
+
+    def _recognize_single_image(self, image) -> RecognitionResult:
+        """Keep rank-only cards in the annotation view just like live play."""
+
+        try:
+            return self.recognition_service.recognize(
+                image,
+                allow_unknown_suit=True,
+            )
+        except TypeError as exc:
+            # Older plug-ins and test doubles may not have the opt-in yet.
+            if "allow_unknown_suit" not in str(exc):
+                raise
+            return self.recognition_service.recognize(image)
 
     def _template_recognition_succeeded(
         self,
@@ -1336,12 +1752,22 @@ class AnnotationPage(QWidget):
             self.crop_template_button,
             self.delete_template_button,
             self.template_table,
+            self.session_combo,
+            self.refresh_sessions_button,
+            self.session_play_button,
+            self.session_step_button,
+            self.session_rewind_button,
+            self.session_forward_button,
+            self.session_frame_spin,
+            self.session_jump_button,
+            self.session_speed_combo,
         ):
             widget.setEnabled(not busy)
 
     def _crop_succeeded(self, sample) -> None:
         self.recognition_service.reload_templates()
         self._refresh_template_status()
+        self._refresh_preview()
         self.status.setText(f"模板已保存：{sample.sample_id}")
 
     def _crop_failed(self, message: str) -> None:
@@ -1355,8 +1781,8 @@ class AnnotationPage(QWidget):
         if self._crop_thread is not None and self._crop_thread.isRunning():
             self.status.setText("正在裁剪模板……")
             return
-        if self.current_image is None or self.current_image_path is None:
-            self.status.setText("请先选择图片文件夹中的图片")
+        if self.current_image is None:
+            self.status.setText("请先选择图片或定位到对局录像帧")
             return
         label = self._template_label_value()
         if not label:
@@ -1368,11 +1794,14 @@ class AnnotationPage(QWidget):
             self.w_spin.value(),
             self.h_spin.value(),
         )
-        source_image = (
-            self.current_image_path.relative_to(self.image_folder).as_posix()
-            if self.image_folder is not None
-            else self.current_image_path.name
-        )
+        if self.current_image_path is None:
+            source_image = self._session_frame_source()
+        else:
+            source_image = (
+                self.current_image_path.relative_to(self.image_folder).as_posix()
+                if self.image_folder is not None
+                else self.current_image_path.name
+            )
         image = self.current_image.copy()
         kind = str(self.template_kind_combo.currentData())
         source_role = str(self.template_source_role_combo.currentData())
@@ -1402,6 +1831,7 @@ class AnnotationPage(QWidget):
     def closeEvent(self, event) -> None:
         self._closing = True
         self._recognition_request_id += 1
+        self._stop_session_decode()
         if self._crop_thread is not None and self._crop_thread.isRunning():
             self._crop_thread.wait(5000)
         if self._recognition_thread is not None and self._recognition_thread.isRunning():

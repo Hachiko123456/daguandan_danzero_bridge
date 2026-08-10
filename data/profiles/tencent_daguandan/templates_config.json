@@ -2329,6 +2329,54 @@
         1280,
         720
       ]
+    },
+    {
+      "sample_id": "effect_straight_001",
+      "kind": "effect",
+      "label": "straight",
+      "file": "templates/effect/straight.png",
+      "source_image": "sessions/game_20260810_000418_3ccf81/video/game.avi#frame=258",
+      "source_role": "play",
+      "abs_box": [
+        914,
+        236,
+        138,
+        75
+      ],
+      "ratio_box": [
+        0.714063,
+        0.327778,
+        0.107813,
+        0.104167
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "effect_three_with_two_001",
+      "kind": "effect",
+      "label": "three_with_two",
+      "file": "templates/effect/three_with_two.png",
+      "source_image": "sessions/game_20260810_085029_7d1882/video/game.avi#frame=235",
+      "source_role": "generic",
+      "abs_box": [
+        513,
+        276,
+        183,
+        65
+      ],
+      "ratio_box": [
+        0.400781,
+        0.383333,
+        0.142969,
+        0.090278
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
     }
   ]
 }

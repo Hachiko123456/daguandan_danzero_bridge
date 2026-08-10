@@ -640,6 +640,7 @@ def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp
     )
     before = orchestrator.snapshot.semantic_dict()
 
+    assert orchestrator._apply_left_suit_correction(target, probe) is None
     correction = orchestrator._apply_left_suit_correction(target, probe)
 
     assert correction is not None
@@ -647,6 +648,113 @@ def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp
     assert correction.payload["target_event_id"] == target.event_id
     assert correction.payload["cards"] == ["3C", "3H", "4C", "4H", "5C", "5H"]
     assert orchestrator.snapshot.semantic_dict() == before
+    orchestrator.finish()
+
+
+def test_pre_self_turn_left_suit_probe_corrects_only_after_two_matching_reads(tmp_path):
+    left_probe = PlayRegionResult(
+        player="left",
+        cards=("3S",),
+        is_pass=False,
+        confidence=0.95,
+        diagnostics=(),
+        annotations=(),
+        source="left-sidecar",
+    )
+    self_play = PlayRegionResult(
+        player="self",
+        cards=("4H",),
+        is_pass=False,
+        confidence=0.95,
+        diagnostics=(),
+        annotations=(),
+        source="self-play",
+    )
+    recognition = FakeRecognitionService([item for _ in range(8) for item in (left_probe, self_play)])
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="left",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    left_update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("3?",),
+        suit_options=(("S", "C"),),
+        is_pass=False,
+        monotonic_ms=1,
+    )
+    left_event = left_update.event
+    assert left_event is not None
+    assert orchestrator.snapshot.current_player == "self"
+    assert orchestrator._left_suit_correction_target(orchestrator.snapshot) == left_event
+
+    frame = np.zeros((32, 64, 3), np.uint8)
+    update = None
+    for timestamp in range(100, 1_200, 100):
+        update = orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"left-sidecar-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                monotonic_ms=timestamp,
+                occupied=True,
+                motion_score=0.20 if timestamp == 100 else 0.001,
+                pass_visible=False,
+                effect_visible=False,
+            ),
+        )
+        if any(event.event_type == "suit_corrected" for event in orchestrator.events):
+            break
+
+    corrections = [
+        event for event in orchestrator.events if event.event_type == "suit_corrected"
+    ]
+    assert len(corrections) == 1
+    assert corrections[0].payload == {
+        "target_event_id": left_event.event_id,
+        "cards": ["3S"],
+        "reason": "two_frame_left_sidecar_probe",
+    }
+    assert update is not None
+    assert any(event.event_type == "suit_corrected" for event in update.events)
+    assert next(
+        play for play in orchestrator.snapshot.play_history if play.player == "left"
+    ).cards == ("3?",)
+    assert orchestrator.snapshot.current_player in {"self", "right"}
+    orchestrator.finish()
+
+
+def test_left_suit_probe_resets_when_the_full_card_read_changes(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [_play("7S")])
+    target = LiveEvent(
+        event_id="EVT-LEFT-UNKNOWN",
+        event_type="player_played",
+        session_id="game",
+        seq=1,
+        monotonic_ms=1,
+        wall_time="2026-08-10T00:00:00+08:00",
+        trick_id=1,
+        turn_id=1,
+        actor="left",
+        payload={"cards": ["5?"]},
+        confidence=0.7,
+        source="test",
+        state_revision_before=1,
+        state_revision_after=1,
+    )
+    spade = replace(_play("5S"), player="left", source="left-probe")
+    club = replace(_play("5C"), player="left", source="left-probe")
+
+    assert orchestrator._apply_left_suit_correction(target, spade) is None
+    assert orchestrator._apply_left_suit_correction(target, club) is None
+    assert orchestrator._apply_left_suit_correction(target, spade) is None
+    correction = orchestrator._apply_left_suit_correction(target, spade)
+
+    assert correction is not None
+    assert correction.payload["cards"] == ["5S"]
     orchestrator.finish()
 
 

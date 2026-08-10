@@ -65,6 +65,23 @@ def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
     assert any(annotation.label == "2S" for annotation in result.annotations)
 
 
+def test_effect_overlay_just_outside_play_roi_still_gates_the_action():
+    """Effects may overhang the cards, unlike ordinary play templates."""
+
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    # ``right_play`` ends at y=271.  This overlay's centre is below that
+    # boundary, mirroring the real straight effect recorded in 3ccf81/F258.
+    _paste_template(image, "templates/effect/consecutive_pairs.png", 800, 250)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    signal = service.recognize_fast_signals(image, "right")
+
+    assert signal.effect_visible
+
+
 def test_jokers_use_lower_rank_threshold(monkeypatch):
     import cv2 as cv2_module
 
@@ -377,6 +394,12 @@ def test_latest_first_play_recovers_clear_black_suits_and_keeps_occluded_rank():
         ),
         suit_options=result.suit_options,
     ) == ""
+
+    # The annotation/replay single-frame path must retain the same rank-only
+    # card instead of showing five cards merely because the suit is covered.
+    single_frame = service.recognize(frame, allow_unknown_suit=True)
+    left_event = next(event for event in single_frame.events if event.player == "left")
+    assert left_event.cards == ("3H", "3S", "4D", "4S", "5?", "7H")
 
 
 def test_latest_final_screen_recognizes_bottom_end_control():

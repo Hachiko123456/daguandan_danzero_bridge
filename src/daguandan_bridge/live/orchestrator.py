@@ -252,9 +252,11 @@ class LiveOrchestrator:
         self._self_lead_controls_cleared = False
         self._game_end_detected = False
         self._finish_order: list[Seat] = []
-        # A post-self-finish read may improve only a previously obscured left
-        # action.  It is deliberately kept outside the reducer history.
+        # A left-side read may improve only a previously obscured left action.
+        # It is deliberately kept outside the reducer history.  The same
+        # result must be observed twice before it becomes a visual correction.
         self._suit_corrected_event_ids: set[str] = set()
+        self._suit_correction_streaks: dict[str, tuple[tuple[str, ...], int]] = {}
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -528,20 +530,15 @@ class LiveOrchestrator:
             wild_rank = snapshot.wild_rank
             left_correction_target = self._left_suit_correction_target(snapshot)
 
-        # Once our own cards are gone, one frame is used for two independent
-        # purposes: the expected player remains the sole action-commit path;
-        # the left area is only a sidecar that can fill in suits on its most
-        # recent obscured action.  The sidecar never mutates game state.
-        left_correction_result = (
-            self._recognize_play_region(
-                frame,
-                "left",
-                wild_rank=wild_rank,
-                allow_pass=False,
-            )
-            if left_correction_target is not None
-            else None
-        )
+        # The expected player remains the sole action-commit path.  While
+        # self is deciding what to play, an already submitted left action can
+        # become visible again after its action controls disappear.  Read it
+        # as a best-effort sidecar only; a sidecar failure must never block
+        # the current player's recognition.
+        left_correction_result = self._probe_left_suit_correction(
+            frame,
+            wild_rank=wild_rank,
+        ) if left_correction_target is not None else None
         result = self._recognize_play_region(
             frame,
             expected,
@@ -570,12 +567,24 @@ class LiveOrchestrator:
                         fast_signals=fast,
                     )
                 if consensus.status == "needs_confirmation":
-                    return self._require_review(
+                    update = self._require_review(
                         ",".join(consensus.rejected_reasons) or consensus.status,
                         monotonic_ms,
                         fast,
                         consensus,
                     )
+                    if suit_correction is not None:
+                        return replace(
+                            update,
+                            events=(suit_correction, *update.events),
+                        )
+                    return update
+            if suit_correction is not None:
+                return self._update(
+                    event=suit_correction,
+                    events=(suit_correction,),
+                    fast_signals=fast,
+                )
             retry_reason = self._recognition_retry_reason(current_metrics, fast)
             if retry_reason is not None:
                 return self._require_review(
@@ -1200,12 +1209,24 @@ class LiveOrchestrator:
     ) -> LiveEvent | None:
         """Return the one safe visual-only correction target, if any.
 
-        After the local player has finished, the left play area can be partly
-        covered by action controls.  We read it again only when its newest
-        confirmed action contains an unknown suit.  In particular, an exact
-        left action is never re-read and the left-side result can never enter
-        the reducer as a new play or pass.
+        The normal case is the short ``left -> self`` handoff: once the local
+        play controls change, an obscured suit on the immediately preceding
+        left action can become readable again.  We retain the existing
+        post-self-finish probe as a second, display-only recovery window.
+        Exact left actions are never re-read and the sidecar result can never
+        enter the reducer as a new play or pass.
         """
+
+        if snapshot.current_player == "self" and snapshot.play_history:
+            latest_play = snapshot.play_history[-1]
+            if (
+                latest_play.player == "left"
+                and not latest_play.is_pass
+                and any(is_unknown_suit_card(card) for card in latest_play.cards)
+            ):
+                target = self._left_play_event_for_cards(tuple(latest_play.cards))
+                if target is not None:
+                    return target
 
         if "self" not in snapshot.finished_seats or snapshot.current_player == "left":
             return None
@@ -1221,7 +1242,9 @@ class LiveOrchestrator:
             is_unknown_suit_card(card) for card in latest_left_play.cards
         ):
             return None
-        cards = tuple(latest_left_play.cards)
+        return self._left_play_event_for_cards(tuple(latest_left_play.cards))
+
+    def _left_play_event_for_cards(self, cards: tuple[str, ...]) -> LiveEvent | None:
         for event in reversed(self._all_events):
             if (
                 event.event_type == "player_played"
@@ -1232,12 +1255,30 @@ class LiveOrchestrator:
                 return event
         return None
 
+    def _probe_left_suit_correction(
+        self,
+        frame: np.ndarray,
+        *,
+        wild_rank: str,
+    ) -> PlayRegionResult | None:
+        """Run the optional left probe without jeopardizing the formal read."""
+
+        try:
+            return self._recognize_play_region(
+                frame,
+                "left",
+                wild_rank=wild_rank,
+                allow_pass=False,
+            )
+        except (cv2.error, OSError, RuntimeError, ValueError):
+            return None
+
     def _apply_left_suit_correction(
         self,
         target: LiveEvent | None,
         result: PlayRegionResult | None,
     ) -> LiveEvent | None:
-        """Publish a display correction without changing confirmed state."""
+        """Publish a two-frame display correction without changing state."""
 
         if target is None or result is None or result.is_pass:
             return None
@@ -1249,18 +1290,29 @@ class LiveOrchestrator:
             or len(corrected_cards) != len(target_cards)
             or _card_rank_counts(corrected_cards) != _card_rank_counts(target_cards)
         ):
+            self._suit_correction_streaks.pop(target.event_id, None)
+            return None
+        previous = self._suit_correction_streaks.get(target.event_id)
+        streak = (
+            previous[1] + 1
+            if previous is not None and previous[0] == corrected_cards
+            else 1
+        )
+        self._suit_correction_streaks[target.event_id] = (corrected_cards, streak)
+        if streak < 2:
             return None
         self._suit_corrected_event_ids.add(target.event_id)
+        self._suit_correction_streaks.pop(target.event_id, None)
         return self._append_lifecycle_event(
             "suit_corrected",
             {
                 "target_event_id": target.event_id,
                 "cards": list(corrected_cards),
-                "reason": "post_self_finish_left_probe",
+                "reason": "two_frame_left_sidecar_probe",
             },
             actor="left",
             confidence=result.confidence,
-            source="post_self_finish_left_suit_probe",
+            source="two_frame_left_sidecar_probe",
         )
 
     def _request_advice_if_needed(self) -> AdviceRequestKey | None:

@@ -722,6 +722,7 @@ def replay_video_through_live_pipeline(
     first_record, first_frame = first
     actual_events: tuple[LiveEvent, ...] = ()
     frame_count = 0
+    last_record = first_record
 
     with tempfile.TemporaryDirectory(prefix="daguandan-visual-replay-") as temp:
         root = Path(temp)
@@ -762,6 +763,13 @@ def replay_video_through_live_pipeline(
                     frame,
                     monotonic_ms=record.monotonic_ms,
                 )
+                # A committed action can carry lifecycle events produced in
+                # the same frame (finish placement, wind catch, next turn).
+                # Retain the full batch for diagnostics while keeping the
+                # legacy ``event`` field for existing replay readers.
+                update_events = tuple(update.events) or (
+                    (update.event,) if update.event is not None else ()
+                )
                 append_json_line(
                     output,
                     {
@@ -771,11 +779,13 @@ def replay_video_through_live_pipeline(
                         "current_player": update.snapshot.current_player,
                         "state_revision": update.snapshot.revision,
                         "event": update.event.to_dict() if update.event else None,
+                        "events": [event.to_dict() for event in update_events],
                         "review_reason": (
                             update.review.reason if update.review is not None else None
                         ),
                     },
                 )
+                last_record = record
                 frame_count += 1
                 if (
                     on_turn is not None
@@ -789,12 +799,30 @@ def replay_video_through_live_pipeline(
                             truth_log,
                         )
                     )
-            actual_events = runner.events
         finally:
             close_frames = getattr(frames, "close", None)
             if close_frames is not None:
                 close_frames()
+            event_count_before_finish = len(runner.events)
             runner.finish()
+            final_events = runner.events[event_count_before_finish:]
+            if final_events:
+                snapshot = runner.snapshot
+                append_json_line(
+                    output,
+                    {
+                        "frame_index": last_record.frame_index,
+                        "monotonic_ms": last_record.monotonic_ms,
+                        "status": runner.status,
+                        "current_player": snapshot.current_player,
+                        "state_revision": snapshot.revision,
+                        "event": final_events[-1].to_dict(),
+                        "events": [event.to_dict() for event in final_events],
+                        "review_reason": None,
+                        "phase": "finalize",
+                    },
+                )
+            actual_events = runner.events
 
     comparison = compare_timelines(expected_events, actual_events)
     atomic_write_json(

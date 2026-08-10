@@ -168,6 +168,13 @@ class ScreenshotRecognitionService:
     _BLACK_SUIT_HOG_MIN_MARGIN = 0.06
     _LEVEL_THRESHOLD = 0.60
     _STATUS_THRESHOLD = 0.62
+    # Card-type overlays are intentionally larger than the cards they
+    # describe.  Tencent can place their lower edge beyond the configured
+    # play ROI (the right-side straight overlay, for example, extends below
+    # ``right_play``).  Keep this expansion exclusive to effect detection:
+    # cards, buttons and status markers must still obey their own strict ROIs.
+    _EFFECT_SEARCH_MARGIN_X = 96
+    _EFFECT_SEARCH_MARGIN_Y = 96
     # A false first-play confirmation corrupts every later turn.  Require a
     # stronger, clearly better match than ordinary transient status markers.
     _FIRST_PLAY_THRESHOLD = 0.80
@@ -195,7 +202,19 @@ class ScreenshotRecognitionService:
         ] | None = None
         self._black_suit_hog_cache: tuple[tuple[str, np.ndarray], ...] | None = None
 
-    def recognize(self, image: np.ndarray | Path) -> RecognitionResult:
+    def recognize(
+        self,
+        image: np.ndarray | Path,
+        *,
+        allow_unknown_suit: bool = False,
+    ) -> RecognitionResult:
+        """Recognize one image across the configured regions.
+
+        The annotation and replay single-frame tools pass
+        ``allow_unknown_suit=True`` so a matched rank whose suit is hidden is
+        surfaced as ``5?`` instead of being silently removed.  The default
+        remains strict for older callers that use this broad diagnostic scan.
+        """
         started = perf_counter()
         source_image = read_image_unicode(image) if isinstance(image, Path) else image
         if not isinstance(source_image, np.ndarray) or source_image.ndim not in {2, 3}:
@@ -301,6 +320,7 @@ class ScreenshotRecognitionService:
                 wild_rank=level,
                 rank_threshold=self._PLAY_RANK_THRESHOLD,
                 suit_threshold=self._PLAY_SUIT_THRESHOLD,
+                allow_unknown_suit=allow_unknown_suit,
             )
             diagnostics.extend(f"{seat}：{item}" for item in card_diagnostics)
             annotations.extend(card_annotations)
@@ -626,6 +646,10 @@ class ScreenshotRecognitionService:
             predicate=lambda raw: raw.get("kind") == "effect",
             threshold=self._STATUS_THRESHOLD,
             limit=1,
+            search_margin=(
+                self._EFFECT_SEARCH_MARGIN_X,
+                self._EFFECT_SEARCH_MARGIN_Y,
+            ),
         )
         return FastSignalResult(
             expected_player=expected_player,
@@ -1339,6 +1363,7 @@ class ScreenshotRecognitionService:
         threshold: float,
         limit: int,
         use_color: bool = False,
+        search_margin: tuple[int, int] = (0, 0),
     ) -> list[_TemplateMatch]:
         if region is None:
             return []
@@ -1355,14 +1380,23 @@ class ScreenshotRecognitionService:
         if not candidates:
             return []
         # Whole-card templates (jokers, wild cards) can be taller than the
-        # region box; widen the search window to fit them while still
-        # requiring the match CENTER to land inside the region.
+        # region box; widen the search window to fit them.  Effect overlays
+        # additionally receive their explicit outer margin, since their
+        # centre may be just outside a player's card ROI.
+        margin_x = max(0, int(search_margin[0]))
+        margin_y = max(0, int(search_margin[1]))
         max_height = max(template.shape[0] for _, template in candidates)
         max_width = max(template.shape[1] for _, template in candidates)
-        top = max(0, box.y - max(0, max_height - box.h))
-        left = max(0, box.x - max(0, max_width - box.w))
-        bottom = min(image.shape[0], box.y + box.h + max(0, max_height - box.h))
-        right = min(image.shape[1], box.x + box.w + max(0, max_width - box.w))
+        top = max(0, box.y - margin_y - max(0, max_height - box.h))
+        left = max(0, box.x - margin_x - max(0, max_width - box.w))
+        bottom = min(
+            image.shape[0],
+            box.y + box.h + margin_y + max(0, max_height - box.h),
+        )
+        right = min(
+            image.shape[1],
+            box.x + box.w + margin_x + max(0, max_width - box.w),
+        )
         search = image[top:bottom, left:right]
         matches: list[_TemplateMatch] = []
         for raw, template in candidates:
@@ -1403,8 +1437,8 @@ class ScreenshotRecognitionService:
                 center_x = left + x + template_width / 2
                 center_y = top + y + template_height / 2
                 if not (
-                    box.x <= center_x <= box.x + box.w
-                    and box.y <= center_y <= box.y + box.h
+                    box.x - margin_x <= center_x <= box.x + box.w + margin_x
+                    and box.y - margin_y <= center_y <= box.y + box.h + margin_y
                 ):
                     self._suppress_match_score(
                         scores,

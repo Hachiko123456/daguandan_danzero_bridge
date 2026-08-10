@@ -15,11 +15,9 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPushButton,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -33,7 +31,6 @@ from qfluentwidgets import (
     ComboBox,
     PrimaryPushButton,
     PushButton,
-    SpinBox,
     StrongBodyLabel,
     TextEdit,
     TitleLabel,
@@ -67,6 +64,7 @@ from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
 from .single_image_danzero_page import SingleImageDanzeroPage
 from .truth_log_editor import TruthLogEditor
+from .video_playback import ReplayDecodeThread, SessionPlaybackToolbar
 from .workers import OneShotThread
 
 
@@ -136,7 +134,15 @@ class FrameInspectDialog(QDialog):
     def _recognize(self) -> None:
         self.page.set_recognition_busy(True)
         try:
-            result = self._recognition_service.recognize(self._frame)
+            try:
+                result = self._recognition_service.recognize(
+                    self._frame,
+                    allow_unknown_suit=True,
+                )
+            except TypeError as exc:
+                if "allow_unknown_suit" not in str(exc):
+                    raise
+                result = self._recognition_service.recognize(self._frame)
         except Exception as exc:
             self.page.show_recognition_error(str(exc))
             self.page.set_recognition_busy(False)
@@ -180,92 +186,6 @@ class FrameInspectDialog(QDialog):
     def shutdown(self) -> None:
         if self._danzero_thread is not None and self._danzero_thread.isRunning():
             self._danzero_thread.wait(30_000)
-
-
-class ReplayDecodeThread(QThread):
-    frame_ready = Signal(object, object)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        video_path: Path,
-        index_path: Path,
-        parent=None,
-        *,
-        start_frame: int | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.video_path = video_path
-        self.index_path = index_path
-        self._condition = threading.Condition()
-        self._playing = False
-        self._step_requested = False
-        self._stop_requested = False
-        self._speed = 1.0
-        self._start_frame = start_frame
-
-    def play(self) -> None:
-        with self._condition:
-            self._playing = True
-            self._condition.notify_all()
-
-    def pause(self) -> None:
-        with self._condition:
-            self._playing = False
-
-    def step(self) -> None:
-        with self._condition:
-            self._step_requested = True
-            self._condition.notify_all()
-
-    def set_speed(self, speed: float) -> None:
-        with self._condition:
-            self._speed = max(0.1, float(speed))
-            self._condition.notify_all()
-
-    def stop(self) -> None:
-        with self._condition:
-            self._stop_requested = True
-            self._condition.notify_all()
-
-    def run(self) -> None:
-        previous_ms: int | None = None
-        try:
-            for record, frame in VideoReplaySource(
-                self.video_path, self.index_path
-            ).frames(start_frame=self._start_frame):
-                with self._condition:
-                    self._condition.wait_for(
-                        lambda: self._stop_requested
-                        or self._playing
-                        or self._step_requested
-                    )
-                    if self._stop_requested:
-                        return
-                    stepping = self._step_requested and not self._playing
-                    self._step_requested = False
-                    speed = self._speed
-                if previous_ms is not None and not stepping:
-                    delay = max(0.0, (record.monotonic_ms - previous_ms) / 1000 / speed)
-                    with self._condition:
-                        self._condition.wait(timeout=min(delay, 2.0))
-                        if self._stop_requested:
-                            return
-                previous_ms = record.monotonic_ms
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                height, width, channels = rgb.shape
-                image = QImage(
-                    rgb.data,
-                    width,
-                    height,
-                    channels * width,
-                    QImage.Format.Format_RGB888,
-                ).copy()
-                self.frame_ready.emit(record, image)
-                if stepping:
-                    self.pause()
-        except Exception as exc:
-            self.failed.emit(str(exc))
 
 
 class VisualRecognitionReplayThread(QThread):
@@ -427,59 +347,22 @@ class ReplayPage(QWidget):
         self.preview.setStyleSheet(
             "background:#20252b;color:#e8eaed;border-radius:6px;"
         )
-        self.preview_area = QWidget()
-        preview_grid = QGridLayout(self.preview_area)
-        preview_grid.setContentsMargins(0, 0, 0, 0)
-        preview_grid.addWidget(self.preview, 0, 0, 1, 3)
-        self.rewind_button = QPushButton("◀")
-        self.rewind_button.setToolTip("回退 5 秒")
-        self.rewind_button.setFixedSize(44, 44)
-        self.rewind_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rewind_button.setStyleSheet(
-            "QPushButton { background: rgba(0,0,0,110); color: #e8eaed; "
-            "border: none; border-radius: 22px; font-size: 18px; }"
-            "QPushButton:hover { background: rgba(120,180,255,120); color: white; }"
-            "QPushButton:disabled { background: rgba(0,0,0,60); color: #808080; }"
-        )
-        self.forward_button = QPushButton("▶")
-        self.forward_button.setToolTip("快进 5 秒")
-        self.forward_button.setFixedSize(44, 44)
-        self.forward_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.forward_button.setStyleSheet(self.rewind_button.styleSheet())
-        preview_grid.addWidget(
-            self.rewind_button,
-            0,
-            0,
-            alignment=Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-        )
-        preview_grid.addWidget(
-            self.forward_button,
-            0,
-            2,
-            alignment=Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-        )
-        video_layout.addWidget(self.preview_area, 1)
-        playback = QHBoxLayout()
-        self.play_button = PrimaryPushButton("播放")
-        self.step_button = PushButton("单帧")
-        self.frame_spin = SpinBox(self)
-        self.frame_spin.setRange(0, 10_000_000)
-        self.frame_spin.setValue(0)
-        self.frame_spin.setMinimumWidth(110)
-        self.frame_spin.setToolTip("跳转到的起始帧号")
-        self.frame_jump_button = PushButton("从该帧开始")
-        self.speed_combo = ComboBox()
-        for label, speed in (("0.5×", 0.5), ("1×", 1.0), ("2×", 2.0), ("4×", 4.0)):
-            self.speed_combo.addItem(label, userData=speed)
-        self.speed_combo.setCurrentIndex(1)
-        self.frame_status = BodyLabel("帧：—")
-        playback.addWidget(self.play_button)
-        playback.addWidget(self.step_button)
-        playback.addWidget(self.frame_spin)
-        playback.addWidget(self.frame_jump_button)
-        playback.addWidget(self.speed_combo)
-        playback.addWidget(self.frame_status, 1)
-        video_layout.addLayout(playback)
+        video_layout.addWidget(self.preview, 1)
+        self.playback_toolbar = SessionPlaybackToolbar(self)
+        # Existing callers use these page attributes; all of them now point to
+        # the shared toolbar used by the annotation page as well.
+        self.play_button = self.playback_toolbar.play_button
+        self.step_button = self.playback_toolbar.step_button
+        self.rewind_button = self.playback_toolbar.rewind_button
+        self.forward_button = self.playback_toolbar.forward_button
+        self.frame_spin = self.playback_toolbar.frame_spin
+        self.frame_jump_button = self.playback_toolbar.frame_jump_button
+        self.speed_combo = self.playback_toolbar.speed_combo
+        self.frame_status = self.playback_toolbar.frame_status
+        video_layout.addWidget(self.playback_toolbar)
+        self.inspect_frame_button = PushButton("查看 / 标注当前帧")
+        self.inspect_frame_button.setToolTip("在当前暂停帧打开单图识别与模板标注")
+        video_layout.addWidget(self.inspect_frame_button)
         content.addWidget(video_card, 3)
 
         diagnostics_card = CardWidget()
@@ -553,12 +436,12 @@ class ReplayPage(QWidget):
         self.refresh_button.clicked.connect(self.refresh_sessions)
         self.session_combo.currentIndexChanged.connect(self._session_selected)
         self.incident_combo.currentIndexChanged.connect(self._incident_selected)
-        self.play_button.clicked.connect(self._toggle_play_pause)
-        self.step_button.clicked.connect(self.open_frame_inspect)
-        self.frame_jump_button.clicked.connect(self.seek_to_frame)
-        self.rewind_button.clicked.connect(lambda: self._seek_by_seconds(-5))
-        self.forward_button.clicked.connect(lambda: self._seek_by_seconds(5))
-        self.speed_combo.currentIndexChanged.connect(self._speed_changed)
+        self.playback_toolbar.play_pause_requested.connect(self._toggle_play_pause)
+        self.playback_toolbar.step_requested.connect(self.step)
+        self.playback_toolbar.seek_requested.connect(self.seek_to_frame)
+        self.playback_toolbar.seek_seconds_requested.connect(self._seek_by_seconds)
+        self.playback_toolbar.speed_changed.connect(self._speed_changed)
+        self.inspect_frame_button.clicked.connect(self.open_frame_inspect)
         self.replay_mode_combo.currentIndexChanged.connect(self._replay_mode_changed)
         self.state_replay_button.clicked.connect(self.replay_state)
         self.visual_replay_button.clicked.connect(self.analyze_video_to_truth_log)
@@ -614,7 +497,7 @@ class ReplayPage(QWidget):
         frame_count = max(0, int(manifest.get("frame_count", 0) or 0))
         if frame_count <= 0:
             frame_count = len(self._index_records())
-        self.frame_spin.setMaximum(frame_count)
+        self.playback_toolbar.set_frame_count(frame_count)
         self.session_summary.setText(
             f"{manifest.get('session_id', session.name)}　|　状态 {manifest.get('status', '未知')}　|　"
             f"录像帧 {manifest.get('frame_count', 0)}　|　丢帧 {manifest.get('dropped_frames', 0)}"
@@ -658,6 +541,7 @@ class ReplayPage(QWidget):
             self.rewind_button,
             self.forward_button,
             self.speed_combo,
+            self.inspect_frame_button,
         ):
             widget.setEnabled(enabled and playable)
 
@@ -709,7 +593,7 @@ class ReplayPage(QWidget):
         self._update_play_button()
 
     def _update_play_button(self) -> None:
-        self.play_button.setText("暂停" if self._playing else "播放")
+        self.playback_toolbar.set_playing(self._playing)
 
     def _toggle_play_pause(self) -> None:
         if self._playing:
@@ -738,10 +622,10 @@ class ReplayPage(QWidget):
             self._playing = False
             self._update_play_button()
 
-    def seek_to_frame(self) -> None:
+    def seek_to_frame(self, target: int | None = None) -> None:
         if self.current_session is None:
             return
-        target = self.frame_spin.value()
+        target = self.frame_spin.value() if target is None else int(target)
         records = self._index_records()
         if not records:
             self._show_error("帧索引不可读")
@@ -798,9 +682,11 @@ class ReplayPage(QWidget):
         )
         self._restart_decode_at(record, play=was_playing)
 
-    def _speed_changed(self, _index: int) -> None:
+    def _speed_changed(self, speed: float | int = 1.0) -> None:
         if self._decode_thread is not None:
-            self._decode_thread.set_speed(float(self.speed_combo.currentData() or 1.0))
+            self._decode_thread.set_speed(
+                float(speed if isinstance(speed, float) else self.speed_combo.currentData() or 1.0)
+            )
 
     def _show_frame(self, record: FrameIndexRecord, image: QImage) -> None:
         self._current_record = record
@@ -814,6 +700,7 @@ class ReplayPage(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+        self.playback_toolbar.set_current_frame(record.frame_index)
         self.frame_status.setText(
             f"帧 {record.frame_index}　{record.monotonic_ms} ms　此前丢帧 {record.dropped_before}"
         )

@@ -366,6 +366,13 @@ def test_video_visual_replay_runs_live_pipeline_and_compares_turns(tmp_path):
     assert abs(result.comparison.metric_deltas[0].latency_delta_ms) < 2_000
     assert result.output_path.is_file()
     assert result.comparison_path.is_file()
+    rows = list(read_json_lines(result.output_path))
+    assert any(row.get("events") for row in rows)
+    assert any(
+        event.get("event_type") == "session_finalizing"
+        for row in rows
+        for event in row.get("events", ())
+    )
 
 
 def test_truth_log_video_replay_uses_manual_baseline(tmp_path):
