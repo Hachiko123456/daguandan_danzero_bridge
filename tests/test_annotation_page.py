@@ -40,7 +40,7 @@ def test_annotation_page_displays_regions_and_supports_multi_select():
     page.region_config_button.click()
     config = page.region_config_page
 
-    assert config.region_table.rowCount() == 22
+    assert config.region_table.rowCount() == 26
     assert config.region_table.selectionMode() == QAbstractItemView.SelectionMode.ExtendedSelection
     assert page.show_selected_button.text() == "标注选中区域"
     assert config.preview_selected_button.text() == "标注选中区域"

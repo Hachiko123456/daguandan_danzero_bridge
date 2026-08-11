@@ -1113,6 +1113,7 @@ class ReplayPage(QWidget):
                         "lead_player_confirmed",
                         "player_played",
                         "player_passed",
+                        "player_finished",
                         "manual_confirmed_event",
                         "event_correction",
                     }

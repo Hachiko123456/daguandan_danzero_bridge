@@ -74,6 +74,21 @@ class FailingAdvisor:
         raise RuntimeError(f"model failed: {request_id}")
 
 
+class AbsentCardAdvisor:
+    def recommend(self, state, *, request_id=""):
+        return LocalAdvice(
+            strategy="invalid-test",
+            cards=("AS",),
+            play_type="Single",
+            is_pass=False,
+            state_revision=state.revision,
+            elapsed_ms=1.0,
+            request_id=request_id,
+            engine_input={"request_id": request_id},
+            timings={},
+        )
+
+
 class SuitAwareAdvisor(FakeAdvisor):
     def recommend(self, state, *, request_id=""):
         self.calls += 1
@@ -278,4 +293,23 @@ def test_advisor_failure_incident_contains_reproducible_engine_input(tmp_path):
 
     assert engine_input.is_file()
     assert "project_snapshot" in engine_input.read_text("utf-8")
+    orchestrator.finish()
+
+
+def test_advice_containing_a_card_absent_from_current_hand_is_never_exposed(tmp_path):
+    orchestrator = _build(tmp_path, AbsentCardAdvisor())
+    _commit_left_action(orchestrator)
+    _wait_until(
+        lambda: orchestrator.latest_advice is not None
+        and orchestrator.latest_advice.status == "failed"
+    )
+
+    assert orchestrator.latest_advice is not None
+    assert orchestrator.latest_advice.advice is None
+    assert "AS" in orchestrator.latest_advice.error
+    assert any(
+        event.event_type == "advice_failed"
+        and event.payload.get("reason") == "cards_not_in_current_hand"
+        for event in orchestrator.events
+    )
     orchestrator.finish()

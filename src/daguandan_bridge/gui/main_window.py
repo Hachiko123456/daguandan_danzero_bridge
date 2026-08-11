@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QRect
 from qfluentwidgets import FluentIcon, FluentWindow
 
 from ..annotation_service import AnnotationService
 from .annotation_page import AnnotationPage
 from .live_assistant_page import LiveAssistantPage
+from .live_controller import LiveAssistantController
+from .recommendation_window import RecommendationFloatWindow
 from .replay_page import ReplayPage
 
 
@@ -15,10 +18,18 @@ class DaguandanBridgeWindow(FluentWindow):
         live_runtime=None,
     ) -> None:
         super().__init__()
+        self.live_runtime = live_runtime or LiveAssistantController()
         self.annotation_page = AnnotationPage(AnnotationService())
         self.annotation_page.setObjectName("annotationPage")
-        self.live_assistant_page = LiveAssistantPage(live_runtime)
+        self.live_assistant_page = LiveAssistantPage(self.live_runtime)
         self.replay_page = ReplayPage()
+        self.recommendation_window = RecommendationFloatWindow(self.live_runtime)
+        self.live_assistant_page.compact_mode_requested.connect(
+            self.show_compact_recommendation
+        )
+        self.recommendation_window.open_full_assistant_requested.connect(
+            self.show_full_assistant
+        )
 
         self.addSubInterface(
             self.live_assistant_page,
@@ -39,7 +50,32 @@ class DaguandanBridgeWindow(FluentWindow):
         self.resize(1220, 820)
         self.setMinimumSize(980, 700)
 
+    def show_compact_recommendation(self) -> None:
+        try:
+            rect = self.live_runtime.target_client_rect()
+        except Exception:
+            rect = None
+        if rect is not None:
+            self.recommendation_window.place_beside(
+                QRect(
+                    rect.left,
+                    rect.top,
+                    rect.width,
+                    rect.height,
+                )
+            )
+        self.recommendation_window.show()
+        self.recommendation_window.raise_()
+        self.showMinimized()
+
+    def show_full_assistant(self) -> None:
+        self.recommendation_window.hide()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def closeEvent(self, event) -> None:
+        self.recommendation_window.hide()
         self.replay_page.shutdown()
         self.live_assistant_page.shutdown()
         super().closeEvent(event)

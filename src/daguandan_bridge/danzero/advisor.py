@@ -554,6 +554,14 @@ class LocalGuandanAdvisor:
 
     @staticmethod
     def _remaining_counts(snapshot: LocalStrategySnapshot) -> list[int]:
+        if snapshot.remaining_cards is not None:
+            counts = [27, 27, 27, 27]
+            for seat, count in snapshot.remaining_cards.items():
+                counts[_SEAT_TO_PLAYER[seat]] = int(count)
+            counts[0] = len(snapshot.my_hand)
+            if any(count < 0 or count > 27 for count in counts):
+                raise LocalStrategyError("各座位剩余牌数超出有效范围")
+            return counts
         counts = [27, 27, 27, 27]
         for event in snapshot.play_history:
             if not event.is_pass:

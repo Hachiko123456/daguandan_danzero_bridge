@@ -91,6 +91,9 @@ class LiveAssistantController(QObject):
     def is_running(self) -> bool:
         return bool(self._capture_worker and self._capture_worker.is_running)
 
+    def target_client_rect(self):
+        return self.capture_service.target_client_rect(self.profile_name)
+
     def recognize_initial(self) -> None:
         self._start_danzero_warmup()
         if self._initial_thread is not None and self._initial_thread.isRunning():

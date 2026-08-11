@@ -226,6 +226,70 @@
       ]
     },
     {
+      "name": "placement_left",
+      "role": "generic",
+      "abs_box": [
+        0,
+        130,
+        150,
+        120
+      ],
+      "ratio_box": [
+        0.0,
+        0.180556,
+        0.117188,
+        0.166667
+      ]
+    },
+    {
+      "name": "placement_opposite",
+      "role": "generic",
+      "abs_box": [
+        430,
+        0,
+        250,
+        120
+      ],
+      "ratio_box": [
+        0.335938,
+        0.0,
+        0.195312,
+        0.166667
+      ]
+    },
+    {
+      "name": "placement_right",
+      "role": "generic",
+      "abs_box": [
+        1100,
+        130,
+        180,
+        140
+      ],
+      "ratio_box": [
+        0.859375,
+        0.180556,
+        0.140625,
+        0.194444
+      ]
+    },
+    {
+      "name": "placement_self",
+      "role": "generic",
+      "abs_box": [
+        0,
+        520,
+        180,
+        110
+      ],
+      "ratio_box": [
+        0.0,
+        0.722222,
+        0.140625,
+        0.152778
+      ]
+    },
+    {
       "name": "table_anchor_1",
       "role": "anchor",
       "abs_box": [

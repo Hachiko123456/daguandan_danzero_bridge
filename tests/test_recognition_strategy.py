@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from daguandan_bridge.live.consensus import ConsensusContext, RecognitionSample
 from daguandan_bridge.live.recognition_strategy import (
+    decide_best_effort_candidate,
     decide_recognition_strategy,
     has_exhausted_valid_candidates,
 )
@@ -112,3 +115,35 @@ def test_suit_jitter_alone_does_not_exhaust_a_valid_action_window():
         context=_context(),
         limit=5,
     )
+
+
+def test_best_effort_burst_prefers_a_visible_play_over_later_pass_markers():
+    samples = (
+        _sample("7S"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+        _sample("7S"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+    )
+
+    result = decide_best_effort_candidate(samples, context=_context())
+
+    assert result is not None
+    assert not result.is_pass
+    assert result.cards == ("7S",)
+    assert result.source == "best_effort_burst"
+    assert "candidate_conflict_resolved_best_effort" in result.integrity_warnings
+
+
+def test_next_turn_evidence_commits_an_unresolved_non_pass_instead_of_blocking():
+    context = replace(_context(), next_turn_evidence=True)
+
+    result = decide_best_effort_candidate(
+        (_sample("3S", "4H"),) * 5,
+        context=context,
+    )
+
+    assert result is not None
+    assert not result.is_pass
+    assert result.cards == ("3S", "4H")
+    assert "observed_pattern_unresolved" in result.integrity_warnings

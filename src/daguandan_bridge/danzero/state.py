@@ -53,6 +53,7 @@ class LocalStrategySnapshot:
     my_hand: tuple[str, ...]
     trick_plays: tuple[PlayEvent, ...]
     play_history: tuple[PlayEvent, ...]
+    remaining_cards: dict[Seat, int] | None
     revision: int
     readiness_errors: tuple[str, ...]
 
@@ -69,6 +70,7 @@ class GuanDanState:
     my_hand: tuple[str, ...] = ()
     trick_plays: list[PlayEvent] = field(default_factory=list)
     play_history: list[PlayEvent] = field(default_factory=list)
+    remaining_cards: dict[Seat, int] | None = None
     revision: int = 0
     updated_at: datetime = field(
         default_factory=lambda: datetime.now().astimezone()
@@ -224,6 +226,7 @@ class GuanDanState:
         self.my_hand = ()
         self.trick_plays.clear()
         self.play_history.clear()
+        self.remaining_cards = None
         self._touch()
 
     @property
@@ -263,6 +266,11 @@ class GuanDanState:
             my_hand=self.my_hand,
             trick_plays=tuple(self.trick_plays),
             play_history=tuple(self.play_history),
+            remaining_cards=(
+                dict(self.remaining_cards)
+                if self.remaining_cards is not None
+                else None
+            ),
             revision=self.revision,
             readiness_errors=self.readiness_errors,
         )

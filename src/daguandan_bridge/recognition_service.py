@@ -93,6 +93,14 @@ class PlayRegionResult:
 
 
 @dataclass(frozen=True)
+class PlacementSignal:
+    player: Seat
+    placement: str
+    confidence: float
+    source: str
+
+
+@dataclass(frozen=True)
 class FastSignalResult:
     expected_player: Seat
     active_player: Seat | None
@@ -101,6 +109,7 @@ class FastSignalResult:
     effect_visible: bool
     super_double_visible: bool = False
     game_end_control: str | None = None
+    placements: tuple[PlacementSignal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -168,6 +177,10 @@ class ScreenshotRecognitionService:
     _BLACK_SUIT_HOG_MIN_MARGIN = 0.06
     _LEVEL_THRESHOLD = 0.60
     _STATUS_THRESHOLD = 0.62
+    # Placement badges mutate the player lifecycle and can end the round.
+    # Historical recordings show persistent decorative false matches below
+    # 0.88, while real head/second/third badges match at 0.94-1.00.
+    _PLACEMENT_THRESHOLD = 0.90
     # Card-type overlays are intentionally larger than the cards they
     # describe.  Tencent can place their lower edge beyond the configured
     # play ROI (the right-side straight overlay, for example, extends below
@@ -651,6 +664,11 @@ class ScreenshotRecognitionService:
                 self._EFFECT_SEARCH_MARGIN_Y,
             ),
         )
+        placements = self._recognize_placements(
+            source_image,
+            regions,
+            templates,
+        )
         return FastSignalResult(
             expected_player=expected_player,
             active_player=active_player,
@@ -659,7 +677,56 @@ class ScreenshotRecognitionService:
             effect_visible=bool(effects),
             super_double_visible="super_double" in buttons,
             game_end_control=game_end_control,
+            placements=placements,
         )
+
+    def recognize_placements(
+        self,
+        image: np.ndarray | Path,
+    ) -> tuple[PlacementSignal, ...]:
+        """Read persistent 头游/二游/三游 labels independently of card counts."""
+
+        source_image = self._source_image(image)
+        regions = {
+            region.name: region for region in self.annotation_service.list_regions()
+        }
+        return self._recognize_placements(
+            source_image,
+            regions,
+            self._templates(),
+        )
+
+    def _recognize_placements(
+        self,
+        image: np.ndarray,
+        regions: dict[str, RegionRecord],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...],
+    ) -> tuple[PlacementSignal, ...]:
+        detected: list[PlacementSignal] = []
+        for player in SEATS_IN_ORDER:
+            candidates: list[_TemplateMatch] = []
+            for placement in ("head", "second", "third", "last"):
+                matched, _score, _source, match = self._recognize_status(
+                    image,
+                    regions.get(f"placement_{player}"),
+                    templates,
+                    label=placement,
+                    threshold=self._PLACEMENT_THRESHOLD,
+                )
+                if matched and match is not None:
+                    candidates.append(match)
+            if not candidates:
+                continue
+            best = max(candidates, key=lambda item: item.score)
+            detected.append(
+                PlacementSignal(
+                    player=player,
+                    placement=best.label,
+                    confidence=best.score,
+                    source=best.source,
+                )
+            )
+        return tuple(detected)
 
     @staticmethod
     def _source_image(image: np.ndarray | Path) -> np.ndarray:

@@ -15,6 +15,7 @@ import numpy as np
 
 from ..annotation_service import AnnotationService
 from ..danzero.advisor import LocalAdvice, StrategyExecutionTrace
+from ..danzero.rules import infer_best_action
 from ..danzero.state import GuanDanState, Seat
 from ..recognition_service import (
     PLAY_REGION_TO_SEAT,
@@ -38,6 +39,7 @@ from .card_uncertainty import (
 from .recognition_strategy import (
     RecognitionStrategy,
     coerce_recognition_strategy,
+    decide_best_effort_candidate,
     decide_recognition_strategy,
     has_exhausted_valid_candidates,
     strategy_spec,
@@ -252,6 +254,7 @@ class LiveOrchestrator:
         self._self_lead_controls_cleared = False
         self._game_end_detected = False
         self._finish_order: list[Seat] = []
+        self._placement_streaks: dict[Seat, tuple[str, int]] = {}
         # A left-side read may improve only a previously obscured left action.
         # It is deliberately kept outside the reducer history.  The same
         # result must be observed twice before it becomes a visual correction.
@@ -320,6 +323,7 @@ class LiveOrchestrator:
         self._last_monotonic_ms = int(monotonic_ms)
         self._game_end_detected = False
         self._finish_order = []
+        self._placement_streaks.clear()
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
             hand=hand,
@@ -466,6 +470,20 @@ class LiveOrchestrator:
         with self._state_lock:
             if not self._analysis_job_is_current(job_key):
                 return self._update()
+            placement_events = self._apply_visual_placements(
+                fast,
+                defer_player=expected,
+            )
+            if placement_events:
+                self._analysis_epoch += 1
+                self._clear_burst()
+                self._activate_zone(monotonic_ms)
+                self._request_advice_if_needed()
+                return self._update(
+                    event=placement_events[-1],
+                    events=placement_events,
+                    fast_signals=fast,
+                )
             game_end = self._handle_game_end_control(fast)
             if game_end is not None:
                 return game_end
@@ -558,7 +576,11 @@ class LiveOrchestrator:
             consensus = self._decide_if_ready(current_metrics, fast)
             if consensus is not None:
                 if consensus.status == "confirmed":
-                    event, events = self._commit_consensus(consensus, monotonic_ms)
+                    event, events = self._commit_consensus(
+                        consensus,
+                        monotonic_ms,
+                        fast=fast,
+                    )
                     if suit_correction is not None:
                         events = (suit_correction, *events)
                     return self._update(
@@ -1181,7 +1203,12 @@ class LiveOrchestrator:
         self._baseline_by_seat[player] = gray.copy()
         self._previous_by_seat[player] = gray
 
-    def _activate_zone(self, monotonic_ms: int) -> None:
+    def _activate_zone(
+        self,
+        monotonic_ms: int,
+        *,
+        accept_initial_occupied: bool = False,
+    ) -> None:
         player = self.snapshot.current_player
         if player is None:
             self._zone = None
@@ -1199,6 +1226,7 @@ class LiveOrchestrator:
             settle_ms=max(self.settle_ms, spec.settle_ms),
             stable_ms=spec.stable_ms,
             action_timeout_ms=self.action_timeout_ms,
+            accept_initial_occupied=accept_initial_occupied,
         )
         self._self_turn_corroborated = False
         self._clear_burst()
@@ -1528,6 +1556,36 @@ class LiveOrchestrator:
                 self._notify_update_listener()
                 return
             advice = completion.advice
+            missing_cards = Counter(advice.cards) - Counter(snapshot.my_hand)
+            if not advice.is_pass and missing_cards:
+                missing_text = " ".join(sorted(missing_cards.elements()))
+                error = f"DanZero 建议包含当前手牌中不存在的牌：{missing_text}"
+                self.latest_advice = LiveAdvice(
+                    key=key,
+                    status="failed",
+                    error=error,
+                )
+                self.store.append_advice(
+                    {
+                        "request_id": key.request_id,
+                        "status": "failed",
+                        "turn_id": key.turn_id,
+                        "state_revision": key.state_revision,
+                        "error": error,
+                    }
+                )
+                self._append_advice_event(
+                    "advice_failed",
+                    {
+                        "request_id": key.request_id,
+                        "error": error,
+                        "reason": "cards_not_in_current_hand",
+                    },
+                    confidence=0.0,
+                )
+                self._signal_advice_completion(key)
+                self._notify_update_listener()
+                return
             visible = self._self_turn_corroborated
             if visible:
                 self._set_advice_visible_latency(key)
@@ -1728,6 +1786,101 @@ class LiveOrchestrator:
             )
         return tuple(outcomes)
 
+    def _apply_visual_placements(
+        self,
+        fast: FastSignalResult,
+        *,
+        defer_player: Seat | None = None,
+    ) -> tuple[LiveEvent, ...]:
+        """Commit persistent placement badges after two matching frames.
+
+        Opponent starting counts are not always inferable from our own 27-card
+        hand.  Explicit placement badges therefore override only that
+        player's remaining count and finished state; they never fabricate an
+        action or card face.
+        """
+
+        by_player = {
+            signal.player: signal
+            for signal in getattr(fast, "placements", ())
+            if signal.player in TURN_ORDER
+        }
+        for player in tuple(self._placement_streaks):
+            if player not in by_player:
+                self._placement_streaks.pop(player, None)
+
+        completed: list[LiveEvent] = []
+        placement_order = {"head": 0, "second": 1, "third": 2, "last": 3}
+        placement_sequence = ("head", "second", "third")
+        signals = sorted(
+            by_player.values(),
+            key=lambda item: placement_order.get(str(item.placement), 99),
+        )
+        for signal in signals:
+            player = signal.player
+            if player in self.reducer.snapshot().finished_seats:
+                self._placement_streaks.pop(player, None)
+                continue
+            placement = str(signal.placement).strip().lower()
+            expected_placement = (
+                placement_sequence[len(self._finish_order)]
+                if len(self._finish_order) < len(placement_sequence)
+                else None
+            )
+            # A visually similar status decoration must never invent an
+            # impossible finish order.  Out-of-order labels are discarded,
+            # including their accumulated streak, so a later valid label has
+            # to become stable from scratch.
+            if placement != expected_placement:
+                self._placement_streaks.pop(player, None)
+                continue
+            previous = self._placement_streaks.get(player)
+            streak = (
+                previous[1] + 1
+                if previous is not None and previous[0] == placement
+                else 1
+            )
+            self._placement_streaks[player] = (placement, streak)
+            # A finish badge often appears on the same frames as the final
+            # card.  Give the normal two-valid-card path several frames to
+            # submit that action first.  If animation/card recognition never
+            # settles, the badge still acts as a bounded fallback instead of
+            # leaving the whole game stuck on this player.
+            required_streak = 6 if player == defer_player else 2
+            if streak < required_streak:
+                continue
+            self._placement_streaks.pop(player, None)
+            event = self.reducer.confirm_player_finished(
+                player,
+                placement=placement,
+                confidence=float(signal.confidence),
+                source=f"two_frame_placement:{signal.source}",
+            )
+            completed.append(self._publish_event(event))
+            if player not in self._finish_order:
+                self._finish_order.append(player)
+
+            if placement == "third":
+                after = self.reducer.snapshot()
+                remaining = [
+                    seat
+                    for seat in TURN_ORDER
+                    if seat not in after.finished_seats
+                    and seat not in self._finish_order
+                ]
+                if len(remaining) == 1:
+                    last_player = remaining[0]
+                    self._finish_order.append(last_player)
+                    completed.append(
+                        self._append_lifecycle_event(
+                            "player_finished",
+                            {"placement": "last"},
+                            actor=last_player,
+                            source="inferred_after_visual_third",
+                        )
+                    )
+        return tuple(completed)
+
     def _append_lifecycle_event(
         self,
         event_type: str,
@@ -1825,8 +1978,18 @@ class LiveOrchestrator:
         fast: FastSignalResult,
     ) -> ConsensusResult | None:
         context = self._consensus_context(metrics, fast)
-        return decide_recognition_strategy(
+        result = decide_recognition_strategy(
             self.recognition_strategy,
+            self._samples,
+            context=context,
+        )
+        if (
+            result is not None
+            or len(self._samples) < self.burst_sample_limit
+            or not context.next_turn_evidence
+        ):
+            return result
+        return decide_best_effort_candidate(
             self._samples,
             context=context,
         )
@@ -1898,11 +2061,60 @@ class LiveOrchestrator:
         self,
         result: ConsensusResult,
         monotonic_ms: int,
+        *,
+        fast: FastSignalResult | None = None,
     ) -> tuple[LiveEvent, tuple[LiveEvent, ...]]:
         player = self.snapshot.current_player
         assert player is not None
         before = self.reducer.snapshot()
         commit_cards = result.resolved_cards if not result.is_pass else result.cards
+        action_metadata: dict[str, object] = {}
+        integrity_warnings = list(result.integrity_warnings)
+        if not result.is_pass:
+            table_event = next(
+                (play for play in reversed(before.trick_plays) if not play.is_pass),
+                None,
+            )
+            table_cards = table_event.cards if table_event is not None else ()
+            preferred_play_type = None
+            current_advice = self.latest_advice
+            if (
+                player == "self"
+                and current_advice is not None
+                and current_advice.status == "ready"
+                and current_advice.advice is not None
+                and current_advice.key
+                == AdviceRequestKey(before.session_id, before.turn_id, before.revision)
+                and Counter(current_advice.advice.cards) == Counter(commit_cards)
+            ):
+                preferred_play_type = current_advice.advice.play_type
+            try:
+                inference = infer_best_action(
+                    commit_cards,
+                    table_cards,
+                    before.wild_rank,
+                    preferred_play_type=preferred_play_type,
+                )
+            except (ImportError, ModuleNotFoundError, ValueError):
+                inference = None
+            if inference is None or inference.action is None:
+                integrity_warnings.append("observed_pattern_unresolved")
+            else:
+                action_metadata = {
+                    "play_type": str(inference.action[0]),
+                    "logical_rank": str(inference.action[1]),
+                    "logical_label": inference.logical_label,
+                    "beats_table": inference.beats_table,
+                    "interpretation_ambiguous": inference.ambiguous,
+                    "wildcard_substitutions": [
+                        {"card": card, "as_rank": rank}
+                        for card, rank in inference.wildcard_substitutions
+                    ],
+                }
+                if table_cards and not inference.beats_table:
+                    integrity_warnings.append("observed_table_mismatch")
+                if inference.ambiguous:
+                    integrity_warnings.append("wildcard_interpretation_ambiguous")
         event = self._record_action(
             player,
             commit_cards,
@@ -1915,11 +2127,21 @@ class LiveOrchestrator:
             suit_options=(
                 () if commit_cards != result.cards else result.suit_options
             ),
-            integrity_warnings=result.integrity_warnings,
+            integrity_warnings=tuple(dict.fromkeys(integrity_warnings)),
+            action_metadata=action_metadata,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
         self._first_action_pending = False
-        self._activate_zone(monotonic_ms)
+        after = self.reducer.snapshot()
+        self._activate_zone(
+            monotonic_ms,
+            accept_initial_occupied=bool(
+                fast is not None
+                and after.current_player is not None
+                and fast.active_player == after.current_player
+                and after.trick_id == before.trick_id
+            ),
+        )
         turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
         events = (event, *outcomes) + ((turn_started,) if turn_started else ())
@@ -1936,6 +2158,7 @@ class LiveOrchestrator:
         evidence_refs: tuple[str, ...] = (),
         suit_options: tuple[tuple[str, ...], ...] = (),
         integrity_warnings: tuple[str, ...] = (),
+        action_metadata: dict[str, object] | None = None,
     ) -> LiveEvent:
         if is_pass:
             return self.reducer.record_pass(
@@ -1952,6 +2175,7 @@ class LiveOrchestrator:
             evidence_refs=evidence_refs,
             suit_options=suit_options,
             integrity_warnings=integrity_warnings,
+            action_metadata=action_metadata,
         )
 
     def _require_review(

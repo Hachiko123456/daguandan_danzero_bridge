@@ -100,3 +100,83 @@ def test_live_source_reports_geometry_change_as_interruption(tmp_path, monkeypat
     with pytest.raises(LiveCaptureInterrupted, match="geometry"):
         source.capture()
     source.close()
+
+
+def test_visible_screen_capture_rejects_occluded_target_before_frame_is_returned(
+    tmp_path,
+    monkeypatch,
+):
+    service = CaptureService(tmp_path / "profiles")
+    create_profile(
+        service.profiles_root,
+        ProfileConfig("test_game", "Test", ("Test",)),
+    )
+    target = TargetWindow(hwnd=123, title="Test Window")
+    frame = _frame_snapshot().frame
+    frame = CapturedStandardizedFrame(
+        standardization=frame.standardization,
+        rect=frame.rect,
+        backend="screen",
+        dpi=frame.dpi,
+        window_title=frame.window_title,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_target_window",
+        lambda _keywords: target,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.get_client_rect_on_screen",
+        lambda _target: ClientRect(10, 20, 1280, 720),
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.capture_standardized_client_frame",
+        lambda *_args: frame,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_screen_occluders",
+        lambda *_args: (TargetWindow(hwnd=456, title="DanZero 推荐"),),
+    )
+
+    source = service.open_live_source("test_game")
+    with pytest.raises(LiveCaptureInterrupted, match="DanZero 推荐"):
+        source.capture()
+    source.close()
+
+
+def test_background_window_capture_ignores_screen_occluders(tmp_path, monkeypatch):
+    service = CaptureService(tmp_path / "profiles")
+    create_profile(
+        service.profiles_root,
+        ProfileConfig("test_game", "Test", ("Test",)),
+    )
+    target = TargetWindow(hwnd=123, title="Test Window")
+    frame = _frame_snapshot().frame
+    frame = CapturedStandardizedFrame(
+        standardization=frame.standardization,
+        rect=frame.rect,
+        backend="printwindow",
+        dpi=frame.dpi,
+        window_title=frame.window_title,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_target_window",
+        lambda _keywords: target,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.get_client_rect_on_screen",
+        lambda _target: ClientRect(10, 20, 1280, 720),
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.capture_standardized_client_frame",
+        lambda *_args: frame,
+    )
+    checked = []
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_screen_occluders",
+        lambda *_args: checked.append(True),
+    )
+
+    source = service.open_live_source("test_game")
+    assert source.capture().frame.backend == "printwindow"
+    assert checked == []
+    source.close()

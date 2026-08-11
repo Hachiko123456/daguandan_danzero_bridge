@@ -319,6 +319,18 @@ def test_live_page_timeline_is_selectable_and_distinguishes_visible_advice():
     page.close()
 
 
+def test_live_page_exposes_compact_recommendation_mode():
+    _app()
+    page = LiveAssistantPage(FakeRuntime())
+    requested = []
+    page.compact_mode_requested.connect(lambda: requested.append(True))
+
+    page.compact_button.click()
+
+    assert requested == [True]
+    page.close()
+
+
 def test_live_page_shows_unconfirmed_pass_advice_instead_of_hiding_it():
     app = _app()
     page = LiveAssistantPage(FakeRuntime())
@@ -352,6 +364,40 @@ def test_live_page_shows_unconfirmed_pass_advice_instead_of_hiding_it():
     assert "待确认" not in page.timeline.toPlainText()
     assert "DanZero 建议" in page.timeline.toPlainText()
     assert "#0f766e" in page.timeline.toHtml().lower()
+    page.close()
+
+
+def test_live_page_renders_one_compact_entry_when_advice_becomes_visible():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    local = LocalAdvice(
+        strategy="test",
+        cards=(),
+        play_type="PASS",
+        is_pass=True,
+        state_revision=8,
+        elapsed_ms=12.0,
+        request_id="ADV-0007-0008",
+        engine_input={},
+        timings={},
+    )
+    hidden = LiveAdvice(
+        key=AdviceRequestKey("session", 7, 8),
+        status="ready",
+        visible=False,
+        advice=local,
+    )
+    visible = replace(hidden, visible=True)
+    snapshot = SimpleNamespace(current_player="self", trick_id=1, turn_id=7)
+
+    page.apply_update(LiveUpdate(status="running", snapshot=snapshot, advice=hidden))
+    page.apply_update(LiveUpdate(status="running", snapshot=snapshot, advice=visible))
+    app.processEvents()
+
+    text = page.timeline.toPlainText()
+    assert text.count("DanZero 建议") == 1
+    assert text.count("建议：不出") == 1
+    assert "请求 ADV" not in text
     page.close()
 
 

@@ -626,6 +626,32 @@ class VideoReplaySource:
             self._warnings = tuple(warnings)
 
 
+def _stable_visual_initial_state(
+    recognition_service: Any,
+    frames: tuple[np.ndarray, ...],
+) -> tuple[str, tuple[str, ...]] | None:
+    """Return the same valid 27-card state from two recorded opening frames."""
+
+    recognize = getattr(recognition_service, "recognize", None)
+    if not callable(recognize) or len(frames) < 2:
+        return None
+    candidates: list[tuple[str, tuple[str, ...]]] = []
+    for frame in frames[:2]:
+        result = recognize(frame)
+        level = str(getattr(result, "round_level", ""))
+        cards = tuple(str(card) for card in getattr(result, "my_hand", ()))
+        try:
+            state = GuanDanState()
+            state.set_round_level(level)
+            state.confirm_hand(cards)
+        except Exception:
+            return None
+        if len(state.my_hand) != 27:
+            return None
+        candidates.append((level, state.my_hand))
+    return candidates[0] if candidates[0] == candidates[1] else None
+
+
 def replay_video_through_live_pipeline(
     session: Path,
     recognition_service: Any,
@@ -637,6 +663,8 @@ def replay_video_through_live_pipeline(
     use_live_pipeline: bool = False,
     sample_every_frame: bool = False,
     recognition_strategy: str = "two_valid_streak",
+    output_root: Path | None = None,
+    persist_frame_log: bool = True,
 ) -> VisualPipelineReplayResult:
     """Run timestamped recorded frames through the production live pipeline.
 
@@ -654,13 +682,17 @@ def replay_video_through_live_pipeline(
     del sample_every_frame
     session = Path(session)
     using_truth_log = truth_log is not None
-    output = session / ("truth_replay.jsonl" if using_truth_log else "visual_replay.jsonl")
-    comparison_path = session / (
+    artifact_root = Path(output_root) if output_root is not None else session
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    output = artifact_root / (
+        "truth_replay.jsonl" if using_truth_log else "visual_replay.jsonl"
+    )
+    comparison_path = artifact_root / (
         "truth_replay_comparison.json"
         if using_truth_log
         else "visual_replay_comparison.json"
     )
-    report_path = session / (
+    report_path = artifact_root / (
         "truth_replay_report.txt" if using_truth_log else "visual_replay_report.txt"
     )
     output.unlink(missing_ok=True)
@@ -720,6 +752,30 @@ def replay_video_through_live_pipeline(
     if first is None:
         raise ValueError("录像没有可回放帧")
     first_record, first_frame = first
+    prefetched_frames = [(first_record, first_frame)]
+    initial_state_warnings: list[ReplayWarning] = []
+    if use_live_pipeline:
+        second = next(frames, None)
+        if second is not None:
+            prefetched_frames.append(second)
+        visual_initial = _stable_visual_initial_state(
+            recognition_service,
+            tuple(frame for _record, frame in prefetched_frames),
+        )
+        if visual_initial is not None:
+            visual_level, visual_hand = visual_initial
+            stored_hand = tuple(sorted(str(card) for card in hand))
+            if visual_level != round_level or visual_hand != stored_hand:
+                initial_state_warnings.append(
+                    ReplayWarning(
+                        "initial_state_mismatch",
+                        "Recorded opening frames disagree with the stored initial "
+                        f"state (level {round_level!r} -> {visual_level!r}); "
+                        "the visual state was used for live-pipeline replay.",
+                    )
+                )
+            round_level = visual_level
+            hand = visual_hand
     actual_events: tuple[LiveEvent, ...] = ()
     frame_count = 0
     last_record = first_record
@@ -752,7 +808,7 @@ def replay_video_through_live_pipeline(
             monotonic_ms=int(first_record.monotonic_ms),
         )
         try:
-            for record, frame in chain(((first_record, first_frame),), frames):
+            for record, frame in chain(prefetched_frames, frames):
                 if stop_requested is not None and stop_requested():
                     break
                 if wait_for_position is not None and not wait_for_position(
@@ -770,9 +826,10 @@ def replay_video_through_live_pipeline(
                 update_events = tuple(update.events) or (
                     (update.event,) if update.event is not None else ()
                 )
-                append_json_line(
-                    output,
-                    {
+                if persist_frame_log:
+                    append_json_line(
+                        output,
+                        {
                         "frame_index": record.frame_index,
                         "monotonic_ms": record.monotonic_ms,
                         "status": update.status,
@@ -783,8 +840,8 @@ def replay_video_through_live_pipeline(
                         "review_reason": (
                             update.review.reason if update.review is not None else None
                         ),
-                    },
-                )
+                        },
+                    )
                 last_record = record
                 frame_count += 1
                 if (
@@ -806,7 +863,7 @@ def replay_video_through_live_pipeline(
             event_count_before_finish = len(runner.events)
             runner.finish()
             final_events = runner.events[event_count_before_finish:]
-            if final_events:
+            if final_events and persist_frame_log:
                 snapshot = runner.snapshot
                 append_json_line(
                     output,
@@ -854,7 +911,7 @@ def replay_video_through_live_pipeline(
         output_path=output,
         comparison_path=comparison_path,
         frame_count=frame_count,
-        warnings=video_source.warnings,
+        warnings=(*video_source.warnings, *initial_state_warnings),
         comparison=comparison,
     )
 

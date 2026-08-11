@@ -14,6 +14,7 @@ from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.replay import (
     EventReplayer,
     VideoReplaySource,
+    _stable_visual_initial_state,
     compare_timelines,
     replay_truth_through_live_advisor,
     replay_video_through_live_pipeline,
@@ -34,6 +35,26 @@ HAND = tuple(f"{rank}{suit}" for rank in ("2", "3", "4", "5", "6", "7") for suit
     "8H",
     "8C",
 )
+
+
+def test_visual_replay_initial_state_requires_two_matching_valid_frames():
+    class Recognition:
+        def recognize(self, _frame):
+            return type(
+                "Result",
+                (),
+                {"round_level": "8", "my_hand": HAND},
+            )()
+
+    frames = (
+        np.zeros((32, 64, 3), np.uint8),
+        np.ones((32, 64, 3), np.uint8),
+    )
+
+    assert _stable_visual_initial_state(Recognition(), frames) == (
+        "8",
+        tuple(sorted(HAND)),
+    )
 
 
 class TrustedReplayAdvisor:

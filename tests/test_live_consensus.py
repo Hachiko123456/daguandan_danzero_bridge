@@ -51,12 +51,13 @@ def test_three_matching_burst_samples_confirm_cards_as_multiset():
     assert result.vote_count == 3
 
 
-def test_illegal_card_pattern_is_rejected_even_with_three_votes():
+def test_structurally_impossible_pattern_is_rejected_without_becoming_pass():
     samples = [_play("3S", "4H") for _ in range(3)]
 
     result = BurstConsensus(min_votes=3).decide(samples, context=_context())
 
     assert result.status == "review_required"
+    assert not result.is_pass
     assert "illegal_pattern" in result.rejected_reasons
 
 
@@ -161,14 +162,31 @@ def test_unknown_suit_self_action_is_reconciled_to_the_confirmed_hand():
     assert result.resolved_cards == ("2H", "3C", "4C", "5S", "AS")
 
 
-def test_play_that_does_not_beat_current_table_action_is_rejected():
+def test_play_that_does_not_beat_reconstructed_table_is_still_committed():
     result = BurstConsensus(min_votes=3).decide(
         [_play("6S") for _ in range(3)],
         context=_context(table_cards=("7S",)),
     )
 
-    assert result.status == "review_required"
-    assert "does_not_beat_table" in result.rejected_reasons
+    assert result.status == "confirmed"
+    assert result.cards == ("6S",)
+    assert "observed_table_mismatch" in result.integrity_warnings
+
+
+def test_stable_play_wins_over_a_pass_candidate_in_the_same_turn():
+    samples = [
+        _play("7S"),
+        _play("7S"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+    ]
+
+    result = BurstConsensus(min_votes=2).decide(samples, context=_context())
+
+    assert result.status == "confirmed"
+    assert not result.is_pass
+    assert result.cards == ("7S",)
 
 
 def test_self_play_does_not_require_post_hand_reconciliation():

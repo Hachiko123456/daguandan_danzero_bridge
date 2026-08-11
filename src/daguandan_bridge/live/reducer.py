@@ -167,6 +167,7 @@ class LiveReducer:
         evidence_refs: Iterable[str] = (),
         suit_options: Iterable[Iterable[str]] = (),
         integrity_warnings: Iterable[str] = (),
+        action_metadata: dict[str, object] | None = None,
     ) -> LiveEvent:
         self._require_expected_player(player)
         raw_cards = tuple(str(card) for card in cards)
@@ -183,6 +184,14 @@ class LiveReducer:
         warnings = tuple(dict.fromkeys(str(item) for item in integrity_warnings if str(item)))
         if warnings:
             payload["integrity_warnings"] = list(warnings)
+        if action_metadata:
+            payload.update(
+                {
+                    str(key): value
+                    for key, value in action_metadata.items()
+                    if str(key)
+                }
+            )
         event = self._new_event(
             "player_played",
             actor=player,
@@ -210,6 +219,33 @@ class LiveReducer:
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
+        )
+        self.apply(event)
+        return event
+
+    def confirm_player_finished(
+        self,
+        player: Seat,
+        *,
+        placement: str,
+        confidence: float = 1.0,
+        source: str = "visual_placement",
+    ) -> LiveEvent:
+        """Confirm a persistent finish badge when card-count inference is wrong."""
+
+        if player not in TURN_ORDER:
+            raise GameStateError("出完牌玩家无效")
+        if player in self._finished_seats:
+            raise GameStateError("该玩家已经出完牌")
+        normalized_placement = str(placement).strip().lower()
+        if normalized_placement not in {"head", "second", "third", "last"}:
+            raise GameStateError("玩家名次无效")
+        event = self._new_event(
+            "player_finished",
+            actor=player,
+            payload={"placement": normalized_placement},
+            confidence=confidence,
+            source=source,
         )
         self.apply(event)
         return event
@@ -308,7 +344,31 @@ class LiveReducer:
         if event.event_type in _ACTION_EVENT_TYPES:
             self._apply_action(event)
             return
+        if event.event_type == "player_finished":
+            self._apply_player_finished(event)
+            return
         raise GameStateError(f"Reducer 不支持事件类型：{event.event_type}")
+
+    def _apply_player_finished(self, event: LiveEvent) -> None:
+        player = event.actor
+        if player not in TURN_ORDER:
+            raise GameStateError("出完牌玩家无效")
+        placement = str(event.payload.get("placement", "")).strip().lower()
+        if placement not in {"head", "second", "third", "last"}:
+            raise GameStateError("玩家名次无效")
+        if player in self._finished_seats:
+            return
+        self._remaining_cards[player] = 0
+        self._finished_seats.add(player)
+        if len(self._finished_seats) >= 3:
+            self._trick_plays.clear()
+            self._current_player = None
+            return
+        if self._current_player == player:
+            self._current_player = next_active_seat(
+                player,
+                frozenset(self._finished_seats),
+            )
 
     def _apply_initial(self, event: LiveEvent) -> None:
         hand = self._normalize_cards(event.payload.get("hand", ()))
@@ -464,6 +524,7 @@ class LiveReducer:
             my_hand=snapshot.my_hand,
             trick_plays=list(snapshot.trick_plays),
             play_history=list(snapshot.play_history),
+            remaining_cards=dict(snapshot.remaining_cards),
             revision=snapshot.revision,
         )
         return state

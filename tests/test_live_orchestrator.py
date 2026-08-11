@@ -21,6 +21,7 @@ from daguandan_bridge.live.zone_lifecycle import ZoneFrameMetrics
 from daguandan_bridge.recognition_service import (
     FastSignalResult,
     OpeningSignal,
+    PlacementSignal,
     PlayRegionResult,
 )
 from daguandan_bridge.gui.workers import LatestOnlyWorker
@@ -84,6 +85,7 @@ def _orchestrator(
     lead_player="right",
     round_level="2",
     settle_ms=100,
+    hand=HAND,
     **options,
 ):
     store = LiveSessionStore(tmp_path / "profiles", "tencent_daguandan", session_id="game")
@@ -110,11 +112,90 @@ def _orchestrator(
     )
     orchestrator.start(
         round_level=round_level,
-        hand=HAND,
+        hand=hand,
         lead_player=lead_player,
         monotonic_ms=0,
     )
     return orchestrator
+
+
+def test_latest_game_wildcard_play_is_committed_and_removed_from_hand(tmp_path):
+    latest_hand = (
+        "10D", "10H", "2D", "2H", "4C", "4D", "4S", "5D", "5S",
+        "6C", "7C", "7D", "7H", "8C", "8H", "8S", "9C", "9D", "9H",
+        "AC", "AS", "JC", "JD", "KS", "QC", "big_joker", "small_joker",
+    )
+    played = ("JC", "JD", "9H", "2D", "2H")
+    samples = [
+        PlayRegionResult(
+            player="self",
+            cards=played,
+            is_pass=False,
+            confidence=0.94,
+            diagnostics=(),
+            annotations=(),
+            source="latest-game-regression",
+        )
+        for _ in range(2)
+    ]
+    orchestrator = _orchestrator(
+        tmp_path,
+        samples,
+        lead_player="self",
+        round_level="9",
+        settle_ms=0,
+        hand=latest_hand,
+    )
+    orchestrator.commit_trusted_action(
+        actor="self",
+        cards=("4C", "4D", "4S", "5D", "5S"),
+        is_pass=False,
+        monotonic_ms=10,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right",
+        cards=("10C", "10H", "10S", "KH", "KS"),
+        is_pass=False,
+        monotonic_ms=20,
+    )
+    orchestrator.commit_trusted_action(
+        actor="opposite", is_pass=True, monotonic_ms=30
+    )
+    orchestrator.commit_trusted_action(
+        actor="left", is_pass=True, monotonic_ms=40
+    )
+
+    updates = []
+    for timestamp in (100, 200):
+        updates.append(
+            orchestrator.ingest_frame(
+                np.zeros((32, 64, 3), np.uint8),
+                monotonic_ms=timestamp,
+                wall_time=f"wildcard-{timestamp}",
+                metrics=ZoneFrameMetrics(
+                    monotonic_ms=timestamp,
+                    occupied=True,
+                    motion_score=0.20 if timestamp == 100 else 0.0,
+                    pass_visible=False,
+                    effect_visible=False,
+                    content_changed=timestamp == 100,
+                ),
+            )
+        )
+
+    event = updates[-1].event
+    assert event is not None
+    assert event.event_type == "player_played"
+    assert event.actor == "self"
+    assert tuple(event.payload["cards"]) == tuple(sorted(played))
+    assert event.payload["logical_label"] == "JJJ22"
+    assert event.payload["beats_table"] is True
+    assert event.payload["wildcard_substitutions"] == [
+        {"card": "9H", "as_rank": "J"}
+    ]
+    assert orchestrator.snapshot.current_player == "right"
+    assert not (set(played) & set(orchestrator.snapshot.my_hand))
+    orchestrator.finish()
 
 
 def _orchestrator_with_default_settle(
@@ -608,6 +689,153 @@ def test_finished_player_and_wind_catch_are_emitted_to_the_timeline(tmp_path):
         and event.payload == {"from_player": "right", "to_player": "left"}
         for event in latest
     )
+    orchestrator.finish()
+
+
+def test_visual_head_badge_recovers_finish_and_wind_after_two_frames(tmp_path):
+    orchestrator = _orchestrator(
+        tmp_path,
+        [_play("7S")],
+        lead_player="left",
+    )
+    orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("9S",),
+        is_pass=False,
+        monotonic_ms=1,
+    )
+    fast = FastSignalResult(
+        expected_player="self",
+        active_player="self",
+        pass_visible=False,
+        self_action_buttons_visible=True,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="left",
+                placement="head",
+                confidence=0.99,
+                source="template:head",
+            ),
+        ),
+    )
+
+    assert orchestrator._apply_visual_placements(fast) == ()
+    events = orchestrator._apply_visual_placements(fast)
+
+    assert len(events) == 1
+    assert events[0].event_type == "player_finished"
+    assert events[0].actor == "left"
+    assert events[0].payload["placement"] == "head"
+    assert orchestrator.snapshot.remaining_cards["left"] == 0
+
+    orchestrator.commit_trusted_action(
+        actor="self",
+        cards=(),
+        is_pass=True,
+        monotonic_ms=2,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right",
+        cards=(),
+        is_pass=True,
+        monotonic_ms=3,
+    )
+    update = orchestrator.commit_trusted_action(
+        actor="opposite",
+        cards=(),
+        is_pass=True,
+        monotonic_ms=4,
+    )
+
+    assert orchestrator.snapshot.current_player == "right"
+    assert any(
+        event.event_type == "wind_caught"
+        and event.payload == {"from_player": "left", "to_player": "right"}
+        for event in update.events
+    )
+    orchestrator.finish()
+
+
+def test_current_player_badge_waits_for_final_card_path_before_fallback(tmp_path):
+    orchestrator = _orchestrator(
+        tmp_path,
+        [_play("AS")],
+        lead_player="self",
+    )
+    fast = FastSignalResult(
+        expected_player="self",
+        active_player="self",
+        pass_visible=False,
+        self_action_buttons_visible=True,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="self",
+                placement="third",
+                confidence=0.99,
+                source="template:third",
+            ),
+        ),
+    )
+    orchestrator.reducer.confirm_player_finished(
+        "left",
+        placement="head",
+        confidence=1.0,
+        source="test",
+    )
+    orchestrator.reducer.confirm_player_finished(
+        "opposite",
+        placement="second",
+        confidence=1.0,
+        source="test",
+    )
+    orchestrator._finish_order.extend(("left", "opposite"))
+
+    for _ in range(5):
+        assert orchestrator._apply_visual_placements(fast, defer_player="self") == ()
+        assert "self" not in orchestrator.snapshot.finished_seats
+
+    events = orchestrator._apply_visual_placements(fast, defer_player="self")
+
+    assert len(events) == 2
+    assert events[0].event_type == "player_finished"
+    assert events[0].actor == "self"
+    assert events[0].payload["placement"] == "third"
+    assert events[1].event_type == "player_finished"
+    assert events[1].actor == "right"
+    assert events[1].payload["placement"] == "last"
+    orchestrator.finish()
+
+
+def test_out_of_order_visual_placement_never_changes_game_state(tmp_path):
+    orchestrator = _orchestrator(
+        tmp_path,
+        [_play("7S")],
+        lead_player="self",
+    )
+    fast = FastSignalResult(
+        expected_player="self",
+        active_player="self",
+        pass_visible=False,
+        self_action_buttons_visible=True,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="left",
+                placement="third",
+                confidence=0.99,
+                source="template:false-third",
+            ),
+        ),
+    )
+
+    for _ in range(8):
+        assert orchestrator._apply_visual_placements(fast) == ()
+
+    assert orchestrator.snapshot.finished_seats == frozenset()
+    assert orchestrator._finish_order == []
+    assert orchestrator._placement_streaks == {}
     orchestrator.finish()
 
 

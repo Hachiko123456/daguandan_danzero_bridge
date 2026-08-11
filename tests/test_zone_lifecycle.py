@@ -40,6 +40,20 @@ def test_zone_starts_waiting_without_clearing_previous_content():
     ).phase == ZonePhase.SETTLING
 
 
+def test_delayed_turn_handoff_can_sample_cards_already_visible_on_activation():
+    zone = ZoneLifecycle(
+        expected_player="right",
+        activated_at_ms=0,
+        settle_ms=0,
+        accept_initial_occupied=True,
+    )
+
+    decision = zone.observe(_metrics(0, occupied=True))
+
+    assert decision.phase == ZonePhase.BURST_READ
+    assert decision.collect_sample
+
+
 def test_pass_marker_enters_action_window_without_waiting_for_clear():
     zone = ZoneLifecycle(
         expected_player="opposite",

@@ -57,6 +57,7 @@ class ZoneLifecycle:
         settle_ms: int = 1_000,
         stable_ms: int = 0,
         action_timeout_ms: int = 22_000,
+        accept_initial_occupied: bool = False,
     ) -> None:
         if settle_ms < 0 or stable_ms < 0 or action_timeout_ms <= 0:
             raise ValueError("settle_ms and action_timeout_ms must be valid")
@@ -66,6 +67,8 @@ class ZoneLifecycle:
         self.settle_ms = int(settle_ms)
         self.stable_ms = int(stable_ms)
         self.action_timeout_ms = int(action_timeout_ms)
+        self._accept_initial_occupied = bool(accept_initial_occupied)
+        self._activation_observed = False
         self._settle_started_ms: int | None = None
         self._stable_since_ms: int | None = None
         self._effect_last_seen_ms: int | None = None
@@ -83,10 +86,17 @@ class ZoneLifecycle:
             )
 
         action_visible = bool(metrics.occupied or metrics.pass_visible)
+        initial_occupied = bool(
+            not self._activation_observed
+            and self._accept_initial_occupied
+            and metrics.occupied
+        )
+        self._activation_observed = True
         changed = bool(
             metrics.content_changed
             or metrics.pass_visible
             or metrics.motion_score >= self._ACTION_START_MOTION
+            or initial_occupied
         )
 
         if self.phase == ZonePhase.WAIT_ACTION:

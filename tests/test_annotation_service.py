@@ -31,7 +31,7 @@ def test_migrated_profile_contains_all_named_regions():
     service = AnnotationService()
     regions = service.list_regions()
 
-    assert len(regions) == 22
+    assert len(regions) == 26
     assert {region.name for region in regions} >= {
         "my_hand",
         "my_play",
@@ -95,6 +95,7 @@ def test_region_and_role_labels_are_chinese_but_keep_internal_keys():
     assert REGION_DISPLAY_NAMES["table_anchor_1"] == "牌桌锚点一"
     assert REGION_DISPLAY_NAMES["button_actions"] == "按钮区域"
     assert REGION_DISPLAY_NAMES["game_end_controls"] == "换桌 / 再来一局区域"
+    assert REGION_DISPLAY_NAMES["placement_left"] == "左侧名次提示"
     assert ROLE_DISPLAY_NAMES == {
         "hand": "手牌",
         "play": "出牌",
@@ -108,7 +109,7 @@ def test_profile_region_config_has_no_source_image_field():
     payload = json.loads(service.regions_path.read_text(encoding="utf-8"))
 
     assert payload["schema_version"] == 2
-    assert len(payload["regions"]) == 22
+    assert len(payload["regions"]) == 26
     assert all("source_image" not in item for item in payload["regions"])
 
 

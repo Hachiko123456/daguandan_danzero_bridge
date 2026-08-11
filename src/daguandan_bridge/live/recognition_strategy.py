@@ -204,6 +204,128 @@ def decide_recognition_strategy(
     )
 
 
+def decide_best_effort_candidate(
+    samples: Iterable[RecognitionSample],
+    *,
+    context: ConsensusContext,
+) -> ConsensusResult | None:
+    """Resolve an exhausted burst without pausing the live game.
+
+    Exact consecutive agreement remains the normal path.  When animation or
+    suit flicker exhausts the bounded burst, select the strongest observed
+    physical candidate instead of emitting ``conflicting_valid_candidates``.
+    A non-pass candidate always outranks a pass marker in the same turn.
+    """
+
+    grouped: dict[tuple[bool, tuple[str, ...]], list[tuple[int, RecognitionSample]]] = (
+        defaultdict(list)
+    )
+    unresolved: dict[tuple[bool, tuple[str, ...]], list[tuple[int, RecognitionSample]]] = (
+        defaultdict(list)
+    )
+    rejected: list[str] = []
+    for index, sample in enumerate(samples):
+        cards, suit_options = canonical_candidate(
+            sample.cards,
+            sample.suit_options,
+            is_pass=sample.is_pass,
+        )
+        reason = BurstConsensus.validate_candidate(
+            sample.is_pass,
+            cards,
+            context,
+            suit_options=suit_options,
+        )
+        if reason:
+            rejected.append(reason)
+            if (
+                reason == "illegal_pattern"
+                and context.next_turn_evidence
+                and not sample.is_pass
+                and cards
+            ):
+                unresolved[(False, cards)].append(
+                    (
+                        index,
+                        RecognitionSample(
+                            cards=cards,
+                            is_pass=False,
+                            confidence=sample.confidence,
+                            source=sample.source,
+                            evidence_ref=sample.evidence_ref,
+                            suit_options=suit_options,
+                            post_hand=sample.post_hand,
+                        ),
+                    )
+                )
+            continue
+        normalized = RecognitionSample(
+            cards=cards,
+            is_pass=bool(sample.is_pass),
+            confidence=sample.confidence,
+            source=sample.source,
+            evidence_ref=sample.evidence_ref,
+            suit_options=suit_options,
+            post_hand=sample.post_hand,
+        )
+        grouped[_key(normalized)].append((index, normalized))
+    if not grouped and unresolved:
+        grouped = unresolved
+    if not grouped:
+        return None
+
+    winner_items = max(
+        grouped.values(),
+        key=lambda votes: (
+            not votes[-1][1].is_pass,
+            len(votes),
+            sum(item.confidence for _index, item in votes) / len(votes),
+            votes[-1][0],
+        ),
+    )
+    winner = [item for _index, item in winner_items]
+    sample = _conservative_unknown_sample(winner)
+    confidence = sum(item.confidence for item in winner) / len(winner)
+    warnings = list(
+        BurstConsensus.integrity_warnings(
+            sample.is_pass,
+            sample.cards,
+            context,
+            suit_options=sample.suit_options,
+        )
+    )
+    if len(grouped) > 1:
+        warnings.append("candidate_conflict_resolved_best_effort")
+    if unresolved and grouped is unresolved:
+        warnings.append("observed_pattern_unresolved")
+    candidate = ConsensusCandidate(
+        cards=sample.cards,
+        is_pass=sample.is_pass,
+        votes=len(winner),
+        mean_confidence=confidence,
+        valid=True,
+    )
+    return ConsensusResult(
+        status="confirmed",
+        cards=sample.cards,
+        is_pass=sample.is_pass,
+        confidence=confidence,
+        source="best_effort_burst",
+        vote_count=len(winner),
+        candidates=(candidate,),
+        resolved_cards=BurstConsensus.resolve_commit_cards(
+            sample.is_pass,
+            sample.cards,
+            context,
+            suit_options=sample.suit_options,
+        ),
+        rejected_reasons=tuple(dict.fromkeys(rejected)),
+        evidence_refs=tuple(item.evidence_ref for item in winner if item.evidence_ref),
+        suit_options=sample.suit_options,
+        integrity_warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
 def has_exhausted_valid_candidates(
     samples: Iterable[RecognitionSample],
     *,

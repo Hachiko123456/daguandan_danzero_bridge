@@ -5,6 +5,7 @@ from collections import Counter
 import pytest
 
 from daguandan_bridge.danzero import GameStateError
+from daguandan_bridge.danzero.advisor import LocalGuandanAdvisor
 from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.turns import TURN_ORDER, next_active_seat
 
@@ -128,6 +129,30 @@ def test_third_finish_ends_the_round_without_creating_a_fourth_turn():
     assert snapshot.finished_seats == frozenset({"left", "opposite", "right"})
     assert snapshot.current_player is None
     assert snapshot.trick_plays == ()
+
+
+def test_visual_finish_badge_corrects_an_unknown_opponent_starting_count():
+    reducer = LiveReducer("visual-finish")
+    reducer.confirm_initial_state(
+        round_level="2",
+        hand=INITIAL_HAND,
+        lead_player="left",
+    )
+    reducer.record_play("left", ("9S",))
+
+    event = reducer.confirm_player_finished(
+        "left",
+        placement="head",
+        confidence=0.98,
+    )
+    snapshot = reducer.snapshot()
+
+    assert event.event_type == "player_finished"
+    assert snapshot.remaining_cards["left"] == 0
+    assert snapshot.finished_seats == frozenset({"left"})
+    assert snapshot.current_player == "self"
+    strategy_snapshot = reducer.to_guandan_state().local_snapshot()
+    assert LocalGuandanAdvisor._remaining_counts(strategy_snapshot)[1] == 0
 
 
 def test_correction_rebuild_matches_clean_history():

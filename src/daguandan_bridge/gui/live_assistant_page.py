@@ -83,6 +83,8 @@ class _ClickableCardStrip(QWidget):
 class LiveAssistantPage(ScrollArea):
     """Semi-automatic live assistant; all game decisions stay in the orchestrator."""
 
+    compact_mode_requested = Signal()
+
     def __init__(self, runtime: Any | None = None, parent=None) -> None:
         super().__init__(parent)
         self.runtime = runtime or LiveAssistantController()
@@ -247,8 +249,10 @@ class LiveAssistantPage(ScrollArea):
         self.pause_button = PushButton("暂停")
         self.resume_button = PushButton("继续")
         self.finish_button = PrimaryPushButton("结束并封存")
+        self.compact_button = PushButton("进入极简推荐浮窗")
         control_row.addWidget(self.pause_button)
         control_row.addWidget(self.resume_button)
+        control_row.addWidget(self.compact_button)
         control_row.addWidget(self.finish_button)
         state_layout.addLayout(control_row)
         columns.addWidget(state_card, 2)
@@ -290,6 +294,7 @@ class LiveAssistantPage(ScrollArea):
         self.pause_button.clicked.connect(self.runtime.pause)
         self.resume_button.clicked.connect(self.runtime.resume)
         self.finish_button.clicked.connect(self.runtime.finish)
+        self.compact_button.clicked.connect(self.compact_mode_requested.emit)
         self.manual_confirm_button.clicked.connect(self._confirm_manual)
         self.hand_edit.textChanged.connect(self._refresh_initialization)
         self.initial_hand_cards.clicked.connect(self._edit_initial_hand)
@@ -345,6 +350,7 @@ class LiveAssistantPage(ScrollArea):
             setter(str(self.recognition_strategy_combo.currentData()))
         start = getattr(self.runtime, "start_listening", None)
         if callable(start):
+            self.compact_mode_requested.emit()
             start()
             self.initialization_status.setText(
                 "正在持续监听页面；稳定识别两次相同的 27 张手牌后自动开始。"
@@ -511,30 +517,16 @@ class LiveAssistantPage(ScrollArea):
     def _show_advice(self, raw: object | None) -> None:
         if not isinstance(raw, LiveAdvice):
             return
-        if raw.status == "ready" and raw.advice is not None and not raw.visible:
+        if raw.status == "ready" and raw.advice is not None:
             suggestion = (
                 "建议：不出"
                 if raw.advice.is_pass
-                else f"建议：{self._play_type_text(raw.advice.play_type)}"
+                else f"建议：出牌 · {self._play_type_text(raw.advice.play_type)}"
             )
             self._append_advice_timeline_entry(
                 raw,
-                f"{suggestion}；耗时 {raw.advice.elapsed_ms:.0f} ms；"
-                f"请求 {raw.key.request_id}",
+                suggestion,
             )
-        elif raw.status == "ready" and raw.advice is not None:
-            suggestion = (
-                "建议：不出"
-                if raw.advice.is_pass
-                else f"建议：{self._play_type_text(raw.advice.play_type)}"
-            )
-            self._append_advice_timeline_entry(
-                raw,
-                f"{suggestion}；耗时 {raw.advice.elapsed_ms:.0f} ms；"
-                f"请求 {raw.key.request_id}",
-            )
-        elif raw.status == "stale":
-            self._append_advice_timeline_entry(raw, "DanZero 旧建议已丢弃。")
         elif raw.status == "failed":
             self._append_advice_timeline_entry(
                 raw,
@@ -574,7 +566,6 @@ class LiveAssistantPage(ScrollArea):
         key = (
             raw.key.request_id,
             raw.status,
-            raw.visible,
             cards,
             raw.error,
             raw.suit_uncertain,
@@ -589,14 +580,16 @@ class LiveAssistantPage(ScrollArea):
             accent, background, title = "#B91C1C", "#FEF2F2", "DanZero 计算失败"
         else:
             accent, background, title = "#0F766E", "#E7F6F2", "DanZero 建议"
+            if advice is not None:
+                detail += f"　{advice.elapsed_ms:.0f} ms"
         if raw.suit_uncertain:
             agreement = "建议一致" if raw.advice_agrees_across_variants else "建议存在分歧"
             detail += f"；花色遮挡：已评估 {raw.variant_count} 个可行分支，{agreement}"
         self._append_timeline_html(
             "<div style='margin:5px 0 9px 0; padding:6px; "
             f"background:{background}; border-left:4px solid {accent};'>"
-            f"<span style='color:{accent}; font-weight:600;'>{title}</span><br>"
-            f"<span style='color:{accent};'>{html.escape(detail)}</span>{cards_html}"
+            f"<span style='color:{accent}; font-size:18px; font-weight:700;'>"
+            f"{html.escape(title)} · {html.escape(detail)}</span>{cards_html}"
             "</div>"
         )
 

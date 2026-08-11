@@ -101,7 +101,21 @@ def event_action_text(event: LiveEvent) -> str:
     if event.event_type == "turn_started":
         return f"轮到{seat_text(event.payload.get('player', event.actor))}"
     if event.event_type == "player_played":
-        return f"{seat}出牌：{cards or '未识别到牌面'}"
+        detail = ""
+        logical_label = str(event.payload.get("logical_label", "") or "")
+        substitutions = event.payload.get("wildcard_substitutions", ())
+        if logical_label and isinstance(substitutions, Iterable) and tuple(substitutions):
+            mappings = []
+            for item in substitutions:
+                if not isinstance(item, dict):
+                    continue
+                physical = str(item.get("card", ""))
+                rank = str(item.get("as_rank", ""))
+                if physical and rank:
+                    mappings.append(f"{physical}→{rank}")
+            suffix = f"，万能牌：{'/'.join(mappings)}" if mappings else ""
+            detail = f"（逻辑：{logical_label}{suffix}）"
+        return f"{seat}出牌：{cards or '未识别到牌面'}{detail}"
     if event.event_type == "player_passed":
         return f"{seat}不出"
     if event.event_type == "player_finished":

@@ -2377,6 +2377,78 @@
         1280,
         720
       ]
+    },
+    {
+      "sample_id": "status_placement_head_001",
+      "kind": "status",
+      "label": "head",
+      "file": "templates/status/placement_head.png",
+      "source_image": "sessions/game_20260811_004039_f975e3/video/game.avi#frame=1065",
+      "source_role": "generic",
+      "abs_box": [
+        0,
+        150,
+        115,
+        58
+      ],
+      "ratio_box": [
+        0.0,
+        0.208333,
+        0.089844,
+        0.080556
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_placement_second_001",
+      "kind": "status",
+      "label": "second",
+      "file": "templates/status/placement_second.png",
+      "source_image": "sessions/game_20260811_004039_f975e3/video/game.avi#frame=1620",
+      "source_role": "generic",
+      "abs_box": [
+        480,
+        25,
+        115,
+        55
+      ],
+      "ratio_box": [
+        0.375,
+        0.034722,
+        0.089844,
+        0.076389
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_placement_third_001",
+      "kind": "status",
+      "label": "third",
+      "file": "templates/status/placement_third.png",
+      "source_image": "sessions/game_20260811_004039_f975e3/video/game.avi#frame=1620",
+      "source_role": "generic",
+      "abs_box": [
+        5,
+        545,
+        115,
+        55
+      ],
+      "ratio_box": [
+        0.003906,
+        0.756944,
+        0.089844,
+        0.076389
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
     }
   ]
 }

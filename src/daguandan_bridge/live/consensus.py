@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-from ..danzero.rules import action_for_cards, play_beats_table
+from ..danzero.rules import actions_for_cards, infer_best_action
 from .card_uncertainty import (
     feasible_action_variants,
     feasible_self_hand_variants,
@@ -174,8 +174,19 @@ class BurstConsensus:
                 item.rejected_reason for item in candidates if item.rejected_reason
             )
         )
-        if len(accepted) == 1:
-            winner = accepted[0]
+        if accepted:
+            # A stable visible play is an observed event, not a proposal for
+            # the rule engine to approve.  Prefer any non-pass candidate over
+            # a later pass marker and resolve remaining conflicts by evidence
+            # strength so the live turn can never stall here.
+            winner = max(
+                accepted,
+                key=lambda item: (
+                    not item.is_pass,
+                    item.votes,
+                    item.mean_confidence,
+                ),
+            )
             return ConsensusResult(
                 status="confirmed",
                 cards=winner.cards,
@@ -242,29 +253,21 @@ class BurstConsensus:
         if not context.validate_rules:
             return ""
         try:
-            legal_variants = [
-                variant
+            if not any(
+                actions_for_cards(variant, context.level_rank)
                 for variant in variants
-                if action_for_cards(variant, context.level_rank) is not None
-            ]
-            if not legal_variants:
-                return "illegal_pattern"
-            # A previous table play with an obscured suit must not stop the
-            # live flow.  Its exact suit remains explicit in history and the
-            # advisor will evaluate every concrete branch later.
-            if context.table_cards and not any(
-                is_unknown_suit_card(card) for card in context.table_cards
-            ) and not any(
-                play_beats_table(
-                    variant,
-                    context.table_cards,
-                    context.level_rank,
-                )
-                for variant in legal_variants
             ):
-                return "does_not_beat_table"
+                # This is a structural OCR guard only.  A legal action that
+                # does not beat the reconstructed table is still accepted;
+                # ``does_not_beat_table`` is never a rejection reason.
+                return "illegal_pattern"
         except (ImportError, ModuleNotFoundError, ValueError):
             return "illegal_pattern"
+        # Rule interpretation is deliberately not a commit gate.  Once the
+        # game UI has shown a stable non-empty action, the action happened.
+        # Whether its reconstructed cards form a known pattern or beat the
+        # reconstructed table is captured by ``integrity_warnings`` below and
+        # must never turn the action into PASS or block the turn.
         return ""
 
     @staticmethod
@@ -284,25 +287,24 @@ class BurstConsensus:
             suit_options=suit_options,
             known_hand=context.known_hand,
         )
+        ranked: list[tuple[int, int, tuple[str, ...]]] = []
         for variant in variants:
             try:
-                if action_for_cards(variant, context.level_rank) is None:
-                    continue
-                if context.table_cards and not any(
-                    is_unknown_suit_card(card) for card in context.table_cards
-                ) and not play_beats_table(
+                inference = infer_best_action(
                     variant,
                     context.table_cards,
                     context.level_rank,
-                ):
-                    continue
+                )
+                ranked.append(
+                    (
+                        int(inference.beats_table),
+                        int(inference.action is not None),
+                        variant,
+                    )
+                )
             except (ImportError, ModuleNotFoundError, ValueError):
-                continue
-            return variant
-        # ``validate_candidate`` has already established that at least one
-        # concrete variant is legal.  Keep this defensive fallback for callers
-        # that use the public helper directly.
-        return variants[0] if variants else cards
+                ranked.append((0, 0, variant))
+        return max(ranked, default=(0, 0, cards))[-1]
 
     _validate_candidate = validate_candidate
 
@@ -318,6 +320,7 @@ class BurstConsensus:
 
         if is_pass:
             return ()
+        warnings: list[str] = []
         if historical_suit_constraints_relaxed(
             cards=cards,
             suit_options=suit_options,
@@ -325,8 +328,43 @@ class BurstConsensus:
             known_suit_options=context.known_suit_options,
             candidate_already_known=context.candidate_already_known,
         ):
-            return ("historical_suit_constraints_relaxed",)
-        return ()
+            warnings.append("historical_suit_constraints_relaxed")
+
+        variants = feasible_action_variants(
+            cards=cards,
+            suit_options=suit_options,
+            known_cards=context.known_cards,
+            known_suit_options=context.known_suit_options,
+            candidate_already_known=context.candidate_already_known,
+        )
+        if context.known_hand:
+            variants = feasible_self_hand_variants(
+                cards=cards,
+                suit_options=suit_options,
+                known_hand=context.known_hand,
+            )
+        try:
+            inferences = tuple(
+                infer_best_action(
+                    variant,
+                    context.table_cards,
+                    context.level_rank,
+                )
+                for variant in variants
+            )
+        except (ImportError, ModuleNotFoundError, ValueError):
+            inferences = ()
+        if not any(inference.action is not None for inference in inferences):
+            warnings.append("observed_pattern_unresolved")
+        elif (
+            context.table_cards
+            and not any(is_unknown_suit_card(card) for card in context.table_cards)
+            and not any(inference.beats_table for inference in inferences)
+        ):
+            warnings.append("observed_table_mismatch")
+        if any(inference.ambiguous for inference in inferences):
+            warnings.append("wildcard_interpretation_ambiguous")
+        return tuple(dict.fromkeys(warnings))
 
     @staticmethod
     def _review(
