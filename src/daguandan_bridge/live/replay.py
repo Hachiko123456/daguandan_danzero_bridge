@@ -440,6 +440,7 @@ def _event_to_turn_data(
     )
     return {
         "turn_id": event.turn_id,
+        "trick_id": event.trick_id,
         "frame_index": frame_index,
         "actor": event.actor,
         "expected_cards": list(expected.cards) if expected else [],
@@ -1196,7 +1197,7 @@ def _record_frame_match(
                     seq=turn.index,
                     monotonic_ms=record.monotonic_ms,
                     wall_time=record.wall_time,
-                    trick_id=1,
+                    trick_id=turn.trick_id,
                     turn_id=turn.index,
                     actor=turn.actor,
                     payload={

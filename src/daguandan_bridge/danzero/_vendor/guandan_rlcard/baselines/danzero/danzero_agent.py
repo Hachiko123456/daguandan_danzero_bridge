@@ -173,6 +173,7 @@ class DanzeroAgent(Player):
         self.count_A_self = 0
         self.count_A_oppo = 0
         self.action = Action()
+        self.last_feature_batch = None
 
     def step(self, state):
         if not state['actions']:
@@ -646,6 +647,7 @@ class DanzeroAgent(Player):
             'x_batch': x_batch.astype(np.int8),
             'x_no_action': x_no_action.astype(np.float32),
         }
+        self.last_feature_batch = obs['x_batch'].copy()
 
         return obs
 

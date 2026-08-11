@@ -15,7 +15,10 @@ from daguandan_bridge.live.recognition_strategy import (
     RECOGNITION_STRATEGY_OPTIONS,
     decide_recognition_strategy,
 )
-from daguandan_bridge.live.replay import VideoReplaySource
+from daguandan_bridge.live.replay import (
+    VideoReplaySource,
+    replay_video_through_live_pipeline,
+)
 from daguandan_bridge.live.session_store import read_json_lines
 from daguandan_bridge.live.truth_log import TruthLog, load_truth_log
 from daguandan_bridge.recognition_service import ScreenshotRecognitionService
@@ -24,20 +27,47 @@ from daguandan_bridge.template_service import TemplateService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_ROOT = PROJECT_ROOT / "data" / "profiles" / "tencent_daguandan" / "sessions"
-TRUTH_SESSION_IDS = (
-    "game_20260807_002323_616108",
-    "game_20260806_231123_e5ec3c",
-    "game_20260806_150516_1fb519",
-)
-FRAME_ANCHORED_SESSION_IDS = (
-    "game_20260806_231123_e5ec3c",
-    "game_20260806_150516_1fb519",
+LATEST_FIRST_TURN_REGRESSION = "game_20260811_140851_296efc"
+ACTION_TYPES = {"player_played", "player_passed", "manual_confirmed_event"}
+
+
+def _available_truth_sessions(root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Discover usable truth fixtures without binding the gate to one workstation."""
+
+    truth_sessions: list[str] = []
+    anchored_sessions: list[str] = []
+    if not root.is_dir():
+        return (), ()
+    for session in sorted(root.iterdir(), key=lambda path: path.name):
+        truth_path = session / "truth_log.json"
+        if not session.is_dir() or not truth_path.is_file():
+            continue
+        try:
+            truth = load_truth_log(truth_path, session_id=session.name)
+        except (OSError, ValueError):
+            continue
+        video_path = session / truth.source_video
+        frame_index_path = session / truth.frame_index_path
+        if not truth.turns or not video_path.is_file() or not frame_index_path.is_file():
+            continue
+        truth_sessions.append(session.name)
+        if any(turn.frame_index is not None for turn in truth.turns):
+            anchored_sessions.append(session.name)
+    return tuple(truth_sessions), tuple(anchored_sessions)
+
+
+TRUTH_SESSION_IDS, FRAME_ANCHORED_SESSION_IDS = _available_truth_sessions(
+    SESSIONS_ROOT
 )
 STRATEGY_VALUES = tuple(value for value, _label in RECOGNITION_STRATEGY_OPTIONS)
-NO_TRUTH_SESSION_IDS = tuple(
-    session.name
-    for session in sorted(SESSIONS_ROOT.iterdir())
-    if session.is_dir() and session.name not in TRUTH_SESSION_IDS
+NO_TRUTH_SESSION_IDS = (
+    tuple(
+        session.name
+        for session in sorted(SESSIONS_ROOT.iterdir())
+        if session.is_dir() and session.name not in TRUTH_SESSION_IDS
+    )
+    if SESSIONS_ROOT.is_dir()
+    else ()
 )
 
 pytestmark = pytest.mark.skipif(
@@ -53,10 +83,15 @@ def test_real_sessions_compare_four_action_strategies_with_bounded_memory(
 
     Only the five-frame windows around edited action frames invoke template
     recognition. Video decoding remains sequential and one-frame-at-a-time.
-    The 616108 log is trusted for action order but has no frame anchors, so it
-    is reported as sequence-only coverage instead of being misused as an
-    accuracy denominator.
+    Truth fixtures are discovered from the current sessions root. Logs without
+    frame anchors are reported as sequence-only coverage instead of being
+    misused as an accuracy denominator.
     """
+
+    assert FRAME_ANCHORED_SESSION_IDS, (
+        "SESSION-FULL requires at least one readable truth_log.json with "
+        "frame anchors plus its source video and frame index"
+    )
 
     annotation = AnnotationService(PROFILES_ROOT, "tencent_daguandan")
     templates = TemplateService(PROFILES_ROOT, "tencent_daguandan")
@@ -136,7 +171,9 @@ def test_real_sessions_compare_four_action_strategies_with_bounded_memory(
 
     report["accuracy_summary"] = _summarize_accuracy(accuracy_rows)
     report["coverage_summary"] = {
-        "truth_sequence_only_sessions": 1,
+        "truth_sequence_only_sessions": (
+            len(TRUTH_SESSION_IDS) - len(FRAME_ANCHORED_SESSION_IDS)
+        ),
         "no_truth_smoke_sessions": len(NO_TRUTH_SESSION_IDS),
         "no_truth_smoke_frames": sum(
             int(row["frames_decoded"])
@@ -147,7 +184,7 @@ def test_real_sessions_compare_four_action_strategies_with_bounded_memory(
     report_path = Path(
         os.environ.get(
             "DAGUANDAN_STRATEGY_REPORT",
-            str(PROJECT_ROOT / "reports" / "real_session_strategy_report.json"),
+            str(tmp_path / "real_session_strategy_report.json"),
         )
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +193,119 @@ def test_real_sessions_compare_four_action_strategies_with_bounded_memory(
 
     assert len(accuracy_rows) == len(FRAME_ANCHORED_SESSION_IDS) * len(STRATEGY_VALUES)
     assert all(row["frames_decoded"] > 0 for row in accuracy_rows)
+
+
+def test_all_sessions_replay_every_frame_through_the_live_pipeline(tmp_path: Path):
+    """SESSION-FULL gate: no session and no frame is reduced to smoke coverage."""
+
+    sessions = _available_live_pipeline_sessions(SESSIONS_ROOT)
+    assert sessions, "SESSION-FULL requires at least one complete recorded session"
+
+    annotation = AnnotationService(PROFILES_ROOT, "tencent_daguandan")
+    templates = TemplateService(PROFILES_ROOT, "tencent_daguandan")
+    recognition = ScreenshotRecognitionService(annotation, templates)
+    rows: list[dict[str, object]] = []
+    latest_actions: list[dict[str, object]] = []
+
+    for session in sessions:
+        frame_index = read_json_lines(session / "video" / "frame_index.jsonl")
+        persist_frame_log = session.name == LATEST_FIRST_TURN_REGRESSION
+        started = time.perf_counter()
+        result = replay_video_through_live_pipeline(
+            session,
+            recognition,
+            use_live_pipeline=True,
+            recognition_strategy="two_valid_streak",
+            output_root=tmp_path / "session_full" / session.name,
+            persist_frame_log=persist_frame_log,
+        )
+        warning_reasons = [warning.reason for warning in result.warnings]
+        actual_actions = (
+            len(result.comparison.identical_turn_ids)
+            + len(result.comparison.changed)
+            + len(result.comparison.added)
+        )
+        completed = (
+            result.frame_count == len(frame_index)
+            and "missing_video_frames" not in warning_reasons
+        )
+        rows.append(
+            {
+                "session": session.name,
+                "frames_expected": len(frame_index),
+                "frames_processed": result.frame_count,
+                "actions": actual_actions,
+                "status": "passed" if completed else "failed",
+                "warnings": warning_reasons,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        )
+        if persist_frame_log:
+            latest_actions = _actions_from_frame_log(result.output_path)
+
+    report = {
+        "schema_version": 1,
+        "qa_scope": "SESSION-FULL",
+        "sessions_root": str(SESSIONS_ROOT),
+        "session_count": len(sessions),
+        "frames_processed": sum(int(row["frames_processed"]) for row in rows),
+        "actions": sum(int(row["actions"]) for row in rows),
+        "runs": rows,
+    }
+    report_path = Path(
+        os.environ.get(
+            "DAGUANDAN_SESSION_FULL_REPORT",
+            str(tmp_path / "session_full_report.json"),
+        )
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    assert all(row["status"] == "passed" for row in rows)
+    assert LATEST_FIRST_TURN_REGRESSION in {session.name for session in sessions}
+    assert [
+        (event["actor"], tuple(event["payload"].get("cards", ())))
+        for event in latest_actions[:2]
+    ] == [("self", ("7C",)), ("right", ("KS",))]
+
+
+def _available_live_pipeline_sessions(root: Path) -> tuple[Path, ...]:
+    if not root.is_dir():
+        return ()
+    required = (
+        Path("manifest.json"),
+        Path("timeline.jsonl"),
+        Path("video/game.avi"),
+        Path("video/frame_index.jsonl"),
+    )
+    sessions: list[Path] = []
+    for session in sorted(root.iterdir(), key=lambda path: path.name):
+        if not session.is_dir() or not all((session / item).is_file() for item in required):
+            continue
+        if not read_json_lines(session / "video" / "frame_index.jsonl"):
+            continue
+        events = read_json_lines(session / "timeline.jsonl")
+        if not any(item.get("event_type") == "initial_state_confirmed" for item in events):
+            continue
+        sessions.append(session)
+    return tuple(sessions)
+
+
+def _actions_from_frame_log(path: Path) -> list[dict[str, object]]:
+    actions: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in read_json_lines(path):
+        for event in record.get("events", ()):
+            event_id = str(event.get("event_id", ""))
+            if event.get("event_type") not in ACTION_TYPES or event_id in seen:
+                continue
+            seen.add(event_id)
+            actions.append(event)
+    return actions
 
 
 def _evaluate_frame_anchored_session(

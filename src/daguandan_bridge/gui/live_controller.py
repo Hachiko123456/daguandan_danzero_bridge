@@ -1,25 +1,20 @@
 from __future__ import annotations
 
-import hashlib
-import os
-from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 from time import monotonic_ns, perf_counter
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
-from ..annotation_service import AnnotationService
-from ..capture_service import CaptureService, FrameSnapshot
-from ..danzero import DanzeroAdvisor
+from ..application.ports import (
+    AdvicePort,
+    CapturePort,
+    RecognitionPort,
+    SessionFactoryPort,
+)
+from ..capture_service import FrameSnapshot
 from ..danzero.state import GuanDanState, RANKS
 from ..live.orchestrator import LiveOrchestrator, LiveUpdate
 from ..live.latest_worker import LatestOnlyWorker
-from ..live.recorder import SessionRecorder
-from ..live.reducer import LiveReducer
-from ..live.session_store import LiveSessionStore
-from ..recognition_service import ScreenshotRecognitionService
-from ..template_service import TemplateService
 from .workers import OneShotThread, WorkerHandle
 
 
@@ -37,31 +32,41 @@ class LiveAssistantController(QObject):
 
     def __init__(
         self,
-        capture_service: CaptureService | None = None,
+        capture_service: CapturePort | None = None,
         *,
         profile_name: str = "tencent_daguandan",
-        advisor: Any | None = None,
+        recognition_service: RecognitionPort | None = None,
+        advisor: AdvicePort | None = None,
+        session_factory: SessionFactoryPort | None = None,
     ) -> None:
         super().__init__()
-        self.capture_service = capture_service or CaptureService()
+        if (
+            capture_service is None
+            or recognition_service is None
+            or advisor is None
+            or session_factory is None
+        ):
+            # Compatibility for direct construction. Production startup passes
+            # the already assembled graph from ``bootstrap``.
+            from ..bootstrap import build_live_controller_dependencies
+
+            assembled = build_live_controller_dependencies(
+                profile_name=profile_name,
+                capture=capture_service,
+                advisor=advisor,
+            )
+            capture_service = capture_service or assembled.capture
+            recognition_service = recognition_service or assembled.recognizer
+            advisor = advisor or assembled.advisor
+            session_factory = session_factory or assembled.session_factory
+        self.capture_service = capture_service
         self.profile_name = profile_name
-        LiveSessionStore.recover_incomplete_sessions(
-            self.capture_service.profiles_root,
-            self.profile_name,
-        )
-        annotation = AnnotationService(
-            self.capture_service.profiles_root,
-            profile_name,
-        )
-        templates = TemplateService(
-            self.capture_service.profiles_root,
-            profile_name,
-        )
-        self.recognition_service = ScreenshotRecognitionService(annotation, templates)
+        self.recognition_service = recognition_service
         # Keep one agent process-wide for this controller: DanZero resets its
         # per-hand cache before every recommendation, so it is safe to reuse
         # while avoiding a 10+ second model load on every new game.
-        self.danzero_advisor = advisor or DanzeroAdvisor()
+        self.danzero_advisor = advisor
+        self.session_factory = session_factory
         self.orchestrator: LiveOrchestrator | None = None
         self._live_source = None
         self._capture_worker: WorkerHandle | None = None
@@ -319,62 +324,21 @@ class LiveAssistantController(QObject):
         if self.orchestrator is not None:
             self.error.emit("当前已有实时对局")
             return False
-        store = None
-        recorder = None
-        source = None
         try:
-            loaded = self.capture_service.load_profile(self.profile_name)
-            store = LiveSessionStore(
-                self.capture_service.profiles_root,
-                self.profile_name,
-            )
-            manifest = self._manifest(
-                loaded.paths.profile_config_path, loaded.paths.templates_config_path
-            )
-            manifest["recognition_strategy"] = recognition_strategy
-            store.start(manifest)
-            recorder = SessionRecorder(
-                store.directory,
-                size=loaded.config.base_size,
-                fps=10,
-            )
-            orchestrator = LiveOrchestrator(
-                reducer=LiveReducer(store.session_id),
-                store=store,
-                recorder=recorder,
-                recognition_service=self.recognition_service,
-                advisor=self.danzero_advisor,
-                recognition_strategy=recognition_strategy,
-                on_update=self.update_ready.emit,
-            )
-            source = self.capture_service.open_live_source(self.profile_name)
-            started_ms = monotonic_ns() // 1_000_000
-            update = orchestrator.start(
+            constructed = self.session_factory.start_session(
                 round_level=round_level,
                 hand=hand,
                 lead_player=lead_player,
-                monotonic_ms=started_ms,
+                recognition_strategy=recognition_strategy,
+                on_update=self.update_ready.emit,
             )
         except Exception as exc:
-            if source is not None:
-                source.close()
-            if recorder is not None:
-                recording = recorder.close()
-                if store is not None:
-                    store.seal(
-                        frame_count=recording.frame_count,
-                        dropped_frames=recording.dropped_frames,
-                        incident_media_failures=(
-                            failure.to_dict()
-                            for failure in recording.incident_media_failures
-                        ),
-                    )
             self.error.emit(str(exc))
             return False
-        self.orchestrator = orchestrator
-        self._live_source = source
+        self.orchestrator = constructed.orchestrator
+        self._live_source = constructed.source
         self._auto_finish_requested = False
-        self.update_ready.emit(update)
+        self.update_ready.emit(constructed.initial_update)
         self._start_analysis_worker()
         self._start_capture_worker()
         return True
@@ -620,22 +584,3 @@ class LiveAssistantController(QObject):
             and self._danzero_warmup_thread.isRunning()
         ):
             self._danzero_warmup_thread.wait(30_000)
-
-    @staticmethod
-    def _manifest(config_path: Path, templates_path: Path) -> dict[str, object]:
-        try:
-            application_version = version("daguandan-danzero-bridge")
-        except PackageNotFoundError:
-            application_version = "0.1.0"
-        return {
-            "application_version": application_version,
-            "owner_pid": os.getpid(),
-            "configuration_hash": LiveAssistantController._file_hash(config_path),
-            "template_manifest_hash": LiveAssistantController._file_hash(templates_path),
-            "target_fps": 10,
-            "codec": "MJPG",
-        }
-
-    @staticmethod
-    def _file_hash(path: Path) -> str:
-        return hashlib.sha256(path.read_bytes() if path.is_file() else b"").hexdigest()

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -153,6 +154,7 @@ class LiveSessionStore:
         self.timeline_path = self.directory / "timeline.jsonl"
         self.timeline_markdown_path = self.directory / "timeline.md"
         self.advice_path = self.directory / "advice.jsonl"
+        self.decisions_path = self.directory / "decisions.jsonl"
         self.observations_part_path = self.directory / "observations.jsonl.part"
         self.observations_gzip_path = self.directory / "observations.jsonl.gz"
         self.incidents_directory = self.directory / "incidents"
@@ -160,6 +162,7 @@ class LiveSessionStore:
         self._started = False
         self._sealed = False
         self._incident_ids: list[str] = []
+        self._decisions: dict[str, dict[str, object]] = {}
 
     def start(self, manifest: dict[str, object]) -> None:
         with self._lock:
@@ -172,6 +175,7 @@ class LiveSessionStore:
             for path in (
                 self.timeline_path,
                 self.advice_path,
+                self.decisions_path,
                 self.observations_part_path,
             ):
                 path.touch()
@@ -224,6 +228,47 @@ class LiveSessionStore:
             payload.setdefault("schema_version", SCHEMA_VERSION)
             payload.setdefault("session_id", self.session_id)
             _append_json_line(self.observations_part_path, payload, durable=False)
+
+    def upsert_decision(self, record: dict[str, object]) -> None:
+        """Atomically maintain one correlated training record per self decision."""
+
+        with self._lock:
+            self._ensure_writable()
+            decision_id = str(record.get("decision_id", "")).strip()
+            if not decision_id:
+                raise ValueError("decision_id is required")
+            current = dict(self._decisions.get(decision_id, {}))
+            current.update(record)
+            current.setdefault("schema", "guandan.live-decision/1")
+            current.setdefault("session_id", self.session_id)
+            self._decisions[decision_id] = current
+            payload = "".join(
+                json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                for _, value in sorted(self._decisions.items())
+            )
+            temp_path = self.decisions_path.with_name(
+                f".{self.decisions_path.name}.{uuid4().hex}.tmp"
+            )
+            try:
+                with temp_path.open("x", encoding="utf-8", newline="\n") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self._replace_decisions_with_retry(temp_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+    def _replace_decisions_with_retry(self, temp_path: Path) -> None:
+        """Publish on Windows despite short-lived reader/antivirus locks."""
+
+        for attempt in range(8):
+            try:
+                os.replace(temp_path, self.decisions_path)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
 
     def create_incident(
         self,

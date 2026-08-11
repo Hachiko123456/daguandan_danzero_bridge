@@ -12,19 +12,22 @@ import numpy as np
 
 from .annotation_service import AnnotationService, RegionRecord
 from .danzero.state import Seat
+from .domain.recognition import (
+    PLAY_REGION_TO_SEAT,
+    SEATS_IN_ORDER,
+    FastSignalResult,
+    OpeningSignal,
+    PlacementSignal,
+    PlayRegionResult,
+    RecognitionAnnotation,
+    RecognitionResult,
+    RecognizedEvent,
+)
 from .image_io import read_image_unicode
 from .models import Box
 from .template_service import TemplateService
-from .live.turns import TURN_ORDER
 
 
-PLAY_REGION_TO_SEAT: dict[str, Seat] = {
-    "my_play": "self",
-    "left_play": "left",
-    "opposite_play": "opposite",
-    "right_play": "right",
-}
-SEATS_IN_ORDER: tuple[Seat, ...] = TURN_ORDER
 BUTTON_LABELS: dict[str, str] = {
     "pass": "不出",
     "play_cards": "出牌",
@@ -40,87 +43,6 @@ BUTTON_LABELS: dict[str, str] = {
     "change_table": "换桌",
     "continue_game": "继续游戏",
 }
-
-
-@dataclass(frozen=True)
-class RecognitionAnnotation:
-    label: str
-    box: tuple[int, int, int, int]
-    confidence: float
-    category: str
-
-
-@dataclass(frozen=True)
-class RecognizedEvent:
-    player: Seat
-    cards: tuple[str, ...]
-    is_pass: bool
-    confidence: float
-    source: str
-
-
-@dataclass(frozen=True)
-class RecognitionResult:
-    round_level: str | None
-    wild_rank: str | None
-    current_player: Seat | None
-    lead_player: Seat | None
-    my_hand: tuple[str, ...]
-    events: tuple[RecognizedEvent, ...]
-    field_confidences: dict[str, float]
-    sources: dict[str, str]
-    unresolved_fields: tuple[str, ...]
-    diagnostics: tuple[str, ...]
-    annotations: tuple[RecognitionAnnotation, ...] = ()
-    buttons: tuple[str, ...] = ()
-    elapsed_ms: float = 0.0
-
-
-@dataclass(frozen=True)
-class PlayRegionResult:
-    player: Seat
-    cards: tuple[str, ...]
-    is_pass: bool
-    confidence: float
-    diagnostics: tuple[str, ...]
-    annotations: tuple[RecognitionAnnotation, ...]
-    source: str = ""
-    post_hand: tuple[str, ...] = ()
-    post_hand_confidence: float = 0.0
-    # One candidate suit sequence per card.  Exact cards carry one option;
-    # e.g. an occluded red 5 keeps ``("H", "D")`` for ``5?``.
-    suit_options: tuple[tuple[str, ...], ...] = ()
-
-
-@dataclass(frozen=True)
-class PlacementSignal:
-    player: Seat
-    placement: str
-    confidence: float
-    source: str
-
-
-@dataclass(frozen=True)
-class FastSignalResult:
-    expected_player: Seat
-    active_player: Seat | None
-    pass_visible: bool
-    self_action_buttons_visible: bool
-    effect_visible: bool
-    super_double_visible: bool = False
-    game_end_control: str | None = None
-    placements: tuple[PlacementSignal, ...] = ()
-
-
-@dataclass(frozen=True)
-class OpeningSignal:
-    """Raw opening evidence, before the live state machine commits a lead."""
-
-    super_double_visible: bool
-    marker_player: Seat | None
-    active_player: Seat | None
-    self_action_buttons_visible: bool
-    game_end_control: str | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +136,26 @@ class ScreenshotRecognitionService:
             tuple[dict[str, object], np.ndarray], ...
         ] | None = None
         self._black_suit_hog_cache: tuple[tuple[str, np.ndarray], ...] | None = None
+
+    def play_roi(self, image: np.ndarray, seat: Seat) -> np.ndarray:
+        """Return the configured play-region crop without exposing annotation infrastructure."""
+
+        region_name = next(
+            name for name, mapped_seat in PLAY_REGION_TO_SEAT.items()
+            if mapped_seat == seat
+        )
+        region = next(
+            (
+                item
+                for item in self.annotation_service.list_regions()
+                if item.name == region_name
+            ),
+            None,
+        )
+        if region is None:
+            return image
+        box = self.annotation_service._box_for_image(region, image)
+        return image[box.y : box.y + box.h, box.x : box.x + box.w]
 
     def recognize(
         self,

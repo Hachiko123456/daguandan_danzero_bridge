@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from copy import deepcopy
+
+from daguandan_bridge.domain.truth import LabelProvenance, TruthEvidence
 
 from daguandan_bridge.live.truth_log import (
     TruthInitialState,
@@ -40,7 +43,8 @@ def test_truth_log_round_trips_arbitrary_action_chain(tmp_path):
     loaded = load_truth_log(path, session_id="game-test")
 
     assert loaded == _log()
-    assert loaded.to_dict()["schema_version"] == 2
+    assert loaded.to_dict()["schema_version"] == 3
+    assert loaded.to_dict()["schema"] == "guandan.truth/3"
     assert [turn.actor for turn in loaded.turns] == ["self", "right", "opposite", "self"]
 
 
@@ -82,4 +86,44 @@ def test_truth_log_migrates_schema_one_turns():
     log = truth_log_from_dict(raw)
 
     assert log.turns[0].index == 1
-    assert log.to_dict()["schema_version"] == 2
+    assert log.to_dict()["schema_version"] == 3
+
+
+def test_schema_two_read_is_non_mutating_and_infers_real_trick_ids():
+    raw = {
+        "schema_version": 2,
+        "source_session_id": "legacy-v2",
+        "source_video": {"path": "video/game.avi", "frame_index_path": "video/frame_index.jsonl"},
+        "initial_state": {"round_level": "2", "lead_player": "self", "my_hand": list(HAND)},
+        "turns": [
+            {"index": 1, "actor": "self", "is_pass": False, "cards": ["5H"]},
+            {"index": 2, "actor": "right", "is_pass": True, "cards": []},
+            {"index": 3, "actor": "opposite", "is_pass": True, "cards": []},
+            {"index": 4, "actor": "left", "is_pass": True, "cards": []},
+            {"index": 5, "actor": "self", "is_pass": False, "cards": ["6H"]},
+        ],
+    }
+    original = deepcopy(raw)
+    log = truth_log_from_dict(raw)
+    assert raw == original
+    assert [turn.trick_id for turn in log.turns] == [1, 1, 1, 1, 2]
+    assert [event.trick_id for event in log.to_events()[1:]] == [1, 1, 1, 1, 2]
+
+
+def test_truth_v3_round_trips_label_provenance_evidence_and_uncertainty():
+    turn = TruthTurn(
+        1,
+        "left",
+        False,
+        ("5?",),
+        trick_id=2,
+        evidence=TruthEvidence((10, 11), 500, "left_play"),
+        label_status="verified",
+        provenance=LabelProvenance(source="human_review", annotator="a", confidence=1),
+    )
+    log = TruthLog("v3", TruthInitialState("2", "left", HAND), (turn,))
+    loaded = truth_log_from_dict(log.to_dict())
+    assert loaded.turns[0].trick_id == 2
+    assert loaded.turns[0].evidence.frame_indices == (10, 11)
+    assert loaded.turns[0].label_status == "verified"
+    assert loaded.turns[0].uncertainty == ("unknown_suit",)

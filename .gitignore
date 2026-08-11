@@ -23,6 +23,7 @@ dist/
 # Project runtime output
 data/profiles/*/screenshots/
 data/profiles/*/sessions/
+.codex/workflow/
 *.log
 
 # IDE and OS files

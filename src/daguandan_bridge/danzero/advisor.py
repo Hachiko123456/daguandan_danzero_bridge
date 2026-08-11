@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
 from importlib.resources import files
 import os
@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 import warnings
 
 import numpy as np
+
+from ..domain.advice import LocalAdvice, StrategyExecutionTrace
 
 if TYPE_CHECKING:
     from .state import LocalStrategySnapshot, PlayEvent
@@ -37,63 +39,6 @@ _DANZERO_CHECKPOINT_SHA256 = "a6f132e50e205709c0efdb1b550d935c5bfc313b21726b0e70
 
 class LocalStrategyError(RuntimeError):
     """The current observed state cannot be evaluated by a local agent."""
-
-
-class StrategyExecutionTrace:
-    """Thread-safe progress data retained when a request fails or times out."""
-
-    def __init__(self, request_id: str = "") -> None:
-        self.request_id = str(request_id)
-        self._lock = Lock()
-        self._phase = ""
-        self._phase_started = perf_counter()
-        self._timings: dict[str, float] = {}
-        self._engine_input: dict[str, object] | None = None
-
-    def begin(self, phase: str) -> None:
-        with self._lock:
-            self._close_phase()
-            self._phase = str(phase)
-            self._phase_started = perf_counter()
-
-    def end(self) -> None:
-        with self._lock:
-            self._close_phase()
-            self._phase = ""
-
-    def set_engine_input(self, value: dict[str, object]) -> None:
-        with self._lock:
-            self._engine_input = LocalGuandanAdvisor._json_safe(value)  # type: ignore[assignment]
-
-    def snapshot(self) -> dict[str, object]:
-        with self._lock:
-            current_phase = self._phase
-            phase_elapsed = (
-                (perf_counter() - self._phase_started) * 1000
-                if current_phase
-                else 0.0
-            )
-            timings = dict(self._timings)
-            if current_phase:
-                timings[current_phase] = (
-                    timings.get(current_phase, 0.0) + phase_elapsed
-                )
-            return {
-                "request_id": self.request_id,
-                "current_phase": current_phase or None,
-                "phase_elapsed_ms": round(phase_elapsed, 3),
-                "timings": {
-                    key: round(value, 3) for key, value in timings.items()
-                },
-                "engine_input": self._engine_input,
-            }
-
-    def _close_phase(self) -> None:
-        if self._phase:
-            self._timings[self._phase] = (
-                self._timings.get(self._phase, 0.0)
-                + (perf_counter() - self._phase_started) * 1000
-            )
 
 
 def _missing_dependency_error(
@@ -121,19 +66,6 @@ def _missing_dependency_error(
         "请在当前运行 Python 解释器中执行："
         f'"{sys.executable}" -m pip install -r requirements.txt'
     )
-
-
-@dataclass(frozen=True)
-class LocalAdvice:
-    strategy: str
-    cards: tuple[str, ...]
-    play_type: str
-    is_pass: bool
-    state_revision: int
-    elapsed_ms: float
-    request_id: str = ""
-    engine_input: dict[str, object] | None = None
-    timings: dict[str, float] = field(default_factory=dict)
 
 
 def available_strategies() -> tuple[str, ...]:
@@ -323,7 +255,18 @@ class LocalGuandanAdvisor:
         execution.set_engine_input(engine_input)
         try:
             execution.begin("agent_step")
+            if hasattr(agent, "last_feature_batch"):
+                agent.last_feature_batch = None
             action = agent.step(state)
+            feature_batch = getattr(agent, "last_feature_batch", None)
+            if feature_batch is None and self.strategy == "danzero":
+                feature_batch = agent.prepare(agent.parse(state)).get("x_batch")
+            if feature_batch is not None:
+                rows = np.asarray(feature_batch)
+                if rows.ndim == 2 and rows.shape[1] == 567:
+                    engine_input["feature_schema"] = "danzero-567/v1"
+                    engine_input["features_567"] = rows.tolist()
+                    execution.set_engine_input(engine_input)
         except Exception as exc:
             raise LocalStrategyError(
                 f"本地策略 {self.strategy} 推理失败：{exc}"

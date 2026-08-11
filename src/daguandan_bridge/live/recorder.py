@@ -11,48 +11,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from ..domain.recording import (
+    IncidentMedia,
+    IncidentMediaFailure,
+    RecorderWarning,
+    RecordingResult,
+)
 from ..image_io import save_image_unicode
 from ..storage import append_json_line, atomic_write_json
-
-
-@dataclass(frozen=True)
-class RecorderWarning:
-    reason: str
-    monotonic_ms: int
-    details: str
-
-
-@dataclass(frozen=True)
-class RecordingResult:
-    video_path: Path
-    index_path: Path
-    frame_count: int
-    dropped_frames: int
-    incident_media_failures: tuple["IncidentMediaFailure", ...] = ()
-
-
-@dataclass(frozen=True)
-class IncidentMedia:
-    clip_path: Path
-    contact_sheet_path: Path
-    trigger_frame_path: Path
-    frame_count: int
-
-
-@dataclass(frozen=True)
-class IncidentMediaFailure:
-    reason: str
-    incident_directory: Path
-    trigger_ms: int
-    details: str
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "reason": self.reason,
-            "incident_directory": str(self.incident_directory),
-            "trigger_ms": self.trigger_ms,
-            "details": self.details,
-        }
 
 
 @dataclass

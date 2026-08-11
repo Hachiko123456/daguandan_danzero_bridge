@@ -9,7 +9,7 @@ from daguandan_bridge.danzero.advisor import LocalAdvice
 from daguandan_bridge.live.orchestrator import LiveOrchestrator
 from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.live.reducer import LiveReducer
-from daguandan_bridge.live.session_store import LiveSessionStore
+from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
 from daguandan_bridge.live.zone_lifecycle import ZoneFrameMetrics
 from daguandan_bridge.recognition_service import FastSignalResult, PlayRegionResult
 
@@ -222,6 +222,31 @@ def test_trusted_action_uses_live_turn_transition_and_waits_for_advice(tmp_path)
     assert update.event.source == "trusted_log_replay"
     assert update.event.evidence_refs == ("TRUTH-000001",)
     assert orchestrator.snapshot.current_player == "self"
+
+
+def test_self_decision_correlates_pre_state_advice_and_actual_action(tmp_path):
+    advisor = FakeAdvisor()
+    orchestrator = _build(tmp_path, advisor)
+    _commit_left_action(orchestrator)
+    assert advisor.called.wait(2)
+    _wait_until(lambda: orchestrator.latest_advice is not None and orchestrator.latest_advice.status == "ready")
+
+    update = orchestrator.commit_trusted_action(
+        actor="self",
+        cards=("2S", "2H"),
+        is_pass=False,
+        monotonic_ms=900,
+    )
+    records = read_json_lines(orchestrator.store.decisions_path)
+
+    assert len(records) == 1
+    assert records[0]["decision_id"].startswith("advice:turn_")
+    assert records[0]["state_before"]["current_player"] == "self"
+    assert records[0]["legal_actions"] == [["Single"]]
+    assert records[0]["model_advice"]["cards"] == ["2S"]
+    assert records[0]["actual_action"] == {"cards": ["2H", "2S"], "is_pass": False}
+    assert records[0]["actual_action_event_id"] == update.event.event_id
+    orchestrator.finish()
     assert update.advice is not None
     advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
     assert advice is not None

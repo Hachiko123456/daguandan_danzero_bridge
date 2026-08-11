@@ -13,17 +13,22 @@ from typing import Any, Callable, Literal
 import cv2
 import numpy as np
 
-from ..annotation_service import AnnotationService
-from ..danzero.advisor import LocalAdvice, StrategyExecutionTrace
-from ..danzero.rules import infer_best_action
-from ..danzero.state import GuanDanState, Seat
-from ..recognition_service import (
+from ..application.ports import (
+    AdvicePort,
+    RecognitionPort,
+    RecordingPort,
+    SessionPersistencePort,
+)
+from ..domain.advice import LocalAdvice, StrategyExecutionTrace
+from ..domain.recognition import (
     PLAY_REGION_TO_SEAT,
     FastSignalResult,
     OpeningSignal,
     PlayRegionResult,
-    ScreenshotRecognitionService,
 )
+from ..domain.recording import RecorderWarning
+from ..danzero.rules import infer_best_action
+from ..danzero.state import GuanDanState, Seat
 from .consensus import (
     BurstConsensus,
     ConsensusCandidate,
@@ -46,9 +51,7 @@ from .recognition_strategy import (
 )
 from .models import LiveEvent, LiveSnapshot
 from .latest_worker import LatestOnlyWorker
-from .recorder import RecorderWarning, SessionRecorder
 from .reducer import LiveReducer
-from .session_store import LiveSessionStore
 from .turns import TURN_ORDER
 from .zone_lifecycle import ZoneFrameMetrics, ZoneLifecycle, ZonePhase
 
@@ -127,6 +130,10 @@ class AdviceRequestKey:
     def request_id(self) -> str:
         return f"ADV-{self.turn_id:04d}-{self.state_revision:04d}"
 
+    @property
+    def decision_id(self) -> str:
+        return f"{self.session_id}:turn_{self.turn_id}:revision_{self.state_revision}"
+
 
 @dataclass(frozen=True)
 class LiveAdvice:
@@ -183,10 +190,10 @@ class LiveOrchestrator:
         self,
         *,
         reducer: LiveReducer,
-        store: LiveSessionStore,
-        recorder: SessionRecorder,
-        recognition_service: ScreenshotRecognitionService | Any,
-        advisor: Any | None = None,
+        store: SessionPersistencePort,
+        recorder: RecordingPort,
+        recognition_service: RecognitionPort,
+        advisor: AdvicePort | None = None,
         settle_ms: int = 0,
         action_timeout_ms: int = 28_000,
         burst_sample_limit: int = 5,
@@ -231,6 +238,7 @@ class LiveOrchestrator:
         self._published_sequence = 0
         self._advice_lock = RLock()
         self._requested_advice: set[AdviceRequestKey] = set()
+        self._decision_id_by_revision: dict[int, str] = {}
         self._advice_completion_events: dict[AdviceRequestKey, Event] = {}
         self._self_turn_corroborated = False
         self.latest_advice: LiveAdvice | None = None
@@ -492,7 +500,11 @@ class LiveOrchestrator:
                 return self._update(fast_signals=fast)
             self._apply_fast_signal(fast)
             if self._self_lead_waiting_for_action(expected, fast):
-                self._reset_waiting_self_lead(monotonic_ms)
+                self._reset_waiting_self_lead(
+                    monotonic_ms,
+                    frame=frame,
+                    expected=expected,
+                )
                 return self._update(fast_signals=fast)
             if self._zone is None or self._zone.expected_player != expected:
                 self._activate_zone(monotonic_ms)
@@ -1183,13 +1195,44 @@ class LiveOrchestrator:
             self._self_lead_controls_seen = True
             return True
         if not self._self_lead_controls_seen:
+            # The analysis worker intentionally drops stale frames.  It can
+            # therefore see lead confirmation and then resume only after the
+            # local action controls have disappeared.  A timer already on the
+            # next seat is positive evidence that self did act; do not wait
+            # forever for a controls-visible frame which is no longer queued.
+            if fast.active_player not in (None, "self"):
+                self._self_lead_controls_cleared = True
+                return False
             return True
         self._self_lead_controls_cleared = True
         return False
 
-    def _reset_waiting_self_lead(self, monotonic_ms: int) -> None:
+    def _reset_waiting_self_lead(
+        self,
+        monotonic_ms: int,
+        *,
+        frame: np.ndarray | None = None,
+        expected: Seat = "self",
+    ) -> None:
+        # Keep the pre-play reference while self is choosing a card.  Calling
+        # ``_activate_zone`` without preservation on every buttons-visible
+        # frame erased the opening baseline; the first static played card then
+        # became the new baseline and the action window never opened.
+        if frame is not None and expected not in self._baseline_by_seat:
+            roi = self._play_roi(frame, expected)
+            gray = cv2.GaussianBlur(
+                cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY),
+                (5, 5),
+                0,
+            )
+            self._baseline_by_seat[expected] = gray.copy()
+            self._previous_by_seat[expected] = gray
+            self._content_prev_by_seat[expected] = self._content_fingerprint(
+                frame,
+                expected,
+            )
         self._clear_burst()
-        self._activate_zone(monotonic_ms)
+        self._activate_zone(monotonic_ms, preserve_baseline=True)
 
     def _seed_first_action_baseline(self, player: Seat) -> None:
         frames = self._lead_stability_frames
@@ -1208,6 +1251,7 @@ class LiveOrchestrator:
         monotonic_ms: int,
         *,
         accept_initial_occupied: bool = False,
+        preserve_baseline: bool = False,
     ) -> None:
         player = self.snapshot.current_player
         if player is None:
@@ -1216,9 +1260,10 @@ class LiveOrchestrator:
         # Every action window starts from the expected player's current ROI.
         # Old cards and an earlier animation in this same seat must not count
         # as a new action after turn ownership changes.
-        self._baseline_by_seat.pop(player, None)
-        self._previous_by_seat.pop(player, None)
-        self._content_prev_by_seat.pop(player, None)
+        if not preserve_baseline:
+            self._baseline_by_seat.pop(player, None)
+            self._previous_by_seat.pop(player, None)
+            self._content_prev_by_seat.pop(player, None)
         spec = strategy_spec(self.recognition_strategy)
         self._zone = ZoneLifecycle(
             expected_player=player,
@@ -1362,6 +1407,7 @@ class LiveOrchestrator:
             if key in self._requested_advice:
                 return key
             state = self.reducer.to_guandan_state()
+            self._decision_id_by_revision[key.state_revision] = key.decision_id
             self._requested_advice.add(key)
             self._advice_completion_events[key] = Event()
             self._advice_requested_at_ms[key] = self._last_monotonic_ms
@@ -1372,6 +1418,19 @@ class LiveOrchestrator:
                     "status": "requested",
                     "turn_id": key.turn_id,
                     "state_revision": key.state_revision,
+                }
+            )
+            self.store.upsert_decision(
+                {
+                    "decision_id": key.decision_id,
+                    "request_id": key.request_id,
+                    "actor": "self",
+                    "turn_id": key.turn_id,
+                    "trick_id": snapshot.trick_id,
+                    "state_revision": key.state_revision,
+                    "state_before": self._decision_state(state),
+                    "label_status": "draft",
+                    "status": "requested",
                 }
             )
             self._append_advice_event(
@@ -1617,6 +1676,22 @@ class LiveOrchestrator:
                     "advice_agrees_across_suit_variants": completion.advice_agrees_across_variants,
                 }
             )
+            engine_input = advice.engine_input or {}
+            self.store.upsert_decision(
+                {
+                    "decision_id": key.decision_id,
+                    "status": "ready",
+                    "legal_actions": list(engine_input.get("legal_actions", ())),
+                    "feature_schema": engine_input.get("feature_schema"),
+                    "features_567": engine_input.get("features_567"),
+                    "model_advice": {
+                        "cards": list(advice.cards),
+                        "is_pass": advice.is_pass,
+                        "play_type": advice.play_type,
+                        "strategy": advice.strategy,
+                    },
+                }
+            )
             self._append_advice_event(
                 "advice_ready",
                 {
@@ -1723,8 +1798,40 @@ class LiveOrchestrator:
         """Persist the action first, then append its non-semantic outcomes."""
 
         published = self._publish_event(event)
+        if published.actor == "self":
+            decision_id = self._decision_id_by_revision.get(
+                published.state_revision_before
+            )
+            if decision_id is not None:
+                self.store.upsert_decision(
+                    {
+                        "decision_id": decision_id,
+                        "actual_action_event_id": published.event_id,
+                        "actual_turn_id": published.turn_id,
+                        "actual_trick_id": published.trick_id,
+                        "actual_action": {
+                            "cards": list(published.payload.get("cards", ())),
+                            "is_pass": published.event_type == "player_passed"
+                            or bool(published.payload.get("is_pass", False)),
+                        },
+                    }
+                )
         outcomes = self._append_action_outcomes(before, self.reducer.snapshot())
         return published, outcomes
+
+    @staticmethod
+    def _decision_state(state: GuanDanState) -> dict[str, object]:
+        return {
+            "round_level": state.round_level,
+            "wild_rank": state.wild_rank,
+            "current_player": state.current_player,
+            "lead_player": state.lead_player,
+            "my_hand": list(state.my_hand),
+            "trick": [event.to_dict() for event in state.trick_plays],
+            "history": [event.to_dict() for event in state.play_history],
+            "remaining_cards": dict(state.remaining_cards),
+            "revision": state.revision,
+        }
 
     def _append_action_outcomes(
         self,
@@ -2376,20 +2483,8 @@ class LiveOrchestrator:
 
 
     def _play_roi(self, frame: np.ndarray, player: Seat) -> np.ndarray:
-        annotation_service = getattr(self.recognition_service, "annotation_service", None)
-        if annotation_service is None:
-            return frame
-        region_name = next(
-            name for name, seat in PLAY_REGION_TO_SEAT.items() if seat == player
-        )
-        region = next(
-            (item for item in annotation_service.list_regions() if item.name == region_name),
-            None,
-        )
-        if region is None:
-            return frame
-        box = AnnotationService._box_for_image(region, frame)
-        return frame[box.y : box.y + box.h, box.x : box.x + box.w]
+        cropper = getattr(self.recognition_service, "play_roi", None)
+        return cropper(frame, player) if callable(cropper) else frame
 
     def _clear_burst(self) -> None:
         self._samples.clear()

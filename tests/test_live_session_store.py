@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from daguandan_bridge.live.models import LiveEvent
 from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
@@ -92,6 +93,65 @@ def test_advice_log_keeps_full_engine_input(tmp_path):
     record = read_json_lines(store.advice_path)[0]
     assert record["engine_input"] == engine_input
     assert record["timings"]["agent_step"] == 12.5
+
+
+def test_decision_upsert_keeps_one_correlated_record(tmp_path):
+    store = LiveSessionStore(tmp_path, "profile", session_id="decision-test")
+    store.start({})
+    store.upsert_decision({"decision_id": "D-1", "state_before": {"revision": 1}})
+    store.upsert_decision({"decision_id": "D-1", "actual_action_event_id": "EV-1"})
+
+    records = read_json_lines(store.decisions_path)
+
+    assert len(records) == 1
+    assert records[0]["state_before"] == {"revision": 1}
+    assert records[0]["actual_action_event_id"] == "EV-1"
+
+
+def test_decision_upsert_uses_unique_temp_files_and_retries_transient_windows_lock(
+    tmp_path,
+    monkeypatch,
+):
+    store = LiveSessionStore(tmp_path, "profile", session_id="decision-retry")
+    store.start({})
+    real_replace = os.replace
+    attempts = []
+
+    def transient_replace(source, target):
+        attempts.append((source, target))
+        if len(attempts) < 3:
+            raise PermissionError(5, "transient lock", str(target))
+        return real_replace(source, target)
+
+    monkeypatch.setattr("daguandan_bridge.live.session_store.os.replace", transient_replace)
+    store.upsert_decision({"decision_id": "D-1", "status": "ready"})
+
+    assert len(attempts) == 3
+    assert read_json_lines(store.decisions_path)[0]["status"] == "ready"
+    assert not tuple(store.directory.glob(".decisions.jsonl.*.tmp"))
+
+
+def test_decision_upserts_are_serialized_without_lost_records(tmp_path):
+    store = LiveSessionStore(tmp_path, "profile", session_id="decision-concurrent")
+    store.start({})
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(
+                store.upsert_decision,
+                {"decision_id": f"D-{index:02d}", "state_revision": index},
+            )
+            for index in range(24)
+        ]
+        for future in futures:
+            future.result()
+
+    records = read_json_lines(store.decisions_path)
+    assert len(records) == 24
+    assert {record["decision_id"] for record in records} == {
+        f"D-{index:02d}" for index in range(24)
+    }
+    assert not tuple(store.directory.glob(".decisions.jsonl.*.tmp"))
 
 
 def test_incident_contains_state_observations_and_llm_report(tmp_path):

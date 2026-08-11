@@ -1559,13 +1559,14 @@ class FakeSelfLeadRecognitionService(FakeLeadRecognitionService):
         self.post_hand = post_hand
         self.suit_options = suit_options
         self.controls_visible = True
+        self.active_player = None
         self.targeted_calls = 0
 
     def recognize_fast_signals(self, _image, expected_player):
         self.fast_calls += 1
         return FastSignalResult(
             expected_player=expected_player,
-            active_player=expected_player,
+            active_player=self.active_player or expected_player,
             pass_visible=False,
             self_action_buttons_visible=(
                 expected_player == "self" and self.controls_visible
@@ -1618,6 +1619,147 @@ def test_self_lead_waits_for_action_controls_to_clear(tmp_path):
     assert update.snapshot.current_player == "self"
     assert recognition.targeted_calls == 0
     assert orchestrator.latest_review is None
+    orchestrator.finish()
+
+
+def test_self_lead_buttons_do_not_erase_the_opening_roi_baseline(tmp_path):
+    recognition = FakeSelfLeadRecognitionService(cards=("7C",))
+    orchestrator, _update = _lead_orchestrator(tmp_path, recognition)
+    opening = np.zeros((32, 64, 3), np.uint8)
+
+    for timestamp in (100, 200, 300):
+        orchestrator.ingest_frame(
+            opening,
+            monotonic_ms=timestamp,
+            wall_time=f"lead-{timestamp}",
+        )
+    baseline = orchestrator._baseline_by_seat["self"].copy()
+
+    orchestrator.ingest_frame(
+        np.full((32, 64, 3), 255, np.uint8),
+        monotonic_ms=400,
+        wall_time="buttons-visible",
+    )
+
+    assert np.array_equal(orchestrator._baseline_by_seat["self"], baseline)
+    orchestrator.finish()
+
+
+def test_explicit_self_lead_initializes_the_roi_baseline_only_once(tmp_path):
+    recognition = FakeSelfLeadRecognitionService(cards=("7C",))
+    orchestrator, _update = _lead_orchestrator(
+        tmp_path,
+        recognition,
+        lead_player="self",
+    )
+
+    orchestrator.ingest_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=100,
+        wall_time="first-buttons-frame",
+    )
+    baseline = orchestrator._baseline_by_seat["self"].copy()
+    orchestrator.ingest_frame(
+        np.full((32, 64, 3), 255, np.uint8),
+        monotonic_ms=200,
+        wall_time="later-buttons-frame",
+    )
+
+    assert np.array_equal(orchestrator._baseline_by_seat["self"], baseline)
+    orchestrator.finish()
+
+
+def test_self_lead_recovers_when_worker_skips_all_buttons_visible_frames(tmp_path):
+    recognition = FakeSelfLeadRecognitionService(cards=("7C",))
+    orchestrator, _update = _lead_orchestrator(tmp_path, recognition)
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    for timestamp in (100, 200, 300):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"lead-{timestamp}",
+        )
+    recognition.controls_visible = False
+    recognition.active_player = "right"
+    for timestamp in (400, 500, 600):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"played-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.001, False, False),
+        )
+
+    actions = [
+        event
+        for event in orchestrator.events
+        if event.event_type in {"player_played", "player_passed"}
+    ]
+    assert [(event.actor, event.payload["cards"]) for event in actions] == [
+        ("self", ["7C"]),
+    ]
+    assert orchestrator.snapshot.current_player == "right"
+    orchestrator.finish()
+
+
+class FakeSelfThenRightRecognitionService(FakeSelfLeadRecognitionService):
+    def recognize_play_region(self, _image, seat, *, wild_rank):
+        del wild_rank
+        self.targeted_calls += 1
+        cards = self.cards if seat == "self" else ("KS",)
+        post_hand = (
+            tuple(card for card in HAND if card not in set(self.cards))
+            if seat == "self"
+            else ()
+        )
+        return PlayRegionResult(
+            player=seat,
+            cards=cards,
+            is_pass=False,
+            confidence=0.95,
+            diagnostics=(),
+            annotations=(),
+            source="fake_self_then_right",
+            post_hand=post_hand,
+            post_hand_confidence=0.95 if seat == "self" else 0.0,
+        )
+
+
+def test_self_first_play_handoff_captures_already_visible_right_play(tmp_path):
+    recognition = FakeSelfThenRightRecognitionService(cards=("7C",))
+    orchestrator, _update = _lead_orchestrator(tmp_path, recognition)
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    for timestamp in (100, 200, 300):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"lead-{timestamp}",
+        )
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=400,
+        wall_time="buttons-visible",
+    )
+    recognition.controls_visible = False
+    recognition.active_player = "right"
+    for timestamp in (500, 600, 700, 800, 900, 1000):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"action-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.001, False, False),
+        )
+
+    actions = [
+        event
+        for event in orchestrator.events
+        if event.event_type in {"player_played", "player_passed"}
+    ]
+    assert [
+        (event.actor, tuple(event.payload["cards"])) for event in actions[:2]
+    ] == [("self", ("7C",)), ("right", ("KS",))]
+    assert orchestrator.snapshot.current_player == "opposite"
     orchestrator.finish()
 
 

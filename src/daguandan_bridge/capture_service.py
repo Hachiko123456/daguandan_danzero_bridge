@@ -104,6 +104,12 @@ class CaptureService:
     def open_live_source(self, profile_name: str) -> LiveCaptureSource:
         return LiveCaptureSource(self.load_profile(profile_name))
 
+    def capture_frame(self, profile_name: str) -> FrameSnapshot:
+        """Capture one frame through the same validated persistent-source adapter."""
+
+        with self.open_live_source(profile_name) as source:
+            return source.capture()
+
     def target_client_rect(self, profile_name: str):
         """Locate the target for companion-window placement without capturing."""
 

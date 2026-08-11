@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from ..danzero.state import Seat
+
+
+PLAY_REGION_TO_SEAT: dict[str, Seat] = {
+    "my_play": "self",
+    "left_play": "left",
+    "opposite_play": "opposite",
+    "right_play": "right",
+}
+SEATS_IN_ORDER: tuple[Seat, ...] = ("self", "right", "opposite", "left")
+
+
+@dataclass(frozen=True)
+class RecognitionAnnotation:
+    label: str
+    box: tuple[int, int, int, int]
+    confidence: float
+    category: str
+
+
+@dataclass(frozen=True)
+class RecognizedEvent:
+    player: Seat
+    cards: tuple[str, ...]
+    is_pass: bool
+    confidence: float
+    source: str
+
+
+@dataclass(frozen=True)
+class RecognitionResult:
+    round_level: str | None
+    wild_rank: str | None
+    current_player: Seat | None
+    lead_player: Seat | None
+    my_hand: tuple[str, ...]
+    events: tuple[RecognizedEvent, ...]
+    field_confidences: dict[str, float]
+    sources: dict[str, str]
+    unresolved_fields: tuple[str, ...]
+    diagnostics: tuple[str, ...]
+    annotations: tuple[RecognitionAnnotation, ...] = ()
+    buttons: tuple[str, ...] = ()
+    elapsed_ms: float = 0.0
+
+
+@dataclass(frozen=True)
+class PlayRegionResult:
+    player: Seat
+    cards: tuple[str, ...]
+    is_pass: bool
+    confidence: float
+    diagnostics: tuple[str, ...]
+    annotations: tuple[RecognitionAnnotation, ...]
+    source: str = ""
+    post_hand: tuple[str, ...] = ()
+    post_hand_confidence: float = 0.0
+    suit_options: tuple[tuple[str, ...], ...] = ()
+
+
+@dataclass(frozen=True)
+class PlacementSignal:
+    player: Seat
+    placement: str
+    confidence: float
+    source: str
+
+
+@dataclass(frozen=True)
+class FastSignalResult:
+    expected_player: Seat
+    active_player: Seat | None
+    pass_visible: bool
+    self_action_buttons_visible: bool
+    effect_visible: bool
+    super_double_visible: bool = False
+    game_end_control: str | None = None
+    placements: tuple[PlacementSignal, ...] = ()
+
+
+@dataclass(frozen=True)
+class OpeningSignal:
+    """Raw opening evidence, before the live state machine commits a lead."""
+
+    super_double_visible: bool
+    marker_player: Seat | None
+    active_player: Seat | None
+    self_action_buttons_visible: bool
+    game_end_control: str | None = None

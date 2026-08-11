@@ -34,6 +34,11 @@ def test_danzero_returns_advice_for_a_confirmed_local_hand():
 
     assert advice.strategy == "danzero"
     assert advice.cards in {("3S",), ("4H",), ("5D",)}
+    assert advice.engine_input is not None
+    assert advice.engine_input["feature_schema"] == "danzero-567/v1"
+    features = advice.engine_input["features_567"]
+    assert len(features) == advice.engine_input["legal_action_count"]
+    assert all(len(row) == 567 for row in features)
 
 
 def test_wildcard_full_house_uses_the_interpretation_that_beats_the_table():

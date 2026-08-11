@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+
+SOURCE = Path(__file__).parents[1] / "src" / "daguandan_bridge"
+
+
+def _imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    result: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            result.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            result.add("." * node.level + (node.module or ""))
+    return result
+
+
+def test_domain_and_application_layers_do_not_import_ui_or_infrastructure():
+    forbidden = ("PySide6", "qfluentwidgets", "cv2", "daguandan_bridge.gui", "..gui", "..infrastructure")
+    for layer in ("domain", "application"):
+        for path in (SOURCE / layer).rglob("*.py"):
+            imports = _imports(path)
+            assert not any(name.startswith(forbidden) for name in imports), (path, imports)
+
+
+def test_orchestrator_depends_on_ports_not_live_concrete_adapters():
+    source = (SOURCE / "live" / "orchestrator.py").read_text(encoding="utf-8")
+    for concrete in (
+        "ScreenshotRecognitionService",
+        "LiveSessionStore",
+        "SessionRecorder",
+        "danzero.advisor",
+    ):
+        assert concrete not in source
+    assert "RecognitionPort" in source
+    assert "SessionPersistencePort" in source
+    assert "RecordingPort" in source
+    assert "AdvicePort" in source
+
+
+def test_live_controller_and_window_do_not_construct_live_adapters():
+    controller = (SOURCE / "gui" / "live_controller.py").read_text(encoding="utf-8")
+    window = (SOURCE / "gui" / "main_window.py").read_text(encoding="utf-8")
+    for concrete in ("LiveSessionStore(", "SessionRecorder(", "LiveOrchestrator(", "ScreenshotRecognitionService(", "DanzeroAdvisor("):
+        assert concrete not in controller
+        assert concrete not in window
+    assert "session_factory.start_session" in controller

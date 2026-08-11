@@ -1203,6 +1203,9 @@ class ReplayPage(QWidget):
             turns=(),
             source_video=self.truth_log.source_video,
             frame_index_path=self.truth_log.frame_index_path,
+            label_status=self.truth_log.label_status,
+            provenance=self.truth_log.provenance,
+            outcome=self.truth_log.outcome,
         )
 
     def _collect_truth_scan_turn(self, data: object) -> None:
@@ -1249,6 +1252,11 @@ class ReplayPage(QWidget):
                         if raw.get("frame_index") is not None
                         else None
                     ),
+                    trick_id=(
+                        int(raw["trick_id"])
+                        if raw.get("trick_id") is not None
+                        else None
+                    ),
                 )
             )
             seen_turns.add(turn_id)
@@ -1258,6 +1266,9 @@ class ReplayPage(QWidget):
             turns=tuple(turns),
             source_video=baseline.source_video,
             frame_index_path=baseline.frame_index_path,
+            label_status=baseline.label_status,
+            provenance=baseline.provenance,
+            outcome=baseline.outcome,
         )
 
     def _truth_scan_completed(self, _value: object) -> None:

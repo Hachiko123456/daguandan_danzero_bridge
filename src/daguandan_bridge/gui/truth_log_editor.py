@@ -32,6 +32,7 @@ from ..live.truth_log import (
     card_code_to_text,
     save_truth_log,
 )
+from ..domain.truth import LabelProvenance
 from ..live.turns import TURN_ORDER
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
@@ -376,6 +377,7 @@ class TruthLogEditor(QWidget):
         number_item = QTableWidgetItem(str(row + 1))
         if turn.frame_index is not None:
             number_item.setData(Qt.ItemDataRole.UserRole, turn.frame_index)
+        number_item.setData(int(Qt.ItemDataRole.UserRole) + 1, turn)
         self.table.setItem(row, 0, number_item)
         player = QComboBox()
         for seat in SEATS:
@@ -479,6 +481,17 @@ class TruthLogEditor(QWidget):
                 if number_item is not None
                 else None
             )
+            original = (
+                number_item.data(int(Qt.ItemDataRole.UserRole) + 1)
+                if number_item is not None
+                else None
+            )
+            unchanged = bool(
+                isinstance(original, TruthTurn)
+                and original.actor == actor
+                and original.is_pass == is_pass
+                and original.cards == cards
+            )
             turns.append(
                 TruthTurn(
                     row + 1,
@@ -486,6 +499,16 @@ class TruthLogEditor(QWidget):
                     is_pass,
                     cards,
                     frame_index=frame_index if isinstance(frame_index, int) else None,
+                    monotonic_ms=original.monotonic_ms if unchanged else None,
+                    trick_id=original.trick_id if unchanged else None,
+                    evidence=original.evidence if unchanged else None,
+                    label_status=original.label_status if unchanged else "draft",
+                    provenance=(
+                        original.provenance
+                        if unchanged
+                        else LabelProvenance(source="human_editor")
+                    ),
+                    uncertainty=original.uncertainty if unchanged else (),
                 )
             )
         lead = self.lead_combo.currentData()
@@ -499,6 +522,9 @@ class TruthLogEditor(QWidget):
             turns=tuple(turns),
             source_video=self.truth_log.source_video,
             frame_index_path=self.truth_log.frame_index_path,
+            label_status=self.truth_log.label_status,
+            provenance=self.truth_log.provenance,
+            outcome=self.truth_log.outcome,
         )
 
     def _recognition(self) -> ScreenshotRecognitionService:

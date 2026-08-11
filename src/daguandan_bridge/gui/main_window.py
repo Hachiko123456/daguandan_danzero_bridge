@@ -3,10 +3,8 @@ from __future__ import annotations
 from PySide6.QtCore import QRect
 from qfluentwidgets import FluentIcon, FluentWindow
 
-from ..annotation_service import AnnotationService
 from .annotation_page import AnnotationPage
 from .live_assistant_page import LiveAssistantPage
-from .live_controller import LiveAssistantController
 from .recommendation_window import RecommendationFloatWindow
 from .replay_page import ReplayPage
 
@@ -15,14 +13,19 @@ class DaguandanBridgeWindow(FluentWindow):
     def __init__(
         self,
         *,
+        dependencies=None,
         live_runtime=None,
     ) -> None:
         super().__init__()
-        self.live_runtime = live_runtime or LiveAssistantController()
-        self.annotation_page = AnnotationPage(AnnotationService())
+        if dependencies is None:
+            from ..bootstrap import build_application_dependencies
+
+            dependencies = build_application_dependencies(live_runtime=live_runtime)
+        self.live_runtime = live_runtime or dependencies.live_runtime
+        self.annotation_page = AnnotationPage(dependencies.annotation_service)
         self.annotation_page.setObjectName("annotationPage")
         self.live_assistant_page = LiveAssistantPage(self.live_runtime)
-        self.replay_page = ReplayPage()
+        self.replay_page = ReplayPage(dependencies.sessions_root)
         self.recommendation_window = RecommendationFloatWindow(self.live_runtime)
         self.live_assistant_page.compact_mode_requested.connect(
             self.show_compact_recommendation

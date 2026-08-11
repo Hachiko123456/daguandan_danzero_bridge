@@ -9,9 +9,17 @@ from typing import Any, Iterable
 from .models import LiveEvent
 
 from ..danzero.state import RANKS, SEATS, SUITS, Seat
+from ..domain.truth import (
+    LabelProvenance,
+    LabelStatus,
+    TruthEvidence,
+    TruthOutcome,
+    normalize_label_status,
+)
 from ..storage import atomic_write_json, load_json_document
 
-_SCHEMA_VERSION = 2
+_SCHEMA = "guandan.truth/3"
+_SCHEMA_VERSION = 3
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _SUIT_LABELS = {"S": "黑桃", "H": "红桃", "C": "梅花", "D": "方块"}
 _LABEL_TO_SUIT = {value: key for key, value in _SUIT_LABELS.items()}
@@ -53,6 +61,16 @@ def cards_to_text(cards: Iterable[str]) -> str:
     return "、".join(card_code_to_text(card) for card in cards)
 
 
+def _normalized_uncertainty(
+    cards: tuple[str, ...],
+    values: tuple[str, ...],
+) -> tuple[str, ...]:
+    result = [str(item) for item in values]
+    if any(card.endswith("?") for card in cards) and "unknown_suit" not in result:
+        result.append("unknown_suit")
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class TruthInitialState:
     round_level: str
@@ -76,6 +94,11 @@ class TruthTurn:
     cards: tuple[str, ...]
     frame_index: int | None = None
     monotonic_ms: int | None = None
+    trick_id: int = 0
+    evidence: TruthEvidence = TruthEvidence()
+    label_status: LabelStatus = "draft"
+    provenance: LabelProvenance = LabelProvenance()
+    uncertainty: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -86,8 +109,14 @@ class TruthTurn:
         frame_index: int | None = None,
         monotonic_ms: int | None = None,
         legacy_frame_index: int | None = None,
+        *,
+        trick_id: int | None = None,
+        evidence: TruthEvidence | None = None,
+        label_status: LabelStatus = "draft",
+        provenance: LabelProvenance | None = None,
+        uncertainty: tuple[str, ...] = (),
     ) -> None:
-        # Accept schema-1 positional construction while writing schema 2.
+        # Accept schema-1 positional construction while writing schema 3.
         if isinstance(actor, int) and isinstance(is_pass, str) and isinstance(cards, bool):
             legacy_turn_id = int(index)
             legacy_trick_id = actor
@@ -100,6 +129,19 @@ class TruthTurn:
             object.__setattr__(self, "cards", legacy_cards)
             object.__setattr__(self, "frame_index", legacy_frame_index)
             object.__setattr__(self, "monotonic_ms", monotonic_ms)
+            object.__setattr__(self, "trick_id", max(1, legacy_trick_id))
+            object.__setattr__(
+                self,
+                "evidence",
+                evidence
+                or TruthEvidence(
+                    frame_indices=(legacy_frame_index,) if legacy_frame_index is not None else (),
+                    monotonic_ms=monotonic_ms,
+                ),
+            )
+            object.__setattr__(self, "label_status", normalize_label_status(label_status))
+            object.__setattr__(self, "provenance", provenance or LabelProvenance())
+            object.__setattr__(self, "uncertainty", _normalized_uncertainty(legacy_cards, uncertainty))
             return
         object.__setattr__(self, "index", int(index))
         object.__setattr__(self, "actor", actor)
@@ -107,27 +149,36 @@ class TruthTurn:
         object.__setattr__(self, "cards", tuple(cards))
         object.__setattr__(self, "frame_index", frame_index)
         object.__setattr__(self, "monotonic_ms", monotonic_ms)
+        object.__setattr__(self, "trick_id", max(0, int(trick_id or 0)))
+        object.__setattr__(
+            self,
+            "evidence",
+            evidence
+            or TruthEvidence(
+                frame_indices=(frame_index,) if frame_index is not None else (),
+                monotonic_ms=monotonic_ms,
+            ),
+        )
+        object.__setattr__(self, "label_status", normalize_label_status(label_status))
+        object.__setattr__(self, "provenance", provenance or LabelProvenance())
+        object.__setattr__(self, "uncertainty", _normalized_uncertainty(tuple(cards), uncertainty))
 
     @property
     def turn_id(self) -> int:
         return self.index
 
-    @property
-    def trick_id(self) -> int:
-        return 1
-
     def to_dict(self) -> dict[str, object]:
-        raw: dict[str, object] = {
-            "index": self.index,
+        return {
+            "turn_id": self.index,
+            "trick_id": self.trick_id,
             "actor": self.actor,
             "is_pass": self.is_pass,
             "cards": list(self.cards),
+            "evidence": self.evidence.to_dict(),
+            "label_status": self.label_status,
+            "provenance": self.provenance.to_dict(),
+            "uncertainty": list(self.uncertainty),
         }
-        if self.frame_index is not None:
-            raw["frame_index"] = self.frame_index
-        if self.monotonic_ms is not None:
-            raw["monotonic_ms"] = self.monotonic_ms
-        return raw
 
 
 @dataclass(frozen=True)
@@ -137,16 +188,31 @@ class TruthLog:
     turns: tuple[TruthTurn, ...]
     source_video: str = "video/game.avi"
     frame_index_path: str = "video/frame_index.jsonl"
+    label_status: LabelStatus = "draft"
+    provenance: LabelProvenance = LabelProvenance()
+    outcome: TruthOutcome = TruthOutcome()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "label_status", normalize_label_status(self.label_status))
+        object.__setattr__(
+            self,
+            "turns",
+            _with_inferred_trick_ids(self.turns, len(self.initial_state.my_hand)),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "schema": _SCHEMA,
             "schema_version": _SCHEMA_VERSION,
             "source_session_id": self.source_session_id,
             "source_video": {
                 "path": self.source_video,
                 "frame_index_path": self.frame_index_path,
             },
+            "label_status": self.label_status,
+            "provenance": self.provenance.to_dict(),
             "initial_state": self.initial_state.to_dict(),
+            "outcome": self.outcome.to_dict(),
             "turns": [turn.to_dict() for turn in self.turns],
         }
 
@@ -183,7 +249,7 @@ class TruthLog:
                     seq=turn.index,
                     monotonic_ms=turn.monotonic_ms or turn.index,
                     wall_time=datetime.now().astimezone().isoformat(),
-                    trick_id=1,
+                    trick_id=turn.trick_id,
                     turn_id=turn.index,
                     actor=turn.actor,
                     payload={"cards": list(turn.cards), "is_pass": turn.is_pass},
@@ -197,10 +263,15 @@ class TruthLog:
 
 
 def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
-    version = int(raw.get("schema_version", 1))
-    if version not in {1, 2}:
+    schema = str(raw.get("schema", ""))
+    if schema and schema != _SCHEMA:
+        raise ValueError(f"unsupported truth schema: {schema}")
+    if schema == _SCHEMA and int(raw.get("schema_version", 3)) != 3:
+        raise ValueError("truth schema and schema_version conflict")
+    version = 3 if schema == _SCHEMA else int(raw.get("schema_version", 1))
+    if version not in {1, 2, 3}:
         raise ValueError("不支持的标准日志版本")
-    session_id = str(raw.get("source_session_id", "")).strip()
+    session_id = str(raw.get("source_session_id", raw.get("session_id", ""))).strip()
     if not session_id:
         raise ValueError("标准日志缺少源对局 ID")
     initial = raw.get("initial_state")
@@ -229,14 +300,35 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
             raise ValueError(f"第 {index} 条不出动作不能有牌面")
         if not is_pass and not cards:
             raise ValueError(f"第 {index} 条出牌动作必须填写牌面")
+        evidence_raw = item.get("evidence")
+        if isinstance(evidence_raw, dict):
+            evidence = TruthEvidence.from_dict(evidence_raw)
+        else:
+            legacy_frame = _optional_int(item.get("frame_index"))
+            legacy_ms = _optional_int(item.get("monotonic_ms"))
+            evidence = TruthEvidence(
+                frame_indices=(legacy_frame,) if legacy_frame is not None else (),
+                monotonic_ms=legacy_ms,
+            )
+        uncertainty_raw = item.get("uncertainty", ())
+        if not isinstance(uncertainty_raw, (list, tuple)):
+            raise ValueError(f"turn {index} uncertainty must be an array")
         turns.append(
             TruthTurn(
                 index=index,
                 actor=actor,  # type: ignore[arg-type]
                 is_pass=is_pass,
                 cards=cards,
-                frame_index=_optional_int(item.get("frame_index")),
-                monotonic_ms=_optional_int(item.get("monotonic_ms")),
+                frame_index=evidence.frame_indices[0] if evidence.frame_indices else None,
+                monotonic_ms=evidence.monotonic_ms,
+                trick_id=_optional_int(item.get("trick_id")),
+                evidence=evidence,
+                label_status=normalize_label_status(item.get("label_status", "draft")),
+                provenance=LabelProvenance.from_dict(
+                    item.get("provenance"),
+                    default_source="" if version == 3 else "legacy_migration",
+                ),
+                uncertainty=tuple(str(value) for value in uncertainty_raw),
             )
         )
     source = raw.get("source_video") or {}
@@ -252,6 +344,12 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
         turns=tuple(turns),
         source_video=str(source.get("path", "video/game.avi")),
         frame_index_path=str(source.get("frame_index_path", "video/frame_index.jsonl")),
+        label_status=normalize_label_status(raw.get("label_status", "draft")),
+        provenance=LabelProvenance.from_dict(
+            raw.get("provenance"),
+            default_source="" if version == 3 else "legacy_migration",
+        ),
+        outcome=TruthOutcome.from_dict(raw.get("outcome")),
     )
 
 
@@ -264,6 +362,58 @@ def load_truth_log(path: Path, *, session_id: str | None = None) -> TruthLog:
 
 def save_truth_log(path: Path, log: TruthLog) -> None:
     atomic_write_json(path, truth_log_from_dict(log.to_dict()).to_dict())
+
+
+def _with_inferred_trick_ids(
+    turns: tuple[TruthTurn, ...],
+    self_starting_cards: int,
+) -> tuple[TruthTurn, ...]:
+    """Fill absent trick ids with the same pass-cycle semantics as the reducer."""
+
+    current_trick = 1
+    leader: Seat | None = None
+    passed: set[Seat] = set()
+    played = {seat: 0 for seat in SEATS}
+    starting = {seat: 27 for seat in SEATS}
+    starting["self"] = self_starting_cards
+    result: list[TruthTurn] = []
+    for turn in turns:
+        if turn.trick_id > 0:
+            current_trick = turn.trick_id
+        assigned = current_trick
+        result.append(
+            TruthTurn(
+                turn.index,
+                turn.actor,
+                turn.is_pass,
+                turn.cards,
+                frame_index=turn.frame_index,
+                monotonic_ms=turn.monotonic_ms,
+                trick_id=assigned,
+                evidence=turn.evidence,
+                label_status=turn.label_status,
+                provenance=turn.provenance,
+                uncertainty=turn.uncertainty,
+            )
+        )
+        if turn.is_pass:
+            if leader is not None:
+                passed.add(turn.actor)
+        else:
+            leader = turn.actor
+            passed.clear()
+            played[turn.actor] += len(turn.cards)
+        finished = {
+            seat for seat in SEATS if played[seat] >= max(1, starting[seat])
+        }
+        active = set(SEATS) - finished
+        if leader is not None:
+            required = active - {leader}
+            if required and required.issubset(passed):
+                current_trick = assigned + 1
+                leader = None
+                passed.clear()
+    return tuple(result)
 
 
 def _normalize_cards(value: object, label: str, *, allow_empty: bool = False) -> tuple[str, ...]:
