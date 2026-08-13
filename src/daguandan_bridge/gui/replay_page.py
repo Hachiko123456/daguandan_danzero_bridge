@@ -11,16 +11,21 @@ from typing import Callable
 import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QColor, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
+    QBoxLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QScrollArea,
+    QStyle,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -39,8 +44,15 @@ from qfluentwidgets import (
 )
 
 from ..annotation_service import AnnotationService
+from ..application.replay_turn_draft import ReplayTurnDraftAssembler
+from ..advisor_strategy import (
+    ADVISOR_OPTIONS,
+    build_advisor,
+    load_profile_advisor_strategy,
+    normalize_advisor_strategy,
+    save_profile_advisor_strategy,
+)
 from ..config import PROFILES_ROOT
-from ..danzero import DanzeroAdvisor
 from ..image_io import save_image_unicode
 from ..live.models import LiveEvent
 from ..live.reducer import LiveReducer
@@ -82,18 +94,32 @@ class FrameInspectDialog(QDialog):
         frame_number: int | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("单帧查看与标注")
+        self.setWindowTitle("当前画面标注")
         self.resize(980, 900)
         self._frame = frame
         self._recognition_service = recognition
-        self._danzero_advisor = DanzeroAdvisor()
+        if session is not None:
+            self._profiles_root = Path(session).parents[2]
+            self._profile_name = Path(session).parents[1].name
+        else:
+            self._profiles_root = PROFILES_ROOT
+            self._profile_name = "tencent_daguandan"
+        self._advisor_strategy = load_profile_advisor_strategy(
+            self._profiles_root,
+            self._profile_name,
+        )
+        self._danzero_advisor = build_advisor(
+            self._advisor_strategy,
+            profiles_root=self._profiles_root,
+            profile_name=self._profile_name,
+        )
         self._danzero_thread: OneShotThread | None = None
         self._session = session
         self._frame_number = frame_number
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         toolbar = QHBoxLayout()
-        self.save_frame_button = PushButton("保存当前帧为截图")
+        self.save_frame_button = PushButton("保存当前画面为截图")
         self.save_frame_button.setToolTip(
             "保存后可在『区域标注』页选择该图片，框选并裁剪模板"
         )
@@ -101,14 +127,33 @@ class FrameInspectDialog(QDialog):
         self.save_frame_hint = BodyLabel("")
         toolbar.addWidget(self.save_frame_hint, 1)
         layout.addLayout(toolbar)
-        self.page = SingleImageDanzeroPage(parent=self)
+        self.page = SingleImageDanzeroPage(
+            parent=self,
+            advisor_strategy=self._advisor_strategy,
+        )
         self.page.setWindowFlags(Qt.WindowType.Widget)
         layout.addWidget(self.page)
         self.page.recognize_requested.connect(self._recognize)
         self.page.test_requested.connect(self._run_danzero_test)
+        self.page.advisor_strategy_changed.connect(self._advisor_changed)
         self.page.set_frame_image(frame, info_text)
         self.save_frame_button.clicked.connect(self._save_frame)
         self._recognize()
+
+    def _advisor_changed(self, strategy: str) -> None:
+        self._advisor_strategy = normalize_advisor_strategy(strategy)
+        profile_path = self._profiles_root / self._profile_name / "profile.json"
+        if profile_path.is_file():
+            self._advisor_strategy = save_profile_advisor_strategy(
+                self._profiles_root,
+                self._profile_name,
+                self._advisor_strategy,
+            )
+        self._danzero_advisor = build_advisor(
+            self._advisor_strategy,
+            profiles_root=self._profiles_root,
+            profile_name=self._profile_name,
+        )
 
     def _save_frame(self) -> None:
         try:
@@ -254,10 +299,13 @@ class TrustedAdviceReplayThread(QThread):
         session: Path,
         truth_log: TruthLog,
         parent=None,
+        *,
+        advisor_strategy: str = "danzero",
     ) -> None:
         super().__init__(parent)
         self.session = Path(session)
         self.truth_log = truth_log
+        self.advisor_strategy = normalize_advisor_strategy(advisor_strategy)
         self._stop_requested = threading.Event()
 
     def stop(self) -> None:
@@ -265,9 +313,15 @@ class TrustedAdviceReplayThread(QThread):
 
     def run(self) -> None:
         try:
+            profiles_root = self.session.parents[2]
+            profile_name = self.session.parents[1].name
             result = replay_truth_through_live_advisor(
                 self.session,
-                DanzeroAdvisor(),
+                build_advisor(
+                    self.advisor_strategy,
+                    profiles_root=profiles_root,
+                    profile_name=profile_name,
+                ),
                 truth_log=self.truth_log,
                 stop_requested=self._stop_requested.is_set,
                 on_advice=lambda data: self.advice_result.emit(data),
@@ -284,6 +338,12 @@ class ReplayPage(QWidget):
             sessions_root
             or (PROFILES_ROOT / "tencent_daguandan" / "sessions")
         )
+        self.profiles_root = self.sessions_root.parent.parent
+        self.profile_name = self.sessions_root.parent.name
+        self.advisor_strategy = load_profile_advisor_strategy(
+            self.profiles_root,
+            self.profile_name,
+        )
         self.current_session: Path | None = None
         self._decode_thread: ReplayDecodeThread | None = None
         self._visual_thread: VisualRecognitionReplayThread | None = None
@@ -292,6 +352,9 @@ class ReplayPage(QWidget):
         self.truth_log: TruthLog | None = None
         self._truth_scan_base: TruthLog | None = None
         self._truth_scan_turns: list[dict[str, object]] = []
+        self._truth_draft_assembler: ReplayTurnDraftAssembler | None = None
+        self._truth_editor: TruthLogEditor | None = None
+        self._content_vertical: bool | None = None
         self._current_record: FrameIndexRecord | None = None
         self._current_image: QImage | None = None
         self._recognition_service: ScreenshotRecognitionService | None = None
@@ -305,12 +368,145 @@ class ReplayPage(QWidget):
         self.refresh_sessions()
 
     def _apply_theme(self, *_args) -> None:
-        background = "#202020" if isDarkTheme() else "#f3f3f3"
-        foreground = "#f5f5f5" if isDarkTheme() else "#1f1f1f"
-        self.setStyleSheet(
-            f"QWidget#replayPage {{ background: {background}; color: {foreground}; }}"
-            f" QWidget#replayPage QLabel {{ color: {foreground}; }}"
+        dark = bool(isDarkTheme())
+        colors = (
+            {
+                "background": "#202020",
+                "surface": "#292929",
+                "surface_alt": "#242424",
+                "base": "#1e1e1e",
+                "border": "#454545",
+                "foreground": "#f5f5f5",
+                "muted": "#c8c8c8",
+                "selection": "#0f6cbd",
+                "selection_text": "#ffffff",
+            }
+            if dark
+            else {
+                "background": "#f3f3f3",
+                "surface": "#ffffff",
+                "surface_alt": "#f8f8f8",
+                "base": "#ffffff",
+                "border": "#d6d6d6",
+                "foreground": "#1f1f1f",
+                "muted": "#606060",
+                "selection": "#0f6cbd",
+                "selection_text": "#ffffff",
+            }
         )
+        self.setStyleSheet(
+            f"QWidget#replayPage {{ background:{colors['background']};"
+            f" color:{colors['foreground']}; }}"
+            f" QWidget#replayPage QLabel {{ color:{colors['foreground']}; }}"
+            f" QScrollArea#replayContentScroll, QWidget#replayContentViewport,"
+            f" QWidget#replayContentHost {{ background:{colors['background']};"
+            " border:0; }}"
+            f" QWidget#replaySelectorCard, QWidget#replayVideoCard,"
+            f" QWidget#replayDiagnosticsCard, QStackedWidget#replayDiagnosticsStack,"
+            f" QWidget#replayDiagnosticsPage, QWidget#replayEditorPage {{"
+            f" background:{colors['surface']}; color:{colors['foreground']}; }}"
+            f" QTextEdit#replayDiagnostics {{ background:{colors['base']};"
+            f" color:{colors['foreground']}; border:1px solid {colors['border']};"
+            f" selection-background-color:{colors['selection']};"
+            f" selection-color:{colors['selection_text']}; }}"
+            f" QWidget#truthLogEditor {{ background:{colors['surface']};"
+            f" color:{colors['foreground']}; }}"
+            f" QWidget#truthLogEditor QTableWidget {{ background:{colors['base']};"
+            f" alternate-background-color:{colors['surface_alt']};"
+            f" color:{colors['foreground']}; gridline-color:{colors['border']};"
+            f" border:1px solid {colors['border']};"
+            f" selection-background-color:{colors['selection']};"
+            f" selection-color:{colors['selection_text']}; }}"
+            f" QWidget#truthLogEditor QHeaderView::section {{"
+            f" background:{colors['surface_alt']}; color:{colors['foreground']};"
+            f" border:0; border-right:1px solid {colors['border']};"
+            f" border-bottom:1px solid {colors['border']}; padding:5px; }}"
+            f" QWidget#truthLogEditor QScrollArea {{ background:{colors['base']};"
+            f" border:1px solid {colors['border']}; }}"
+            f" QWidget#truthLogEditor QComboBox,"
+            f" QWidget#truthLogEditor QPushButton {{"
+            f" background:{colors['surface_alt']}; color:{colors['foreground']};"
+            f" border:1px solid {colors['border']}; border-radius:4px;"
+            " padding:4px 8px; }}"
+            f" QWidget#truthLogEditor QComboBox:disabled,"
+            f" QWidget#truthLogEditor QPushButton:disabled {{"
+            f" color:{colors['muted']}; }}"
+            f" QWidget#truthLogEditor QComboBox QAbstractItemView {{"
+            f" background:{colors['base']}; color:{colors['foreground']};"
+            f" selection-background-color:{colors['selection']};"
+            f" selection-color:{colors['selection_text']}; }}"
+        )
+        foreground = QColor(colors["foreground"])
+        muted = QColor(colors["muted"])
+        selection = QColor(colors["selection"])
+        selection_text = QColor(colors["selection_text"])
+
+        def apply_palette(widget: QWidget, *, window: str, base: str) -> None:
+            palette = widget.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(window))
+            palette.setColor(QPalette.ColorRole.Base, QColor(base))
+            palette.setColor(
+                QPalette.ColorRole.AlternateBase,
+                QColor(colors["surface_alt"]),
+            )
+            for role in (
+                QPalette.ColorRole.WindowText,
+                QPalette.ColorRole.Text,
+                QPalette.ColorRole.ButtonText,
+            ):
+                palette.setColor(role, foreground)
+                palette.setColor(QPalette.ColorGroup.Disabled, role, muted)
+            palette.setColor(QPalette.ColorRole.PlaceholderText, muted)
+            palette.setColor(QPalette.ColorRole.Highlight, selection)
+            palette.setColor(QPalette.ColorRole.HighlightedText, selection_text)
+            widget.setPalette(palette)
+
+        apply_palette(
+            self,
+            window=colors["background"],
+            base=colors["base"],
+        )
+        for widget in (
+            self.content_scroll,
+            self.content_scroll.viewport(),
+            self.content_host,
+        ):
+            apply_palette(
+                widget,
+                window=colors["background"],
+                base=colors["background"],
+            )
+            widget.setAutoFillBackground(True)
+        for widget in (
+            self.selector_card,
+            self.video_card,
+            self.diagnostics_card,
+            self.diagnostics_stack,
+            self.diagnostics_page,
+            self.editor_page,
+        ):
+            apply_palette(
+                widget,
+                window=colors["surface"],
+                base=colors["base"],
+            )
+        apply_palette(
+            self.diagnostics,
+            window=colors["base"],
+            base=colors["base"],
+        )
+        for editor in self.findChildren(TruthLogEditor):
+            apply_palette(
+                editor,
+                window=colors["surface"],
+                base=colors["base"],
+            )
+            for table in editor.findChildren(QTableWidget):
+                apply_palette(
+                    table,
+                    window=colors["base"],
+                    base=colors["base"],
+                )
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -319,6 +515,8 @@ class ReplayPage(QWidget):
         root.addWidget(TitleLabel("对局回放与复测"))
 
         selector = CardWidget()
+        self.selector_card = selector
+        selector.setObjectName("replaySelectorCard")
         selector_layout = QVBoxLayout(selector)
         selector_layout.setContentsMargins(16, 14, 16, 14)
         selector_layout.addWidget(StrongBodyLabel("选择已隔离的对局会话"))
@@ -336,19 +534,71 @@ class ReplayPage(QWidget):
         selector_layout.addWidget(self.session_summary)
         root.addWidget(selector)
 
-        content = QHBoxLayout()
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setObjectName("replayContentScroll")
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.content_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        self.content_host = QWidget()
+        self.content_host.setObjectName("replayContentHost")
+        self.content_scroll.viewport().setObjectName("replayContentViewport")
+        self.content_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(14)
+        self.content_host.setLayout(self.content_layout)
+        self.content_scroll.setWidget(self.content_host)
         video_card = CardWidget()
+        self.video_card = video_card
+        video_card.setObjectName("replayVideoCard")
         video_layout = QVBoxLayout(video_card)
         video_layout.setContentsMargins(16, 14, 16, 16)
         video_layout.addWidget(StrongBodyLabel("录像（使用逐帧原始时间戳）"))
         self.preview = QLabel("选择包含录像的对局后可播放")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(640, 360)
+        self.preview.setMinimumSize(480, 270)
         self.preview.setStyleSheet(
             "background:#20252b;color:#e8eaed;border-radius:6px;"
         )
-        video_layout.addWidget(self.preview, 1)
-        self.playback_toolbar = SessionPlaybackToolbar(self)
+        preview_host = QWidget()
+        preview_grid = QGridLayout(preview_host)
+        preview_grid.setContentsMargins(0, 0, 0, 0)
+        preview_grid.addWidget(self.preview, 0, 0)
+        self.rewind_overlay_button = QToolButton()
+        self.rewind_overlay_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowLeft)
+        )
+        self.rewind_overlay_button.setToolTip("后退 5 秒")
+        self.rewind_overlay_button.setAccessibleName("后退 5 秒")
+        self.forward_overlay_button = QToolButton()
+        self.forward_overlay_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight)
+        )
+        self.forward_overlay_button.setToolTip("前进 5 秒")
+        self.forward_overlay_button.setAccessibleName("前进 5 秒")
+        for button in (self.rewind_overlay_button, self.forward_overlay_button):
+            button.setFixedSize(42, 58)
+            button.setStyleSheet(
+                "QToolButton{background:rgba(15,15,15,150);color:white;"
+                "border:1px solid rgba(255,255,255,90);border-radius:8px;"
+                "font-size:34px;} QToolButton:hover{background:rgba(0,120,212,190);}"
+            )
+        preview_grid.addWidget(
+            self.rewind_overlay_button,
+            0,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
+        preview_grid.addWidget(
+            self.forward_overlay_button,
+            0,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        video_layout.addWidget(preview_host, 1)
+        self.playback_toolbar = SessionPlaybackToolbar(self, overlay_seek=True)
         # Existing callers use these page attributes; all of them now point to
         # the shared toolbar used by the annotation page as well.
         self.play_button = self.playback_toolbar.play_button
@@ -360,16 +610,27 @@ class ReplayPage(QWidget):
         self.speed_combo = self.playback_toolbar.speed_combo
         self.frame_status = self.playback_toolbar.frame_status
         video_layout.addWidget(self.playback_toolbar)
-        self.inspect_frame_button = PushButton("查看 / 标注当前帧")
-        self.inspect_frame_button.setToolTip("在当前暂停帧打开单图识别与模板标注")
-        video_layout.addWidget(self.inspect_frame_button)
-        content.addWidget(video_card, 3)
+        annotation_row = QHBoxLayout()
+        annotation_row.addWidget(StrongBodyLabel("画面工具"))
+        self.inspect_frame_button = PushButton("当前画面标注")
+        self.inspect_frame_button.setToolTip(
+            "打开当前显示画面的单图识别与模板标注；不会前进到下一帧"
+        )
+        annotation_row.addWidget(self.inspect_frame_button)
+        annotation_row.addStretch(1)
+        video_layout.addLayout(annotation_row)
+        self.content_layout.addWidget(video_card, 3)
 
         diagnostics_card = CardWidget()
+        self.diagnostics_card = diagnostics_card
+        diagnostics_card.setObjectName("replayDiagnosticsCard")
         diagnostics_layout = QVBoxLayout(diagnostics_card)
         diagnostics_layout.setContentsMargins(16, 14, 16, 16)
         self.diagnostics_stack = QStackedWidget()
+        self.diagnostics_stack.setObjectName("replayDiagnosticsStack")
         diag_page = QWidget()
+        self.diagnostics_page = diag_page
+        diag_page.setObjectName("replayDiagnosticsPage")
         diag_layout = QVBoxLayout(diag_page)
         diag_layout.setContentsMargins(0, 0, 0, 0)
         diag_layout.addWidget(StrongBodyLabel("复测与诊断"))
@@ -380,6 +641,7 @@ class ReplayPage(QWidget):
         self.truth_replay_button = PrimaryPushButton("开始复测")
         self.truth_edit_button = PushButton("手动编辑出牌日志")
         self.diagnostics = TextEdit()
+        self.diagnostics.setObjectName("replayDiagnostics")
         self.diagnostics.setReadOnly(True)
         self.diagnostics.setPlaceholderText("复测结果会显示在这里。")
         diag_layout.addWidget(self.visual_replay_button)
@@ -396,6 +658,17 @@ class ReplayPage(QWidget):
             userData="trusted_advisor",
         )
         mode_row.addWidget(self.replay_mode_combo)
+        mode_row.addWidget(BodyLabel("建议模型"))
+        self.advisor_strategy_combo = ComboBox()
+        for value, label in ADVISOR_OPTIONS:
+            self.advisor_strategy_combo.addItem(label, userData=value)
+        advisor_index = self.advisor_strategy_combo.findData(self.advisor_strategy)
+        if advisor_index >= 0:
+            self.advisor_strategy_combo.setCurrentIndex(advisor_index)
+        self.advisor_strategy_combo.setToolTip(
+            "用于可信日志驱动复测，并持久化为当前 profile 默认值。"
+        )
+        mode_row.addWidget(self.advisor_strategy_combo)
         mode_row.addWidget(BodyLabel("识别策略"))
         self.recognition_strategy_combo = ComboBox()
         for value, label in RECOGNITION_STRATEGY_OPTIONS:
@@ -415,6 +688,8 @@ class ReplayPage(QWidget):
         diag_layout.addWidget(self.replay_overlay_check)
         diag_layout.addWidget(self.diagnostics, 1)
         editor_page = QWidget()
+        self.editor_page = editor_page
+        editor_page.setObjectName("replayEditorPage")
         editor_layout = QVBoxLayout(editor_page)
         editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_header = QHBoxLayout()
@@ -430,8 +705,8 @@ class ReplayPage(QWidget):
         self.diagnostics_stack.addWidget(diag_page)
         self.diagnostics_stack.addWidget(editor_page)
         diagnostics_layout.addWidget(self.diagnostics_stack)
-        content.addWidget(diagnostics_card, 2)
-        root.addLayout(content, 1)
+        self.content_layout.addWidget(diagnostics_card, 2)
+        root.addWidget(self.content_scroll, 1)
 
         self.refresh_button.clicked.connect(self.refresh_sessions)
         self.session_combo.currentIndexChanged.connect(self._session_selected)
@@ -440,9 +715,18 @@ class ReplayPage(QWidget):
         self.playback_toolbar.step_requested.connect(self.step)
         self.playback_toolbar.seek_requested.connect(self.seek_to_frame)
         self.playback_toolbar.seek_seconds_requested.connect(self._seek_by_seconds)
+        self.rewind_overlay_button.clicked.connect(
+            lambda: self.playback_toolbar.seek_seconds_requested.emit(-5.0)
+        )
+        self.forward_overlay_button.clicked.connect(
+            lambda: self.playback_toolbar.seek_seconds_requested.emit(5.0)
+        )
         self.playback_toolbar.speed_changed.connect(self._speed_changed)
         self.inspect_frame_button.clicked.connect(self.open_frame_inspect)
         self.replay_mode_combo.currentIndexChanged.connect(self._replay_mode_changed)
+        self.advisor_strategy_combo.currentIndexChanged.connect(
+            self._advisor_strategy_changed
+        )
         self.state_replay_button.clicked.connect(self.replay_state)
         self.visual_replay_button.clicked.connect(self.analyze_video_to_truth_log)
         self.truth_edit_button.clicked.connect(self.edit_truth_log)
@@ -450,6 +734,29 @@ class ReplayPage(QWidget):
         self.back_to_diagnostics_button.clicked.connect(self._back_to_diagnostics)
         self._set_session_actions(False)
         self._replay_mode_changed()
+        self._arrange_content(vertical=True)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not hasattr(self, "content_layout"):
+            return
+        width = event.size().width()
+        if width <= 1160:
+            self._arrange_content(vertical=True)
+        elif width >= 1220:
+            self._arrange_content(vertical=False)
+
+    def _arrange_content(self, *, vertical: bool) -> None:
+        if vertical == self._content_vertical:
+            return
+        self._content_vertical = vertical
+        self.content_layout.setDirection(
+            QBoxLayout.Direction.TopToBottom
+            if vertical
+            else QBoxLayout.Direction.LeftToRight
+        )
+        self.content_layout.setStretch(0, 1 if vertical else 3)
+        self.content_layout.setStretch(1, 1 if vertical else 2)
 
     def refresh_sessions(self) -> None:
         selected = self.current_session
@@ -474,6 +781,18 @@ class ReplayPage(QWidget):
 
     def select_session(self, session: Path) -> None:
         session = Path(session).resolve()
+        self._truth_scan_base = None
+        self._truth_draft_assembler = None
+        if self._truth_editor is not None:
+            self._truth_editor.shutdown()
+        self._truth_editor = None
+        if hasattr(self, "truth_editor_host"):
+            while self.truth_editor_host.count():
+                item = self.truth_editor_host.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            self.diagnostics_stack.setCurrentIndex(0)
         self._stop_decode()
         self.current_session = session
         self._current_record = None
@@ -515,9 +834,26 @@ class ReplayPage(QWidget):
         trusted = self.replay_mode_combo.currentData() == "trusted_advisor"
         pipeline = self.replay_mode_combo.currentData() == "pipeline"
         self.recognition_strategy_combo.setEnabled(pipeline)
+        self.advisor_strategy_combo.setEnabled(trusted)
         self.truth_replay_button.setText(
             "开始实时助手测试" if trusted else "开始复测"
         )
+
+    def _advisor_strategy_changed(self, _index: int = -1) -> None:
+        self.advisor_strategy = normalize_advisor_strategy(
+            self.advisor_strategy_combo.currentData()
+        )
+        profile_path = self.profiles_root / self.profile_name / "profile.json"
+        if not profile_path.is_file():
+            return
+        try:
+            self.advisor_strategy = save_profile_advisor_strategy(
+                self.profiles_root,
+                self.profile_name,
+                self.advisor_strategy,
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def _set_session_actions(self, enabled: bool, *, playable: bool = False) -> None:
         for widget in (
@@ -540,6 +876,8 @@ class ReplayPage(QWidget):
             self.frame_jump_button,
             self.rewind_button,
             self.forward_button,
+            self.rewind_overlay_button,
+            self.forward_overlay_button,
             self.speed_combo,
             self.inspect_frame_button,
         ):
@@ -644,12 +982,12 @@ class ReplayPage(QWidget):
         if self.current_session is None:
             return
         if self._current_image is None:
-            self._show_error("请先播放或暂停到目标帧，再点单帧")
+            self._show_error("请先播放或暂停到目标画面，再点『当前画面标注』")
             return
         frame_bgr = self._qimage_to_bgr(self._current_image)
         record = self._current_record
         info = (
-            f"当前帧：{self.current_session.name}　"
+            f"当前画面：{self.current_session.name}　"
             f"帧 {record.frame_index if record is not None else '—'}"
             f"　{record.monotonic_ms if record is not None else 0} ms"
         )
@@ -839,7 +1177,8 @@ class ReplayPage(QWidget):
                 image = self._first_frame_bgr()
             if image is None:
                 self._show_error(
-                    "请先播放或单帧到有牌局的画面（推荐开局画面），再点编辑出牌日志"
+                    "请先播放或点『下一帧』到有牌局的画面（推荐开局画面），"
+                    "再点编辑出牌日志"
                 )
                 return
             try:
@@ -863,8 +1202,10 @@ class ReplayPage(QWidget):
             frame_provider=self._current_frame_bgr_and_index,
         )
         editor.log_saved.connect(self._on_truth_log_saved)
+        self._truth_editor = editor
         self.truth_editor_host.addWidget(editor)
         self.diagnostics_stack.setCurrentIndex(1)
+        self._apply_theme()
 
     def _back_to_diagnostics(self) -> None:
         self.diagnostics_stack.setCurrentIndex(0)
@@ -1014,6 +1355,7 @@ class ReplayPage(QWidget):
             self.current_session,
             truth_log,
             self,
+            advisor_strategy=self.advisor_strategy,
         )
         thread.completed.connect(self._trusted_completed)
         thread.failed.connect(self._show_error)
@@ -1022,10 +1364,13 @@ class ReplayPage(QWidget):
         self._trusted_thread = thread
         self.truth_replay_button.setEnabled(False)
         self.diagnostics.setPlainText(
-            "正在使用可信出牌日志驱动实时 DanZero；不重新识别视频，"
+            f"正在使用可信出牌日志驱动实时 {self.advisor_strategy_combo.currentText()}；不重新识别视频，"
             "结果会写入当前对局的 replay_runs：\n"
         )
         thread.start()
+
+    def _truth_scan_failed(self, message: str) -> None:
+        self._show_error(message)
 
     _REPLAY_SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 
@@ -1164,13 +1509,16 @@ class ReplayPage(QWidget):
             return
         self._truth_scan_base = baseline
         self._truth_scan_turns = []
+        self._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
+        self.truth_log = baseline
+        self._show_truth_log_editor()
         thread = VisualRecognitionReplayThread(
             self.current_session,
             baseline,
             parent=self,
         )
         thread.completed.connect(self._truth_scan_completed)
-        thread.failed.connect(self._show_error)
+        thread.failed.connect(self._truth_scan_failed)
         thread.turn_result.connect(self._collect_truth_scan_turn)
         thread.finished.connect(lambda: self._visual_finished(thread))
         thread.replay_mode = "pipeline"
@@ -1181,7 +1529,7 @@ class ReplayPage(QWidget):
         self.truth_replay_button.setEnabled(False)
         self.diagnostics.setPlainText(
             "正在逐帧分析视频并生成出牌日志草稿；使用与实时助手相同的状态机和识别策略。\n"
-            "完成后会自动打开编辑器，请逐条校验并手动保存。"
+            "每确认一手会立即追加到编辑器；请逐条校验，草稿需手动保存。"
         )
         thread.start()
 
@@ -1215,6 +1563,19 @@ class ReplayPage(QWidget):
         if not is_pass and not cards:
             return
         self._truth_scan_turns.append(record)
+        if self._truth_draft_assembler is None and self._truth_scan_base is not None:
+            self._truth_draft_assembler = ReplayTurnDraftAssembler(self._truth_scan_base)
+        if self._truth_draft_assembler is None:
+            return
+        appended = self._truth_draft_assembler.append(record)
+        if not appended.accepted or appended.turn is None:
+            return
+        self.truth_log = appended.truth_log
+        if self._truth_editor is not None:
+            self._truth_editor.append_confirmed_turn(
+                appended.turn,
+                status=appended.status,
+            )
         seat = self._REPLAY_SEAT_LABELS.get(str(record.get("actor")), "未知座位")
         action = "不出" if is_pass else "出牌 " + " ".join(cards)
         self.diagnostics.insertPlainText(
@@ -1274,15 +1635,19 @@ class ReplayPage(QWidget):
     def _truth_scan_completed(self, _value: object) -> None:
         if self._truth_scan_base is None:
             return
-        self.truth_log = self._truth_log_from_scan_turns(
-            self._truth_scan_base,
-            self._truth_scan_turns,
-        )
+        if self._truth_draft_assembler is not None:
+            self.truth_log = self._truth_draft_assembler.truth_log
+        else:
+            self.truth_log = self._truth_log_from_scan_turns(
+                self._truth_scan_base,
+                self._truth_scan_turns,
+            )
         self._truth_scan_base = None
         self.truth_status.setText(
             f"出牌日志：逐帧分析生成 {len(self.truth_log.turns)} 条，待校验保存"
         )
-        self._show_truth_log_editor()
+        if self._truth_editor is None:
+            self._show_truth_log_editor()
 
     def _visual_completed(self, value: object) -> None:
         result = value
@@ -1452,6 +1817,8 @@ class ReplayPage(QWidget):
 
     def shutdown(self) -> None:
         self._stop_decode()
+        if self._truth_editor is not None:
+            self._truth_editor.shutdown()
         if self._visual_thread is not None and self._visual_thread.isRunning():
             self._visual_thread.stop()
             self._visual_thread.wait(30_000)

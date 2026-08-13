@@ -27,8 +27,9 @@ class SessionPlaybackToolbar(QWidget):
     seek_seconds_requested = Signal(float)
     speed_changed = Signal(float)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, overlay_seek: bool = False) -> None:
         super().__init__(parent)
+        self._overlay_seek = bool(overlay_seek)
         self.setObjectName("sessionPlaybackToolbar")
         self._layout = QGridLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -37,7 +38,7 @@ class SessionPlaybackToolbar(QWidget):
         self._compact_layout: bool | None = None
 
         self.play_button = PrimaryPushButton("播放")
-        self.step_button = PushButton("单帧")
+        self.step_button = PushButton("下一帧")
         self.rewind_button = PushButton("后退 5 秒")
         self.forward_button = PushButton("前进 5 秒")
         self.frame_spin = SpinBox(self)
@@ -47,6 +48,12 @@ class SessionPlaybackToolbar(QWidget):
         self.frame_spin.setMinimumWidth(156)
         self.frame_spin.setToolTip("跳转到指定录像帧")
         self.frame_jump_button = PushButton("跳转")
+        # Compatibility aliases remain callable, but the replay surface now
+        # exposes ±5 s as video overlays and Enter performs frame seeking.
+        if self._overlay_seek:
+            self.rewind_button.hide()
+            self.forward_button.hide()
+            self.frame_jump_button.hide()
         self.speed_combo = ComboBox()
         for label, speed in (("0.5×", 0.5), ("1×", 1.0), ("2×", 2.0), ("4×", 4.0)):
             self.speed_combo.addItem(label, userData=speed)
@@ -84,6 +91,9 @@ class SessionPlaybackToolbar(QWidget):
             lambda: self.seek_seconds_requested.emit(5.0)
         )
         self.frame_jump_button.clicked.connect(
+            lambda: self.seek_requested.emit(self.frame_spin.value())
+        )
+        self.frame_spin.lineEdit().returnPressed.connect(
             lambda: self.seek_requested.emit(self.frame_spin.value())
         )
         self.speed_combo.currentIndexChanged.connect(
@@ -127,26 +137,42 @@ class SessionPlaybackToolbar(QWidget):
             self._layout.removeWidget(widget)
         for column in range(5):
             self._layout.setColumnStretch(column, 0)
+        if not self._overlay_seek:
+            if compact:
+                self._layout.addWidget(self.play_button, 0, 0)
+                self._layout.addWidget(self.step_button, 0, 1)
+                self._layout.addWidget(self.speed_combo, 0, 2)
+                self._layout.addWidget(self.rewind_button, 1, 0)
+                self._layout.addWidget(self.forward_button, 1, 1)
+                self._layout.addWidget(self.frame_spin, 2, 0, 1, 2)
+                self._layout.addWidget(self.frame_jump_button, 2, 2)
+                self._layout.addWidget(self.frame_status, 2, 3)
+                self._layout.setColumnStretch(3, 1)
+                return
+            self._layout.addWidget(self.play_button, 0, 0)
+            self._layout.addWidget(self.step_button, 0, 1)
+            self._layout.addWidget(self.rewind_button, 0, 2)
+            self._layout.addWidget(self.forward_button, 0, 3)
+            self._layout.addWidget(self.speed_combo, 0, 4)
+            self._layout.addWidget(self.frame_spin, 1, 0, 1, 2)
+            self._layout.addWidget(self.frame_jump_button, 1, 2)
+            self._layout.addWidget(self.frame_status, 1, 3, 1, 2)
+            self._layout.setColumnStretch(3, 1)
+            return
         if compact:
             self._layout.addWidget(self.play_button, 0, 0)
             self._layout.addWidget(self.step_button, 0, 1)
             self._layout.addWidget(self.speed_combo, 0, 2)
-            self._layout.addWidget(self.rewind_button, 1, 0)
-            self._layout.addWidget(self.forward_button, 1, 1)
-            self._layout.addWidget(self.frame_spin, 2, 0, 1, 2)
-            self._layout.addWidget(self.frame_jump_button, 2, 2)
-            self._layout.addWidget(self.frame_status, 2, 3)
+            self._layout.addWidget(self.frame_spin, 1, 0, 1, 2)
+            self._layout.addWidget(self.frame_status, 1, 2, 1, 2)
             self._layout.setColumnStretch(3, 1)
             return
         # The normal two-row surface is shared with the annotation page.
         self._layout.addWidget(self.play_button, 0, 0)
         self._layout.addWidget(self.step_button, 0, 1)
-        self._layout.addWidget(self.rewind_button, 0, 2)
-        self._layout.addWidget(self.forward_button, 0, 3)
-        self._layout.addWidget(self.speed_combo, 0, 4)
+        self._layout.addWidget(self.speed_combo, 0, 2)
         self._layout.addWidget(self.frame_spin, 1, 0, 1, 2)
-        self._layout.addWidget(self.frame_jump_button, 1, 2)
-        self._layout.addWidget(self.frame_status, 1, 3, 1, 2)
+        self._layout.addWidget(self.frame_status, 1, 2, 1, 3)
         self._layout.setColumnStretch(3, 1)
 
 

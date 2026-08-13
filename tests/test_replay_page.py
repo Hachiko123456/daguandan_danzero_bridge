@@ -7,8 +7,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+import daguandan_bridge.gui.replay_page as replay_page_module
+from daguandan_bridge.application.replay_turn_draft import ReplayTurnDraftAssembler
 from daguandan_bridge.gui.main_window import DaguandanBridgeWindow
 from daguandan_bridge.gui.replay_page import FrameInspectDialog, ReplayPage
 from daguandan_bridge.live.recorder import SessionRecorder
@@ -17,6 +21,21 @@ from daguandan_bridge.recognition_service import RecognitionResult, RecognizedEv
 
 def _app():
     return QApplication.instance() or QApplication([])
+
+
+def _contrast(first: QColor, second: QColor) -> float:
+    def luminance(color: QColor) -> float:
+        channels = (color.redF(), color.greenF(), color.blueF())
+        linear = tuple(
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        )
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    light, dark = sorted((luminance(first), luminance(second)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
 
 
 def _recorded_session(tmp_path, *, with_initial=False):
@@ -117,8 +136,138 @@ def test_replay_page_can_load_recorded_session(tmp_path):
     assert page.frame_spin.maximum() == 2
     assert page.playback_toolbar.play_button is page.play_button
     assert page.playback_toolbar.rewind_button is page.rewind_button
+    assert page.step_button.text() == "下一帧"
+    assert page.inspect_frame_button.text() == "当前画面标注"
     assert "game-test" in page.session_summary.text()
     assert "3" in page.session_summary.text()
+    page.shutdown()
+    page.close()
+
+
+def test_replay_page_uses_overlay_seek_and_hysteretic_responsive_layout(tmp_path):
+    app = _app()
+    session = _recorded_session(tmp_path)
+    page = ReplayPage(session.parent)
+    page.show()
+
+    assert page.playback_toolbar.rewind_button.isHidden()
+    assert page.playback_toolbar.forward_button.isHidden()
+    assert page.playback_toolbar.frame_jump_button.isHidden()
+    assert page.content_scroll.horizontalScrollBarPolicy() == (
+        Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    page.resize(1024, 768)
+    app.processEvents()
+    assert page._content_vertical is True
+    page.resize(1180, 768)
+    app.processEvents()
+    assert page._content_vertical is True
+    page.resize(1366, 768)
+    app.processEvents()
+    assert page._content_vertical is False
+    page.resize(1180, 768)
+    app.processEvents()
+    assert page._content_vertical is False
+
+    requested = []
+    page.playback_toolbar.seek_seconds_requested.connect(requested.append)
+    page.rewind_overlay_button.click()
+    page.forward_overlay_button.click()
+    assert requested[-2:] == [-5.0, 5.0]
+    requested_frames = []
+    page.playback_toolbar.seek_requested.connect(requested_frames.append)
+    page.frame_spin.setValue(1)
+    page.frame_spin.lineEdit().returnPressed.emit()
+    assert requested_frames[-1] == 1
+    page.shutdown()
+    page.close()
+
+
+def test_replay_page_light_and_dark_palettes_cover_native_scroll_and_editor_views(
+    tmp_path,
+    monkeypatch,
+):
+    app = _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    monkeypatch.setattr(replay_page_module, "isDarkTheme", lambda: False)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._show_truth_log_editor()
+    app.processEvents()
+
+    light_viewport = page.content_scroll.viewport().palette().color(
+        QPalette.ColorRole.Window
+    )
+    light_base = page.diagnostics.palette().color(QPalette.ColorRole.Base)
+    light_text = page.diagnostics.palette().color(QPalette.ColorRole.Text)
+    editor = page._truth_editor
+    assert editor is not None
+    light_table_base = editor.table.palette().color(QPalette.ColorRole.Base)
+    assert light_viewport.lightnessF() > 0.8
+    assert light_table_base.lightnessF() > 0.85
+    assert _contrast(light_base, light_text) >= 7.0
+
+    monkeypatch.setattr(replay_page_module, "isDarkTheme", lambda: True)
+    page._apply_theme()
+    app.processEvents()
+    dark_viewport = page.content_scroll.viewport().palette().color(
+        QPalette.ColorRole.Window
+    )
+    dark_card = page.diagnostics_card.palette().color(QPalette.ColorRole.Window)
+    dark_base = page.diagnostics.palette().color(QPalette.ColorRole.Base)
+    dark_text = page.diagnostics.palette().color(QPalette.ColorRole.Text)
+    dark_table_base = editor.table.palette().color(QPalette.ColorRole.Base)
+    dark_table_text = editor.table.palette().color(QPalette.ColorRole.Text)
+    assert dark_viewport.lightnessF() < 0.2
+    assert dark_card.lightnessF() < 0.25
+    assert dark_base.lightnessF() < light_base.lightnessF()
+    assert dark_table_base.lightnessF() < light_table_base.lightnessF()
+    assert _contrast(dark_base, dark_text) >= 7.0
+    assert _contrast(dark_table_base, dark_table_text) >= 7.0
+    page.shutdown()
+    page.close()
+
+
+def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
+    _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    baseline = page._truth_log_for_video_scan()
+    page._truth_scan_base = baseline
+    page._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
+    page.truth_log = baseline
+    page._show_truth_log_editor()
+
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 1,
+            "trick_id": 1,
+            "frame_index": 12,
+            "actor": "self",
+            "recognized_cards": ["2S"],
+            "recognized_pass": False,
+        }
+    )
+    editor = page._truth_editor
+    assert editor is not None
+    assert editor.table.rowCount() == 1
+    assert editor.table.item(0, 5).text() == "扫描确认"
+
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 2,
+            "trick_id": 1,
+            "frame_index": 25,
+            "actor": "right",
+            "recognized_cards": [],
+            "recognized_pass": True,
+        }
+    )
+    assert editor.table.rowCount() == 2
+    assert editor.table.item(1, 5).text() == "扫描确认"
+    assert [turn.actor for turn in page.truth_log.turns] == ["self", "right"]
+    assert not (session / "truth_log.json").exists()
     page.shutdown()
     page.close()
 
@@ -319,6 +468,8 @@ def test_frame_inspect_dialog_shows_frame_and_recognizes():
     app.processEvents()
 
     assert dialog.page._source_image is frame
+    assert dialog.windowTitle() == "当前画面标注"
+    assert dialog.save_frame_button.text() == "保存当前画面为截图"
     assert not dialog.page.isWindow(), "embedded page must not be a separate window"
     assert dialog.page.image_preview.pixmap() is not None
     assert dialog.page.recognition_elapsed_ms is not None

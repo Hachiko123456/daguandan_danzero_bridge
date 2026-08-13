@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .application.ports import AdvicePort, CapturePort, RecognitionPort, SessionFactoryPort
+from .advisor_strategy import build_advisor, load_profile_advisor_strategy
 from .config import PROFILES_ROOT
 
 
@@ -28,12 +29,12 @@ def build_live_controller_dependencies(
     profile_name: str = "tencent_daguandan",
     capture: CapturePort | None = None,
     advisor: AdvicePort | None = None,
+    advisor_strategy: str | None = None,
 ) -> LiveControllerDependencies:
     """The single composition root for the live assistant adapters."""
 
     from .annotation_service import AnnotationService
     from .capture_service import CaptureService
-    from .danzero import DanzeroAdvisor
     from .infrastructure.live_session import DefaultLiveSessionFactory
     from .live.session_store import LiveSessionStore
     from .recognition_service import ScreenshotRecognitionService
@@ -47,7 +48,15 @@ def build_live_controller_dependencies(
     annotation = AnnotationService(capture_adapter.profiles_root, profile_name)
     templates = TemplateService(capture_adapter.profiles_root, profile_name)
     recognizer = ScreenshotRecognitionService(annotation, templates)
-    advice_adapter = advisor or DanzeroAdvisor()
+    selected_strategy = advisor_strategy or load_profile_advisor_strategy(
+        capture_adapter.profiles_root,
+        profile_name,
+    )
+    advice_adapter = advisor or build_advisor(
+        selected_strategy,
+        profiles_root=capture_adapter.profiles_root,
+        profile_name=profile_name,
+    )
     factory = DefaultLiveSessionFactory(
         capture_adapter,
         recognizer,

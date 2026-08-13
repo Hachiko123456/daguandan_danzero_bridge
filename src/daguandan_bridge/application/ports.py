@@ -131,6 +131,8 @@ class LiveSessionConstruction:
 
 @runtime_checkable
 class SessionFactoryPort(Protocol):
+    def with_advisor(self, advisor: AdvicePort) -> "SessionFactoryPort": ...
+
     def start_session(
         self,
         *,

@@ -6,6 +6,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.gui.truth_log_editor import (
@@ -83,7 +85,7 @@ def test_card_picker_uses_chinese_labels_and_double_deck_limit():
     assert "5H" not in picker.selected.item(0).text()
 
 
-def test_editor_has_only_four_action_columns_and_reorders_rows(tmp_path):
+def test_editor_keeps_action_columns_first_and_reorders_rows(tmp_path):
     _app()
     editor = TruthLogEditor(tmp_path, _log())
 
@@ -99,35 +101,236 @@ def test_editor_has_only_four_action_columns_and_reorders_rows(tmp_path):
     assert editor.table.item(0, 0).text() == "1"
 
 
+def test_editor_exposes_turn_metadata(tmp_path):
+    _app()
+    log = TruthLog(
+        "game",
+        TruthInitialState("2", "left", HAND),
+        (
+            TruthTurn(1, "left", False, ("3D",), frame_index=12, trick_id=1),
+            TruthTurn(2, "self", False, ("4C",), frame_index=26, trick_id=1),
+        ),
+    )
+    editor = TruthLogEditor(tmp_path, log)
+
+    assert [
+        editor.table.horizontalHeaderItem(index).text() for index in range(7)
+    ] == ["序号", "玩家", "动作", "牌面", "牌墩", "状态", "模型推荐"]
+    assert editor.table.item(1, 4).text() == "1"
+    assert editor.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == 26
+    assert editor.table.item(0, 6) is None
+    assert editor.table.item(1, 6) is not None
+
+
+def test_append_confirmed_turn_stays_unsaved_and_marks_scan_status(tmp_path):
+    _app()
+    editor = TruthLogEditor(tmp_path, _log())
+
+    row = editor.append_confirmed_turn(
+        TruthTurn(1, "self", False, ("2S",), frame_index=18, trick_id=1)
+    )
+
+    assert row == 0
+    assert editor.table.item(0, 5).text() == "扫描确认"
+    assert not (tmp_path / "truth_log.json").exists()
+
+
 def test_insert_row_before_selection_and_renumbers(tmp_path):
     _app()
     editor = TruthLogEditor(tmp_path, _log())
-    editor._append_row(TruthTurn(1, "right", False, ("2S",)))
+    editor._append_row(TruthTurn(1, "self", False, ("2S",)))
     editor._append_row(TruthTurn(2, "opposite", True, ()))
 
     editor.table.selectRow(1)
     editor.insert_row()
-    editor.table.selectRow(1)
-    editor.table.cellWidget(1, 1).setCurrentIndex(
-        editor.table.cellWidget(1, 1).findData("self")
-    )
     editor.table.cellWidget(1, 2).setCurrentIndex(1)
 
     assert editor.table.rowCount() == 3
     assert [editor.table.item(r, 0).text() for r in range(3)] == ["1", "2", "3"]
+    assert editor.table.item(1, 5).text() == "待编辑"
+    assert editor.table.cellWidget(1, 1).currentData() == "right"
     assert editor._cards_from_row(1) == ()
     assert editor.table.cellWidget(1, 2).currentIndex() == 1
 
     log = editor._build_log()
     assert log.turns[0].cards == ("2S",)
     assert log.turns[1].index == 2
-    assert log.turns[1].actor == "self"
+    assert log.turns[1].actor == "right"
     assert log.turns[1].is_pass is True
     assert log.turns[2].actor == "opposite"
     assert log.turns[2].is_pass is True
 
 
-def test_editor_appends_recognized_plays_from_frame(tmp_path):
+def test_editor_table_stretches_and_empty_play_prompts_for_cards(tmp_path):
+    _app()
+    editor = TruthLogEditor(tmp_path, _log())
+
+    editor.add_row()
+
+    table_index = editor.layout().indexOf(editor.table)
+    placeholder = editor.table.cellWidget(0, 3).layout().itemAt(0).widget()
+    assert editor.layout().stretch(table_index) == 1
+    assert editor.table.item(0, 5).text() == "待编辑"
+    assert placeholder.text() == "等待画面识别…"
+    editor.table.cellWidget(0, 2).setCurrentIndex(1)
+    assert editor.table.cellWidget(0, 3).layout().itemAt(0).widget().text() == "不出"
+
+
+def test_log_card_picker_control_is_removed_but_hand_picker_remains(tmp_path):
+    _app()
+    editor = TruthLogEditor(tmp_path, _log())
+
+    assert not hasattr(editor, "cards_button")
+    assert not hasattr(editor, "choose_cards")
+    picker = CardPickerDialog(editor._hand)
+    assert picker.cards() == editor._hand
+
+
+def test_resize_table_preserves_scroll_position_and_widget_lookup(tmp_path):
+    app = _app()
+    editor = TruthLogEditor(tmp_path, _log())
+    editor.table.setFixedHeight(120)
+    for index in range(24):
+        actor = ("self", "right", "opposite", "left")[index % 4]
+        editor._append_row(TruthTurn(index + 1, actor, True, ()))
+    editor.show()
+    app.processEvents()
+    bar = editor.table.verticalScrollBar()
+    assert bar.maximum() > 0
+    bar.setValue(0)
+
+    editor._resize_table()
+
+    assert bar.value() == 0
+    target = editor.table.cellWidget(0, 2)
+    assert editor._row_for_widget(target) == 0
+
+
+def test_log_combo_wheel_does_not_change_selected_values(tmp_path):
+    _app()
+    editor = TruthLogEditor(tmp_path, _log())
+    editor.add_row()
+    player = editor.table.cellWidget(0, 1)
+    action = editor.table.cellWidget(0, 2)
+    editor.lead_combo.setCurrentIndex(editor.lead_combo.findData("self"))
+    editor.round_level_combo.setCurrentIndex(editor.round_level_combo.findData("2"))
+    player.setCurrentIndex(player.findData("self"))
+    action.setCurrentIndex(0)
+    event = QWheelEvent(
+        QPointF(4, 4),
+        QPointF(4, 4),
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+
+    for combo in (editor.lead_combo, editor.round_level_combo, player, action):
+        combo.wheelEvent(event)
+
+    assert editor.lead_combo.currentData() == "self"
+    assert editor.round_level_combo.currentData() == "2"
+    assert player.currentData() == "self"
+    assert action.currentIndex() == 0
+
+
+def test_selected_row_recognition_atomically_replaces_only_that_row(tmp_path):
+    app = _app()
+    log = TruthLog(
+        "game",
+        TruthInitialState("2", "self", HAND),
+        (
+            TruthTurn(1, "self", False, ("3S",), frame_index=1),
+            TruthTurn(2, "right", True, (), frame_index=2),
+            TruthTurn(3, "opposite", False, ("4H",), frame_index=3),
+        ),
+    )
+    region = PlayRegionResult(
+        player="right",
+        cards=("5?", "5H"),
+        is_pass=False,
+        confidence=0.87,
+        diagnostics=(),
+        annotations=(),
+        source="template:right-play",
+    )
+    editor = TruthLogEditor(
+        tmp_path,
+        log,
+        frame_provider=lambda: (44, np.zeros((32, 64, 3), np.uint8)),
+        recognition_service=_FakeRecognition(_fake_result(), region_result=region),
+    )
+    editor.table.setFixedHeight(80)
+    editor.show()
+    app.processEvents()
+    editor.table.selectRow(1)
+    bar = editor.table.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    scroll_before = bar.value()
+
+    editor._recognize_frame()
+
+    assert editor.table.rowCount() == 3
+    assert editor.table.cellWidget(0, 1).currentData() == "self"
+    assert editor._cards_from_row(0) == ("3S",)
+    assert editor.table.cellWidget(1, 1).currentData() == "right"
+    assert editor.table.cellWidget(1, 2).currentIndex() == 0
+    assert editor._cards_from_row(1) == ("5?", "5H")
+    assert editor.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == 44
+    assert editor.table.cellWidget(2, 1).currentData() == "opposite"
+    assert editor._cards_from_row(2) == ("4H",)
+    assert bar.value() == scroll_before
+    assert "原子回填" in editor.recognition_hint.text()
+
+    built = editor._build_log()
+    replaced = built.turns[1]
+    assert replaced.evidence.frame_indices == (44,)
+    assert replaced.evidence.roi_name == "right_play"
+    assert replaced.provenance.source == "template:right-play"
+    assert replaced.provenance.confidence == 0.87
+    assert replaced.uncertainty == ("unknown_suit",)
+
+
+def test_cleared_selection_appends_even_when_current_row_remains(tmp_path):
+    _app()
+    editor = TruthLogEditor(
+        tmp_path,
+        TruthLog(
+            "game",
+            TruthInitialState("2", "self", HAND),
+            (TruthTurn(1, "self", True, (), frame_index=1),),
+        ),
+        frame_provider=lambda: (9, np.zeros((32, 64, 3), np.uint8)),
+        recognition_service=_FakeRecognition(
+            _fake_result(),
+            region_result=PlayRegionResult(
+                player="right",
+                cards=(),
+                is_pass=True,
+                confidence=0.91,
+                diagnostics=(),
+                annotations=(),
+                source="template:right-pass",
+            ),
+        ),
+    )
+    editor.table.selectRow(0)
+    editor.table.clearSelection()
+    assert editor.table.currentRow() == 0
+    assert editor._selected_rows() == []
+
+    editor._recognize_frame()
+
+    assert editor.table.rowCount() == 2
+    assert editor.table.cellWidget(0, 1).currentData() == "self"
+    assert editor.table.cellWidget(1, 1).currentData() == "right"
+    assert editor.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == 9
+    assert "已追加 1 条" in editor.recognition_hint.text()
+
+
+def test_editor_rejects_multiple_recognized_plays_from_frame(tmp_path):
     _app()
     result = _fake_result(
         lead_player="left",
@@ -145,13 +348,14 @@ def test_editor_appends_recognized_plays_from_frame(tmp_path):
 
     editor._recognize_frame()
 
-    assert editor.table.rowCount() == 2
-    assert editor.lead_combo.currentData() == "left"
-    assert "2" in editor.recognition_hint.text()
-    assert editor._last_recognized_frame == 7
+    assert editor.table.rowCount() == 0
+    assert editor.lead_combo.currentData() == "self"
+    assert "2 个候选" in editor.recognition_hint.text()
+    assert "未写入" in editor.recognition_hint.text()
+    assert editor._last_recognized_frame is None
 
     editor._recognize_frame()
-    assert editor.table.rowCount() == 2
+    assert editor.table.rowCount() == 0
 
 
 def test_editor_recognize_hand_updates_hand(tmp_path):
@@ -173,7 +377,7 @@ def test_editor_recognize_hand_updates_hand(tmp_path):
 
     editor._frame_provider = lambda: (None, None)
     editor._recognize_hand()
-    assert "播放或单帧" in editor.recognition_hint.text()
+    assert "播放或点『下一帧』" in editor.recognition_hint.text()
 
 
 def test_editor_recognize_requires_frame(tmp_path):
@@ -206,12 +410,12 @@ def test_editor_cards_column_uses_badges_and_round_trips(tmp_path):
     assert editor._cards_from_row(0) == ()
 
 
-def test_recognize_frame_skips_persisting_previous_plays(tmp_path):
+def test_recognize_frame_rejects_persisting_multiple_plays(tmp_path):
     _app()
-    right_play = RecognizedEvent("right", ("4H", "4H"), False, 0.95, "test")
-    opposite_play = RecognizedEvent("opposite", ("5S", "5S", "5S"), False, 0.9, "test")
-    frame_one = _fake_result(events=(right_play,))
-    frame_two = _fake_result(events=(right_play, opposite_play))
+    self_play = RecognizedEvent("self", ("4H", "4H"), False, 0.95, "test")
+    right_play = RecognizedEvent("right", ("5S", "5S", "5S"), False, 0.9, "test")
+    frame_one = _fake_result(events=(self_play,))
+    frame_two = _fake_result(events=(self_play, right_play))
     editor = TruthLogEditor(
         tmp_path,
         _log(),
@@ -226,12 +430,13 @@ def test_recognize_frame_skips_persisting_previous_plays(tmp_path):
     editor._recognition_service = _FakeRecognition(frame_two)
     editor._recognize_frame()
 
-    assert editor.table.rowCount() == 2
-    assert editor._cards_from_row(1) == ("5S", "5S", "5S")
-    assert "忽略 1" in editor.recognition_hint.text()
+    assert editor.table.rowCount() == 1
+    assert editor._cards_from_row(0) == ("4H", "4H")
+    assert "2 个候选" in editor.recognition_hint.text()
+    assert "未写入" in editor.recognition_hint.text()
 
 
-def test_recognize_frame_keeps_new_pass_and_drops_stale_ones(tmp_path):
+def test_recognize_frame_rejects_new_and_stale_pass_candidates_together(tmp_path):
     _app()
     # 用户场景：左家出完（rows=[left]）-> 轮到自己，点识别追加"自己不出"；
     # 换帧后再点（expected=右家），画面残留的"自己不出"被丢弃，
@@ -263,9 +468,9 @@ def test_recognize_frame_keeps_new_pass_and_drops_stale_ones(tmp_path):
     )
     editor._recognize_frame()
 
-    assert editor.table.rowCount() == 3
-    assert editor._cards_from_row(2) == ()
-    assert "忽略 1" in editor.recognition_hint.text()
+    assert editor.table.rowCount() == 2
+    assert "2 个候选" in editor.recognition_hint.text()
+    assert "未写入" in editor.recognition_hint.text()
 
 
 def test_recognize_frame_drops_stale_pass_of_non_expected_player(tmp_path):
@@ -284,7 +489,64 @@ def test_recognize_frame_drops_stale_pass_of_non_expected_player(tmp_path):
     editor._recognize_frame()
 
     assert editor.table.rowCount() == 2
-    assert "忽略" in editor.recognition_hint.text()
+    assert "上下文冲突" in editor.recognition_hint.text()
+    assert "未写入" in editor.recognition_hint.text()
+
+
+@pytest.mark.parametrize("case", ["failure", "empty", "multiple", "conflict"])
+def test_recognition_non_committable_results_leave_all_editor_state_untouched(
+    tmp_path,
+    case,
+):
+    _app()
+
+    class FailingRecognition:
+        def recognize_play_region(self, *args, **kwargs):
+            raise RuntimeError("matcher failed")
+
+    result = _fake_result(events=())
+    recognition = _FakeRecognition(result)
+    if case == "failure":
+        recognition = FailingRecognition()
+    elif case == "multiple":
+        recognition = _FakeRecognition(
+            _fake_result(
+                lead_player="left",
+                events=(
+                    RecognizedEvent("right", (), True, 0.9, "one"),
+                    RecognizedEvent("opposite", ("5S",), False, 0.8, "two"),
+                ),
+            )
+        )
+    elif case == "conflict":
+        recognition = _FakeRecognition(
+            _fake_result(
+                lead_player="left",
+                events=(RecognizedEvent("left", (), True, 0.9, "stale"),),
+            )
+        )
+
+    editor = TruthLogEditor(
+        tmp_path,
+        TruthLog(
+            "game",
+            TruthInitialState("2", "self", HAND),
+            (TruthTurn(1, "self", True, (), frame_index=3),),
+        ),
+        frame_provider=lambda: (12, np.zeros((32, 64, 3), np.uint8)),
+        recognition_service=recognition,
+    )
+    before = editor._build_log().to_dict()
+    lead_before = editor.lead_combo.currentData()
+    scroll_before = editor._table_scroll_position()
+
+    editor._recognize_frame()
+
+    assert editor._build_log().to_dict() == before
+    assert editor.lead_combo.currentData() == lead_before
+    assert editor._table_scroll_position() == scroll_before
+    assert editor._last_recognized_frame is None
+    assert "未写入" in editor.recognition_hint.text()
 
 
 def test_recognize_frame_targets_only_next_player_region(tmp_path):
@@ -335,6 +597,59 @@ def test_expected_next_player_follows_turn_order(tmp_path):
     editor = TruthLogEditor(tmp_path, _log())
 
     assert editor._expected_next_player() == "self"
+
+
+def test_add_row_infers_player_from_tail_and_skips_finished_player(tmp_path):
+    _app()
+    editor = TruthLogEditor(tmp_path, _log())
+
+    editor.add_row()
+    assert editor.table.cellWidget(0, 1).currentData() == "self"
+    editor.table.cellWidget(0, 2).setCurrentIndex(1)
+    editor._append_row(TruthTurn(2, "right", False, ("3S",) * 27))
+    editor._append_row(TruthTurn(3, "opposite", True, ()))
+    editor._append_row(TruthTurn(4, "left", True, ()))
+
+    editor.add_row()
+
+    assert editor.table.cellWidget(4, 1).currentData() == "self"
+
+
+def test_insert_row_uses_only_prior_history_and_warns_on_conflict(tmp_path):
+    _app()
+    editor = TruthLogEditor(tmp_path, _log())
+    editor._append_row(TruthTurn(1, "self", True, ()))
+    editor._append_row(TruthTurn(2, "opposite", True, ()))
+    editor._append_row(TruthTurn(3, "left", True, ()))
+    editor._append_row(TruthTurn(4, "self", True, ()))
+    editor._append_row(TruthTurn(5, "right", False, ("3S",) * 27))
+
+    editor.table.selectRow(1)
+    editor.insert_row()
+
+    inserted_player = editor.table.cellWidget(1, 1)
+    assert inserted_player.currentData() == "right"
+    assert not bool(inserted_player.property("sequenceConflict"))
+    assert editor.table.item(1, 5).text() == "待编辑"
+
+    conflict_editor = TruthLogEditor(tmp_path, _log())
+    conflict_editor._append_row(TruthTurn(1, "self", True, ()))
+    conflict_editor._append_row(TruthTurn(2, "right", True, ()))
+    conflict_editor.table.selectRow(1)
+    conflict_editor.insert_row()
+
+    conflict_player = conflict_editor.table.cellWidget(1, 1)
+    assert bool(conflict_player.property("sequenceConflict"))
+    assert "冲突" in conflict_editor.table.item(1, 5).text()
+    assert "冲突" in conflict_editor.save_status.text()
+    with pytest.raises(ValueError, match="冲突"):
+        conflict_editor._build_log()
+
+    conflict_player.setCurrentIndex(conflict_player.findData("opposite"))
+    conflict_editor.table.cellWidget(1, 2).setCurrentIndex(1)
+    assert not bool(conflict_player.property("sequenceConflict"))
+    assert "人工确认" in conflict_editor.table.item(1, 5).text()
+    conflict_editor._build_log()
     for seat in ("self", "right", "opposite", "left"):
         editor._append_row(TruthTurn(editor.table.rowCount() + 1, seat, False, ()))
     assert editor._expected_next_player() == "self"
@@ -409,7 +724,7 @@ def test_end_status_marks_game_over_when_a_team_finishes(tmp_path):
 def test_unknown_suit_card_round_trips(tmp_path):
     _app()
     region_result = PlayRegionResult(
-        player="left",
+        player="right",
         cards=("5?", "7H"),
         is_pass=False,
         confidence=0.8,
@@ -433,11 +748,20 @@ def test_unknown_suit_card_round_trips(tmp_path):
     assert editor._cards_from_row(1) == ("5?", "7H")
     log = editor._build_log()
     assert log.turns[1].cards == ("5?", "7H")
+    assert log.turns[1].evidence.frame_indices == (1,)
+    assert log.turns[1].evidence.roi_name == "right_play"
+    assert log.turns[1].provenance.source == "region"
+    assert log.turns[1].provenance.confidence == 0.8
+    assert log.turns[1].uncertainty == ("unknown_suit",)
+    assert log.turns[1].label_status == "draft"
     editor._save()
     from daguandan_bridge.live.truth_log import load_truth_log
 
     loaded = load_truth_log(tmp_path / "truth_log.json", session_id="game")
     assert loaded.turns[1].cards == ("5?", "7H")
+    assert loaded.turns[1].evidence.roi_name == "right_play"
+    assert loaded.turns[1].provenance.confidence == 0.8
+    assert loaded.turns[1].uncertainty == ("unknown_suit",)
 
 
 def test_card_text_code_round_trips_unknown_suit():

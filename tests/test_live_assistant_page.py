@@ -604,14 +604,26 @@ def test_review_bar_disables_candidate_that_failed_rule_validation():
     page.close()
 
 
-def test_main_window_registers_live_page_in_fluent_navigation():
+def test_main_window_registers_live_page_in_fluent_navigation(monkeypatch):
     app = _app()
+    registrations = []
+    add_sub_interface = DaguandanBridgeWindow.addSubInterface
+
+    def record_sub_interface(window, interface, icon, text, *args, **kwargs):
+        registrations.append((interface, icon, text))
+        return add_sub_interface(window, interface, icon, text, *args, **kwargs)
+
+    monkeypatch.setattr(
+        DaguandanBridgeWindow, "addSubInterface", record_sub_interface
+    )
     window = DaguandanBridgeWindow(live_runtime=FakeRuntime())
 
     assert isinstance(window, FluentWindow)
     assert not hasattr(window, "capture_page")
     assert window.annotation_page.objectName() == "annotationPage"
     assert window.live_assistant_page.objectName() == "liveAssistantPage"
+    assert not hasattr(window, "model_evaluation_page")
+    assert all(text != "模型整局评测" for _interface, _icon, text in registrations)
 
     window.close()
     app.processEvents()

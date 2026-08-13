@@ -354,7 +354,15 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
 
 
 def load_truth_log(path: Path, *, session_id: str | None = None) -> TruthLog:
-    log = truth_log_from_dict(load_json_document(path, {}))
+    raw = load_json_document(path, {})
+    if (
+        session_id
+        and isinstance(raw, dict)
+        and not str(raw.get("source_session_id") or "").strip()
+        and not str(raw.get("session_id") or "").strip()
+    ):
+        raw = {**raw, "source_session_id": session_id}
+    log = truth_log_from_dict(raw)
     if session_id is not None and log.source_session_id != session_id:
         raise ValueError("标准日志不属于当前选择的对局")
     return log

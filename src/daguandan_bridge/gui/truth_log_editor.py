@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -24,24 +25,34 @@ from PySide6.QtWidgets import (
 )
 
 from ..annotation_service import AnnotationService
+from ..application.model_evaluation import EvaluationRunResult, ModelEvaluationService
+from ..application.timeline_truth_migration import TimelineTruthMigrationService
 from ..danzero.state import RANKS, SEATS, SUITS
 from ..live.truth_log import (
     TruthInitialState,
     TruthLog,
     TruthTurn,
     card_code_to_text,
+    load_truth_log,
     save_truth_log,
 )
-from ..domain.truth import LabelProvenance
+from ..domain.truth import LabelProvenance, TruthEvidence
 from ..live.turns import TURN_ORDER
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
 from .single_image_danzero_page import CardBadge
+from .model_evaluation_page import ModelEvaluationPanel
 
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _RANK_LABELS = {rank: rank for rank in RANKS}
 _SUIT_LABELS = {"S": "黑桃", "H": "红桃", "C": "梅花", "D": "方块"}
 _STARTING_CARDS = 27
+_PLAY_ROI_NAMES = {
+    "self": "my_play",
+    "right": "right_play",
+    "opposite": "opposite_play",
+    "left": "left_play",
+}
 
 _SUIT_ORDER = {"S": 0, "H": 1, "C": 2, "D": 3}
 # 逆序展示时同点数按 黑桃 > 红桃 > 梅花 > 方块。
@@ -53,6 +64,16 @@ _RANK_STRENGTH = {
     "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9,
     "9": 10, "10": 11, "J": 12, "Q": 13, "K": 14, "A": 15,
 }
+
+
+@dataclass(frozen=True)
+class _FrameRecognitionCandidate:
+    actor: str
+    is_pass: bool
+    cards: tuple[str, ...]
+    confidence: float
+    source: str
+    roi_name: str
 
 
 def _sort_hand_cards(
@@ -136,8 +157,16 @@ class CardPickerDialog(QDialog):
         return tuple(self._cards)
 
 
+class ScrollSafeComboBox(QComboBox):
+    """Let the surrounding log view consume wheel gestures safely."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
 class TruthLogEditor(QWidget):
     log_saved = Signal(object)
+    draft_changed = Signal()
 
     def __init__(
         self,
@@ -148,6 +177,8 @@ class TruthLogEditor(QWidget):
         frame_provider: Callable[[], tuple[int | None, np.ndarray | None]]
         | None = None,
         recognition_service: ScreenshotRecognitionService | None = None,
+        evaluation_service: ModelEvaluationService | None = None,
+        repair_service: TimelineTruthMigrationService | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = Path(session)
@@ -175,7 +206,7 @@ class TruthLogEditor(QWidget):
             self.clear_button = None
         lead_row = QHBoxLayout()
         lead_row.addWidget(QLabel("首出玩家"))
-        self.lead_combo = QComboBox()
+        self.lead_combo = ScrollSafeComboBox()
         for seat in SEATS:
             self.lead_combo.addItem(_SEAT_LABELS[seat], userData=seat)
         self.lead_combo.setCurrentIndex(max(0, self.lead_combo.findData(truth_log.initial_state.lead_player)))
@@ -184,7 +215,7 @@ class TruthLogEditor(QWidget):
         layout.addLayout(lead_row)
         info_row = QHBoxLayout()
         info_row.addWidget(QLabel("当前级牌"))
-        self.round_level_combo = QComboBox()
+        self.round_level_combo = ScrollSafeComboBox()
         for rank in RANKS:
             self.round_level_combo.addItem(rank, rank)
         self.round_level_combo.setCurrentIndex(
@@ -219,8 +250,10 @@ class TruthLogEditor(QWidget):
         self._render_hand_badges()
         self.edit_hand_button.clicked.connect(self._edit_hand)
         self.recognize_hand_button.clicked.connect(self._recognize_hand)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(("序号", "玩家", "动作", "牌面"))
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ("序号", "玩家", "动作", "牌面", "牌墩", "状态", "模型推荐")
+        )
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table, 1)
@@ -228,16 +261,16 @@ class TruthLogEditor(QWidget):
         self.add_button = QPushButton("新增一行")
         self.insert_button = QPushButton("插入行")
         self.remove_button = QPushButton("删除选中行")
-        self.cards_button = QPushButton("选择牌面")
-        self.recognize_frame_button = QPushButton("识别本帧")
+        self.recognize_frame_button = QPushButton("识别当前画面")
         controls.addWidget(self.add_button)
         controls.addWidget(self.insert_button)
         controls.addWidget(self.remove_button)
-        controls.addWidget(self.cards_button)
         controls.addWidget(self.recognize_frame_button)
         controls.addStretch(1)
         layout.addLayout(controls)
-        self.recognition_hint = QLabel("识别本帧：把回放停到目标画面后点此按钮")
+        self.recognition_hint = QLabel(
+            "识别当前画面：选中一行可回填该行；清除选择后至多追加一行"
+        )
         self.recognition_hint.setWordWrap(True)
         layout.addWidget(self.recognition_hint)
         buttons = QHBoxLayout()
@@ -254,11 +287,31 @@ class TruthLogEditor(QWidget):
         self.add_button.clicked.connect(self.add_row)
         self.insert_button.clicked.connect(self.insert_row)
         self.remove_button.clicked.connect(self.remove_row)
-        self.cards_button.clicked.connect(self.choose_cards)
         self.recognize_frame_button.clicked.connect(self._recognize_frame)
         self.save_button.clicked.connect(self._save)
         self.table.cellChanged.connect(self._cell_changed)
         self._render()
+        self.evaluation_panel = ModelEvaluationPanel(
+            self.session,
+            service=evaluation_service,
+            repair_service=repair_service,
+            parent=self,
+        )
+        self.evaluation_panel.result_ready.connect(self._show_evaluation_result)
+        self.evaluation_panel.result_invalidated.connect(self._clear_recommendations)
+        self.evaluation_panel.truth_repaired.connect(self._reload_repaired_truth)
+        layout.addWidget(
+            self.evaluation_panel,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
+        layout.setStretchFactor(self.table, 1)
+        if not self._matches_saved_truth():
+            self.evaluation_panel.invalidate_input()
+        self.lead_combo.currentIndexChanged.connect(self._draft_mutated)
+        self.round_level_combo.currentIndexChanged.connect(
+            self._round_level_changed
+        )
 
     def _render_hand_badges(self) -> None:
         while self.hand_cards_layout.count():
@@ -286,6 +339,11 @@ class TruthLogEditor(QWidget):
     def _set_hand(self, cards: tuple[str, ...]) -> None:
         self._hand = tuple(cards)
         self._render_hand_badges()
+        self._draft_mutated()
+
+    def _round_level_changed(self, *_args) -> None:
+        self._render_hand_badges()
+        self._draft_mutated()
 
     def _edit_hand(self) -> None:
         dialog = CardPickerDialog(self._hand, self)
@@ -299,7 +357,7 @@ class TruthLogEditor(QWidget):
         _frame_index, image = self._frame_provider()
         if image is None:
             self.recognition_hint.setText(
-                "识别手牌：请先在回放页播放或单帧到开局画面"
+                "识别手牌：请先在回放页播放或点『下一帧』到开局画面"
             )
             return
         try:
@@ -322,23 +380,36 @@ class TruthLogEditor(QWidget):
             self.clear_button.setEnabled(False)
         if self.resume_banner is not None:
             self.resume_banner.setText("已清空出牌记录，正在从头开始识别")
+        self._draft_mutated()
 
     def _render(self) -> None:
         self.table.blockSignals(True)
         self.table.setRowCount(0)
         for turn in self.truth_log.turns:
-            self._append_row(turn)
+            self._append_row(turn, editable=True, notify=False)
         self.table.blockSignals(False)
         self._resize_table()
 
+    def _matches_saved_truth(self) -> bool:
+        try:
+            saved = load_truth_log(
+                self.session / "truth_log.json",
+                session_id=self.session.name,
+            )
+        except Exception:
+            return False
+        return saved.to_dict() == self.truth_log.to_dict()
+
     @staticmethod
-    def _card_strip_widget(cards: tuple[str, ...]) -> QWidget:
+    def _card_strip_widget(
+        cards: tuple[str, ...], *, is_pass: bool = False
+    ) -> QWidget:
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
         if not cards:
-            label = QLabel("不出")
+            label = QLabel("不出" if is_pass else "等待画面识别…")
             layout.addWidget(label)
         else:
             for card in cards:
@@ -349,7 +420,6 @@ class TruthLogEditor(QWidget):
     def _resize_table(self) -> None:
         self.table.resizeRowsToContents()
         self.table.resizeColumnToContents(3)
-        self.table.scrollToBottom()
         self._update_end_status()
 
     def _update_end_status(self) -> None:
@@ -370,31 +440,113 @@ class TruthLogEditor(QWidget):
         row: int | None = None,
         *,
         editable: bool = False,
+        status: str | None = None,
+        notify: bool = True,
     ) -> None:
         if row is None:
             row = self.table.rowCount()
         self.table.insertRow(row)
+        self._populate_row(
+            row,
+            turn,
+            editable=editable,
+            status=status,
+        )
+        self._renumber_rows()
+        if notify:
+            self._draft_mutated()
+
+    def _populate_row(
+        self,
+        row: int,
+        turn: TruthTurn,
+        *,
+        editable: bool,
+        status: str | None = None,
+    ) -> None:
         number_item = QTableWidgetItem(str(row + 1))
         if turn.frame_index is not None:
             number_item.setData(Qt.ItemDataRole.UserRole, turn.frame_index)
         number_item.setData(int(Qt.ItemDataRole.UserRole) + 1, turn)
+        number_item.setFlags(
+            number_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+        )
         self.table.setItem(row, 0, number_item)
-        player = QComboBox()
+        player = ScrollSafeComboBox()
         for seat in SEATS:
             player.addItem(_SEAT_LABELS[seat], userData=seat)
         player.setCurrentIndex(max(0, player.findData(turn.actor)))
         if not editable:
             player.setEnabled(False)
+        player.currentIndexChanged.connect(
+            lambda _index, combo=player: self._player_changed(
+                self._row_for_widget(combo)
+            )
+        )
+        player.activated.connect(
+            lambda _index, combo=player: self._player_changed(
+                self._row_for_widget(combo)
+            )
+        )
         self.table.setCellWidget(row, 1, player)
-        action = QComboBox()
+        action = ScrollSafeComboBox()
         action.addItems(("出牌", "不出"))
         action.setCurrentIndex(1 if turn.is_pass else 0)
         if not editable:
             action.setEnabled(False)
-        action.currentIndexChanged.connect(lambda _index, r=row: self._action_changed(r))
+        action.currentIndexChanged.connect(
+            lambda _index, combo=action: self._action_changed(
+                self._row_for_widget(combo)
+            )
+        )
         self.table.setCellWidget(row, 2, action)
-        self.table.setCellWidget(row, 3, self._card_strip_widget(turn.cards))
-        self._renumber_rows()
+        self.table.setCellWidget(
+            row,
+            3,
+            self._card_strip_widget(turn.cards, is_pass=turn.is_pass),
+        )
+        metadata = (
+            QTableWidgetItem(str(turn.trick_id or "—")),
+            QTableWidgetItem(status or str(turn.label_status)),
+        )
+        for column, item in enumerate(metadata, 4):
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, column, item)
+        if turn.actor == "self":
+            recommendation = QTableWidgetItem("")
+            recommendation.setFlags(
+                recommendation.flags() & ~Qt.ItemFlag.ItemIsEditable
+            )
+            self.table.setItem(row, 6, recommendation)
+        else:
+            self.table.takeItem(row, 6)
+
+    def _replace_row(
+        self,
+        row: int,
+        turn: TruthTurn,
+        *,
+        status: str,
+    ) -> None:
+        self.table.blockSignals(True)
+        try:
+            self._populate_row(row, turn, editable=True, status=status)
+        finally:
+            self.table.blockSignals(False)
+        self._draft_mutated()
+
+    def append_confirmed_turn(
+        self,
+        turn: TruthTurn,
+        *,
+        status: str = "扫描确认",
+    ) -> int:
+        """Append one scan-confirmed action to the unsaved in-memory draft."""
+
+        row = self.table.rowCount()
+        self._append_row(turn, editable=True, status=status)
+        self._resize_table()
+        return row
 
     def _renumber_rows(self) -> None:
         for index in range(self.table.rowCount()):
@@ -403,26 +555,57 @@ class TruthLogEditor(QWidget):
                 item.setText(str(index + 1))
 
     def add_row(self) -> None:
+        scroll = self._table_scroll_position()
+        row = self.table.rowCount()
+        actor = self._expected_player_at(row) or "self"
         self._append_row(
-            TruthTurn(self.table.rowCount() + 1, "self", False, ()),
+            TruthTurn(row + 1, actor, False, ()),
             editable=True,
+            status="待编辑",
         )
-        self.table.selectRow(self.table.rowCount() - 1)
         self._resize_table()
+        self._restore_table_scroll(scroll)
 
     def insert_row(self) -> None:
         """在当前选中行之前插入一行；未选中则追加到末尾。"""
-        row = self.table.currentRow()
+        selected_rows = self._selected_rows()
+        row = selected_rows[0] if len(selected_rows) == 1 else -1
         if row < 0:
             self.add_row()
             return
+        scroll = self._table_scroll_position()
+        before = self._expected_player_at(row)
+        after_actor = self._player_at(row)
+        after = (
+            self._previous_active_player(
+                after_actor,
+                self._out_players_before(row),
+            )
+            if after_actor is not None
+            else None
+        )
+        actor = before or after or "self"
+        conflict = bool(before and after and before != after)
+        status = "待确认：前后玩家候选冲突" if conflict else "待编辑"
         self._append_row(
-            TruthTurn(self.table.rowCount() + 1, "self", False, ()),
+            TruthTurn(self.table.rowCount() + 1, actor, False, ()),
             row=row,
             editable=True,
+            status=status,
         )
-        self.table.selectRow(row)
+        player = self.table.cellWidget(row, 1)
+        if player is not None:
+            player.setProperty("sequenceConflict", conflict)
         self._resize_table()
+        self.table.selectRow(row)
+        self._restore_table_scroll(scroll)
+        if conflict:
+            self.save_status.setText(
+                "插入位置前后玩家候选冲突："
+                f"前序推断为{_SEAT_LABELS[str(before)]}，"
+                f"后序反推为{_SEAT_LABELS[str(after)]}；"
+                "请人工选择玩家确认后再保存"
+            )
 
     def remove_row(self) -> None:
         row = self.table.currentRow()
@@ -430,28 +613,69 @@ class TruthLogEditor(QWidget):
             self.table.removeRow(row)
             self._renumber_rows()
             self._resize_table()
+            if self.table.rowCount():
+                self.table.selectRow(min(row, self.table.rowCount() - 1))
+            self._draft_mutated()
+
+    def _selected_rows(self) -> list[int]:
+        selection = self.table.selectionModel()
+        if selection is None:
+            return []
+        return sorted(index.row() for index in selection.selectedRows())
+
+    def _table_scroll_position(self) -> tuple[int, int]:
+        return (
+            self.table.horizontalScrollBar().value(),
+            self.table.verticalScrollBar().value(),
+        )
+
+    def _restore_table_scroll(self, position: tuple[int, int]) -> None:
+        horizontal, vertical = position
+        self.table.horizontalScrollBar().setValue(horizontal)
+        self.table.verticalScrollBar().setValue(vertical)
 
     def _action_changed(self, row: int) -> None:
+        if row < 0:
+            return
         combo = self.table.cellWidget(row, 2)
-        if combo is not None and combo.currentIndex() == 1:
-            self.table.setCellWidget(row, 3, self._card_strip_widget(()))
+        if combo is not None:
+            if combo.currentIndex() == 1:
+                self.table.setCellWidget(
+                    row, 3, self._card_strip_widget((), is_pass=True)
+                )
+            elif not self._cards_from_row(row):
+                self.table.setCellWidget(row, 3, self._card_strip_widget(()))
             self._resize_table()
+        self._draft_mutated()
+
+    def _player_changed(self, row: int) -> None:
+        if row < 0:
+            return
+        player = self.table.cellWidget(row, 1)
+        if player is not None and bool(player.property("sequenceConflict")):
+            player.setProperty("sequenceConflict", False)
+            status = self.table.item(row, 5)
+            if status is not None:
+                status.setText("待编辑（已人工确认玩家）")
+            self.save_status.setText("玩家顺序冲突已人工确认；出牌日志仍未保存")
+        self._clear_recommendations()
+        self._draft_mutated()
+
+    def _row_for_widget(self, widget: QWidget) -> int:
+        for row in range(self.table.rowCount()):
+            if any(
+                self.table.cellWidget(row, column) is widget
+                for column in (1, 2)
+            ):
+                return row
+        viewport_position = widget.mapTo(
+            self.table.viewport(),
+            widget.rect().center(),
+        )
+        return self.table.indexAt(viewport_position).row()
 
     def _cell_changed(self, _row: int, _column: int) -> None:
         return
-
-    def choose_cards(self) -> None:
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        action = self.table.cellWidget(row, 2)
-        if action is not None and action.currentIndex() == 1:
-            return
-        current = self._cards_from_row(row)
-        dialog = CardPickerDialog(current, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.table.setCellWidget(row, 3, self._card_strip_widget(dialog.cards()))
-            self._resize_table()
 
     def _cards_from_row(self, row: int) -> tuple[str, ...]:
         widget = self.table.cellWidget(row, 3)
@@ -470,6 +694,11 @@ class TruthLogEditor(QWidget):
         for row in range(self.table.rowCount()):
             player = self.table.cellWidget(row, 1)
             action = self.table.cellWidget(row, 2)
+            if player is not None and bool(player.property("sequenceConflict")):
+                raise ValueError(
+                    f"第 {row + 1} 条动作的前后玩家候选冲突，"
+                    "请人工确认玩家后再保存"
+                )
             actor = player.currentData()
             is_pass = action.currentIndex() == 1
             cards = () if is_pass else self._cards_from_row(row)
@@ -537,13 +766,9 @@ class TruthLogEditor(QWidget):
             )
         return self._recognition_service
 
-    def _out_players(self) -> set[str]:
-        """已出完（手牌打光）的玩家：累计出牌数达到起始手牌数。
-
-        自己按编辑器里的初始手牌数计算，其他玩家按掼蛋初始 27 张计算。
-        """
+    def _played_card_counts_before(self, stop_row: int) -> dict[str, int]:
         played: dict[str, int] = {}
-        for row in range(self.table.rowCount()):
+        for row in range(max(0, min(stop_row, self.table.rowCount()))):
             player = self.table.cellWidget(row, 1)
             action = self.table.cellWidget(row, 2)
             if player is None or action is None or action.currentIndex() == 1:
@@ -552,6 +777,9 @@ class TruthLogEditor(QWidget):
             played[player_name] = played.get(player_name, 0) + len(
                 self._cards_from_row(row)
             )
+        return played
+
+    def _finished_players(self, played: dict[str, int]) -> set[str]:
         out: set[str] = set()
         for player in TURN_ORDER:
             start = len(self._hand) if player == "self" else _STARTING_CARDS
@@ -559,19 +787,29 @@ class TruthLogEditor(QWidget):
                 out.add(player)
         return out
 
-    def _expected_next_player(self) -> str | None:
-        if self.table.rowCount() == 0:
-            lead = self.lead_combo.currentData()
-            return str(lead) if lead else None
-        player = self.table.cellWidget(self.table.rowCount() - 1, 1)
+    def _out_players_before(self, stop_row: int) -> set[str]:
+        return self._finished_players(self._played_card_counts_before(stop_row))
+
+    def _out_players(self) -> set[str]:
+        """已出完（手牌打光）的玩家：累计出牌数达到起始手牌数。
+
+        自己按编辑器里的初始手牌数计算，其他玩家按掼蛋初始 27 张计算。
+        """
+        return self._out_players_before(self.table.rowCount())
+
+    def _player_at(self, row: int) -> str | None:
+        if not 0 <= row < self.table.rowCount():
+            return None
+        player = self.table.cellWidget(row, 1)
         if player is None:
             return None
         actor = str(player.currentData())
+        return actor if actor in TURN_ORDER else None
+
+    @staticmethod
+    def _next_active_player(actor: str, out: set[str]) -> str | None:
         if actor not in TURN_ORDER:
             return None
-        # 出完的玩家不再参与，轮转时跳过（如右家出完后：
-        # 自己 -> 对家 -> 左家 -> 自己）。
-        out = self._out_players()
         index = TURN_ORDER.index(actor)
         for offset in range(1, len(TURN_ORDER) + 1):
             seat = TURN_ORDER[(index + offset) % len(TURN_ORDER)]
@@ -579,20 +817,172 @@ class TruthLogEditor(QWidget):
                 return seat
         return None
 
+    @staticmethod
+    def _previous_active_player(actor: str, out: set[str]) -> str | None:
+        if actor not in TURN_ORDER:
+            return None
+        index = TURN_ORDER.index(actor)
+        for offset in range(1, len(TURN_ORDER) + 1):
+            seat = TURN_ORDER[(index - offset) % len(TURN_ORDER)]
+            if seat not in out:
+                return seat
+        return None
+
+    def _expected_player_at(self, row: int) -> str | None:
+        row = max(0, min(row, self.table.rowCount()))
+        if row == 0:
+            lead = self.lead_combo.currentData()
+            return str(lead) if lead in TURN_ORDER else None
+        actor = self._player_at(row - 1)
+        if actor is None:
+            return None
+        return self._next_active_player(actor, self._out_players_before(row))
+
+    def _expected_next_player(self) -> str | None:
+        return self._expected_player_at(self.table.rowCount())
+
+    def _recognition_candidate(
+        self,
+        image: np.ndarray,
+        expected: str,
+    ) -> tuple[_FrameRecognitionCandidate | None, str]:
+        recognition = self._recognition()
+        region_result = recognition.recognize_play_region(
+            image,
+            expected,
+            wild_rank=str(self.round_level_combo.currentData()),
+            allow_unknown_suit=True,
+        )
+        if region_result is not None and (
+            region_result.cards or region_result.is_pass
+        ):
+            return (
+                _FrameRecognitionCandidate(
+                    actor=str(region_result.player),
+                    is_pass=bool(region_result.is_pass),
+                    cards=tuple(region_result.cards),
+                    confidence=float(region_result.confidence),
+                    source=str(region_result.source),
+                    roi_name=_PLAY_ROI_NAMES.get(str(region_result.player), ""),
+                ),
+                f"仅识别{_SEAT_LABELS.get(str(region_result.player), str(region_result.player))}区域",
+            )
+
+        try:
+            result = recognition.recognize(image, allow_unknown_suit=True)
+        except TypeError as exc:
+            if "allow_unknown_suit" not in str(exc):
+                raise
+            result = recognition.recognize(image)
+        if not result.events:
+            return None, "当前画面没有识别到出牌动作"
+        if len(result.events) != 1:
+            raise ValueError(
+                f"当前画面识别到 {len(result.events)} 个候选动作，无法安全写入"
+            )
+        event = result.events[0]
+        return (
+            _FrameRecognitionCandidate(
+                actor=str(event.player),
+                is_pass=bool(event.is_pass),
+                cards=tuple(event.cards),
+                confidence=float(event.confidence),
+                source=str(event.source),
+                roi_name=_PLAY_ROI_NAMES.get(str(event.player), ""),
+            ),
+            "整幅画面识别",
+        )
+
+    def _validate_recognition_context(
+        self,
+        candidate: _FrameRecognitionCandidate,
+        *,
+        target_row: int,
+        replacing: bool,
+    ) -> None:
+        expected = self._expected_player_at(target_row)
+        if expected is None:
+            raise ValueError("无法从当前位置前的有效记录推断玩家")
+        if candidate.actor not in TURN_ORDER:
+            raise ValueError("识别结果包含无效玩家")
+        if candidate.actor != expected:
+            raise ValueError(
+                "识别玩家与当前位置上下文冲突："
+                f"应为{_SEAT_LABELS[expected]}，识别为{_SEAT_LABELS[candidate.actor]}"
+            )
+        if candidate.is_pass and candidate.cards:
+            raise ValueError("识别结果同时包含不出和牌面")
+        if not candidate.is_pass and not candidate.cards:
+            raise ValueError("识别结果没有可写入的动作")
+        if not 0.0 <= candidate.confidence <= 1.0:
+            raise ValueError("识别置信度无效")
+        for card in candidate.cards:
+            card_code_to_text(card)
+
+        if not replacing or target_row + 1 >= self.table.rowCount():
+            return
+        played = self._played_card_counts_before(target_row)
+        if not candidate.is_pass:
+            played[candidate.actor] = played.get(candidate.actor, 0) + len(
+                candidate.cards
+            )
+        expected_after = self._next_active_player(
+            candidate.actor,
+            self._finished_players(played),
+        )
+        actual_after = self._player_at(target_row + 1)
+        if expected_after != actual_after:
+            expected_label = _SEAT_LABELS.get(str(expected_after), "无")
+            actual_label = _SEAT_LABELS.get(str(actual_after), "无")
+            raise ValueError(
+                "识别结果与下一行上下文冲突："
+                f"识别后应轮到{expected_label}，下一行为{actual_label}"
+            )
+
     def _recognize_frame(self) -> None:
         if self._frame_provider is None:
             self.recognition_hint.setText(
-                "识别本帧：当前编辑器未接入回放画面，请手动填写"
+                "识别当前画面：当前编辑器未接入回放画面"
             )
             return
         frame_index, image = self._frame_provider()
         if image is None:
             self.recognition_hint.setText(
-                "识别本帧：请先在回放页播放或单帧到目标画面"
+                "识别当前画面：请先在回放页播放或点『下一帧』到目标画面"
             )
             return
-        same_frame: set[tuple[str, bool, tuple[str, ...]]] = set()
-        if frame_index is not None:
+        selected_rows = self._selected_rows()
+        if len(selected_rows) > 1:
+            self.recognition_hint.setText(
+                "识别当前画面：选中了多行，无法确定唯一回填目标；未写入"
+            )
+            return
+        replacing = len(selected_rows) == 1
+        target_row = selected_rows[0] if replacing else self.table.rowCount()
+        expected = self._expected_player_at(target_row)
+        if expected is None:
+            self.recognition_hint.setText(
+                "识别当前画面：无法从当前位置前的有效记录推断玩家；未写入"
+            )
+            return
+        try:
+            candidate, source_note = self._recognition_candidate(image, expected)
+            if candidate is None:
+                self.recognition_hint.setText(
+                    f"识别当前画面：{source_note}；未写入"
+                )
+                return
+            self._validate_recognition_context(
+                candidate,
+                target_row=target_row,
+                replacing=replacing,
+            )
+        except Exception as exc:
+            self.recognition_hint.setText(f"识别当前画面失败：{exc}；未写入")
+            return
+
+        signature = (candidate.actor, candidate.is_pass, candidate.cards)
+        if not replacing and frame_index is not None:
             for row in range(self.table.rowCount()):
                 item = self.table.item(row, 0)
                 if item is None or item.data(Qt.ItemDataRole.UserRole) != frame_index:
@@ -601,107 +991,58 @@ class TruthLogEditor(QWidget):
                 action = self.table.cellWidget(row, 2)
                 if player is None or action is None:
                     continue
-                same_frame.add(
-                    (
-                        str(player.currentData()),
-                        action.currentIndex() == 1,
-                        self._cards_from_row(row),
-                    )
+                existing = (
+                    str(player.currentData()),
+                    action.currentIndex() == 1,
+                    self._cards_from_row(row),
                 )
-        pending: list[tuple[str, bool, tuple[str, ...]]] = []
-        source_note = ""
-        filtered_passes = 0
-        try:
-            recognition = self._recognition()
-            expected = self._expected_next_player()
-            if expected is not None:
-                try:
-                    region_result = recognition.recognize_play_region(
-                        image,
-                        expected,
-                        wild_rank=self.truth_log.initial_state.round_level,
-                        allow_unknown_suit=True,
+                if existing == signature:
+                    self.recognition_hint.setText(
+                        "识别当前画面：该动作已由当前画面记录；未重复写入"
                     )
-                except Exception:
-                    region_result = None
-                if region_result is not None and (region_result.cards or region_result.is_pass):
-                    pending.append(
-                        (region_result.player, region_result.is_pass, region_result.cards)
-                    )
-                    source_note = f"（仅识别{_SEAT_LABELS[region_result.player]}区域）"
-            if not pending:
-                result = recognition.recognize(image)
-                if result.lead_player in SEATS:
-                    index = self.lead_combo.findData(result.lead_player)
-                    if index >= 0:
-                        self.lead_combo.setCurrentIndex(index)
-                for event in result.events:
-                    # "不出"标记会残留在画面上，只有轮到预期玩家时才算新动作；
-                    # 其他玩家的不出是旧一轮的残留，直接丢弃。
-                    if expected is not None and event.is_pass and event.player != expected:
-                        filtered_passes += 1
-                        continue
-                    pending.append((event.player, event.is_pass, event.cards))
-        except Exception as exc:
-            self.recognition_hint.setText(f"识别本帧失败：{exc}")
-            return
-        self._last_recognized_frame = frame_index
-        last_rows: dict[str, int] = {}
-        for row in range(self.table.rowCount()):
-            player = self.table.cellWidget(row, 1)
-            if player is not None:
-                last_rows[str(player.currentData())] = row
-        added = 0
-        skipped = 0
-        for player, is_pass, cards in pending:
-            signature = (player, is_pass, tuple(cards))
-            if signature in same_frame:
-                skipped += 1
-                continue
-            last_row = last_rows.get(player)
-            if (
-                not is_pass
-                and last_row is not None
-            ):
-                action = self.table.cellWidget(last_row, 2)
-                existing_pass = action is not None and action.currentIndex() == 1
-                if existing_pass == is_pass and self._cards_from_row(last_row) == tuple(
-                    cards
-                ):
-                    skipped += 1
-                    continue
-            self._append_row(
-                TruthTurn(
-                    self.table.rowCount() + 1,
-                    player,
-                    is_pass,
-                    cards,
-                    frame_index=frame_index,
-                )
+                    return
+
+        original = (
+            self.table.item(target_row, 0).data(
+                int(Qt.ItemDataRole.UserRole) + 1
             )
-            same_frame.add(signature)
-            last_rows[player] = self.table.rowCount() - 1
-            added += 1
-        if added:
-            self._resize_table()
+            if replacing and self.table.item(target_row, 0) is not None
+            else None
+        )
+        trick_id = original.trick_id if isinstance(original, TruthTurn) else None
+        turn = TruthTurn(
+            target_row + 1,
+            candidate.actor,
+            candidate.is_pass,
+            candidate.cards,
+            frame_index=frame_index,
+            trick_id=trick_id,
+            evidence=TruthEvidence(
+                frame_indices=(frame_index,) if frame_index is not None else (),
+                roi_name=candidate.roi_name,
+            ),
+            label_status="draft",
+            provenance=LabelProvenance(
+                source=candidate.source or "frame_recognition",
+                confidence=candidate.confidence,
+            ),
+        )
+        scroll = self._table_scroll_position()
+        if replacing:
+            self._replace_row(target_row, turn, status="画面识别回填")
+        else:
+            self._append_row(turn, editable=True, status="画面识别追加")
+        self._resize_table()
+        self._restore_table_scroll(scroll)
+        self._last_recognized_frame = frame_index
+        if replacing:
             self.recognition_hint.setText(
-                f"识别本帧：已追加 {added} 条出牌记录"
-                + (
-                    f"，忽略 {skipped + filtered_passes} 条已记录或残留的旧出牌"
-                    if skipped + filtered_passes
-                    else ""
-                )
-                + source_note
-                + "，可手动修改"
+                f"识别当前画面：已原子回填第 {target_row + 1} 行"
+                f"（{source_note}），行数和相邻行未改变"
             )
         else:
             self.recognition_hint.setText(
-                "识别本帧：没有新的出牌记录"
-                + (
-                    f"（忽略 {skipped + filtered_passes} 条已记录或残留的旧出牌）"
-                    if skipped + filtered_passes
-                    else ""
-                )
+                f"识别当前画面：已追加 1 条出牌记录（{source_note}）"
             )
 
     def _save(self) -> None:
@@ -711,5 +1052,84 @@ class TruthLogEditor(QWidget):
             self.truth_log = log
             self.save_status.setText(f"已保存 {len(log.turns)} 条，可继续编辑")
             self.log_saved.emit(log)
+            self.evaluation_panel.saved_input_updated()
         except Exception as exc:
+            self.save_status.setText(f"保存失败：{exc}")
             QLabel(str(exc), self).show()
+
+    def _draft_mutated(self, *_args) -> None:
+        panel = getattr(self, "evaluation_panel", None)
+        if panel is not None:
+            panel.invalidate_input()
+        self.draft_changed.emit()
+
+    def _clear_recommendations(self) -> None:
+        for row in range(self.table.rowCount()):
+            player = self.table.cellWidget(row, 1)
+            is_self = player is not None and player.currentData() == "self"
+            item = self.table.item(row, 6)
+            if is_self and item is None:
+                item = QTableWidgetItem("")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row, 6, item)
+            elif is_self:
+                item.setText("")
+            elif item is not None:
+                self.table.takeItem(row, 6)
+
+    def _show_evaluation_result(self, result: EvaluationRunResult) -> None:
+        self._clear_recommendations()
+        for decision in result.decisions:
+            turn_id = decision.get("turn_id")
+            if not isinstance(turn_id, int):
+                continue
+            row = turn_id - 1
+            if not 0 <= row < self.table.rowCount():
+                continue
+            player = self.table.cellWidget(row, 1)
+            if player is None or player.currentData() != "self":
+                continue
+            predicted = decision.get("predicted_action")
+            text = _recommendation_text(predicted)
+            if decision.get("status") != "evaluated":
+                text = f"错误：{decision.get('error_code') or 'unknown'}"
+            item = self.table.item(row, 6)
+            if item is None:
+                item = QTableWidgetItem("")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row, 6, item)
+            item.setText(text)
+
+    def _reload_repaired_truth(self, _result: object) -> None:
+        try:
+            repaired = load_truth_log(
+                self.session / "truth_log.json",
+                session_id=self.session.name,
+            )
+        except Exception as exc:
+            self.save_status.setText(f"修复后重新载入失败：{exc}")
+            return
+        self.truth_log = repaired
+        self.lead_combo.setCurrentIndex(
+            max(0, self.lead_combo.findData(repaired.initial_state.lead_player))
+        )
+        self.round_level_combo.setCurrentIndex(
+            max(0, self.round_level_combo.findData(repaired.initial_state.round_level))
+        )
+        self._hand = tuple(repaired.initial_state.my_hand)
+        self._render_hand_badges()
+        self._render()
+        self.evaluation_panel.saved_input_updated()
+        self.save_status.setText("旧日志已安全修复并重新载入；原文件已备份")
+
+    def shutdown(self) -> None:
+        self.evaluation_panel.shutdown()
+
+
+def _recommendation_text(value: object) -> str:
+    if not isinstance(value, dict):
+        return "—"
+    if value.get("is_pass"):
+        return "不出"
+    cards = value.get("cards", ())
+    return " ".join(str(card) for card in cards)

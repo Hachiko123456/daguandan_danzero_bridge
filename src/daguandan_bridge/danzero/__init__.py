@@ -14,6 +14,20 @@ class DanzeroAdvisor:
         """Load the DanZero model so the first advice call stays responsive."""
         self._advisor.initialize()
 
+    def audit_info(self) -> dict[str, object]:
+        """Return immutable checkpoint identity without exposing model internals."""
+
+        checkpoint = self._advisor._danzero_checkpoint_path()
+        import hashlib
+
+        return {
+            "backend": "danzero",
+            "status": "loaded" if self._advisor._agent is not None else "available",
+            "path": str(checkpoint),
+            "digest": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            "schema": "danzero-adapter/v1",
+        }
+
     def recommend(
         self,
         state: GuanDanState,

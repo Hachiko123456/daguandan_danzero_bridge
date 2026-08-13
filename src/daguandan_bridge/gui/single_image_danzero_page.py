@@ -35,6 +35,7 @@ from qfluentwidgets import (
     TableWidget,
 )
 
+from ..advisor_strategy import ADVISOR_OPTIONS, normalize_advisor_strategy
 from ..danzero.state import GameStateError, GuanDanState, RANKS, SEATS
 from ..image_io import read_image_unicode
 from ..live.truth_log import card_code_to_text
@@ -174,9 +175,17 @@ class SingleImageDanzeroPage(QDialog):
     test_requested = Signal(object)
     state_built = Signal(object)
     recognize_requested = Signal()
+    advisor_strategy_changed = Signal(str)
 
-    def __init__(self, image_path: Path | None = None, parent=None):
+    def __init__(
+        self,
+        image_path: Path | None = None,
+        parent=None,
+        *,
+        advisor_strategy: str = "danzero",
+    ):
         super().__init__(parent)
+        self.advisor_strategy = normalize_advisor_strategy(advisor_strategy)
         self.image_path = Path(image_path) if image_path is not None else None
         self._events: list[tuple[str, str, tuple[str, ...]]] = []
         self._source_image: np.ndarray | None = None
@@ -308,10 +317,17 @@ class SingleImageDanzeroPage(QDialog):
         self.wild_rank_combo = self._rank_combo()
         self.current_player_combo = self._seat_combo()
         self.lead_player_combo = self._seat_combo()
+        self.advisor_strategy_combo = ScrollSafeComboBox()
+        for value, label in ADVISOR_OPTIONS:
+            self.advisor_strategy_combo.addItem(label, value)
+        advisor_index = self.advisor_strategy_combo.findData(self.advisor_strategy)
+        if advisor_index >= 0:
+            self.advisor_strategy_combo.setCurrentIndex(advisor_index)
         context_form.addRow("当前级牌", self.round_level_combo)
         context_form.addRow("百搭牌级别", self.wild_rank_combo)
         context_form.addRow("当前行动者", self.current_player_combo)
         context_form.addRow("本轮首出者", self.lead_player_combo)
+        context_form.addRow("建议模型", self.advisor_strategy_combo)
         parameter_layout.addLayout(context_form)
         self.incomplete_status = CopyableLabel()
         self.incomplete_status.setWordWrap(True)
@@ -329,7 +345,9 @@ class SingleImageDanzeroPage(QDialog):
         event_layout.setContentsMargins(18, 16, 18, 16)
         event_layout.setSpacing(8)
         event_layout.addWidget(StrongBodyLabel("本轮出牌事件"))
-        event_layout.addWidget(CaptionLabel("可补充或删除事件；出牌使用与手牌相同的代码格式。"))
+        event_layout.addWidget(CaptionLabel(
+            "可补充或删除事件；FableDan 必须从第一手开始填写完整标准出牌/不出历史。"
+        ))
         event_form = QGridLayout()
         self.event_player_combo = self._seat_combo()
         self.event_action_combo = ScrollSafeComboBox()
@@ -410,6 +428,9 @@ class SingleImageDanzeroPage(QDialog):
         self.test_button.clicked.connect(self._request_test)
         self.close_button.clicked.connect(self.close)
         self.recognize_button.clicked.connect(self.recognize_requested)
+        self.advisor_strategy_combo.currentIndexChanged.connect(
+            self._advisor_strategy_selected
+        )
         for combo in (
             self.round_level_combo,
             self.wild_rank_combo,
@@ -422,6 +443,12 @@ class SingleImageDanzeroPage(QDialog):
                 lambda *_args: self._update_completion_status()
             )
         self.my_hand_edit.textChanged.connect(self._update_completion_status)
+
+    def _advisor_strategy_selected(self, _index: int = -1) -> None:
+        self.advisor_strategy = normalize_advisor_strategy(
+            self.advisor_strategy_combo.currentData()
+        )
+        self.advisor_strategy_changed.emit(self.advisor_strategy)
 
     def set_image_path(self, image_path: Path | None) -> None:
         self.image_path = Path(image_path) if image_path is not None else None

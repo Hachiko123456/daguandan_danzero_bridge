@@ -30,6 +30,7 @@ from qfluentwidgets import (
     qconfig,
 )
 
+from ..advisor_strategy import ADVISOR_OPTIONS
 from ..danzero.state import RANKS
 from ..live.display_text import (
     event_action_text,
@@ -170,6 +171,16 @@ class LiveAssistantPage(ScrollArea):
         self.recognition_strategy_combo.setToolTip(
             "实时与“状态机管线”复测使用同一策略；可用同一录像横向比较。"
         )
+        self.advisor_strategy_combo = ComboBox()
+        for value, label in ADVISOR_OPTIONS:
+            self.advisor_strategy_combo.addItem(label, userData=value)
+        selected_advisor = str(getattr(self.runtime, "advisor_strategy", "danzero"))
+        selected_index = self.advisor_strategy_combo.findData(selected_advisor)
+        if selected_index >= 0:
+            self.advisor_strategy_combo.setCurrentIndex(selected_index)
+        self.advisor_strategy_combo.setToolTip(
+            "只影响下一局；实时对局开始后锁定，结束后可重新选择。"
+        )
         # Internal normalized codes remain here for the state machine; the
         # user edits the visible card strip through the existing picker.
         self.hand_edit = LineEdit(self)
@@ -195,6 +206,7 @@ class LiveAssistantPage(ScrollArea):
         form.addRow("当前级牌", self.round_level_combo)
         form.addRow("首发候选（实时会再次验证）", self.lead_player_combo)
         form.addRow("动作识别策略", self.recognition_strategy_combo)
+        form.addRow("建议模型（下一局）", self.advisor_strategy_combo)
         form.addRow("初始手牌（点击牌面可修改）", self.initial_hand_scroll)
         initial_layout.addLayout(form)
         initial_actions = QHBoxLayout()
@@ -303,6 +315,9 @@ class LiveAssistantPage(ScrollArea):
         self.recognition_strategy_combo.currentIndexChanged.connect(
             self._update_recognition_strategy
         )
+        self.advisor_strategy_combo.currentIndexChanged.connect(
+            self._update_advisor_strategy
+        )
         self._update_recognition_strategy()
         self._set_live_controls(False)
 
@@ -345,6 +360,7 @@ class LiveAssistantPage(ScrollArea):
             )
 
     def _start_listening(self) -> None:
+        self._update_advisor_strategy()
         setter = getattr(self.runtime, "set_recognition_strategy", None)
         if callable(setter):
             setter(str(self.recognition_strategy_combo.currentData()))
@@ -364,6 +380,17 @@ class LiveAssistantPage(ScrollArea):
         setter = getattr(self.runtime, "set_recognition_strategy", None)
         if callable(setter):
             setter(str(self.recognition_strategy_combo.currentData()))
+
+    def _update_advisor_strategy(self, *_args) -> None:
+        if self._session_active:
+            return
+        setter = getattr(self.runtime, "set_advisor_strategy", None)
+        if not callable(setter):
+            return
+        try:
+            setter(str(self.advisor_strategy_combo.currentData()))
+        except Exception as exc:
+            self.show_error(str(exc))
 
     def apply_initial_recognition(self, result: object, snapshot: object | None) -> None:
         level = getattr(result, "round_level", None)
@@ -399,6 +426,7 @@ class LiveAssistantPage(ScrollArea):
         self.round_level_combo.setEnabled(enabled)
         self.lead_player_combo.setEnabled(enabled)
         self.recognition_strategy_combo.setEnabled(enabled)
+        self.advisor_strategy_combo.setEnabled(enabled)
 
     def _render_initial_hand_cards(self, cards: tuple[str, ...]) -> None:
         while self.initial_hand_cards_layout.count():

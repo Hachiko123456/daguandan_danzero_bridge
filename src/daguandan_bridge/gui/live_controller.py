@@ -11,6 +11,12 @@ from ..application.ports import (
     RecognitionPort,
     SessionFactoryPort,
 )
+from ..advisor_strategy import (
+    build_advisor,
+    load_profile_advisor_strategy,
+    normalize_advisor_strategy,
+    save_profile_advisor_strategy,
+)
 from ..capture_service import FrameSnapshot
 from ..danzero.state import GuanDanState, RANKS
 from ..live.orchestrator import LiveOrchestrator, LiveUpdate
@@ -66,6 +72,14 @@ class LiveAssistantController(QObject):
         # per-hand cache before every recommendation, so it is safe to reuse
         # while avoiding a 10+ second model load on every new game.
         self.danzero_advisor = advisor
+        self.advisor_strategy = (
+            "fabledan"
+            if type(advisor).__name__ == "FableDanAdvisor"
+            else load_profile_advisor_strategy(
+                self.capture_service.profiles_root,
+                self.profile_name,
+            )
+        )
         self.session_factory = session_factory
         self.orchestrator: LiveOrchestrator | None = None
         self._live_source = None
@@ -120,6 +134,40 @@ class LiveAssistantController(QObject):
         """Use the selected live recognition strategy for future auto sessions."""
 
         self._recognition_strategy = str(strategy)
+
+    def set_advisor_strategy(self, strategy: str) -> None:
+        """Select the advisor for the next session and persist the profile default."""
+
+        normalized = normalize_advisor_strategy(strategy)
+        if self.orchestrator is not None:
+            raise RuntimeError("实时对局开始后建议模型已锁定")
+        if normalized == self.advisor_strategy:
+            save_profile_advisor_strategy(
+                self.capture_service.profiles_root,
+                self.profile_name,
+                normalized,
+            )
+            return
+        advisor = build_advisor(
+            normalized,
+            profiles_root=self.capture_service.profiles_root,
+            profile_name=self.profile_name,
+        )
+        rebind = getattr(self.session_factory, "with_advisor", None)
+        if not callable(rebind):
+            raise RuntimeError("当前会话工厂不支持切换建议模型")
+        session_factory = rebind(advisor)
+        save_profile_advisor_strategy(
+            self.capture_service.profiles_root,
+            self.profile_name,
+            normalized,
+        )
+        self.advisor_strategy = normalized
+        self.danzero_advisor = advisor
+        self.session_factory = session_factory
+        self._danzero_warmup_complete = False
+        if not self._danzero_warmup_running:
+            self._start_danzero_warmup()
 
     def start_listening(self) -> None:
         """Continuously inspect the current page and start only on a stable deal."""
@@ -283,12 +331,14 @@ class LiveAssistantController(QObject):
         if not callable(initializer):
             return
         self._danzero_warmup_running = True
-        self.danzero_warmup_status.emit("DanZero 模型预热中")
+        advisor = self.danzero_advisor
+        label = "FableDan" if self.advisor_strategy == "fabledan" else "DanZero"
+        self.danzero_warmup_status.emit(f"{label} 模型预热中")
 
-        def operation() -> float:
+        def operation() -> tuple[object, float]:
             started = perf_counter()
             initializer()
-            return (perf_counter() - started) * 1_000
+            return advisor, (perf_counter() - started) * 1_000
 
         thread = OneShotThread(operation, self)
         thread.result.connect(self._danzero_warmup_succeeded)
@@ -297,15 +347,23 @@ class LiveAssistantController(QObject):
         self._danzero_warmup_thread = thread
         thread.start()
 
-    def _danzero_warmup_succeeded(self, elapsed_ms: float) -> None:
+    def _danzero_warmup_succeeded(self, value: object) -> None:
+        if isinstance(value, tuple):
+            advisor, elapsed_ms = value
+            if advisor is not self.danzero_advisor:
+                return
+        else:
+            elapsed_ms = value
         self._danzero_warmup_complete = True
+        label = "FableDan" if self.advisor_strategy == "fabledan" else "DanZero"
         self.danzero_warmup_status.emit(
-            f"DanZero 模型已就绪（首次预热 {float(elapsed_ms):.0f} ms）"
+            f"{label} 模型已就绪（首次预热 {float(elapsed_ms):.0f} ms）"
         )
 
     def _danzero_warmup_failed(self, message: str) -> None:
+        label = "FableDan" if self.advisor_strategy == "fabledan" else "DanZero"
         self.danzero_warmup_status.emit(
-            f"DanZero 模型预热失败，首次建议时将自动重试：{message}"
+            f"{label} 模型预热失败，首次建议时将自动重试：{message}"
         )
 
     def _danzero_warmup_finished(self) -> None:

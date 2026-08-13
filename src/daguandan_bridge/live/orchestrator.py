@@ -1453,6 +1453,21 @@ class LiveOrchestrator:
             for event in job.state.play_history
             for card in event.cards
         )
+        if has_unknown_suit and bool(
+            getattr(self.advisor, "requires_exact_history_suits", False)
+        ):
+            engine_input = self._fallback_engine_input(job)
+            audit_info = getattr(self.advisor, "audit_info", None)
+            if callable(audit_info):
+                engine_input.update(audit_info())
+            return _AdviceCompletion(
+                job.key,
+                error="FableDan 不接受未知花色历史；请先完成可审计的花色确认",
+                engine_input=engine_input,
+                suit_uncertain=True,
+                variant_count=0,
+                advice_agrees_across_variants=False,
+            )
         if not variants:
             return _AdviceCompletion(
                 job.key,

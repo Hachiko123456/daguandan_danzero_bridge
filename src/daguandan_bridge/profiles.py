@@ -155,6 +155,7 @@ class ProfileConfig:
     viewport_aspect_ratio: float = 16 / 9
     match_settings: MatchSettings = field(default_factory=MatchSettings)
     counter_settings: CounterSettings = field(default_factory=CounterSettings)
+    advisor_strategy: str = "danzero"
 
     def normalized(self) -> "ProfileConfig":
         base_size = (int(self.base_size[0]), int(self.base_size[1]))
@@ -188,6 +189,9 @@ class ProfileConfig:
         )
         if not keywords:
             raise ProfileConfigError("window_title_keywords 至少需要一个窗口标题关键字")
+        advisor_strategy = str(self.advisor_strategy).strip().lower()
+        if advisor_strategy not in {"danzero", "fabledan"}:
+            raise ProfileConfigError("advisor_strategy 只能是 danzero 或 fabledan")
 
         return ProfileConfig(
             name=normalize_profile_name(self.name),
@@ -204,6 +208,7 @@ class ProfileConfig:
             viewport_aspect_ratio=viewport_aspect_ratio,
             match_settings=self.match_settings.normalized(),
             counter_settings=self.counter_settings.normalized(),
+            advisor_strategy=advisor_strategy,
         )
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -223,6 +228,7 @@ class ProfileConfig:
             "viewport_aspect_ratio": normalized.viewport_aspect_ratio,
             "match_settings": normalized.match_settings.to_json_dict(),
             "counter_settings": normalized.counter_settings.to_json_dict(),
+            "advisor_strategy": normalized.advisor_strategy,
         }
 
 
@@ -356,6 +362,7 @@ def load_profile_config(paths: ProfilePaths) -> ProfileConfig:
                     str(item) for item in counter_raw.get("count_region_roles", ("play",))
                 ),
             ),
+            advisor_strategy=str(data.get("advisor_strategy", "danzero")),
         ).normalized()
     except (KeyError, TypeError, ValueError, IndexError) as exc:
         raise ProfileConfigError("profile.json 字段无效") from exc

@@ -1,0 +1,13 @@
+Vendored from FableDan commit 7cc5e311b9860bc44f76c082d9c1b21fc8b2d3ec.
+
+Included runtime files:
+- fabledan/__init__.py
+- fabledan/cards.py
+- fabledan/combos.py
+- fabledan/encode.py
+- fabledan/agents.py
+- fabledan/model_np.py
+
+The upstream engine, ring runner, torch/training/evaluation code, and Botzone
+integration are intentionally excluded. The vendored runtime remains subject to
+FABLEDAN_LICENSE in this directory.

@@ -1311,6 +1311,7 @@ def test_annotation_page_can_step_a_recorded_session_without_saving_a_screenshot
     assert page.session_frame_spin.minimumWidth() >= 156
     assert page.session_playback_toolbar.play_button is page.session_play_button
     assert page.session_playback_toolbar.frame_spin is page.session_frame_spin
+    assert page.session_step_button.text() == "下一帧"
 
     page.close()
     app.processEvents()

@@ -49,7 +49,11 @@ from ..annotation_service import (
     RegionRecord,
     display_region_name,
 )
-from ..danzero import DanzeroAdvisor
+from ..advisor_strategy import (
+    build_advisor,
+    load_profile_advisor_strategy,
+    save_profile_advisor_strategy,
+)
 from ..danzero.advisor import format_engine_input_summary
 from ..image_io import read_image_unicode
 from ..live.replay import FrameIndexRecord, VideoReplaySource
@@ -333,7 +337,15 @@ class AnnotationPage(QWidget):
         self.current_roi: Box | None = None
         self.region_config_page: RegionConfigPage | None = None
         self.single_image_danzero_page: SingleImageDanzeroPage | None = None
-        self.danzero_advisor = DanzeroAdvisor()
+        self.advisor_strategy = load_profile_advisor_strategy(
+            self.service.profiles_root,
+            self.service.profile_name,
+        )
+        self.danzero_advisor = build_advisor(
+            self.advisor_strategy,
+            profiles_root=self.service.profiles_root,
+            profile_name=self.service.profile_name,
+        )
         self._crop_thread: QThread | None = None
         self._recognition_thread: QThread | None = None
         self._danzero_warmup_thread: QThread | None = None
@@ -1502,8 +1514,12 @@ class AnnotationPage(QWidget):
             self.single_image_danzero_page = SingleImageDanzeroPage(
                 self.current_image_path,
                 self,
+                advisor_strategy=self.advisor_strategy,
             )
             self.single_image_danzero_page.test_requested.connect(self._run_danzero_test)
+            self.single_image_danzero_page.advisor_strategy_changed.connect(
+                self._single_image_advisor_changed
+            )
             self.single_image_danzero_page.recognize_requested.connect(
                 self._start_template_recognition
             )
@@ -1520,6 +1536,24 @@ class AnnotationPage(QWidget):
         self.single_image_danzero_page.activateWindow()
         self._start_danzero_warmup()
         self._start_template_recognition()
+
+    def _single_image_advisor_changed(self, strategy: str) -> None:
+        try:
+            self.advisor_strategy = save_profile_advisor_strategy(
+                self.service.profiles_root,
+                self.service.profile_name,
+                strategy,
+            )
+            self.danzero_advisor = build_advisor(
+                self.advisor_strategy,
+                profiles_root=self.service.profiles_root,
+                profile_name=self.service.profile_name,
+            )
+            self._danzero_warmup_elapsed_ms = None
+            self._start_danzero_warmup()
+        except Exception as exc:
+            if self.single_image_danzero_page is not None:
+                self.single_image_danzero_page.show_test_error(str(exc))
 
     def _start_danzero_warmup(self) -> None:
         if self._danzero_warmup_thread is not None and self._danzero_warmup_thread.isRunning():

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import pytest
 from copy import deepcopy
+import json
+
+import pytest
 
 from daguandan_bridge.domain.truth import LabelProvenance, TruthEvidence
 
@@ -70,6 +72,47 @@ def test_truth_log_rejects_cards_on_pass_and_wrong_session(tmp_path):
     raw["turns"][1]["cards"] = ["红桃5"]  # type: ignore[index]
     with pytest.raises(ValueError, match="不出动作"):
         truth_log_from_dict(raw)
+
+
+@pytest.mark.parametrize("schema_version", (1, 2, 3))
+def test_context_session_id_loads_legacy_log_without_rewriting_file(
+    tmp_path, schema_version
+):
+    raw = _log().to_dict()
+    raw.pop("source_session_id")
+    if schema_version < 3:
+        raw.pop("schema")
+        raw["schema_version"] = schema_version
+    path = tmp_path / "truth_log.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    original_bytes = path.read_bytes()
+
+    loaded = load_truth_log(path, session_id="game-test")
+
+    assert loaded.source_session_id == "game-test"
+    assert path.read_bytes() == original_bytes
+
+
+def test_legacy_log_without_source_id_requires_session_context(tmp_path):
+    raw = _log().to_dict()
+    raw.pop("source_session_id")
+    path = tmp_path / "truth_log.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="缺少源对局 ID"):
+        truth_log_from_dict(raw)
+    with pytest.raises(ValueError, match="缺少源对局 ID"):
+        load_truth_log(path)
+
+
+def test_context_session_id_does_not_override_explicit_source_id(tmp_path):
+    raw = _log().to_dict()
+    raw["source_session_id"] = "another-game"
+    path = tmp_path / "truth_log.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="不属于"):
+        load_truth_log(path, session_id="game-test")
 
 
 def test_truth_log_migrates_schema_one_turns():

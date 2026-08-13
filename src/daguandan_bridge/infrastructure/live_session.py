@@ -35,6 +35,14 @@ class DefaultLiveSessionFactory:
         self.advisor = advisor
         self.profile_name = profile_name
 
+    def with_advisor(self, advisor: AdvicePort) -> "DefaultLiveSessionFactory":
+        return DefaultLiveSessionFactory(
+            self.capture,
+            self.recognizer,
+            advisor,
+            profile_name=self.profile_name,
+        )
+
     def start_session(
         self,
         *,
@@ -55,6 +63,14 @@ class DefaultLiveSessionFactory:
                 loaded.paths.templates_config_path,
             )
             manifest["recognition_strategy"] = recognition_strategy
+            audit_info = getattr(self.advisor, "audit_info", None)
+            if callable(audit_info):
+                manifest["advisor"] = audit_info()
+            else:
+                manifest["advisor"] = {
+                    "backend": type(self.advisor).__name__ if self.advisor else "none",
+                    "standard_no_tribute": True,
+                }
             store.start(manifest)
             recorder = SessionRecorder(
                 store.directory,

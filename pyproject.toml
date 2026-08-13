@@ -23,6 +23,7 @@ include = ["daguandan_bridge*"]
 
 [tool.setuptools.package-data]
 "daguandan_bridge.danzero._vendor.guandan_rlcard" = ["baselines/danzero/q_network.ckpt"]
+"daguandan_bridge.fabledan._vendor" = ["FABLEDAN_LICENSE", "FABLEDAN_REVISION"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
