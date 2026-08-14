@@ -148,6 +148,10 @@ def test_fixed_session_panel_initializes_model_only_after_explicit_start(tmp_pat
     assert "coverage 1/1" in panel.metrics_label.text()
     assert (panel._result.report_directory / "decisions.jsonl").is_file()
     assert (panel._result.report_directory / "report.md").is_file()
+    details = panel.details_view.toPlainText()
+    assert "评测产物" in details
+    assert "决策日志：" in details
+    assert str(panel._result.report_directory / "decisions.jsonl") in details
     panel.shutdown()
     panel.close()
 

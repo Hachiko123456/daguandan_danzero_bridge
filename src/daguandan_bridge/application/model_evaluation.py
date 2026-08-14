@@ -692,9 +692,13 @@ def _decision_record(
     advice: AdviceResult | None,
 ) -> dict[str, object]:
     backend = prepared.strategy_audit.get("backend", _BINDINGS[prepared.strategy_id][1])
+    fabledan_decision: dict[str, object] | None = None
     if advice is not None and isinstance(advice.engine_input, dict):
         backend = advice.engine_input.get("backend", backend)
-    return {
+        embedded = advice.engine_input.get("decision_log")
+        if isinstance(embedded, dict):
+            fabledan_decision = _json_safe(embedded)
+    record: dict[str, object] = {
         "decision_id": f"T{turn.index:04d}",
         "turn_id": turn.index,
         "trick_id": turn.trick_id,
@@ -716,6 +720,9 @@ def _decision_record(
         "error_code": error.code if error else None,
         "error_message": error.message if error else None,
     }
+    if fabledan_decision is not None:
+        record["fabledan_decision"] = fabledan_decision
+    return record
 
 
 def _action_dict(is_pass: bool, cards) -> dict[str, object]:

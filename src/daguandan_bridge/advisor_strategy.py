@@ -116,7 +116,7 @@ def build_evaluation_advisor(
     profiles_root: Path | str = PROFILES_ROOT,
     profile_name: str = "tencent_daguandan",
 ):
-    """Build an evaluation-only advisor without reading or writing profile defaults."""
+    """构建不读取也不改写配置默认值的评测专用策略。"""
 
     normalized = normalize_evaluation_strategy(strategy)
     if normalized.startswith("fabledan_"):
@@ -127,7 +127,8 @@ def build_evaluation_advisor(
             profiles_root,
             profile_name,
             runtime_policy=policy,
-            debug=False,
+            debug=True,
+            write_decision_log=False,
         )
     from .danzero import DanzeroAdvisor
 

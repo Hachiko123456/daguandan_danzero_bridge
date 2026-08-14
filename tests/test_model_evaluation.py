@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -147,6 +148,38 @@ def test_teacher_forced_run_binds_each_strategy_and_publishes_metrics(
     }
     assert "teacher-forced" in (result.report_directory / "report.md").read_text("utf-8")
     assert "不是闭环胜率" in (result.report_directory / "report.md").read_text("utf-8")
+
+
+def test_fabledan_evaluation_embeds_decision_debug_in_run_artifact(tmp_path):
+    truth = _truth("game")
+    session = _session(tmp_path, "game", truth)
+    service = ModelEvaluationService(
+        profiles_root=tmp_path / "profiles",
+        profile_name="profile",
+    )
+
+    prepared = service.prepare(session, strategy_id="fabledan_rule")
+    result = service.run(prepared)
+
+    assert prepared.ready
+    assert isinstance(prepared.advisor, FableDanAdvisor)
+    assert prepared.advisor.debug is True
+    assert prepared.advisor.write_decision_log is False
+    assert prepared.strategy_audit["decision_log_mode"] == "embedded"
+    assert result.status == "completed"
+    records = [
+        json.loads(line)
+        for line in (result.report_directory / "decisions.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    assert records
+    for record in records:
+        embedded = record["fabledan_decision"]
+        assert embedded["schema"] == "fabledan-decision/1"
+        assert embedded["request_id"] == record["request_id"]
+        assert embedded["best_action"] == embedded["candidates"][0]["action"]
+        assert len(embedded["legal_actions"]) == embedded["legal_action_count"]
 
 
 def test_prepare_accepts_saved_legacy_session_truth_without_source_id(tmp_path):
@@ -341,6 +374,58 @@ def test_two_representative_real_sessions_have_stable_preflight_outcomes():
     assert repaired_input.eligible_self_decisions == 17
 
 
+def test_real_session_fabledan_model_embeds_complete_decision_logs(tmp_path):
+    profiles = Path(__file__).parents[1] / "data" / "profiles"
+    source = (
+        profiles
+        / "tencent_daguandan"
+        / "sessions"
+        / "game_20260809_100241_aed6c1"
+    )
+    weights = (
+        profiles
+        / "tencent_daguandan"
+        / "models"
+        / "fabledan_weights.npz"
+    )
+    if not source.is_dir() or not weights.is_file():
+        pytest.skip("真实会话或 FableDan 权重不可用")
+    session = (
+        tmp_path
+        / "profiles"
+        / "profile"
+        / "sessions"
+        / source.name
+    )
+    session.mkdir(parents=True)
+    shutil.copy2(source / "manifest.json", session / "manifest.json")
+    shutil.copy2(source / "truth_log.json", session / "truth_log.json")
+    service = ModelEvaluationService(
+        profiles_root=profiles,
+        profile_name="tencent_daguandan",
+    )
+
+    prepared = service.prepare(session, strategy_id="fabledan_model")
+    result = service.run(prepared)
+
+    assert prepared.ready
+    assert result.status == "completed"
+    records = [
+        json.loads(line)
+        for line in (result.report_directory / "decisions.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    assert len(records) == prepared.eligible_self_decisions
+    for record in records:
+        embedded = record["fabledan_decision"]
+        assert embedded["schema"] == "fabledan-decision/1"
+        assert embedded["model_filename"] == "fabledan_weights.npz"
+        assert len(embedded["q_values"]) == embedded["legal_action_count"]
+        assert embedded["best_action"] == embedded["candidates"][0]["action"]
+        assert "decision_log_path" not in embedded
+
+
 def test_strategy_independent_validation_does_not_initialize_model(tmp_path):
     session = _session(tmp_path, "game", _truth("game"))
     advisor = FakeAdvisor("danzero_model")
@@ -403,6 +488,8 @@ def test_evaluation_factory_is_independent_from_profile_default(tmp_path):
 
     assert isinstance(advisor, FableDanAdvisor)
     assert advisor.runtime_policy == "rule_only"
+    assert advisor.debug is True
+    assert advisor.write_decision_log is False
     assert json.loads((profile / "profile.json").read_text("utf-8"))[
         "advisor_strategy"
     ] == "danzero"

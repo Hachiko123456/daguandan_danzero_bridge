@@ -338,6 +338,8 @@ def test_detailed_decision_uses_one_inference_and_appends_complete_jsonl(tmp_pat
     assert first.second_q == first.candidates[1].q_value
     assert first.q_gap == pytest.approx(first.best_q - first.second_q)
     assert second.advice.cards
+    assert "decision_log" not in first.advice.engine_input
+    assert "decision_log_path" in first.advice.engine_input
 
     log_path = next(log_directory.glob("*.jsonl"))
     records = [json.loads(line) for line in log_path.read_text("utf-8").splitlines()]
@@ -355,6 +357,31 @@ def test_detailed_decision_uses_one_inference_and_appends_complete_jsonl(tmp_pat
     assert records[0]["model_filename"] == "best.npz"
     assert records[0]["model_hash"] == "test-digest"
     assert records[0]["validation_warnings"] == []
+
+
+def test_debug_can_embed_complete_log_without_appending_jsonl(tmp_path):
+    log_directory = tmp_path / "logs" / "fabledan_decisions"
+    advisor = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        debug=True,
+        write_decision_log=False,
+        log_directory=log_directory,
+    )
+    model = _install_counting_runtime(advisor, tmp_path)
+
+    result = advisor.recommend_detailed(_left_55_state(), request_id="embedded-log")
+
+    embedded = result.advice.engine_input["decision_log"]
+    assert model.calls == 1
+    assert embedded["schema"] == "fabledan-decision/1"
+    assert embedded["request_id"] == "embedded-log"
+    assert embedded["lead_text"] == "55"
+    assert embedded["best_action"] == embedded["candidates"][0]["action"]
+    assert len(embedded["q_values"]) == embedded["legal_action_count"]
+    assert result.advice.engine_input["decision_log_mode"] == "embedded"
+    assert "decision_log_path" not in result.advice.engine_input
+    assert not log_directory.exists()
 
 
 def test_debug_false_preserves_recommend_api_without_writing_logs(tmp_path):

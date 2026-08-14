@@ -468,6 +468,15 @@ class ModelEvaluationPanel(QWidget):
                 latency.get("p95"),
             )
         )
+        decisions_name = str(result.summary.get("decisions_path", "decisions.jsonl"))
+        report_name = str(result.summary.get("report_path", "report.md"))
+        self._set_detail_section(
+            "评测产物",
+            "决策日志：{}\n评测报告：{}".format(
+                result.report_directory / decisions_name,
+                result.report_directory / report_name,
+            ),
+        )
 
     def inspect_repair(self) -> None:
         self._start_repair_worker("inspect", "正在检查旧日志修复资格…")

@@ -163,6 +163,7 @@ class FableDanAdvisor:
         *,
         runtime_policy: Literal["auto", "model_required", "rule_only"] = "auto",
         debug: bool = False,
+        write_decision_log: bool = True,
         log_directory: Path | str | None = None,
         top_n: int = 5,
     ) -> None:
@@ -174,6 +175,7 @@ class FableDanAdvisor:
         self.profile_name = str(profile_name)
         self.runtime_policy = runtime_policy
         self.debug = bool(debug)
+        self.write_decision_log = bool(write_decision_log)
         self.top_n = int(top_n)
         self.log_directory = (
             Path(log_directory)
@@ -353,15 +355,19 @@ class FableDanAdvisor:
                 engine_input=engine_input,
                 decision=decision_audit,
             )
-            try:
-                log_path = self._append_decision_log(timestamp, log_payload)
-                engine_input["decision_log_path"] = str(log_path)
-            except Exception as exc:
-                warning = f"FableDan 决策日志写入失败：{exc}"
-                warnings.append(warning)
-                decision_audit["warnings"] = list(warnings)
-                engine_input["validation_warnings"] = list(warnings)
-                _LOGGER.warning(warning, exc_info=True)
+            if self.write_decision_log:
+                try:
+                    log_path = self._append_decision_log(timestamp, log_payload)
+                    engine_input["decision_log_path"] = str(log_path)
+                except Exception as exc:
+                    warning = f"FableDan 决策日志写入失败：{exc}"
+                    warnings.append(warning)
+                    decision_audit["warnings"] = list(warnings)
+                    engine_input["validation_warnings"] = list(warnings)
+                    _LOGGER.warning(warning, exc_info=True)
+            else:
+                # 整局评测把同一记录嵌入自己的原子产物，无需再写实时日志。
+                engine_input["decision_log"] = log_payload
 
         elapsed_ms = (perf_counter() - started) * 1_000
         strategy = (
@@ -510,6 +516,14 @@ class FableDanAdvisor:
             "standard_no_tribute": STANDARD_NO_TRIBUTE,
             "backend_error": runtime.error,
             "runtime_policy": self.runtime_policy,
+            "debug": self.debug,
+            "decision_log_mode": (
+                "append"
+                if self.debug and self.write_decision_log
+                else "embedded"
+                if self.debug
+                else "disabled"
+            ),
         }
 
     def _require_model_runtime(self, runtime: _PolicyRuntime) -> None:
