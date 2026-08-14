@@ -29,6 +29,8 @@ class PlayEvent:
     # A rank-only observation such as ``8?`` retains colour/suit candidates
     # here.  It is deliberately not resolved in the canonical history.
     suit_options: tuple[tuple[str, ...], ...] = ()
+    # 仅用于审计已经确认的动作语义，不参与状态机或规则判定。
+    action_metadata: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -38,6 +40,9 @@ class PlayEvent:
             "observed_at": self.observed_at.isoformat(),
             "source": self.source,
             "suit_options": [list(options) for options in self.suit_options],
+            "action_metadata": (
+                dict(self.action_metadata) if self.action_metadata is not None else None
+            ),
         }
 
 
@@ -167,6 +172,7 @@ class GuanDanState:
         *,
         source: str = "recognition_confirmed",
         suit_options: Iterable[Iterable[str]] = (),
+        action_metadata: dict[str, object] | None = None,
     ) -> PlayEvent:
         seat = self._validate_seat(player, "出牌座位")
         raw_cards = tuple(str(card) for card in cards)
@@ -185,6 +191,7 @@ class GuanDanState:
             observed_at=datetime.now().astimezone(),
             source=source,
             suit_options=tuple(options for _card, options in aligned),
+            action_metadata=(dict(action_metadata) if action_metadata else None),
         )
         self.trick_plays.append(event)
         self.play_history.append(event)

@@ -58,11 +58,14 @@ class LiveSnapshot:
 
     def semantic_dict(self) -> dict[str, object]:
         def play_semantics(event: PlayEvent) -> dict[str, object]:
-            return {
+            raw: dict[str, object] = {
                 "player": event.player,
                 "cards": list(event.cards),
                 "is_pass": event.is_pass,
             }
+            if event.action_metadata is not None:
+                raw["action_metadata"] = dict(event.action_metadata)
+            return raw
 
         return {
             "round_level": self.round_level,

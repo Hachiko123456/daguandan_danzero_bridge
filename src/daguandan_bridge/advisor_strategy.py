@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ EVALUATION_STRATEGY_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 DEFAULT_ADVISOR_STRATEGY = "danzero"
 DEFAULT_FABLEDAN_DEBUG = False
+DEFAULT_FABLEDAN_DIAGNOSTICS = "off"
 _VALID_ADVISORS = {value for value, _label in ADVISOR_OPTIONS}
 _VALID_EVALUATION_STRATEGIES = {
     value for value, _label in EVALUATION_STRATEGY_OPTIONS
@@ -61,6 +63,38 @@ def load_profile_fabledan_debug(
     return value if isinstance(value, bool) else DEFAULT_FABLEDAN_DEBUG
 
 
+def normalize_fabledan_diagnostics(value: object) -> str:
+    normalized = str(value or DEFAULT_FABLEDAN_DIAGNOSTICS).strip().lower()
+    if normalized not in {"off", "basic", "full"}:
+        raise ValueError(f"不支持的 FableDan 诊断级别：{value}")
+    return normalized
+
+
+def load_profile_fabledan_diagnostics(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> str:
+    environment = os.getenv("FABLEDAN_DIAGNOSTICS")
+    if environment is not None:
+        try:
+            return normalize_fabledan_diagnostics(environment)
+        except ValueError:
+            return DEFAULT_FABLEDAN_DIAGNOSTICS
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_FABLEDAN_DIAGNOSTICS
+    if not isinstance(raw, dict):
+        return DEFAULT_FABLEDAN_DIAGNOSTICS
+    if "fabledan_diagnostics" in raw:
+        try:
+            return normalize_fabledan_diagnostics(raw["fabledan_diagnostics"])
+        except ValueError:
+            return DEFAULT_FABLEDAN_DIAGNOSTICS
+    return "full" if raw.get("fabledan_debug") is True else DEFAULT_FABLEDAN_DIAGNOSTICS
+
+
 def save_profile_advisor_strategy(
     profiles_root: Path | str,
     profile_name: str,
@@ -87,17 +121,26 @@ def build_advisor(
     profiles_root: Path | str = PROFILES_ROOT,
     profile_name: str = "tencent_daguandan",
     fabledan_debug: bool | None = None,
+    fabledan_diagnostics: str | None = None,
 ):
     normalized = normalize_advisor_strategy(strategy)
     if normalized == "fabledan":
         from .fabledan import FableDanAdvisor
 
-        debug = (
-            load_profile_fabledan_debug(profiles_root, profile_name)
-            if fabledan_debug is None
-            else bool(fabledan_debug)
+        diagnostics = (
+            normalize_fabledan_diagnostics(fabledan_diagnostics)
+            if fabledan_diagnostics is not None
+            else "full"
+            if fabledan_debug is True
+            else "off"
+            if fabledan_debug is False
+            else load_profile_fabledan_diagnostics(profiles_root, profile_name)
         )
-        return FableDanAdvisor(profiles_root, profile_name, debug=debug)
+        return FableDanAdvisor(
+            profiles_root,
+            profile_name,
+            diagnostics=diagnostics,
+        )
     from .danzero import DanzeroAdvisor
 
     return DanzeroAdvisor()
@@ -127,7 +170,7 @@ def build_evaluation_advisor(
             profiles_root,
             profile_name,
             runtime_policy=policy,
-            debug=True,
+            diagnostics="full",
             write_decision_log=False,
         )
     from .danzero import DanzeroAdvisor

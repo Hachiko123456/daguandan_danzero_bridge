@@ -24,7 +24,7 @@ from ..danzero.state import (
 )
 from ..domain.advice import AdviceResult, StrategyExecutionTrace
 from ._vendor.fabledan.agents import NumpyAgent, RuleAgent
-from ._vendor.fabledan.cards import RANK_NAMES, rank_of
+from ._vendor.fabledan.cards import RANK_NAMES, is_wildcard, rank_of
 from ._vendor.fabledan.combos import (
     PASS,
     TYPE_NAMES,
@@ -32,14 +32,25 @@ from ._vendor.fabledan.combos import (
     beats,
     gen_moves,
 )
-from ._vendor.fabledan.encode import encode_decision
+from ._vendor.fabledan.encode import (
+    BOS_TOK,
+    FEAT_DIM,
+    LEVEL_BASE,
+    PLAYER_BASE,
+    RANK_BASE,
+    RETURN_TOK,
+    TRIBUTE_TOK,
+    TYPE_BASE,
+    encode_decision,
+)
 from ._vendor.fabledan.model_np import NumpyModel
 
 
 UPSTREAM_COMMIT = "7cc5e311b9860bc44f76c082d9c1b21fc8b2d3ec"
 ADAPTER_SCHEMA = "fabledan-adapter/v1"
 STANDARD_NO_TRIBUTE = True
-DECISION_LOG_SCHEMA = "fabledan-decision/1"
+DECISION_TRACE_SCHEMA = "fabledan-trace/1"
+DiagnosticsMode = Literal["off", "basic", "full"]
 _TURN_ORDER: tuple[Seat, ...] = ("self", "right", "opposite", "left")
 _SEAT_TO_PLAYER: dict[Seat, int] = {
     seat: index for index, seat in enumerate(_TURN_ORDER)
@@ -66,6 +77,15 @@ _LOGGER = logging.getLogger(__name__)
 
 class FableDanStateError(GameStateError):
     """A confirmed state cannot be represented without guessing."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 @dataclass(frozen=True)
@@ -163,6 +183,7 @@ class FableDanAdvisor:
         *,
         runtime_policy: Literal["auto", "model_required", "rule_only"] = "auto",
         debug: bool = False,
+        diagnostics: DiagnosticsMode | None = None,
         write_decision_log: bool = True,
         log_directory: Path | str | None = None,
         top_n: int = 5,
@@ -174,7 +195,10 @@ class FableDanAdvisor:
         self.profiles_root = Path(profiles_root)
         self.profile_name = str(profile_name)
         self.runtime_policy = runtime_policy
-        self.debug = bool(debug)
+        self.diagnostics = _normalize_diagnostics_mode(
+            diagnostics if diagnostics is not None else ("full" if debug else "off")
+        )
+        self.debug = self.diagnostics != "off"
         self.write_decision_log = bool(write_decision_log)
         self.top_n = int(top_n)
         self.log_directory = (
@@ -182,7 +206,7 @@ class FableDanAdvisor:
             if log_directory is not None
             else Path(__file__).resolve().parents[3]
             / "logs"
-            / "fabledan_decisions"
+            / "fabledan_traces"
         )
         self.weights_path = (
             self.profiles_root
@@ -255,6 +279,13 @@ class FableDanAdvisor:
                     },
                 }
             )
+            if self.diagnostics != "off":
+                blocked["fabledan_trace"] = _blocked_trace_payload(
+                    request_id=request_id,
+                    state=state,
+                    error=exc,
+                    diagnostics_mode=self.diagnostics,
+                )
             execution_trace.set_engine_input(blocked)
             execution_trace.end()
             raise
@@ -268,9 +299,10 @@ class FableDanAdvisor:
         policy_started = perf_counter()
         active_runtime = runtime
         q_values: tuple[float, ...] | None = None
-        encoding_audit: dict[str, object] = {}
+        tokens: list[int] | None = None
+        features: np.ndarray | None = None
         try:
-            selected_index, q_values, encoding_audit = self._evaluate_policy(
+            selected_index, q_values, tokens, features = self._evaluate_policy(
                 runtime,
                 mapped.observation,
             )
@@ -282,7 +314,7 @@ class FableDanAdvisor:
             active_runtime = self._replace_invalid_numpy_runtime(exc)
             engine_input.update(self._runtime_audit(active_runtime))
             execution_trace.set_engine_input(engine_input)
-            selected_index, q_values, encoding_audit = self._evaluate_policy(
+            selected_index, q_values, tokens, features = self._evaluate_policy(
                 active_runtime,
                 mapped.observation,
             )
@@ -315,20 +347,20 @@ class FableDanAdvisor:
             if best_q is not None and second_q is not None
             else None
         )
-        warnings = (
-            _validate_decision_state(
-                mapped,
-                selected_index=selected_index,
-                q_values=q_values,
-                candidates=candidates,
-            )
-            if self.debug
-            else []
+        diagnostics = _decision_diagnostics(
+            mapped,
+            selected_index=selected_index,
+            q_values=q_values,
+            candidates=candidates,
+            tokens=tokens,
+            features=features,
         )
+        warnings = list(diagnostics["warnings"])
         engine_input["selected_action_index"] = selected_index
         engine_input["selected_action"] = _move_audit(move)
         engine_input.update(self._runtime_audit(active_runtime))
         engine_input["debug"] = self.debug
+        engine_input["diagnostics_mode"] = self.diagnostics
         decision_audit = {
             "best_action": _move_audit(move),
             "best_action_text": _move_text(move),
@@ -340,22 +372,32 @@ class FableDanAdvisor:
             "warnings": list(warnings),
         }
         if self.debug:
+            trace_payload = _decision_trace_payload(
+                request_id=request_id,
+                mapped=mapped,
+                runtime=active_runtime,
+                diagnostics_mode=self.diagnostics,
+                selected_index=selected_index,
+                q_values=q_values,
+                candidates=candidates,
+                tokens=tokens,
+                features=features,
+                diagnostics=diagnostics,
+            )
             engine_input.update(
                 {
                     "top_n": self.top_n,
-                    "encoding": encoding_audit,
+                    "encoding": trace_payload.get("encoding", {}),
                     "q_values": _q_values_audit(mapped.legal, q_values),
                     "decision": decision_audit,
                     "validation_warnings": list(warnings),
+                    "fabledan_trace": trace_payload,
                 }
             )
-            timestamp = datetime.now().astimezone()
-            log_payload = _decision_log_payload(
-                timestamp=timestamp,
-                engine_input=engine_input,
-                decision=decision_audit,
-            )
             if self.write_decision_log:
+                timestamp = datetime.now().astimezone()
+                log_payload = dict(trace_payload)
+                log_payload["timestamp"] = timestamp.isoformat(timespec="seconds")
                 try:
                     log_path = self._append_decision_log(timestamp, log_payload)
                     engine_input["decision_log_path"] = str(log_path)
@@ -365,9 +407,6 @@ class FableDanAdvisor:
                     decision_audit["warnings"] = list(warnings)
                     engine_input["validation_warnings"] = list(warnings)
                     _LOGGER.warning(warning, exc_info=True)
-            else:
-                # 整局评测把同一记录嵌入自己的原子产物，无需再写实时日志。
-                engine_input["decision_log"] = log_payload
 
         elapsed_ms = (perf_counter() - started) * 1_000
         strategy = (
@@ -408,12 +447,9 @@ class FableDanAdvisor:
     def _evaluate_policy(
         runtime: _PolicyRuntime,
         observation: dict[str, object],
-    ) -> tuple[int, tuple[float, ...] | None, dict[str, object]]:
+    ) -> tuple[int, tuple[float, ...] | None, list[int] | None, np.ndarray | None]:
         if runtime.backend != "numpy":
-            return int(runtime.agent.act(observation)), None, {
-                "q_values_available": False,
-                "reason": "RuleAgent does not produce model Q-values",
-            }
+            return int(runtime.agent.act(observation)), None, None, None
 
         # 保持与上游 NumpyAgent 完全相同的推理路径，并让动作选择与调试信息
         # 共享同一次模型推理，避免调试模式引入第二次计算。
@@ -421,19 +457,19 @@ class FableDanAdvisor:
         raw_q_values = runtime.agent.model.q_values(tokens, features)
         q_array = np.asarray(raw_q_values).reshape(-1)
         selected_index = int(np.argmax(q_array))
-        return selected_index, tuple(float(value) for value in q_array), {
-            "q_values_available": True,
-            "token_count": len(tokens),
-            "tokens": [int(token) for token in tokens],
-            "feature_shape": [int(value) for value in features.shape],
-        }
+        return (
+            selected_index,
+            tuple(float(value) for value in q_array),
+            tokens,
+            features,
+        )
 
     def _append_decision_log(
         self,
         timestamp: datetime,
         payload: dict[str, object],
     ) -> Path:
-        path = self.log_directory / f"{timestamp.date().isoformat()}.jsonl"
+        path = self.log_directory / f"fabledan_trace-{timestamp.date().isoformat()}.jsonl"
         line = json.dumps(
             payload,
             ensure_ascii=False,
@@ -517,10 +553,11 @@ class FableDanAdvisor:
             "backend_error": runtime.error,
             "runtime_policy": self.runtime_policy,
             "debug": self.debug,
+            "diagnostics_mode": self.diagnostics,
             "decision_log_mode": (
                 "append"
                 if self.debug and self.write_decision_log
-                else "embedded"
+                else "trace_embedded"
                 if self.debug
                 else "disabled"
             ),
@@ -571,13 +608,27 @@ class FableDanAdvisor:
                         "kind": "pass",
                         "player": event.player,
                         "player_id": player,
+                        "absolute_player": player,
+                        "relative_player": (player - 0) % 4,
+                        "relative_player_label": _relative_player_label(player),
+                        "is_teammate": player == 2,
+                        "source_turn_id": index,
+                        "encoded_player_token": PLAYER_BASE + ((player - 0) % 4),
+                        "encoded_player_token_name": _token_name(
+                            PLAYER_BASE + ((player - 0) % 4)
+                        ),
                         "is_pass": True,
                     }
                 )
                 passed.add(event.player)
             else:
                 card_ids = tuple(allocation.allocate(card) for card in event.cards)
-                move = _unique_observed_move(card_ids, snapshot.round_level, index)
+                move, semantic_resolution = _unique_observed_move(
+                    card_ids,
+                    snapshot.round_level,
+                    index,
+                    event.action_metadata,
+                )
                 if trick_lead is not None and not beats(
                     move, trick_lead, RANK_NAMES.index(snapshot.round_level)
                 ):
@@ -601,9 +652,19 @@ class FableDanAdvisor:
                         "kind": "play",
                         "player": event.player,
                         "player_id": player,
+                        "absolute_player": player,
+                        "relative_player": (player - 0) % 4,
+                        "relative_player_label": _relative_player_label(player),
+                        "is_teammate": player == 2,
+                        "source_turn_id": index,
+                        "encoded_player_token": PLAYER_BASE + ((player - 0) % 4),
+                        "encoded_player_token_name": _token_name(
+                            PLAYER_BASE + ((player - 0) % 4)
+                        ),
                         "is_pass": False,
-                        "move": _move_audit(move),
+                        "move": _move_audit(move, level=RANK_NAMES.index(snapshot.round_level)),
                         "action_text": _move_text(move),
+                        "semantic_resolution": semantic_resolution,
                     }
                 )
 
@@ -719,6 +780,14 @@ class FableDanAdvisor:
                 "revision": snapshot.revision,
             },
             "player": 0,
+            "viewer_absolute": 0,
+            "current_player_absolute": _SEAT_TO_PLAYER[snapshot.current_player],
+            "current_player_relative": (
+                _SEAT_TO_PLAYER[snapshot.current_player] - 0
+            ) % 4,
+            "teammate_absolute": 2,
+            "teammate_relative": 2,
+            "seat_mapping": dict(_SEAT_TO_PLAYER),
             "player_mapping": dict(_PLAYER_MAPPING),
             "player_mapping_labels": {
                 "0": "self/自己",
@@ -740,16 +809,21 @@ class FableDanAdvisor:
             },
             "done": done_flags,
             "lead": (
-                _move_audit(reconstructed_lead)
+                _move_audit(reconstructed_lead, level=level)
                 if reconstructed_lead is not None
                 else None
             ),
             "lead_text": _move_text(reconstructed_lead),
             "lead_owner": lead_owner,
             "lead_owner_seat": trick_leader,
+            "lead_owner_absolute": lead_owner,
+            "lead_owner_relative": (
+                (lead_owner - 0) % 4 if lead_owner is not None else None
+            ),
+            "lead_owner_is_teammate": lead_owner == 2 if lead_owner is not None else None,
             "history": event_audit,
             "events": event_audit,
-            "legal_actions": [_move_audit(move) for move in legal],
+            "legal_actions": [_move_audit(move, level=level) for move in legal],
             "feature_schema": "fabledan-token48-feat80/v1",
         }
         return _MappedState(observation, legal, hand_ids, lead_owner, audit)
@@ -811,7 +885,8 @@ def _unique_observed_move(
     card_ids: tuple[int, ...],
     level_rank: str,
     history_index: int,
-) -> Move:
+    action_metadata: dict[str, object] | None = None,
+) -> tuple[Move, dict[str, object]]:
     level = RANK_NAMES.index(level_rank)
     candidates = [
         move
@@ -822,19 +897,179 @@ def _unique_observed_move(
     for move in candidates:
         by_declaration.setdefault(_move_declaration(move), move)
     if not by_declaration:
-        raise FableDanStateError(f"第 {history_index} 条历史不是合法牌型")
+        diagnostic = {
+            "code": "observed_move_invalid",
+            "source_turn_id": history_index,
+            "physical_cards": sorted(_card_code(card) for card in card_ids),
+            "level": level_rank,
+            "wild_rank": level_rank,
+            "candidate_interpretations": [],
+            "reason": "实体牌无法生成任何 FableDan 合法声明",
+        }
+        raise FableDanStateError(
+            f"第 {history_index} 条历史不是合法牌型",
+            diagnostic=diagnostic,
+        )
+    selected_semantics = _selected_move_semantics(action_metadata)
+    if selected_semantics is not None:
+        matches = [
+            move
+            for move in by_declaration.values()
+            if _move_matches_semantics(move, selected_semantics, level=level)
+        ]
+        if len(matches) == 1:
+            return matches[0], {
+                "selection_source": str(
+                    (action_metadata or {}).get("selection_source", "exact_engine_state")
+                ),
+                "ambiguity": len(by_declaration) > 1,
+                "selected_interpretation": _move_audit(matches[0], level=level),
+                "candidate_interpretations": [
+                    _move_audit(move, level=level) for move in by_declaration.values()
+                ],
+            }
+        diagnostic = {
+            "code": "wildcard_semantics_mismatch",
+            "source_turn_id": history_index,
+            "physical_cards": sorted(_card_code(card) for card in card_ids),
+            "level": level_rank,
+            "wild_rank": level_rank,
+            "provided_interpretation": selected_semantics,
+            "candidate_interpretations": [
+                _move_audit(move, level=level) for move in by_declaration.values()
+            ],
+            "reason": "已记录语义不能唯一匹配 FableDan 候选声明",
+        }
+        raise FableDanStateError(
+            f"第 {history_index} 条历史的 wildcard 语义与 FableDan 候选不一致",
+            diagnostic=diagnostic,
+        )
     if len(by_declaration) != 1:
         declarations = ", ".join(
             str(value) for value in sorted(by_declaration, key=str)
         )
+        diagnostic = {
+            "code": "wildcard_ambiguity",
+            "source_turn_id": history_index,
+            "physical_cards": sorted(_card_code(card) for card in card_ids),
+            "level": level_rank,
+            "wild_rank": level_rank,
+            "ambiguity": True,
+            "candidate_declarations": [
+                {
+                    "type_id": int(move.type),
+                    "key": int(move.key),
+                    "claim_rank_ids": sorted(int(rank) for rank in move.claim_ranks),
+                    "tuple": [
+                        int(move.type),
+                        int(move.key),
+                        sorted(int(rank) for rank in move.claim_ranks),
+                    ],
+                }
+                for move in by_declaration.values()
+            ],
+            "candidate_interpretations": [
+                _move_audit(move, level=level) for move in by_declaration.values()
+            ],
+            "selected_interpretation": None,
+            "selection_source": "unresolved",
+            "reason": "旧 TruthLog 只有实体牌，多个 wildcard 声明消费同一组实体牌",
+        }
         raise FableDanStateError(
-            f"第 {history_index} 条历史的 wildcard 声明不唯一：{declarations}"
+            f"第 {history_index} 条历史的 wildcard 声明不唯一：{declarations}",
+            diagnostic=diagnostic,
         )
-    return next(iter(by_declaration.values()))
+    move = next(iter(by_declaration.values()))
+    return move, {
+        "selection_source": "inferred_unique",
+        "ambiguity": False,
+        "selected_interpretation": _move_audit(move, level=level),
+        "candidate_interpretations": [_move_audit(move, level=level)],
+    }
 
 
 def _move_declaration(move: Move) -> tuple[object, ...]:
     return move.type, move.key, tuple(sorted(int(rank) for rank in move.claim_ranks))
+
+
+def _selected_move_semantics(
+    metadata: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not metadata or metadata.get("selection_source") == "unresolved":
+        return None
+    selected = metadata.get("selected_interpretation")
+    if isinstance(selected, dict):
+        return selected
+    if any(key in metadata for key in ("move_type", "play_type", "type_id")):
+        return metadata
+    return None
+
+
+def _move_matches_semantics(
+    move: Move,
+    semantics: dict[str, object],
+    *,
+    level: int,
+) -> bool:
+    type_id = semantics.get("type_id")
+    if type_id is not None:
+        try:
+            if int(type_id) != move.type:
+                return False
+        except (TypeError, ValueError):
+            return False
+    move_type = semantics.get("move_type", semantics.get("play_type"))
+    if move_type is not None:
+        aliases = {
+            "straightflush": "SFLUSH",
+            "straight_flush": "SFLUSH",
+            "bomb": "BOMB",
+            "straight": "STRAIGHT",
+            "pair": "PAIR",
+            "single": "SINGLE",
+            "triple": "TRIPLE",
+            "fullhouse": "FULL",
+            "full_house": "FULL",
+            "plate": "PLATE",
+            "tube": "TUBE",
+            "rocket": "ROCKET",
+        }
+        normalized = str(move_type).replace("-", "_").replace(" ", "_").lower()
+        expected = aliases.get(normalized, str(move_type).upper())
+        if expected != TYPE_NAMES[move.type]:
+            return False
+    claim_ranks = semantics.get("claim_ranks")
+    if isinstance(claim_ranks, (list, tuple)) and claim_ranks:
+        normalized_claims = sorted(str(value) for value in claim_ranks)
+        if normalized_claims != sorted(RANK_NAMES[int(rank)] for rank in move.claim_ranks):
+            return False
+    assignments = semantics.get(
+        "wildcard_assignments", semantics.get("wildcard_substitutions")
+    )
+    if isinstance(assignments, (list, tuple)) and assignments:
+        expected_assignments = sorted(
+            str(item.get("as_rank", ""))
+            for item in assignments
+            if isinstance(item, dict)
+        )
+        actual_assignments = sorted(
+            str(item["as_rank"])
+            for item in _move_audit(move, level=level).get(
+                "wildcard_assignments", ()
+            )
+            if isinstance(item, dict)
+        )
+        if expected_assignments and actual_assignments != expected_assignments:
+            return False
+    key = semantics.get("key")
+    if key is not None:
+        try:
+            if int(key) != int(move.key):
+                return False
+        except (TypeError, ValueError):
+            # DanZero 可能保存可读点数；已有牌型或声明点数时仍可精确区分。
+            pass
+    return True
 
 
 def _move_signature(move: Move) -> tuple[object, ...]:
@@ -844,12 +1079,40 @@ def _move_signature(move: Move) -> tuple[object, ...]:
     )
 
 
-def _move_audit(move: Move) -> dict[str, object]:
+def _move_audit(move: Move, *, level: int | None = None) -> dict[str, object]:
+    physical_cards = sorted(_card_code(int(card)) for card in move.cards)
+    wildcard_assignments: list[dict[str, object]] = []
+    if level is not None:
+        occurrences: Counter[str] = Counter()
+        for card, claim_rank in zip(move.cards, move.claim_ranks):
+            card_id = int(card)
+            if not is_wildcard(card_id, level):
+                continue
+            code = _card_code(card_id)
+            occurrences[code] += 1
+            wildcard_assignments.append(
+                {
+                    "physical_card": code,
+                    "physical_card_id": card_id,
+                    "occurrence": occurrences[code],
+                    "as_rank": RANK_NAMES[int(claim_rank)],
+                    "as_rank_id": int(claim_rank),
+                }
+            )
     return {
         "play_type": TYPE_NAMES[move.type],
-        "cards": sorted(_card_code(int(card)) for card in move.cards),
+        "type": TYPE_NAMES[move.type],
+        "type_id": int(move.type),
+        "cards": physical_cards,
+        "physical_cards": physical_cards,
         "claim_ranks": [RANK_NAMES[int(rank)] for rank in move.claim_ranks],
+        "claim_rank_ids": [int(rank) for rank in move.claim_ranks],
         "key": int(move.key),
+        "size": int(move.size),
+        "wildcard_count": len(wildcard_assignments),
+        "wildcard_assignments": wildcard_assignments,
+        "is_pass": move.type == PASS,
+        "is_bomb": bool(move.is_bombish()),
     }
 
 
@@ -914,48 +1177,100 @@ def _safe_q_value(
     return float(value) if np.isfinite(value) else None
 
 
-def _validate_decision_state(
+def _decision_diagnostics(
     mapped: _MappedState,
     *,
     selected_index: int,
     q_values: tuple[float, ...] | None,
     candidates: tuple[DecisionCandidate, ...],
-) -> list[str]:
+    tokens: list[int] | None,
+    features: np.ndarray | None,
+) -> dict[str, object]:
     warnings: list[str] = []
+    errors: list[str] = []
+    invariants: dict[str, object] = {}
     observation = mapped.observation
     player = observation.get("player")
-    if player not in {0, 1, 2, 3}:
-        warnings.append(f"player 无效：{player}")
+    invariants["player_id_valid"] = player in {0, 1, 2, 3}
+    invariants["relative_two_is_teammate"] = (
+        mapped.audit.get("teammate_relative") == 2
+        and mapped.audit.get("teammate_absolute") == 2
+    )
+    invariants["seat_mapping_consistent"] = mapped.audit.get("seat_mapping") == {
+        "self": 0,
+        "right": 1,
+        "opposite": 2,
+        "left": 3,
+    }
     hand = observation.get("hand")
-    if not isinstance(hand, list) or not 0 <= len(hand) <= 27:
-        warnings.append("hand 数量不在 0..27 范围内")
+    original_hand = mapped.audit.get("hand")
+    invariants["hand_count_matches"] = (
+        isinstance(hand, list)
+        and isinstance(original_hand, list)
+        and len(hand) == len(original_hand)
+    )
+    invariants["duplicate_cards_preserved"] = (
+        isinstance(hand, list)
+        and isinstance(original_hand, list)
+        and Counter(_card_code(int(card)) for card in hand) == Counter(original_hand)
+    )
     left = observation.get("left")
-    if not isinstance(left, list) or len(left) != 4:
-        warnings.append("left 必须包含四个玩家")
-    if mapped.lead_owner is not None and mapped.lead_owner not in {0, 1, 2, 3}:
-        warnings.append(f"lead_owner 无效：{mapped.lead_owner}")
-    if not mapped.legal:
-        warnings.append("legal actions 为空")
-    if not 0 <= selected_index < len(mapped.legal):
-        warnings.append("best action 索引不属于 legal actions")
-    if len(candidates) != len(mapped.legal):
-        warnings.append("candidates 数量与 legal actions 不一致")
-    elif _move_signature(candidates[0].action) != _move_signature(
-        mapped.legal[selected_index]
-    ):
-        warnings.append("candidates[0] 与模型最终动作不一致")
+    invariants["left_count_shape_valid"] = isinstance(left, list) and len(left) == 4
+    invariants["lead_owner_valid"] = (
+        mapped.lead_owner is None or mapped.lead_owner in {0, 1, 2, 3}
+    )
+    invariants["legal_actions_non_empty"] = bool(mapped.legal)
+    invariants["all_legal_actions_generated_by_rules_engine"] = True
+    invariants["selected_index_in_range"] = 0 <= selected_index < len(mapped.legal)
+    invariants["candidate_count_matches_legal"] = len(candidates) == len(mapped.legal)
+    invariants["selected_action_matches_legal_index"] = (
+        bool(candidates)
+        and 0 <= selected_index < len(mapped.legal)
+        and _move_signature(candidates[0].action)
+        == _move_signature(mapped.legal[selected_index])
+    )
+    available = Counter(mapped.hand_ids)
+    invariants["all_legal_actions_covered_by_hand"] = all(
+        not (Counter(int(card) for card in move.cards) - available)
+        for move in mapped.legal
+    )
+    follow = observation.get("lead") is not None
+    pass_indices = [index for index, move in enumerate(mapped.legal) if move.type == PASS]
+    invariants["follow_pass_present"] = (not follow) or bool(pass_indices)
+    history = mapped.audit.get("history", [])
+    source_history = mapped.audit.get("project_snapshot", {}).get("play_history", [])
+    invariants["events_order_continuous"] = isinstance(history, list) and [
+        item.get("source_turn_id") for item in history if isinstance(item, dict)
+    ] == list(range(1, len(history) + 1))
+    invariants["pass_events_preserved"] = (
+        isinstance(history, list)
+        and isinstance(source_history, list)
+        and sum(bool(item.get("is_pass")) for item in history if isinstance(item, dict))
+        == sum(
+            bool(item.get("is_pass"))
+            for item in source_history
+            if isinstance(item, dict)
+        )
+    )
     if q_values is not None:
-        if len(q_values) != len(mapped.legal):
-            warnings.append("Q-value 数量与 legal actions 不一致")
-        if any(not np.isfinite(value) for value in q_values):
-            warnings.append("Q-value 中包含 NaN 或 Inf")
-        finite_q = [
-            candidate.q_value
-            for candidate in candidates
-            if candidate.q_value is not None
-        ]
-        if any(first < second for first, second in zip(finite_q, finite_q[1:])):
-            warnings.append("candidates 未按 Q-value 降序排列")
+        invariants["q_count_matches_legal"] = len(q_values) == len(mapped.legal)
+        invariants["q_values_finite"] = all(np.isfinite(value) for value in q_values)
+        invariants["selected_index_matches_argmax"] = (
+            bool(q_values) and selected_index == int(np.argmax(np.asarray(q_values)))
+        )
+    else:
+        invariants["q_count_matches_legal"] = None
+        invariants["q_values_finite"] = None
+        invariants["selected_index_matches_argmax"] = None
+    invariants["features_first_dim_matches_legal"] = (
+        features is None
+        or (features.ndim >= 1 and int(features.shape[0]) == len(mapped.legal))
+    )
+    invariants["features_width_matches_schema"] = (
+        features is None
+        or (features.ndim == 2 and int(features.shape[1]) == FEAT_DIM)
+    )
+    invariants["tokens_non_empty"] = tokens is None or bool(tokens)
     lead = observation.get("lead")
     if lead is not None:
         last_play = next(
@@ -966,58 +1281,363 @@ def _validate_decision_state(
             ),
             None,
         )
-        if not isinstance(last_play, dict) or last_play.get("player_id") != mapped.lead_owner:
-            warnings.append("lead_owner 与最新非 PASS 事件不一致")
-        if isinstance(last_play, dict) and last_play.get("move") != _move_audit(lead):
-            warnings.append("lead 与最新非 PASS 事件不一致")
-    return warnings
+        invariants["lead_owner_matches_latest_play"] = (
+            isinstance(last_play, dict)
+            and last_play.get("player_id") == mapped.lead_owner
+        )
+        invariants["lead_matches_latest_play"] = (
+            isinstance(last_play, dict)
+            and last_play.get("move")
+            == _move_audit(lead, level=int(observation["level"]))
+        )
+    else:
+        invariants["lead_owner_matches_latest_play"] = mapped.lead_owner is None
+        invariants["lead_matches_latest_play"] = True
+    for name, passed in invariants.items():
+        if passed is False:
+            errors.append(f"invariant failed: {name}")
+    for item in history if isinstance(history, list) else []:
+        if not isinstance(item, dict):
+            continue
+        resolution = item.get("semantic_resolution")
+        if isinstance(resolution, dict) and resolution.get("ambiguity"):
+            warnings.append(
+                f"history turn {item.get('source_turn_id')} 使用显式语义消解 wildcard 候选"
+            )
+    return {"warnings": warnings, "errors": errors, "invariants": invariants}
 
 
-def _decision_log_payload(
+def _decision_trace_payload(
     *,
-    timestamp: datetime,
-    engine_input: dict[str, object],
-    decision: dict[str, object],
+    request_id: str,
+    mapped: _MappedState,
+    runtime: _PolicyRuntime,
+    diagnostics_mode: DiagnosticsMode,
+    selected_index: int,
+    q_values: tuple[float, ...] | None,
+    candidates: tuple[DecisionCandidate, ...],
+    tokens: list[int] | None,
+    features: np.ndarray | None,
+    diagnostics: dict[str, object],
 ) -> dict[str, object]:
-    model_path = str(engine_input.get("model_path") or engine_input.get("path", ""))
-    return {
-        "schema": DECISION_LOG_SCHEMA,
-        "timestamp": timestamp.isoformat(timespec="seconds"),
-        "request_id": engine_input.get("request_id", ""),
-        "model_path": model_path,
-        "model_filename": Path(model_path).name,
-        "model_hash": engine_input.get("model_hash") or engine_input.get("digest"),
-        "backend": engine_input.get("backend"),
-        "model_status": engine_input.get("status"),
-        "player": engine_input.get("player"),
-        "player_mapping": engine_input.get("player_mapping"),
-        "player_mapping_labels": engine_input.get("player_mapping_labels"),
-        "level": engine_input.get("level"),
-        "level_text": engine_input.get("level_text"),
-        "hand": engine_input.get("hand"),
-        "hand_ids": engine_input.get("hand_ids"),
-        "left": engine_input.get("left"),
-        "left_by_player": engine_input.get("left_by_player"),
-        "lead": engine_input.get("lead"),
-        "lead_text": engine_input.get("lead_text"),
-        "lead_owner": engine_input.get("lead_owner"),
-        "lead_owner_seat": engine_input.get("lead_owner_seat"),
-        "done": engine_input.get("done"),
-        "history": engine_input.get("history"),
-        "events": engine_input.get("events"),
-        "legal_actions": engine_input.get("legal_actions"),
-        "legal_action_count": decision.get("legal_action_count"),
-        "q_values": engine_input.get("q_values"),
-        "candidates": decision.get("candidates"),
-        "best_action": decision.get("best_action"),
-        "best_action_text": decision.get("best_action_text"),
-        "best_q": decision.get("best_q"),
-        "second_q": decision.get("second_q"),
-        "q_gap": decision.get("q_gap"),
-        "encoding": engine_input.get("encoding"),
-        "validation_warnings": engine_input.get("validation_warnings"),
-        "project_snapshot": engine_input.get("project_snapshot"),
+    observation = mapped.observation
+    level = int(observation["level"])
+    audit = mapped.audit
+    project_snapshot = audit["project_snapshot"]
+    original_hand = list(audit.get("hand", ()))
+    rank_counts = Counter(RANK_NAMES[rank_of(int(card))] for card in mapped.hand_ids)
+    event_trace = list(audit.get("events", ()))
+    legal_actions = [
+        {
+            "legal_index": index,
+            **_move_audit(move, level=level),
+            "readable_action": _move_text(move),
+        }
+        for index, move in enumerate(mapped.legal)
+    ]
+    encoding = _encoding_trace(
+        observation,
+        mapped.legal,
+        tokens=tokens,
+        features=features,
+        diagnostics_mode=diagnostics_mode,
+    )
+    q_rows = []
+    if q_values is not None:
+        q_rows = [
+            {
+                "legal_index": index,
+                "action": legal_actions[index],
+                "readable_action": _move_text(move),
+                "q": float(q_values[index]),
+            }
+            for index, move in enumerate(mapped.legal)
+        ]
+        ranking_indices = sorted(
+            range(len(q_values)), key=lambda index: (-q_values[index], index)
+        )
+    else:
+        ranking_indices = [selected_index] + [
+            index for index in range(len(mapped.legal)) if index != selected_index
+        ]
+    q_ranking = [
+        {
+            "rank": rank,
+            "legal_index": index,
+            "readable_action": _move_text(mapped.legal[index]),
+            "q": _safe_q_value(q_values, index),
+        }
+        for rank, index in enumerate(ranking_indices, start=1)
+        if 0 <= index < len(mapped.legal)
+    ]
+    second_index = ranking_indices[1] if len(ranking_indices) > 1 else None
+    selected_q = _safe_q_value(q_values, selected_index)
+    second_q = _safe_q_value(q_values, second_index) if second_index is not None else None
+    source_state = {
+        "state_revision": project_snapshot.get("revision"),
+        "round_level": project_snapshot.get("round_level"),
+        "wild_rank": project_snapshot.get("wild_rank"),
+        "viewer_absolute": audit.get("viewer_absolute"),
+        "seat_mapping": audit.get("seat_mapping"),
+        "current_player_absolute": audit.get("current_player_absolute"),
+        "current_player_relative": audit.get("current_player_relative"),
+        "teammate_absolute": audit.get("teammate_absolute"),
+        "teammate_relative": audit.get("teammate_relative"),
+        "project_snapshot": project_snapshot,
     }
+    adapter_observation: dict[str, object] = {
+        "player": {
+            "absolute_id": observation["player"],
+            "viewer_absolute": audit.get("viewer_absolute"),
+            "relative_id": 0,
+            "seat": "self",
+            "seat_mapping": audit.get("seat_mapping"),
+        },
+        "level": {
+            "level_id": level,
+            "level": RANK_NAMES[level],
+            "wild_rank": RANK_NAMES[level],
+            "wildcard_card_definition": {
+                "physical_card": f"{RANK_NAMES[level]}H",
+                "rule": "heart card of the current level",
+            },
+        },
+        "hand": {
+            "original_cards": original_hand,
+            "internal_representation": [int(card) for card in mapped.hand_ids],
+            "rank_counts": dict(sorted(rank_counts.items())),
+            "total_card_count": len(mapped.hand_ids),
+            "wildcard_count": sum(
+                1 for card in mapped.hand_ids if is_wildcard(int(card), level)
+            ),
+        },
+        "left": list(observation["left"]),
+        "done": list(observation["done"]),
+        "lead": audit.get("lead"),
+        "lead_owner_absolute": audit.get("lead_owner_absolute"),
+        "lead_owner_relative": audit.get("lead_owner_relative"),
+        "lead_owner_is_teammate": audit.get("lead_owner_is_teammate"),
+        "events": event_trace,
+    }
+    if diagnostics_mode == "full":
+        adapter_observation["actual_observation"] = {
+            "level": level,
+            "player": int(observation["player"]),
+            "hand": [int(card) for card in observation["hand"]],
+            "left": list(observation["left"]),
+            "done": list(observation["done"]),
+            "events": event_trace,
+            "lead": audit.get("lead"),
+            "legal": legal_actions,
+        }
+    return {
+        "schema": DECISION_TRACE_SCHEMA,
+        "schema_version": 1,
+        "status": "completed",
+        "diagnostics_mode": diagnostics_mode,
+        "run_id": None,
+        "request_id": request_id,
+        "decision_id": None,
+        "turn_id": None,
+        "trick_id": None,
+        "state_revision": project_snapshot.get("revision"),
+        "state_before_sha256": None,
+        "source_state": source_state,
+        "adapter_observation": adapter_observation,
+        "legal_actions": {
+            "legal_count_before_any_cap": len(mapped.legal),
+            "legal_count_after_cap": len(mapped.legal),
+            "cap_applied": False,
+            "cap_limit": None,
+            "ordering_strategy": "fabledan.gen_moves native order",
+            "actions": legal_actions,
+        },
+        "encoding": encoding,
+        "model_output": {
+            "backend": runtime.backend,
+            "model_path": str(runtime.path),
+            "model_hash": runtime.digest,
+            "q_values": q_rows,
+            "q_ranking": q_ranking,
+            "selected_index": selected_index,
+            "selected_action": legal_actions[selected_index],
+            "selected_q": selected_q,
+            "second_best_index": second_index,
+            "second_best_q": second_q,
+            "q_margin": (
+                selected_q - second_q
+                if selected_q is not None and second_q is not None
+                else None
+            ),
+            "selection_reason": (
+                f"np.argmax(q_values) returned legal_index {selected_index}"
+                if q_values is not None
+                else "RuleAgent returned the legal action index"
+            ),
+        },
+        "diagnostics": diagnostics,
+    }
+
+
+def _encoding_trace(
+    observation: dict[str, object],
+    legal: tuple[Move, ...],
+    *,
+    tokens: list[int] | None,
+    features: np.ndarray | None,
+    diagnostics_mode: DiagnosticsMode,
+) -> dict[str, object]:
+    token_values = [int(value) for value in tokens] if tokens is not None else []
+    token_array = np.asarray(token_values, dtype="<i8")
+    token_trace: dict[str, object] = {
+        "token_length": len(token_values),
+        "tokens_sha256": sha256(token_array.tobytes()).hexdigest(),
+    }
+    if diagnostics_mode == "full":
+        token_trace["tokens"] = token_values
+        token_trace["decoded_tokens"] = [
+            {"position": index, "token_id": token, "name": _token_name(token)}
+            for index, token in enumerate(token_values)
+        ]
+    feature_trace: dict[str, object] = {
+        "feats_shape": list(features.shape) if features is not None else None,
+        "feats_dtype": str(features.dtype) if features is not None else None,
+        "feats_sha256": (
+            sha256(np.ascontiguousarray(features).tobytes()).hexdigest()
+            if features is not None
+            else None
+        ),
+        "feature_summary": [
+            _feature_summary(observation, move, index)
+            for index, move in enumerate(legal)
+        ],
+    }
+    if diagnostics_mode == "full" and features is not None:
+        feature_trace["feats"] = features.tolist()
+    return {"tokens": token_trace, "features": feature_trace}
+
+
+def _feature_summary(
+    observation: dict[str, object], move: Move, legal_index: int
+) -> dict[str, object]:
+    level = int(observation["level"])
+    lead = observation.get("lead")
+    return {
+        "legal_index": legal_index,
+        "hand_count": len(observation["hand"]),
+        "hand_wildcard_count": sum(
+            1 for card in observation["hand"] if is_wildcard(int(card), level)
+        ),
+        "left_counts": list(observation["left"]),
+        "done": list(observation["done"]),
+        "level": RANK_NAMES[level],
+        "action_type": TYPE_NAMES[move.type],
+        "action_key": int(move.key),
+        "action_size": int(move.size),
+        "action_wildcard_count": sum(
+            1 for card in move.cards if is_wildcard(int(card), level)
+        ),
+        "lead_type": TYPE_NAMES[lead.type] if isinstance(lead, Move) else None,
+        "lead_key": int(lead.key) if isinstance(lead, Move) else None,
+    }
+
+
+def _blocked_trace_payload(
+    *,
+    request_id: str,
+    state: GuanDanState,
+    error: Exception,
+    diagnostics_mode: DiagnosticsMode,
+) -> dict[str, object]:
+    diagnostic = (
+        error.diagnostic
+        if isinstance(error, FableDanStateError) and error.diagnostic is not None
+        else {"code": "adapter_observation_failed", "reason": str(error)}
+    )
+    source_state = {
+        "state_revision": state.revision,
+        "round_level": state.round_level,
+        "wild_rank": state.wild_rank,
+        "viewer_absolute": 0,
+        "seat_mapping": dict(_SEAT_TO_PLAYER),
+        "current_player_absolute": (
+            _SEAT_TO_PLAYER.get(state.current_player) if state.current_player else None
+        ),
+        "current_player_relative": (
+            _SEAT_TO_PLAYER.get(state.current_player) if state.current_player else None
+        ),
+        "teammate_absolute": 2,
+        "teammate_relative": 2,
+        "project_snapshot": {
+            "round_level": state.round_level,
+            "wild_rank": state.wild_rank,
+            "current_player": state.current_player,
+            "lead_player": state.lead_player,
+            "my_hand": list(state.my_hand),
+            "play_history": [event.to_dict() for event in state.play_history],
+            "remaining_cards": state.remaining_cards,
+            "revision": state.revision,
+        },
+    }
+    return {
+        "schema": DECISION_TRACE_SCHEMA,
+        "schema_version": 1,
+        "status": "adapter_error",
+        "diagnostics_mode": diagnostics_mode,
+        "run_id": None,
+        "request_id": request_id,
+        "decision_id": None,
+        "turn_id": None,
+        "trick_id": None,
+        "state_revision": state.revision,
+        "state_before_sha256": None,
+        "source_state": source_state,
+        "adapter_observation": None,
+        "legal_actions": None,
+        "encoding": None,
+        "model_output": None,
+        "diagnostics": {
+            "warnings": [],
+            "errors": [str(error)],
+            "invariants": {
+                "relative_two_is_teammate": True,
+                "adapter_observation_constructed": False,
+            },
+            "root_cause": diagnostic,
+        },
+    }
+
+
+def _normalize_diagnostics_mode(value: object) -> DiagnosticsMode:
+    normalized = str(value or "off").strip().lower()
+    if normalized not in {"off", "basic", "full"}:
+        raise ValueError(f"unsupported FableDan diagnostics mode: {value}")
+    return normalized  # type: ignore[return-value]
+
+
+def _relative_player_label(relative: int) -> str:
+    return ("self", "next", "partner", "prev")[int(relative) % 4]
+
+
+def _token_name(token: int) -> str:
+    value = int(token)
+    if value == BOS_TOK:
+        return "BOS"
+    if LEVEL_BASE <= value < LEVEL_BASE + 13:
+        return f"LEVEL_{RANK_NAMES[value - LEVEL_BASE]}"
+    if PLAYER_BASE <= value < PLAYER_BASE + 4:
+        return f"PLAYER_{_relative_player_label(value - PLAYER_BASE).upper()}"
+    if TYPE_BASE <= value < TYPE_BASE + len(TYPE_NAMES):
+        return TYPE_NAMES[value - TYPE_BASE]
+    if value == TRIBUTE_TOK:
+        return "TRIBUTE"
+    if value == RETURN_TOK:
+        return "RETURN"
+    if RANK_BASE <= value < RANK_BASE + len(RANK_NAMES):
+        return f"RANK_{RANK_NAMES[value - RANK_BASE]}"
+    if value == 0:
+        return "PAD"
+    return f"UNKNOWN_{value}"
 
 
 def _next_active(current: Seat, done: set[Seat]) -> Seat:

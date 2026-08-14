@@ -90,6 +90,41 @@ def test_valid_timeline_migrates_to_draft_truth_with_audit_and_is_idempotent(
     assert (session / "truth_log.json").read_bytes() == truth_before
 
 
+def test_timeline_migration_preserves_realtime_move_semantics(tmp_path: Path):
+    session = tmp_path / "sessions" / "semantic"
+    events = _valid_events("semantic")
+    events[1] = replace(
+        events[1],
+        payload={
+            **events[1].payload,
+            "play_type": "Single",
+            "logical_rank": "2",
+            "logical_label": "单张2",
+            "interpretation_ambiguous": False,
+            "wildcard_substitutions": [],
+            "candidate_interpretations": [
+                {"move_type": "Single", "key": "2"}
+            ],
+            "selected_interpretation": {
+                "move_type": "Single",
+                "key": "2",
+                "wildcard_assignments": [],
+            },
+            "selection_source": "realtime_semantics",
+        },
+    )
+    _write_timeline(session, events)
+
+    result = TimelineTruthMigrationService().migrate_session(session)
+    truth = load_truth_log(session / "truth_log.json", session_id="semantic")
+
+    assert result.status == "migrated"
+    semantics = truth.turns[0].move_semantics
+    assert semantics["move_type"] == "Single"
+    assert semantics["selection_source"] == "realtime_semantics"
+    assert semantics["selected_interpretation"]["key"] == "2"
+
+
 def test_action_sequence_mismatch_blocks_without_truth_output(tmp_path: Path):
     session = tmp_path / "sessions" / "bad-sequence"
     events = _valid_events("bad-sequence")

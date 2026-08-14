@@ -822,6 +822,7 @@ class TruthLogEditor(QWidget):
                         else LabelProvenance(source="human_editor")
                     ),
                     uncertainty=original.uncertainty if unchanged else (),
+                    move_semantics=original.move_semantics if unchanged else None,
                 )
             )
         lead = self.lead_combo.currentData()

@@ -27,7 +27,11 @@ from ..domain.recognition import (
     PlayRegionResult,
 )
 from ..domain.recording import RecorderWarning
-from ..danzero.rules import infer_best_action
+from ..danzero.rules import (
+    infer_best_action,
+    logical_action_label,
+    wildcard_substitutions,
+)
 from ..danzero.state import GuanDanState, Seat
 from .consensus import (
     BurstConsensus,
@@ -2220,6 +2224,38 @@ class LiveOrchestrator:
                         {"card": card, "as_rank": rank}
                         for card, rank in inference.wildcard_substitutions
                     ],
+                    "candidate_interpretations": [
+                        {
+                            "move_type": str(action[0]),
+                            "key": str(action[1]),
+                            "logical_label": logical_action_label(
+                                action, before.wild_rank
+                            ),
+                            "wildcard_assignments": [
+                                {"physical_card": card, "as_rank": rank}
+                                for card, rank in wildcard_substitutions(
+                                    action, before.wild_rank
+                                )
+                            ],
+                        }
+                        for action in inference.candidate_actions
+                    ],
+                    "selected_interpretation": (
+                        None
+                        if inference.ambiguous
+                        else {
+                            "move_type": str(inference.action[0]),
+                            "key": str(inference.action[1]),
+                            "logical_label": inference.logical_label,
+                            "wildcard_assignments": [
+                                {"physical_card": card, "as_rank": rank}
+                                for card, rank in inference.wildcard_substitutions
+                            ],
+                        }
+                    ),
+                    "selection_source": (
+                        "unresolved" if inference.ambiguous else "realtime_semantics"
+                    ),
                 }
                 if table_cards and not inference.beats_table:
                     integrity_warnings.append("observed_table_mismatch")

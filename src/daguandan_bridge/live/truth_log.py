@@ -18,8 +18,9 @@ from ..domain.truth import (
 )
 from ..storage import atomic_write_json, load_json_document
 
-_SCHEMA = "guandan.truth/3"
-_SCHEMA_VERSION = 3
+_SCHEMA = "guandan.truth/4"
+_SCHEMA_VERSION = 4
+_SCHEMA_VERSIONS = {"guandan.truth/3": 3, _SCHEMA: _SCHEMA_VERSION}
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _SUIT_LABELS = {"S": "黑桃", "H": "红桃", "C": "梅花", "D": "方块"}
 _LABEL_TO_SUIT = {value: key for key, value in _SUIT_LABELS.items()}
@@ -105,6 +106,7 @@ class TruthTurn:
     label_status: LabelStatus = "draft"
     provenance: LabelProvenance = LabelProvenance()
     uncertainty: tuple[str, ...] = ()
+    move_semantics: dict[str, object] | None = None
 
     def __init__(
         self,
@@ -121,8 +123,9 @@ class TruthTurn:
         label_status: LabelStatus = "draft",
         provenance: LabelProvenance | None = None,
         uncertainty: tuple[str, ...] = (),
+        move_semantics: dict[str, object] | None = None,
     ) -> None:
-        # Accept schema-1 positional construction while writing schema 3.
+        # 继续兼容 schema 1 的位置参数构造，同时统一写出 schema 4。
         if isinstance(actor, int) and isinstance(is_pass, str) and isinstance(cards, bool):
             legacy_turn_id = int(index)
             legacy_trick_id = actor
@@ -148,6 +151,7 @@ class TruthTurn:
             object.__setattr__(self, "label_status", normalize_label_status(label_status))
             object.__setattr__(self, "provenance", provenance or LabelProvenance())
             object.__setattr__(self, "uncertainty", _normalized_uncertainty(legacy_cards, uncertainty))
+            object.__setattr__(self, "move_semantics", _normalize_move_semantics(move_semantics))
             return
         object.__setattr__(self, "index", int(index))
         object.__setattr__(self, "actor", actor)
@@ -168,13 +172,18 @@ class TruthTurn:
         object.__setattr__(self, "label_status", normalize_label_status(label_status))
         object.__setattr__(self, "provenance", provenance or LabelProvenance())
         object.__setattr__(self, "uncertainty", _normalized_uncertainty(tuple(cards), uncertainty))
+        object.__setattr__(
+            self,
+            "move_semantics",
+            None if bool(is_pass) else _normalize_move_semantics(move_semantics),
+        )
 
     @property
     def turn_id(self) -> int:
         return self.index
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        raw: dict[str, object] = {
             "turn_id": self.index,
             "trick_id": self.trick_id,
             "actor": self.actor,
@@ -185,6 +194,9 @@ class TruthTurn:
             "provenance": self.provenance.to_dict(),
             "uncertainty": list(self.uncertainty),
         }
+        if self.move_semantics is not None:
+            raw["move_semantics"] = _json_safe_semantics(self.move_semantics)
+        return raw
 
 
 @dataclass(frozen=True)
@@ -258,7 +270,16 @@ class TruthLog:
                     trick_id=turn.trick_id,
                     turn_id=turn.index,
                     actor=turn.actor,
-                    payload={"cards": list(turn.cards), "is_pass": turn.is_pass},
+                    payload={
+                        "cards": list(turn.cards),
+                        "physical_cards": list(turn.cards),
+                        "is_pass": turn.is_pass,
+                        **(
+                            {"move_semantics": _json_safe_semantics(turn.move_semantics)}
+                            if turn.move_semantics is not None
+                            else {}
+                        ),
+                    },
                     confidence=1.0,
                     source="truth_log",
                     state_revision_before=turn.index,
@@ -270,12 +291,12 @@ class TruthLog:
 
 def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
     schema = str(raw.get("schema", ""))
-    if schema and schema != _SCHEMA:
+    if schema and schema not in _SCHEMA_VERSIONS:
         raise ValueError(f"unsupported truth schema: {schema}")
-    if schema == _SCHEMA and int(raw.get("schema_version", 3)) != 3:
+    if schema and int(raw.get("schema_version", _SCHEMA_VERSIONS[schema])) != _SCHEMA_VERSIONS[schema]:
         raise ValueError("truth schema and schema_version conflict")
-    version = 3 if schema == _SCHEMA else int(raw.get("schema_version", 1))
-    if version not in {1, 2, 3}:
+    version = _SCHEMA_VERSIONS[schema] if schema else int(raw.get("schema_version", 1))
+    if version not in {1, 2, 3, 4}:
         raise ValueError("不支持的标准日志版本")
     session_id = str(raw.get("source_session_id", raw.get("session_id", ""))).strip()
     if not session_id:
@@ -332,9 +353,10 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
                 label_status=normalize_label_status(item.get("label_status", "draft")),
                 provenance=LabelProvenance.from_dict(
                     item.get("provenance"),
-                    default_source="" if version == 3 else "legacy_migration",
+                    default_source="" if version >= 3 else "legacy_migration",
                 ),
                 uncertainty=tuple(str(value) for value in uncertainty_raw),
+                move_semantics=item.get("move_semantics"),  # type: ignore[arg-type]
             )
         )
     source = raw.get("source_video") or {}
@@ -353,7 +375,7 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
         label_status=normalize_label_status(raw.get("label_status", "draft")),
         provenance=LabelProvenance.from_dict(
             raw.get("provenance"),
-            default_source="" if version == 3 else "legacy_migration",
+            default_source="" if version >= 3 else "legacy_migration",
         ),
         outcome=TruthOutcome.from_dict(raw.get("outcome")),
     )
@@ -408,6 +430,7 @@ def _with_inferred_trick_ids(
                 label_status=turn.label_status,
                 provenance=turn.provenance,
                 uncertainty=turn.uncertainty,
+                move_semantics=turn.move_semantics,
             )
         )
         if turn.is_pass:
@@ -457,3 +480,40 @@ def _optional_int(value: object) -> int | None:
     if parsed < 0:
         raise ValueError("定位信息不能为负数")
     return parsed
+
+
+def _normalize_move_semantics(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("move_semantics 必须是 JSON 对象")
+    normalized = _json_safe_semantics(value)
+    source = normalized.get("selection_source")
+    if source is not None and source not in {
+        "realtime_semantics",
+        "ui_detection",
+        "exact_engine_state",
+        "inferred_unique",
+        "unresolved",
+    }:
+        raise ValueError(f"不支持的 wildcard 语义来源：{source}")
+    assignments = normalized.get("wildcard_assignments")
+    if assignments is not None and not isinstance(assignments, list):
+        raise ValueError("wildcard_assignments 必须是数组")
+    candidates = normalized.get("candidate_interpretations")
+    if candidates is not None and not isinstance(candidates, list):
+        raise ValueError("candidate_interpretations 必须是数组")
+    selected = normalized.get("selected_interpretation")
+    if selected is not None and not isinstance(selected, dict):
+        raise ValueError("selected_interpretation 必须是对象或 null")
+    return normalized
+
+
+def _json_safe_semantics(value: object) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe_semantics(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_semantics(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise ValueError(f"move_semantics 包含不可序列化值：{type(value).__name__}")

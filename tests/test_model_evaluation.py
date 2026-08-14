@@ -141,16 +141,19 @@ def test_teacher_forced_run_binds_each_strategy_and_publishes_metrics(
     }
     assert result.summary["metrics"]["latency_ms"]["count"] == 2
     assert [item["turn_id"] for item in result.decisions] == [1, 5]
-    assert set(path.name for path in result.report_directory.iterdir()) == {
+    expected_files = {
         "summary.json",
         "decisions.jsonl",
         "report.md",
     }
+    if strategy_id.startswith("fabledan_"):
+        expected_files.add("fabledan_trace.jsonl")
+    assert set(path.name for path in result.report_directory.iterdir()) == expected_files
     assert "teacher-forced" in (result.report_directory / "report.md").read_text("utf-8")
     assert "不是闭环胜率" in (result.report_directory / "report.md").read_text("utf-8")
 
 
-def test_fabledan_evaluation_embeds_decision_debug_in_run_artifact(tmp_path):
+def test_fabledan_evaluation_publishes_separate_decision_trace(tmp_path):
     truth = _truth("game")
     session = _session(tmp_path, "game", truth)
     service = ModelEvaluationService(
@@ -165,7 +168,7 @@ def test_fabledan_evaluation_embeds_decision_debug_in_run_artifact(tmp_path):
     assert isinstance(prepared.advisor, FableDanAdvisor)
     assert prepared.advisor.debug is True
     assert prepared.advisor.write_decision_log is False
-    assert prepared.strategy_audit["decision_log_mode"] == "embedded"
+    assert prepared.strategy_audit["decision_log_mode"] == "trace_embedded"
     assert result.status == "completed"
     records = [
         json.loads(line)
@@ -174,12 +177,23 @@ def test_fabledan_evaluation_embeds_decision_debug_in_run_artifact(tmp_path):
         .splitlines()
     ]
     assert records
-    for record in records:
-        embedded = record["fabledan_decision"]
-        assert embedded["schema"] == "fabledan-decision/1"
-        assert embedded["request_id"] == record["request_id"]
-        assert embedded["best_action"] == embedded["candidates"][0]["action"]
-        assert len(embedded["legal_actions"]) == embedded["legal_action_count"]
+    traces = [
+        json.loads(line)
+        for line in (result.report_directory / "fabledan_trace.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    assert len(traces) == len(records)
+    for record, trace in zip(records, traces):
+        assert "fabledan_decision" not in record
+        assert record["fabledan_trace_ref"]["request_id"] == record["request_id"]
+        assert trace["schema"] == "fabledan-trace/1"
+        assert trace["run_id"] == result.run_id
+        assert trace["request_id"] == record["request_id"]
+        assert trace["decision_id"] == record["decision_id"]
+        assert len(trace["legal_actions"]["actions"]) == trace["legal_actions"][
+            "legal_count_after_cap"
+        ]
 
 
 def test_prepare_accepts_saved_legacy_session_truth_without_source_id(tmp_path):
@@ -374,7 +388,7 @@ def test_two_representative_real_sessions_have_stable_preflight_outcomes():
     assert repaired_input.eligible_self_decisions == 17
 
 
-def test_real_session_fabledan_model_embeds_complete_decision_logs(tmp_path):
+def test_real_session_fabledan_model_publishes_complete_decision_traces(tmp_path):
     profiles = Path(__file__).parents[1] / "data" / "profiles"
     source = (
         profiles
@@ -417,13 +431,112 @@ def test_real_session_fabledan_model_embeds_complete_decision_logs(tmp_path):
         .splitlines()
     ]
     assert len(records) == prepared.eligible_self_decisions
-    for record in records:
-        embedded = record["fabledan_decision"]
-        assert embedded["schema"] == "fabledan-decision/1"
-        assert embedded["model_filename"] == "fabledan_weights.npz"
-        assert len(embedded["q_values"]) == embedded["legal_action_count"]
-        assert embedded["best_action"] == embedded["candidates"][0]["action"]
-        assert "decision_log_path" not in embedded
+    traces = [
+        json.loads(line)
+        for line in (result.report_directory / "fabledan_trace.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    assert len(traces) == len(records)
+    for record, trace in zip(records, traces):
+        assert record["fabledan_trace_ref"]["decision_id"] == record["decision_id"]
+        assert trace["schema"] == "fabledan-trace/1"
+        assert trace["model_output"]["model_path"].endswith("fabledan_weights.npz")
+        assert len(trace["model_output"]["q_values"]) == trace["legal_actions"][
+            "legal_count_after_cap"
+        ]
+        selected = trace["model_output"]["selected_index"]
+        assert trace["model_output"]["selected_action"] == trace["legal_actions"][
+            "actions"
+        ][selected]
+        assert trace["encoding"]["tokens"]["tokens"]
+        assert trace["encoding"]["features"]["feats"]
+
+
+def test_target_session_explains_t0002_t0014_and_turn23_wildcard(tmp_path):
+    profiles = Path(__file__).parents[1] / "data" / "profiles"
+    source = (
+        profiles
+        / "tencent_daguandan"
+        / "sessions"
+        / "game_20260814_004447_aab3dc"
+    )
+    weights = profiles / "tencent_daguandan" / "models" / "fabledan_weights.npz"
+    if not source.is_dir() or not weights.is_file():
+        pytest.skip("目标真实会话或 FableDan 权重不可用")
+    session = tmp_path / "profiles" / "profile" / "sessions" / source.name
+    session.mkdir(parents=True)
+    shutil.copy2(source / "manifest.json", session / "manifest.json")
+    shutil.copy2(source / "truth_log.json", session / "truth_log.json")
+    service = ModelEvaluationService(
+        profiles_root=profiles,
+        profile_name="tencent_daguandan",
+    )
+
+    prepared = service.prepare(session, strategy_id="fabledan_model")
+    result = service.run(prepared)
+    traces = [
+        json.loads(line)
+        for line in (result.report_directory / "fabledan_trace.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    by_turn = {trace["turn_id"]: trace for trace in traces}
+
+    assert result.status == "completed_with_errors"
+    assert len(traces) == prepared.eligible_self_decisions == 23
+    for trace in traces:
+        assert trace["run_id"] == result.run_id
+        assert trace["request_id"].endswith(trace["decision_id"])
+        assert trace["decision_id"] == f"T{trace['turn_id']:04d}"
+
+    t2 = by_turn[2]
+    assert t2["adapter_observation"]["lead"]["type"] == "PAIR"
+    assert t2["adapter_observation"]["lead"]["physical_cards"] == ["5C", "5H"]
+    assert t2["adapter_observation"]["lead_owner_absolute"] == 3
+    t2_actions = {
+        action["readable_action"]: action
+        for action in t2["legal_actions"]["actions"]
+    }
+    t2_q = {
+        row["readable_action"]: row["q"]
+        for row in t2["model_output"]["q_values"]
+    }
+    assert t2_actions["QQ"]["type"] == "PAIR"
+    assert t2_actions["9999"]["type"] == "BOMB"
+    assert t2_q["QQ"] == pytest.approx(-0.09601562415502184)
+    assert t2_q["9999"] == pytest.approx(-0.06028293120130538)
+    assert t2["model_output"]["selected_action"]["readable_action"] == "9999"
+    assert t2["model_output"]["selection_reason"].startswith("np.argmax")
+
+    t14 = by_turn[14]
+    observation = t14["adapter_observation"]
+    assert observation["lead"]["type"] == "PLATE"
+    assert observation["lead_owner_absolute"] == 2
+    assert observation["lead_owner_relative"] == 2
+    assert observation["lead_owner_is_teammate"] is True
+    assert observation["events"][-2]["encoded_player_token_name"] == "PLAYER_PARTNER"
+    t14_q = {
+        row["readable_action"]: row["q"]
+        for row in t14["model_output"]["q_values"]
+    }
+    assert t14_q["PASS"] == pytest.approx(0.07069822211305947)
+    assert t14_q["JJJJ"] == pytest.approx(0.11479588589067691)
+    assert t14["model_output"]["selected_action"]["readable_action"] == "JJJJ"
+
+    root = by_turn[26]["diagnostics"]["root_cause"]
+    assert root["code"] == "wildcard_ambiguity"
+    assert root["source_turn_id"] == 23
+    assert root["physical_cards"] == ["10C", "6C", "6H", "7C", "9C"]
+    assert [item["tuple"] for item in root["candidate_declarations"]] == [
+        [5, 6, [5, 6, 7, 8, 9]],
+        [9, 6, [5, 6, 7, 8, 9]],
+    ]
+    assert root["selected_interpretation"] is None
+    assert root["selection_source"] == "unresolved"
+    report = (result.report_directory / "report.md").read_text("utf-8")
+    assert report.count("history turn 23 wildcard ambiguity") == 1
+    assert "affected decisions: 26, 30, 34" in report
 
 
 def test_strategy_independent_validation_does_not_initialize_model(tmp_path):

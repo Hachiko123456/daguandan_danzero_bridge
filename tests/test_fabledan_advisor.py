@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from daguandan_bridge.advisor_strategy import (
     build_advisor,
     load_profile_advisor_strategy,
     load_profile_fabledan_debug,
+    load_profile_fabledan_diagnostics,
     save_profile_advisor_strategy,
 )
 from daguandan_bridge.application.ports import AdvicePort
@@ -259,7 +261,7 @@ def test_ambiguous_wildcard_history_is_blocked_before_policy(tmp_path, monkeypat
     state = _following_state(("JC", "JD", "9H", "2D", "2H"), level="9")
 
     with pytest.raises(FableDanStateError, match="wildcard.*不唯一"):
-        FableDanAdvisor(tmp_path, "profile").recommend(
+        FableDanAdvisor(tmp_path, "profile", diagnostics="full").recommend(
             state,
             request_id="wildcard",
             trace=trace,
@@ -268,6 +270,46 @@ def test_ambiguous_wildcard_history_is_blocked_before_policy(tmp_path, monkeypat
     engine_input = trace.snapshot()["engine_input"]
     assert engine_input["validation_status"] == "blocked"
     assert "wildcard" in engine_input["validation_error"]
+    root = engine_input["fabledan_trace"]["diagnostics"]["root_cause"]
+    assert root["code"] == "wildcard_ambiguity"
+    assert root["source_turn_id"] == 1
+    assert len(root["candidate_interpretations"]) >= 2
+    assert root["selected_interpretation"] is None
+    assert root["selection_source"] == "unresolved"
+
+
+def test_explicit_truth_semantics_resolves_wildcard_without_guessing(tmp_path):
+    state = _following_state(("10C", "6C", "6H", "7C", "9C"), level="6")
+    original = state.play_history[0]
+    resolved = replace(
+        original,
+        action_metadata={
+            "ambiguity": True,
+            "selected_interpretation": {
+                "type_id": 5,
+                "key": 6,
+                "claim_ranks": ["6", "7", "8", "9", "10"],
+            },
+            "selection_source": "exact_engine_state",
+        },
+    )
+    state.play_history[0] = resolved
+    state.trick_plays[0] = resolved
+
+    result = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        runtime_policy="rule_only",
+        diagnostics="full",
+        write_decision_log=False,
+    ).recommend_detailed(state, request_id="explicit-wildcard")
+
+    resolution = result.advice.engine_input["fabledan_trace"][
+        "adapter_observation"
+    ]["events"][0]["semantic_resolution"]
+    assert resolution["selection_source"] == "exact_engine_state"
+    assert resolution["ambiguity"] is True
+    assert resolution["selected_interpretation"]["type_id"] == 5
 
 
 def test_incomplete_history_and_remaining_counts_are_blocked(tmp_path):
@@ -278,7 +320,7 @@ def test_incomplete_history_and_remaining_counts_are_blocked(tmp_path):
         FableDanAdvisor(tmp_path, "profile").recommend(state)
 
 
-@pytest.mark.parametrize("version", (1, 2, 3))
+@pytest.mark.parametrize("version", (1, 2, 3, 4))
 def test_legacy_truth_schemas_with_unique_history_can_reach_fabledan(
     tmp_path,
     version: int,
@@ -296,8 +338,8 @@ def test_legacy_truth_schemas_with_unique_history_can_reach_fabledan(
             {"turn_id": 3, "actor": "left", "is_pass": True, "cards": []},
         ],
     }
-    if version == 3:
-        raw.update({"schema": "guandan.truth/3", "schema_version": 3})
+    if version in {3, 4}:
+        raw.update({"schema": f"guandan.truth/{version}", "schema_version": version})
     else:
         raw["schema_version"] = version
     truth = truth_log_from_dict(raw)
@@ -346,20 +388,26 @@ def test_detailed_decision_uses_one_inference_and_appends_complete_jsonl(tmp_pat
     assert len(records) == 2
     assert records[0]["request_id"] == "left-55-a"
     assert records[1]["request_id"] == "left-55-b"
-    assert records[0]["lead_text"] == "55"
-    assert records[0]["lead_owner"] == 3
-    assert records[0]["lead_owner_seat"] == "left"
-    assert records[0]["player_mapping"]["right"] == 1
-    assert records[0]["player_mapping"]["opposite"] == 2
-    assert records[0]["player_mapping"]["left"] == 3
-    assert len(records[0]["candidates"]) == records[0]["legal_action_count"]
-    assert records[0]["best_action"] == records[0]["candidates"][0]["action"]
-    assert records[0]["model_filename"] == "best.npz"
-    assert records[0]["model_hash"] == "test-digest"
-    assert records[0]["validation_warnings"] == []
+    assert records[0]["schema"] == "fabledan-trace/1"
+    observation = records[0]["adapter_observation"]
+    assert observation["lead"]["claim_ranks"] == ["5", "5"]
+    assert observation["lead_owner_absolute"] == 3
+    assert observation["lead_owner_relative"] == 3
+    assert observation["player"]["seat_mapping"]["right"] == 1
+    assert observation["player"]["seat_mapping"]["opposite"] == 2
+    assert observation["player"]["seat_mapping"]["left"] == 3
+    legal_count = records[0]["legal_actions"]["legal_count_after_cap"]
+    assert len(records[0]["model_output"]["q_values"]) == legal_count
+    selected = records[0]["model_output"]["selected_index"]
+    assert records[0]["model_output"]["selected_action"] == records[0][
+        "legal_actions"
+    ]["actions"][selected]
+    assert records[0]["model_output"]["model_path"].endswith("best.npz")
+    assert records[0]["model_output"]["model_hash"] == "test-digest"
+    assert records[0]["diagnostics"]["warnings"] == []
 
 
-def test_debug_can_embed_complete_log_without_appending_jsonl(tmp_path):
+def test_debug_can_embed_complete_trace_without_appending_jsonl(tmp_path):
     log_directory = tmp_path / "logs" / "fabledan_decisions"
     advisor = FableDanAdvisor(
         tmp_path,
@@ -372,16 +420,20 @@ def test_debug_can_embed_complete_log_without_appending_jsonl(tmp_path):
 
     result = advisor.recommend_detailed(_left_55_state(), request_id="embedded-log")
 
-    embedded = result.advice.engine_input["decision_log"]
+    trace = result.advice.engine_input["fabledan_trace"]
     assert model.calls == 1
-    assert embedded["schema"] == "fabledan-decision/1"
-    assert embedded["request_id"] == "embedded-log"
-    assert embedded["lead_text"] == "55"
-    assert embedded["best_action"] == embedded["candidates"][0]["action"]
-    assert len(embedded["q_values"]) == embedded["legal_action_count"]
-    assert result.advice.engine_input["decision_log_mode"] == "embedded"
+    assert result.advice.engine_input["decision_log_mode"] == "trace_embedded"
+    assert "decision_log" not in result.advice.engine_input
     assert "decision_log_path" not in result.advice.engine_input
     assert not log_directory.exists()
+    assert trace["schema"] == "fabledan-trace/1"
+    assert trace["request_id"] == "embedded-log"
+    assert trace["diagnostics_mode"] == "full"
+    assert trace["encoding"]["tokens"]["tokens"]
+    assert trace["encoding"]["features"]["feats_shape"][1] == 80
+    assert len(trace["model_output"]["q_values"]) == result.legal_action_count
+    assert trace["model_output"]["selected_index"] < result.legal_action_count
+    assert trace["diagnostics"]["errors"] == []
 
 
 def test_debug_false_preserves_recommend_api_without_writing_logs(tmp_path):
@@ -400,7 +452,29 @@ def test_debug_false_preserves_recommend_api_without_writing_logs(tmp_path):
     assert advice.strategy == "fabledan-numpy"
     assert advice.engine_input["debug"] is False
     assert "decision" not in advice.engine_input
+    assert "fabledan_trace" not in advice.engine_input
     assert not log_directory.exists()
+
+
+def test_basic_diagnostics_omits_raw_tokens_and_features_but_keeps_legal_q(tmp_path):
+    advisor = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        diagnostics="basic",
+        write_decision_log=False,
+    )
+    _install_counting_runtime(advisor, tmp_path)
+
+    result = advisor.recommend_detailed(_left_55_state(), request_id="basic")
+    trace = result.advice.engine_input["fabledan_trace"]
+
+    assert trace["diagnostics_mode"] == "basic"
+    assert "tokens" not in trace["encoding"]["tokens"]
+    assert "feats" not in trace["encoding"]["features"]
+    assert trace["encoding"]["tokens"]["tokens_sha256"]
+    assert trace["encoding"]["features"]["feats_sha256"]
+    assert len(trace["legal_actions"]["actions"]) == result.legal_action_count
+    assert len(trace["model_output"]["q_values"]) == result.legal_action_count
 
 
 def test_log_failure_warns_but_still_returns_model_recommendation(
@@ -478,6 +552,20 @@ def test_profile_strategy_builds_fabledan_and_persists_default(tmp_path):
         profiles_root=tmp_path,
         profile_name="profile",
     ).debug is True
+
+
+def test_fabledan_diagnostics_environment_overrides_profile(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "profile.json").write_text(
+        json.dumps({"fabledan_diagnostics": "basic"}), encoding="utf-8"
+    )
+
+    assert load_profile_fabledan_diagnostics(tmp_path, "profile") == "basic"
+    monkeypatch.setenv("FABLEDAN_DIAGNOSTICS", "full")
+    assert load_profile_fabledan_diagnostics(tmp_path, "profile") == "full"
+    advisor = build_advisor("fabledan", profiles_root=tmp_path, profile_name="profile")
+    assert advisor.diagnostics == "full"
 
 
 def test_vendor_contains_only_approved_runtime_and_notice_files():

@@ -49,6 +49,7 @@ class ActionInference:
     ambiguous: bool = False
     logical_label: str = ""
     wildcard_substitutions: tuple[tuple[str, str], ...] = ()
+    candidate_actions: tuple[list[object], ...] = ()
 
 
 def actions_for_cards(cards: tuple[str, ...], level_rank: str) -> list[list[object]]:
@@ -263,6 +264,7 @@ def infer_best_action(
         ambiguous=len(all_actions) > 1,
         logical_label=logical_action_label(best, level_rank),
         wildcard_substitutions=wildcard_substitutions(best, level_rank),
+        candidate_actions=all_actions,
     )
 
 

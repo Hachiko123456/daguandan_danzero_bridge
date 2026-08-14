@@ -45,8 +45,8 @@ def test_truth_log_round_trips_arbitrary_action_chain(tmp_path):
     loaded = load_truth_log(path, session_id="game-test")
 
     assert loaded == _log()
-    assert loaded.to_dict()["schema_version"] == 3
-    assert loaded.to_dict()["schema"] == "guandan.truth/3"
+    assert loaded.to_dict()["schema_version"] == 4
+    assert loaded.to_dict()["schema"] == "guandan.truth/4"
     assert [turn.actor for turn in loaded.turns] == ["self", "right", "opposite", "self"]
 
 
@@ -74,7 +74,7 @@ def test_truth_log_rejects_cards_on_pass_and_wrong_session(tmp_path):
         truth_log_from_dict(raw)
 
 
-@pytest.mark.parametrize("schema_version", (1, 2, 3))
+@pytest.mark.parametrize("schema_version", (1, 2, 3, 4))
 def test_context_session_id_loads_legacy_log_without_rewriting_file(
     tmp_path, schema_version
 ):
@@ -83,6 +83,9 @@ def test_context_session_id_loads_legacy_log_without_rewriting_file(
     if schema_version < 3:
         raw.pop("schema")
         raw["schema_version"] = schema_version
+    elif schema_version == 3:
+        raw["schema"] = "guandan.truth/3"
+        raw["schema_version"] = 3
     path = tmp_path / "truth_log.json"
     path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
     original_bytes = path.read_bytes()
@@ -129,7 +132,7 @@ def test_truth_log_migrates_schema_one_turns():
     log = truth_log_from_dict(raw)
 
     assert log.turns[0].index == 1
-    assert log.to_dict()["schema_version"] == 3
+    assert log.to_dict()["schema_version"] == 4
 
 
 def test_schema_two_read_is_non_mutating_and_infers_real_trick_ids():
@@ -153,7 +156,7 @@ def test_schema_two_read_is_non_mutating_and_infers_real_trick_ids():
     assert [event.trick_id for event in log.to_events()[1:]] == [1, 1, 1, 1, 2]
 
 
-def test_truth_v3_round_trips_label_provenance_evidence_and_uncertainty():
+def test_truth_v4_round_trips_label_provenance_evidence_and_uncertainty():
     turn = TruthTurn(
         1,
         "left",
@@ -170,3 +173,40 @@ def test_truth_v3_round_trips_label_provenance_evidence_and_uncertainty():
     assert loaded.turns[0].evidence.frame_indices == (10, 11)
     assert loaded.turns[0].label_status == "verified"
     assert loaded.turns[0].uncertainty == ("unknown_suit",)
+
+
+def test_truth_v4_round_trips_explicit_wildcard_semantics_into_live_events():
+    semantics = {
+        "move_type": "STRAIGHT",
+        "key": 6,
+        "claim_ranks": ["6", "7", "8", "9", "10"],
+        "wildcard_assignments": [
+            {"physical_card": "6H", "as_rank": "8"}
+        ],
+        "ambiguity": True,
+        "candidate_interpretations": [
+            {"move_type": "STRAIGHT", "key": 6},
+            {"move_type": "SFLUSH", "key": 6},
+        ],
+        "selected_interpretation": {
+            "move_type": "STRAIGHT",
+            "key": 6,
+            "claim_ranks": ["6", "7", "8", "9", "10"],
+        },
+        "selection_source": "exact_engine_state",
+    }
+    turn = TruthTurn(
+        1,
+        "self",
+        False,
+        ("10C", "6C", "6H", "7C", "9C"),
+        move_semantics=semantics,
+    )
+    log = TruthLog("semantic", TruthInitialState("6", "self", HAND), (turn,))
+
+    loaded = truth_log_from_dict(log.to_dict())
+    event = loaded.to_events()[1]
+
+    assert loaded.turns[0].move_semantics == semantics
+    assert event.payload["physical_cards"] == list(turn.cards)
+    assert event.payload["move_semantics"] == semantics

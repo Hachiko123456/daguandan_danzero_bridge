@@ -962,7 +962,56 @@ class TimelineTruthMigrationService:
             evidence=TruthEvidence(monotonic_ms=event.monotonic_ms),
             label_status="draft",
             provenance=LabelProvenance(source=MIGRATION_SOURCE),
+            move_semantics=TimelineTruthMigrationService._move_semantics_from_event_payload(
+                event.payload
+            ),
         )
+
+    @staticmethod
+    def _move_semantics_from_event_payload(
+        payload: dict[str, object],
+    ) -> dict[str, object] | None:
+        nested = payload.get("move_semantics")
+        if isinstance(nested, dict):
+            return dict(nested)
+        move_type = payload.get("play_type")
+        if move_type is None:
+            return None
+        ambiguous = bool(payload.get("interpretation_ambiguous", False))
+        assignments = [
+            {
+                "physical_card": str(item.get("physical_card", item.get("card", ""))),
+                "as_rank": str(item.get("as_rank", "")),
+            }
+            for item in payload.get("wildcard_substitutions", ())
+            if isinstance(item, dict)
+        ]
+        selected = payload.get("selected_interpretation")
+        if not isinstance(selected, dict) and not ambiguous:
+            selected = {
+                "move_type": str(move_type),
+                "key": payload.get("logical_rank"),
+                "logical_label": payload.get("logical_label", ""),
+                "wildcard_assignments": assignments,
+            }
+        candidates = payload.get("candidate_interpretations", ())
+        return {
+            "move_type": str(move_type),
+            "key": payload.get("logical_rank"),
+            "claim_ranks": list(payload.get("claim_ranks", ())),
+            "wildcard_assignments": assignments,
+            "ambiguity": ambiguous,
+            "candidate_interpretations": (
+                list(candidates) if isinstance(candidates, (list, tuple)) else []
+            ),
+            "selected_interpretation": selected if isinstance(selected, dict) else None,
+            "selection_source": str(
+                payload.get(
+                    "selection_source",
+                    "unresolved" if ambiguous else "realtime_semantics",
+                )
+            ),
+        }
 
     @staticmethod
     def _normalize_source_actions(

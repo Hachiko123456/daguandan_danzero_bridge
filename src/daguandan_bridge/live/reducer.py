@@ -443,6 +443,7 @@ class LiveReducer:
                 for options in event.payload.get("suit_options", ())
                 if isinstance(options, (list, tuple))
             ),
+            action_metadata=_action_metadata_from_payload(event.payload),
         )
         self._trick_plays.append(play)
         self._play_history.append(play)
@@ -540,3 +541,14 @@ class LiveReducer:
 
     def clone_empty(self) -> "LiveReducer":
         return LiveReducer(self.session_id)
+
+
+def _action_metadata_from_payload(
+    payload: dict[str, object],
+) -> dict[str, object] | None:
+    nested = payload.get("move_semantics")
+    if isinstance(nested, dict):
+        return dict(nested)
+    ignored = {"cards", "is_pass", "suit_options", "integrity_warnings"}
+    metadata = {str(key): value for key, value in payload.items() if key not in ignored}
+    return metadata or None

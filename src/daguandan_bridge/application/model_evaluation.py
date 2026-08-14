@@ -247,6 +247,7 @@ class ModelEvaluationService:
         run_id = _new_run_id()
         created_at = _utc_now()
         decisions: list[dict[str, object]] = []
+        fabledan_traces: list[dict[str, object]] = []
         errors: list[EvaluationIssue] = list(prepared.issues)
         status: FinalStatus = "blocked" if not prepared.ready else "completed"
         cancelled = False
@@ -294,6 +295,15 @@ class ModelEvaluationService:
                             "STRATEGY_DECISION_FAILED", str(exc), turn.index
                         )
                     latency_ms = (perf_counter() - started) * 1_000
+                    fabledan_trace = _evaluation_fabledan_trace(
+                        prepared,
+                        trace=trace,
+                        run_id=run_id,
+                        turn=turn,
+                        state_hash=state_hash,
+                    )
+                    if fabledan_trace is not None:
+                        fabledan_traces.append(fabledan_trace)
 
                     # Construct the comparison only after prediction has returned.
                     actual = _action_dict(turn.is_pass, turn.cards)
@@ -337,6 +347,14 @@ class ModelEvaluationService:
                             advice=None,
                         )
                     decisions.append(decision)
+                    if fabledan_trace is not None:
+                        decision["fabledan_trace_ref"] = {
+                            "path": "fabledan_trace.jsonl",
+                            "run_id": run_id,
+                            "request_id": request_id,
+                            "decision_id": decision["decision_id"],
+                            "turn_id": turn.index,
+                        }
                     _apply_truth_turn(reducer, turn)
                     _emit(
                         progress,
@@ -408,10 +426,21 @@ class ModelEvaluationService:
             "report_path": "report.md",
             "decisions_path": "decisions.jsonl",
         }
-        report = _render_report(summary, decisions)
+        if prepared.strategy_id.startswith("fabledan_"):
+            summary["fabledan_trace_path"] = "fabledan_trace.jsonl"
+        report = _render_report(summary, decisions, fabledan_traces)
         try:
             report_directory = _publish_artifacts(
-                prepared.session_directory, run_id, summary, decisions, report
+                prepared.session_directory,
+                run_id,
+                summary,
+                decisions,
+                report,
+                fabledan_traces=(
+                    fabledan_traces
+                    if prepared.strategy_id.startswith("fabledan_")
+                    else None
+                ),
             )
         except Exception:
             # Artifact publication is itself a terminal failure and must never be
@@ -605,7 +634,12 @@ def _validate_action_rules(snapshot, turn: TruthTurn) -> None:
         card == f"{snapshot.round_level}H" for card in turn.cards
     ):
         signatures = {(str(action[0]), str(action[1])) for action in actions}
-        if len(signatures) > 1:
+        semantics = turn.move_semantics or {}
+        has_selected_semantics = (
+            isinstance(semantics.get("selected_interpretation"), dict)
+            and semantics.get("selection_source") != "unresolved"
+        )
+        if len(signatures) > 1 and not has_selected_semantics:
             raise TruthValidationError(
                 "INPUT_WILDCARD_AMBIGUOUS",
                 "百搭牌动作缺少唯一牌型元数据，不能猜测其声明牌型",
@@ -625,7 +659,12 @@ def _apply_truth_turn(reducer: LiveReducer, turn: TruthTurn) -> None:
     if turn.is_pass:
         reducer.record_pass(turn.actor, source="model_evaluation_truth")
     else:
-        reducer.record_play(turn.actor, turn.cards, source="model_evaluation_truth")
+        reducer.record_play(
+            turn.actor,
+            turn.cards,
+            source="model_evaluation_truth",
+            action_metadata=turn.move_semantics,
+        )
 
 
 def _validate_prepared_binding(strategy_id: str, audit: dict[str, object]) -> None:
@@ -674,6 +713,44 @@ def _validate_predicted_action(snapshot, advice: AdviceResult) -> None:
         raise ValueError("strategy returned a play that does not beat the table")
 
 
+def _evaluation_fabledan_trace(
+    prepared: PreparedEvaluation,
+    *,
+    trace: StrategyExecutionTrace,
+    run_id: str,
+    turn: TruthTurn,
+    state_hash: str,
+) -> dict[str, object] | None:
+    if not prepared.strategy_id.startswith("fabledan_"):
+        return None
+    snapshot = trace.snapshot()
+    engine_input = snapshot.get("engine_input")
+    if not isinstance(engine_input, dict):
+        return None
+    raw = engine_input.get("fabledan_trace")
+    if not isinstance(raw, dict):
+        return None
+    record = _json_safe(raw)
+    if not isinstance(record, dict):
+        return None
+    record.update(
+        {
+            "run_id": run_id,
+            "request_id": trace.request_id,
+            "decision_id": f"T{turn.index:04d}",
+            "turn_id": turn.index,
+            "trick_id": turn.trick_id,
+            "state_revision": turn.index,
+            "state_before_sha256": state_hash,
+        }
+    )
+    source = record.get("source_state")
+    if isinstance(source, dict):
+        source["state_revision"] = turn.index
+        source["state_before_sha256"] = state_hash
+    return record
+
+
 def _decision_record(
     prepared: PreparedEvaluation,
     turn: TruthTurn,
@@ -692,12 +769,8 @@ def _decision_record(
     advice: AdviceResult | None,
 ) -> dict[str, object]:
     backend = prepared.strategy_audit.get("backend", _BINDINGS[prepared.strategy_id][1])
-    fabledan_decision: dict[str, object] | None = None
     if advice is not None and isinstance(advice.engine_input, dict):
         backend = advice.engine_input.get("backend", backend)
-        embedded = advice.engine_input.get("decision_log")
-        if isinstance(embedded, dict):
-            fabledan_decision = _json_safe(embedded)
     record: dict[str, object] = {
         "decision_id": f"T{turn.index:04d}",
         "turn_id": turn.index,
@@ -720,8 +793,6 @@ def _decision_record(
         "error_code": error.code if error else None,
         "error_message": error.message if error else None,
     }
-    if fabledan_decision is not None:
-        record["fabledan_decision"] = fabledan_decision
     return record
 
 
@@ -802,9 +873,28 @@ def _percentile(values: list[float], quantile: float) -> float:
 
 
 def _render_report(
-    summary: dict[str, object], decisions: list[dict[str, object]]
+    summary: dict[str, object],
+    decisions: list[dict[str, object]],
+    fabledan_traces: list[dict[str, object]],
 ) -> str:
     metrics = summary["metrics"]
+    trace_by_turn = {
+        int(trace["turn_id"]): trace
+        for trace in fabledan_traces
+        if isinstance(trace.get("turn_id"), int)
+    }
+    wildcard_roots: dict[int, dict[str, object]] = {}
+    for trace in fabledan_traces:
+        diagnostics = trace.get("diagnostics")
+        root = diagnostics.get("root_cause") if isinstance(diagnostics, dict) else None
+        if not isinstance(root, dict) or root.get("code") != "wildcard_ambiguity":
+            continue
+        source_turn = int(root.get("source_turn_id", 0))
+        group = wildcard_roots.setdefault(
+            source_turn,
+            {"root": root, "affected": []},
+        )
+        group["affected"].append(trace.get("turn_id"))
     lines = [
         "# 模型整局评测报告",
         "",
@@ -824,12 +914,32 @@ def _render_report(
         "## 错误",
         "",
     ]
+    if wildcard_roots:
+        lines.extend(["### 根因聚合", ""])
+        for source_turn, group in sorted(wildcard_roots.items()):
+            root = group["root"]
+            affected = ", ".join(str(value) for value in group["affected"])
+            lines.append(
+                f"- root cause: history turn {source_turn} wildcard ambiguity；"
+                f"affected decisions: {affected}；原因：{root.get('reason')}"
+            )
+        lines.append("")
     errors = summary.get("errors", [])
     if errors:
+        affected = {
+            value
+            for group in wildcard_roots.values()
+            for value in group["affected"]
+        }
+        remaining_errors = [
+            item for item in errors if item.get("turn_id") not in affected
+        ]
         lines.extend(
             f"- `{item.get('code')}` turn={item.get('turn_id', '-')}：{item.get('message')}"
-            for item in errors
+            for item in remaining_errors
         )
+        if not remaining_errors and not wildcard_roots:
+            lines.append("- 无")
     else:
         lines.append("- 无")
     lines.extend(
@@ -837,23 +947,111 @@ def _render_report(
             "",
             "## 逐决策",
             "",
-            "| turn | 场景 | 真实动作 | 预测动作 | exact | 延迟(ms) | 状态 |",
-            "| ---: | --- | --- | --- | --- | ---: | --- |",
+            "| turn | 场景 | lead | lead owner | teammate | legal | 预测动作 | Q | 次优 Q | margin | diagnostics |",
+            "| ---: | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- |",
         ]
     )
     for item in decisions:
+        trace = trace_by_turn.get(int(item["turn_id"]), {})
+        observation = trace.get("adapter_observation", {}) if isinstance(trace, dict) else {}
+        model_output = trace.get("model_output", {}) if isinstance(trace, dict) else {}
+        legal = trace.get("legal_actions", {}) if isinstance(trace, dict) else {}
+        diagnostics = trace.get("diagnostics", {}) if isinstance(trace, dict) else {}
+        lead = observation.get("lead") if isinstance(observation, dict) else None
+        diagnostic_status = (
+            "ERROR"
+            if isinstance(diagnostics, dict) and diagnostics.get("errors")
+            else "WARN"
+            if isinstance(diagnostics, dict) and diagnostics.get("warnings")
+            else "OK"
+        )
         lines.append(
-            "| {turn_id} | {context} | {actual} | {predicted} | {exact} | {latency} | {status} |".format(
+            "| {turn_id} | {context} | {lead} | {owner} | {teammate} | {legal} | {predicted} | {selected_q} | {second_q} | {margin} | {diagnostics} |".format(
                 turn_id=item["turn_id"],
                 context=item["context"],
-                actual=_format_action(item["actual_action"]),
+                lead=_trace_action_text(lead),
+                owner=(
+                    observation.get("lead_owner_absolute", "-")
+                    if isinstance(observation, dict)
+                    else "-"
+                ),
+                teammate=(
+                    observation.get("lead_owner_is_teammate", "-")
+                    if isinstance(observation, dict)
+                    else "-"
+                ),
+                legal=(
+                    legal.get("legal_count_after_cap", "-")
+                    if isinstance(legal, dict)
+                    else "-"
+                ),
                 predicted=_format_action(item["predicted_action"]),
-                exact=item["exact_match"],
-                latency=item["latency_ms"] if item["latency_ms"] is not None else "-",
-                status=item["status"],
+                selected_q=(
+                    model_output.get("selected_q", "-")
+                    if isinstance(model_output, dict)
+                    else "-"
+                ),
+                second_q=(
+                    model_output.get("second_best_q", "-")
+                    if isinstance(model_output, dict)
+                    else "-"
+                ),
+                margin=(
+                    model_output.get("q_margin", "-")
+                    if isinstance(model_output, dict)
+                    else "-"
+                ),
+                diagnostics=diagnostic_status,
             )
         )
+    focus_turns = {
+        int(item["turn_id"])
+        for item in decisions
+        if item.get("exact_match") is False or item.get("status") == "error"
+    } | ({2, 14} & set(trace_by_turn))
+    if focus_turns:
+        lines.extend(["", "## 重点决策诊断", ""])
+    for turn_id in sorted(focus_turns):
+        trace = trace_by_turn.get(turn_id)
+        if not isinstance(trace, dict):
+            continue
+        observation = trace.get("adapter_observation")
+        model_output = trace.get("model_output")
+        if not isinstance(observation, dict) or not isinstance(model_output, dict):
+            continue
+        lines.extend(
+            [
+                f"### T{turn_id:04d}",
+                "",
+                f"- lead：`{_trace_action_text(observation.get('lead'))}`",
+                f"- lead owner：absolute=`{observation.get('lead_owner_absolute')}` / relative=`{observation.get('lead_owner_relative')}` / teammate=`{observation.get('lead_owner_is_teammate')}`",
+                f"- selected：`{_trace_action_text(model_output.get('selected_action'))}` / Q=`{model_output.get('selected_q')}`",
+                f"- second：index=`{model_output.get('second_best_index')}` / Q=`{model_output.get('second_best_q')}` / margin=`{model_output.get('q_margin')}`",
+                "- Top 10：",
+                "",
+            ]
+        )
+        for row in list(model_output.get("q_ranking", ()))[:10]:
+            if isinstance(row, dict):
+                lines.append(
+                    f"  - #{row.get('rank')} index={row.get('legal_index')} "
+                    f"`{row.get('readable_action')}` Q=`{row.get('q')}`"
+                )
     return "\n".join(lines) + "\n"
+
+
+def _trace_action_text(action: object) -> str:
+    if not isinstance(action, dict):
+        return "-"
+    if action.get("is_pass"):
+        return "PASS"
+    readable = action.get("readable_action")
+    if readable:
+        return str(readable)
+    claims = action.get("claim_ranks", ())
+    if isinstance(claims, (list, tuple)) and claims:
+        return "".join(str(value) for value in claims)
+    return str(action.get("type", action.get("play_type", "-")))
 
 
 def _format_action(action: object) -> str:
@@ -870,6 +1068,8 @@ def _publish_artifacts(
     summary: dict[str, object],
     decisions: list[dict[str, object]],
     report: str,
+    *,
+    fabledan_traces: list[dict[str, object]] | None = None,
 ) -> Path:
     root = session / "model_evaluation_runs"
     root.mkdir(parents=True, exist_ok=True)
@@ -885,12 +1085,33 @@ def _publish_artifacts(
         with (temporary / "decisions.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
             for decision in decisions:
                 handle.write(json.dumps(decision, ensure_ascii=False, separators=(",", ":")) + "\n")
+        if fabledan_traces is not None:
+            with (temporary / "fabledan_trace.jsonl").open(
+                "w", encoding="utf-8", newline="\n"
+            ) as handle:
+                for trace in fabledan_traces:
+                    handle.write(
+                        json.dumps(
+                            trace,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        )
+                        + "\n"
+                    )
         (temporary / "report.md").write_text(report, encoding="utf-8")
         loaded = json.loads((temporary / "summary.json").read_text(encoding="utf-8"))
         if loaded.get("run_id") != run_id or loaded.get("status") not in FINAL_STATUSES:
             raise ValueError("summary verification failed")
         for line in (temporary / "decisions.jsonl").read_text(encoding="utf-8").splitlines():
             json.loads(line)
+        if fabledan_traces is not None:
+            for line in (temporary / "fabledan_trace.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                trace = json.loads(line)
+                if trace.get("run_id") != run_id:
+                    raise ValueError("fabledan trace verification failed")
         if not (temporary / "report.md").read_text(encoding="utf-8").strip():
             raise ValueError("report verification failed")
         os.replace(temporary, target)
