@@ -555,6 +555,84 @@ def test_live_page_uses_compact_hand_strip_and_has_no_quick_correction_controls(
     page.close()
 
 
+def test_live_page_shows_fabledan_top_five_and_reuses_detail_payload():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    candidates = [
+        {
+            "rank": index,
+            "action_text": action,
+            "q": q_value,
+            "action": {"play_type": "PAIR", "cards": [], "claim_ranks": []},
+        }
+        for index, (action, q_value) in enumerate(
+            (
+                ("9999", 1.3274),
+                ("PASS", 0.9121),
+                ("66", 0.8473),
+                ("77", 0.8036),
+                ("88", 0.7625),
+                ("1010", 0.7000),
+            ),
+            start=1,
+        )
+    ]
+    advice = LocalAdvice(
+        strategy="fabledan-numpy",
+        cards=("9S", "9H", "9D", "9C"),
+        play_type="BOMB",
+        is_pass=False,
+        state_revision=2,
+        elapsed_ms=12.0,
+        request_id="fabledan-debug",
+        engine_input={
+            "debug": True,
+            "top_n": 5,
+            "model_path": "models/fabledan/best.npz",
+            "player": 0,
+            "level": 3,
+            "level_text": "6",
+            "hand": ["9S", "9H", "9D", "9C"],
+            "left": [27, 27, 27, 25],
+            "lead_text": "55",
+            "lead_owner": 3,
+            "history": [],
+            "legal_actions": [candidate["action"] for candidate in candidates],
+            "q_values": [],
+            "decision": {
+                "best_action_text": "9999",
+                "best_q": 1.3274,
+                "second_q": 0.9121,
+                "q_gap": 0.4153,
+                "candidates": candidates,
+            },
+        },
+        timings={},
+    )
+
+    page._show_fabledan_decision(advice)
+    app.processEvents()
+
+    assert not page.fabledan_debug_card.isHidden()
+    assert page.fabledan_recommendation.text() == "9999"
+    assert page.fabledan_q_value.text() == "Q值：1.3274"
+    assert page.fabledan_q_gap.text() == "Top1 - Top2：0.4153"
+    assert "当前需要压：55" in page.fabledan_context.text()
+    assert page.fabledan_candidates.text().splitlines() == [
+        "1. 9999    Q=1.3274",
+        "2. PASS    Q=0.9121",
+        "3. 66    Q=0.8473",
+        "4. 77    Q=0.8036",
+        "5. 88    Q=0.7625",
+    ]
+    assert "1010" not in page.fabledan_candidates.text()
+    assert '"model_path": "models/fabledan/best.npz"' in page.fabledan_detail.toPlainText()
+    page.fabledan_detail_button.click()
+    assert not page.fabledan_detail.isHidden()
+    assert page.fabledan_detail_button.text() == "收起详细调试"
+    page.close()
+
+
 def test_review_bar_confirms_existing_candidate_with_one_click():
     app = _app()
     runtime = FakeRuntime()

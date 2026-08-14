@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from typing import Any
 
@@ -9,6 +10,7 @@ from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QTextBrowser,
@@ -270,6 +272,45 @@ class LiveAssistantPage(ScrollArea):
         columns.addWidget(state_card, 2)
         root.addLayout(columns)
 
+        self.fabledan_debug_card = CardWidget()
+        debug_layout = QVBoxLayout(self.fabledan_debug_card)
+        debug_layout.setContentsMargins(18, 16, 18, 16)
+        debug_layout.setSpacing(10)
+        debug_header = QHBoxLayout()
+        debug_header.addWidget(StrongBodyLabel("FableDan AI"))
+        debug_header.addStretch(1)
+        self.fabledan_detail_button = PushButton("查看详细调试")
+        debug_header.addWidget(self.fabledan_detail_button)
+        debug_layout.addLayout(debug_header)
+
+        debug_summary = QGridLayout()
+        debug_summary.setHorizontalSpacing(20)
+        debug_summary.setVerticalSpacing(6)
+        self.fabledan_recommendation = TitleLabel("-")
+        self.fabledan_q_value = BodyLabel("Q值：-")
+        self.fabledan_q_gap = BodyLabel("Top1 - Top2：-")
+        self.fabledan_context = CaptionLabel("当前需要压：-　|　当前级牌：-")
+        debug_summary.addWidget(CaptionLabel("推荐"), 0, 0)
+        debug_summary.addWidget(self.fabledan_recommendation, 1, 0)
+        debug_summary.addWidget(self.fabledan_q_value, 0, 1)
+        debug_summary.addWidget(self.fabledan_q_gap, 1, 1)
+        debug_summary.addWidget(self.fabledan_context, 2, 0, 1, 2)
+        debug_layout.addLayout(debug_summary)
+        debug_layout.addWidget(StrongBodyLabel("候选动作（按 Q 值降序）"))
+        self.fabledan_candidates = BodyLabel("-")
+        self.fabledan_candidates.setWordWrap(True)
+        self.fabledan_candidates.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        debug_layout.addWidget(self.fabledan_candidates)
+        self.fabledan_detail = QTextBrowser()
+        self.fabledan_detail.setReadOnly(True)
+        self.fabledan_detail.setMinimumHeight(260)
+        self.fabledan_detail.hide()
+        debug_layout.addWidget(self.fabledan_detail)
+        self.fabledan_debug_card.hide()
+        root.addWidget(self.fabledan_debug_card)
+
         self.review_bar = CardWidget()
         review_layout = QVBoxLayout(self.review_bar)
         review_layout.setContentsMargins(16, 14, 16, 16)
@@ -307,6 +348,9 @@ class LiveAssistantPage(ScrollArea):
         self.resume_button.clicked.connect(self.runtime.resume)
         self.finish_button.clicked.connect(self.runtime.finish)
         self.compact_button.clicked.connect(self.compact_mode_requested.emit)
+        self.fabledan_detail_button.clicked.connect(
+            self._toggle_fabledan_details
+        )
         self.manual_confirm_button.clicked.connect(self._confirm_manual)
         self.hand_edit.textChanged.connect(self._refresh_initialization)
         self.initial_hand_cards.clicked.connect(self._edit_initial_hand)
@@ -546,6 +590,7 @@ class LiveAssistantPage(ScrollArea):
         if not isinstance(raw, LiveAdvice):
             return
         if raw.status == "ready" and raw.advice is not None:
+            self._show_fabledan_decision(raw.advice)
             suggestion = (
                 "建议：不出"
                 if raw.advice.is_pass
@@ -560,6 +605,59 @@ class LiveAssistantPage(ScrollArea):
                 raw,
                 f"DanZero 建议计算失败：{raw.error}",
             )
+
+    def _show_fabledan_decision(self, advice: object) -> None:
+        engine_input = getattr(advice, "engine_input", None)
+        decision = (
+            engine_input.get("decision")
+            if isinstance(engine_input, dict) and engine_input.get("debug") is True
+            else None
+        )
+        if not isinstance(decision, dict):
+            self.fabledan_debug_card.hide()
+            self.fabledan_detail.hide()
+            return
+
+        best_action_text = str(decision.get("best_action_text") or "-")
+        self.fabledan_recommendation.setText(best_action_text)
+        self.fabledan_q_value.setText(
+            f"Q值：{self._format_q_value(decision.get('best_q'))}"
+        )
+        self.fabledan_q_gap.setText(
+            f"Top1 - Top2：{self._format_q_value(decision.get('q_gap'))}"
+        )
+        self.fabledan_context.setText(
+            f"当前需要压：{engine_input.get('lead_text') or '-'}　|　"
+            f"当前级牌：{engine_input.get('level_text') or '-'}"
+        )
+        candidates = decision.get("candidates")
+        top_n = int(engine_input.get("top_n", 5) or 5)
+        lines: list[str] = []
+        if isinstance(candidates, list):
+            for candidate in candidates[:top_n]:
+                if not isinstance(candidate, dict):
+                    continue
+                lines.append(
+                    f"{candidate.get('rank', len(lines) + 1)}. "
+                    f"{candidate.get('action_text') or '-'}    "
+                    f"Q={self._format_q_value(candidate.get('q'))}"
+                )
+        self.fabledan_candidates.setText("\n".join(lines) or "无候选动作")
+        self.fabledan_detail.setPlainText(
+            json.dumps(engine_input, ensure_ascii=False, indent=2, sort_keys=True)
+        )
+        self.fabledan_debug_card.show()
+
+    def _toggle_fabledan_details(self) -> None:
+        visible = not self.fabledan_detail.isVisible()
+        self.fabledan_detail.setVisible(visible)
+        self.fabledan_detail_button.setText(
+            "收起详细调试" if visible else "查看详细调试"
+        )
+
+    @staticmethod
+    def _format_q_value(value: object) -> str:
+        return f"{float(value):.4f}" if isinstance(value, (int, float)) else "-"
 
     def _append_event_to_timeline(self, event: LiveEvent) -> None:
         if event.event_type in {

@@ -279,6 +279,19 @@ class RecommendationFloatWindow(QWidget):
             self.suggestion_label.setText(f"出牌 · {play_type}")
         self._render_cards(tuple(advice.cards))
         details = [f"耗时 {advice.elapsed_ms:.0f} ms"]
+        engine_input = advice.engine_input
+        decision = (
+            engine_input.get("decision")
+            if isinstance(engine_input, dict) and engine_input.get("debug") is True
+            else None
+        )
+        if isinstance(decision, dict):
+            best_q = decision.get("best_q")
+            q_gap = decision.get("q_gap")
+            if isinstance(best_q, (int, float)):
+                details.append(f"Q值 {float(best_q):.4f}")
+            if isinstance(q_gap, (int, float)):
+                details.append(f"Q-gap {float(q_gap):.4f}")
         if raw.suit_uncertain:
             agreement = "各花色分支建议一致" if raw.advice_agrees_across_variants else "花色分支建议有差异"
             details.append(agreement)

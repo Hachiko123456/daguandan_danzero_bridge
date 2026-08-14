@@ -23,7 +23,7 @@ class FakeRuntime(QObject):
     error = Signal(str)
 
 
-def _ready_advice(*, visible: bool) -> LiveAdvice:
+def _ready_advice(*, visible: bool, debug: bool = False) -> LiveAdvice:
     return LiveAdvice(
         key=AdviceRequestKey("session", 7, 8),
         status="ready",
@@ -36,7 +36,14 @@ def _ready_advice(*, visible: bool) -> LiveAdvice:
             state_revision=8,
             elapsed_ms=12.0,
             request_id="ADV-0007-0008",
-            engine_input={},
+            engine_input=(
+                {
+                    "debug": True,
+                    "decision": {"best_q": 1.3274, "q_gap": 0.4153},
+                }
+                if debug
+                else {}
+            ),
             timings={},
         ),
     )
@@ -84,6 +91,26 @@ def test_float_window_marks_capture_backend_and_occlusion_pause():
     runtime.error.emit("屏幕采集已暂停：目标牌桌被其他窗口遮挡")
     app.processEvents()
     assert window.suggestion_label.text() == "窗口遮挡，已暂停"
+    window.hide()
+
+
+def test_float_window_shows_fabledan_q_summary_from_existing_result():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    snapshot = SimpleNamespace(current_player="self")
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            advice=_ready_advice(visible=True, debug=True),
+        )
+    )
+    app.processEvents()
+
+    assert "Q值 1.3274" in window.detail_label.text()
+    assert "Q-gap 0.4153" in window.detail_label.text()
     window.hide()
 
 

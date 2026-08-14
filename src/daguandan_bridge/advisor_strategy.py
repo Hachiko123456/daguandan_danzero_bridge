@@ -18,6 +18,7 @@ EVALUATION_STRATEGY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("fabledan_rule", "FableDan RuleAgent 规则基线"),
 )
 DEFAULT_ADVISOR_STRATEGY = "danzero"
+DEFAULT_FABLEDAN_DEBUG = False
 _VALID_ADVISORS = {value for value, _label in ADVISOR_OPTIONS}
 _VALID_EVALUATION_STRATEGIES = {
     value for value, _label in EVALUATION_STRATEGY_OPTIONS
@@ -45,6 +46,21 @@ def load_profile_advisor_strategy(
         return DEFAULT_ADVISOR_STRATEGY
 
 
+def load_profile_fabledan_debug(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> bool:
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_FABLEDAN_DEBUG
+    if not isinstance(raw, dict):
+        return DEFAULT_FABLEDAN_DEBUG
+    value = raw.get("fabledan_debug", DEFAULT_FABLEDAN_DEBUG)
+    return value if isinstance(value, bool) else DEFAULT_FABLEDAN_DEBUG
+
+
 def save_profile_advisor_strategy(
     profiles_root: Path | str,
     profile_name: str,
@@ -70,12 +86,18 @@ def build_advisor(
     *,
     profiles_root: Path | str = PROFILES_ROOT,
     profile_name: str = "tencent_daguandan",
+    fabledan_debug: bool | None = None,
 ):
     normalized = normalize_advisor_strategy(strategy)
     if normalized == "fabledan":
         from .fabledan import FableDanAdvisor
 
-        return FableDanAdvisor(profiles_root, profile_name)
+        debug = (
+            load_profile_fabledan_debug(profiles_root, profile_name)
+            if fabledan_debug is None
+            else bool(fabledan_debug)
+        )
+        return FableDanAdvisor(profiles_root, profile_name, debug=debug)
     from .danzero import DanzeroAdvisor
 
     return DanzeroAdvisor()
@@ -105,6 +127,7 @@ def build_evaluation_advisor(
             profiles_root,
             profile_name,
             runtime_policy=policy,
+            debug=False,
         )
     from .danzero import DanzeroAdvisor
 

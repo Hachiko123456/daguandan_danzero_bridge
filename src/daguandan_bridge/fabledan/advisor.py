@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
+import json
+import logging
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
 from typing import Any, Iterable, Literal
+
+import numpy as np
 
 from ..config import PROFILES_ROOT
 from ..danzero.state import (
@@ -27,12 +32,14 @@ from ._vendor.fabledan.combos import (
     beats,
     gen_moves,
 )
+from ._vendor.fabledan.encode import encode_decision
 from ._vendor.fabledan.model_np import NumpyModel
 
 
 UPSTREAM_COMMIT = "7cc5e311b9860bc44f76c082d9c1b21fc8b2d3ec"
 ADAPTER_SCHEMA = "fabledan-adapter/v1"
 STANDARD_NO_TRIBUTE = True
+DECISION_LOG_SCHEMA = "fabledan-decision/1"
 _TURN_ORDER: tuple[Seat, ...] = ("self", "right", "opposite", "left")
 _SEAT_TO_PLAYER: dict[Seat, int] = {
     seat: index for index, seat in enumerate(_TURN_ORDER)
@@ -45,6 +52,16 @@ _PARTNER: dict[Seat, Seat] = {
 }
 _SUIT_TO_INDEX = {"H": 0, "D": 1, "S": 2, "C": 3}
 _INDEX_TO_SUIT = {value: key for key, value in _SUIT_TO_INDEX.items()}
+_PLAYER_MAPPING: dict[str, int] = {
+    "self": 0,
+    "right": 1,
+    "opposite": 2,
+    "left": 3,
+    "next": 1,
+    "partner": 2,
+    "previous": 3,
+}
+_LOGGER = logging.getLogger(__name__)
 
 
 class FableDanStateError(GameStateError):
@@ -66,7 +83,55 @@ class _MappedState:
     observation: dict[str, object]
     legal: tuple[Move, ...]
     hand_ids: tuple[int, ...]
+    lead_owner: int | None
     audit: dict[str, object]
+
+
+@dataclass(frozen=True)
+class DecisionCandidate:
+    """按本次决策实际使用的 Q 值排序后的一项合法动作。"""
+
+    rank: int
+    action: Move
+    action_text: str
+    q_value: float | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "rank": self.rank,
+            "action": _move_audit(self.action),
+            "action_text": self.action_text,
+            "q": self.q_value,
+        }
+
+
+@dataclass(frozen=True)
+class FableDanDecisionResult:
+    """保留 ``recommend()`` 接口兼容性的详细策略结果。"""
+
+    advice: AdviceResult
+    best_action: Move
+    best_action_text: str
+    best_q: float | None
+    second_q: float | None
+    q_gap: float | None
+    candidates: tuple[DecisionCandidate, ...]
+    legal_action_count: int
+    model_path: str
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "best_action": _move_audit(self.best_action),
+            "best_action_text": self.best_action_text,
+            "best_q": self.best_q,
+            "second_q": self.second_q,
+            "q_gap": self.q_gap,
+            "candidates": [candidate.to_dict() for candidate in self.candidates],
+            "legal_action_count": self.legal_action_count,
+            "model_path": self.model_path,
+            "warnings": list(self.warnings),
+        }
 
 
 class _PhysicalCards:
@@ -97,12 +162,26 @@ class FableDanAdvisor:
         profile_name: str = "tencent_daguandan",
         *,
         runtime_policy: Literal["auto", "model_required", "rule_only"] = "auto",
+        debug: bool = False,
+        log_directory: Path | str | None = None,
+        top_n: int = 5,
     ) -> None:
         if runtime_policy not in {"auto", "model_required", "rule_only"}:
             raise ValueError(f"unsupported FableDan runtime policy: {runtime_policy}")
+        if int(top_n) < 1:
+            raise ValueError("top_n must be at least 1")
         self.profiles_root = Path(profiles_root)
         self.profile_name = str(profile_name)
         self.runtime_policy = runtime_policy
+        self.debug = bool(debug)
+        self.top_n = int(top_n)
+        self.log_directory = (
+            Path(log_directory)
+            if log_directory is not None
+            else Path(__file__).resolve().parents[3]
+            / "logs"
+            / "fabledan_decisions"
+        )
         self.weights_path = (
             self.profiles_root
             / self.profile_name
@@ -111,6 +190,7 @@ class FableDanAdvisor:
         )
         self._runtime: _PolicyRuntime | None = None
         self._runtime_lock = Lock()
+        self._log_lock = Lock()
 
     def initialize(self) -> None:
         runtime = self._ensure_runtime()
@@ -127,6 +207,19 @@ class FableDanAdvisor:
         request_id: str = "",
         trace: StrategyExecutionTrace | None = None,
     ) -> AdviceResult:
+        return self.recommend_detailed(
+            state,
+            request_id=request_id,
+            trace=trace,
+        ).advice
+
+    def recommend_detailed(
+        self,
+        state: GuanDanState,
+        *,
+        request_id: str = "",
+        trace: StrategyExecutionTrace | None = None,
+    ) -> FableDanDecisionResult:
         started = perf_counter()
         execution_trace = trace or StrategyExecutionTrace(request_id)
         execution_trace.begin("fabledan_validate")
@@ -172,8 +265,13 @@ class FableDanAdvisor:
         execution_trace.begin("fabledan_policy")
         policy_started = perf_counter()
         active_runtime = runtime
+        q_values: tuple[float, ...] | None = None
+        encoding_audit: dict[str, object] = {}
         try:
-            selected_index = int(runtime.agent.act(mapped.observation))
+            selected_index, q_values, encoding_audit = self._evaluate_policy(
+                runtime,
+                mapped.observation,
+            )
         except Exception as exc:
             if runtime.backend != "numpy" or self.runtime_policy == "model_required":
                 execution_trace.end()
@@ -182,7 +280,10 @@ class FableDanAdvisor:
             active_runtime = self._replace_invalid_numpy_runtime(exc)
             engine_input.update(self._runtime_audit(active_runtime))
             execution_trace.set_engine_input(engine_input)
-            selected_index = int(active_runtime.agent.act(mapped.observation))
+            selected_index, q_values, encoding_audit = self._evaluate_policy(
+                active_runtime,
+                mapped.observation,
+            )
         policy_ms = (perf_counter() - policy_started) * 1_000
         if not 0 <= selected_index < len(mapped.legal):
             execution_trace.end()
@@ -204,18 +305,71 @@ class FableDanAdvisor:
             execution_trace.end()
             raise RuntimeError("FableDan 返回动作不属于本次 legal 集合")
 
-        elapsed_ms = (perf_counter() - started) * 1_000
+        candidates = _rank_candidates(mapped.legal, selected_index, q_values)
+        best_q = candidates[0].q_value
+        second_q = candidates[1].q_value if len(candidates) > 1 else None
+        q_gap = (
+            best_q - second_q
+            if best_q is not None and second_q is not None
+            else None
+        )
+        warnings = (
+            _validate_decision_state(
+                mapped,
+                selected_index=selected_index,
+                q_values=q_values,
+                candidates=candidates,
+            )
+            if self.debug
+            else []
+        )
         engine_input["selected_action_index"] = selected_index
         engine_input["selected_action"] = _move_audit(move)
         engine_input.update(self._runtime_audit(active_runtime))
-        execution_trace.set_engine_input(engine_input)
-        execution_trace.end()
+        engine_input["debug"] = self.debug
+        decision_audit = {
+            "best_action": _move_audit(move),
+            "best_action_text": _move_text(move),
+            "best_q": best_q,
+            "second_q": second_q,
+            "q_gap": q_gap,
+            "legal_action_count": len(mapped.legal),
+            "candidates": [candidate.to_dict() for candidate in candidates],
+            "warnings": list(warnings),
+        }
+        if self.debug:
+            engine_input.update(
+                {
+                    "top_n": self.top_n,
+                    "encoding": encoding_audit,
+                    "q_values": _q_values_audit(mapped.legal, q_values),
+                    "decision": decision_audit,
+                    "validation_warnings": list(warnings),
+                }
+            )
+            timestamp = datetime.now().astimezone()
+            log_payload = _decision_log_payload(
+                timestamp=timestamp,
+                engine_input=engine_input,
+                decision=decision_audit,
+            )
+            try:
+                log_path = self._append_decision_log(timestamp, log_payload)
+                engine_input["decision_log_path"] = str(log_path)
+            except Exception as exc:
+                warning = f"FableDan 决策日志写入失败：{exc}"
+                warnings.append(warning)
+                decision_audit["warnings"] = list(warnings)
+                engine_input["validation_warnings"] = list(warnings)
+                _LOGGER.warning(warning, exc_info=True)
+
+        elapsed_ms = (perf_counter() - started) * 1_000
         strategy = (
             "fabledan-numpy"
             if active_runtime.backend == "numpy"
             else "fabledan-rule"
         )
-        return AdviceResult(
+        advice = AdviceResult(
             strategy=strategy,
             cards=cards,
             play_type=TYPE_NAMES[move.type],
@@ -229,6 +383,63 @@ class FableDanAdvisor:
                 "total": elapsed_ms,
             },
         )
+        execution_trace.set_engine_input(engine_input)
+        execution_trace.end()
+        return FableDanDecisionResult(
+            advice=advice,
+            best_action=move,
+            best_action_text=_move_text(move),
+            best_q=best_q,
+            second_q=second_q,
+            q_gap=q_gap,
+            candidates=candidates,
+            legal_action_count=len(mapped.legal),
+            model_path=str(active_runtime.path),
+            warnings=tuple(warnings),
+        )
+
+    @staticmethod
+    def _evaluate_policy(
+        runtime: _PolicyRuntime,
+        observation: dict[str, object],
+    ) -> tuple[int, tuple[float, ...] | None, dict[str, object]]:
+        if runtime.backend != "numpy":
+            return int(runtime.agent.act(observation)), None, {
+                "q_values_available": False,
+                "reason": "RuleAgent does not produce model Q-values",
+            }
+
+        # 保持与上游 NumpyAgent 完全相同的推理路径，并让动作选择与调试信息
+        # 共享同一次模型推理，避免调试模式引入第二次计算。
+        tokens, features = encode_decision(observation)
+        raw_q_values = runtime.agent.model.q_values(tokens, features)
+        q_array = np.asarray(raw_q_values).reshape(-1)
+        selected_index = int(np.argmax(q_array))
+        return selected_index, tuple(float(value) for value in q_array), {
+            "q_values_available": True,
+            "token_count": len(tokens),
+            "tokens": [int(token) for token in tokens],
+            "feature_shape": [int(value) for value in features.shape],
+        }
+
+    def _append_decision_log(
+        self,
+        timestamp: datetime,
+        payload: dict[str, object],
+    ) -> Path:
+        path = self.log_directory / f"{timestamp.date().isoformat()}.jsonl"
+        line = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        with self._log_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(line + "\n")
+        return path
 
     def _ensure_runtime(self) -> _PolicyRuntime:
         with self._runtime_lock:
@@ -289,8 +500,11 @@ class FableDanAdvisor:
         return {
             "backend": runtime.backend,
             "path": str(runtime.path),
+            "model_path": str(runtime.path),
+            "model_filename": runtime.path.name,
             "status": runtime.status,
             "digest": runtime.digest,
+            "model_hash": runtime.digest,
             "upstream_commit": UPSTREAM_COMMIT,
             "schema": ADAPTER_SCHEMA,
             "standard_no_tribute": STANDARD_NO_TRIBUTE,
@@ -338,7 +552,13 @@ class FableDanAdvisor:
                     raise FableDanStateError(f"第 {index} 条历史为无首出的不出")
                 events.append(("pass", player))
                 event_audit.append(
-                    {"index": index, "player": event.player, "is_pass": True}
+                    {
+                        "index": index,
+                        "kind": "pass",
+                        "player": event.player,
+                        "player_id": player,
+                        "is_pass": True,
+                    }
                 )
                 passed.add(event.player)
             else:
@@ -364,9 +584,12 @@ class FableDanAdvisor:
                 event_audit.append(
                     {
                         "index": index,
+                        "kind": "play",
                         "player": event.player,
+                        "player_id": player,
                         "is_pass": False,
                         "move": _move_audit(move),
+                        "action_text": _move_text(move),
                     }
                 )
 
@@ -451,12 +674,19 @@ class FableDanAdvisor:
         legal = tuple(gen_moves(hand_ids, level, reconstructed_lead))
         if not legal:
             raise FableDanStateError("FableDan 没有生成可用合法动作")
+        lead_owner = (
+            _SEAT_TO_PLAYER[trick_leader]
+            if reconstructed_lead is not None and trick_leader is not None
+            else None
+        )
+        left = [counts[seat] for seat in _TURN_ORDER]
+        done_flags = [seat in done for seat in _TURN_ORDER]
         observation: dict[str, object] = {
             "level": level,
             "player": 0,
             "hand": list(hand_ids),
-            "left": [counts[seat] for seat in _TURN_ORDER],
-            "done": [seat in done for seat in _TURN_ORDER],
+            "left": left,
+            "done": done_flags,
             "events": events,
             "lead": reconstructed_lead,
             "legal": list(legal),
@@ -470,13 +700,45 @@ class FableDanAdvisor:
                 "lead_player": snapshot.lead_player,
                 "my_hand": list(snapshot.my_hand),
                 "remaining_cards": counts,
+                "play_history": [event.to_dict() for event in snapshot.play_history],
+                "trick_plays": [event.to_dict() for event in snapshot.trick_plays],
                 "revision": snapshot.revision,
             },
+            "player": 0,
+            "player_mapping": dict(_PLAYER_MAPPING),
+            "player_mapping_labels": {
+                "0": "self/自己",
+                "1": "right/下家",
+                "2": "opposite/队友",
+                "3": "left/上家",
+            },
+            "level": level,
+            "level_text": snapshot.round_level,
+            "hand": list(snapshot.my_hand),
+            "hand_ids": [int(card_id) for card_id in hand_ids],
+            "left": left,
+            "left_by_player": {
+                str(_SEAT_TO_PLAYER[seat]): {
+                    "seat": seat,
+                    "count": counts[seat],
+                }
+                for seat in _TURN_ORDER
+            },
+            "done": done_flags,
+            "lead": (
+                _move_audit(reconstructed_lead)
+                if reconstructed_lead is not None
+                else None
+            ),
+            "lead_text": _move_text(reconstructed_lead),
+            "lead_owner": lead_owner,
+            "lead_owner_seat": trick_leader,
             "history": event_audit,
+            "events": event_audit,
             "legal_actions": [_move_audit(move) for move in legal],
             "feature_schema": "fabledan-token48-feat80/v1",
         }
-        return _MappedState(observation, legal, hand_ids, audit)
+        return _MappedState(observation, legal, hand_ids, lead_owner, audit)
 
 
 def _validate_standard_snapshot(snapshot: LocalStrategySnapshot) -> None:
@@ -574,6 +836,173 @@ def _move_audit(move: Move) -> dict[str, object]:
         "cards": sorted(_card_code(int(card)) for card in move.cards),
         "claim_ranks": [RANK_NAMES[int(rank)] for rank in move.claim_ranks],
         "key": int(move.key),
+    }
+
+
+def _move_text(move: Move | None) -> str:
+    if move is None:
+        return "-"
+    if move.type == PASS:
+        return "PASS"
+    return "".join(RANK_NAMES[int(rank)] for rank in move.claim_ranks)
+
+
+def _rank_candidates(
+    legal: tuple[Move, ...],
+    selected_index: int,
+    q_values: tuple[float, ...] | None,
+) -> tuple[DecisionCandidate, ...]:
+    remaining = [index for index in range(len(legal)) if index != selected_index]
+    if q_values is not None:
+        remaining.sort(
+            key=lambda index: (
+                0 if _safe_q_value(q_values, index) is not None else 1,
+                -(_safe_q_value(q_values, index) or 0.0),
+                index,
+            )
+        )
+    order = [selected_index, *remaining]
+    return tuple(
+        DecisionCandidate(
+            rank=rank,
+            action=legal[index],
+            action_text=_move_text(legal[index]),
+            q_value=_safe_q_value(q_values, index),
+        )
+        for rank, index in enumerate(order, start=1)
+    )
+
+
+def _q_values_audit(
+    legal: tuple[Move, ...],
+    q_values: tuple[float, ...] | None,
+) -> list[dict[str, object]]:
+    if q_values is None:
+        return []
+    return [
+        {
+            "legal_index": index,
+            "action": _move_audit(move),
+            "action_text": _move_text(move),
+            "q": _safe_q_value(q_values, index),
+        }
+        for index, move in enumerate(legal)
+    ]
+
+
+def _safe_q_value(
+    q_values: tuple[float, ...] | None,
+    index: int,
+) -> float | None:
+    if q_values is None or not 0 <= index < len(q_values):
+        return None
+    value = q_values[index]
+    return float(value) if np.isfinite(value) else None
+
+
+def _validate_decision_state(
+    mapped: _MappedState,
+    *,
+    selected_index: int,
+    q_values: tuple[float, ...] | None,
+    candidates: tuple[DecisionCandidate, ...],
+) -> list[str]:
+    warnings: list[str] = []
+    observation = mapped.observation
+    player = observation.get("player")
+    if player not in {0, 1, 2, 3}:
+        warnings.append(f"player 无效：{player}")
+    hand = observation.get("hand")
+    if not isinstance(hand, list) or not 0 <= len(hand) <= 27:
+        warnings.append("hand 数量不在 0..27 范围内")
+    left = observation.get("left")
+    if not isinstance(left, list) or len(left) != 4:
+        warnings.append("left 必须包含四个玩家")
+    if mapped.lead_owner is not None and mapped.lead_owner not in {0, 1, 2, 3}:
+        warnings.append(f"lead_owner 无效：{mapped.lead_owner}")
+    if not mapped.legal:
+        warnings.append("legal actions 为空")
+    if not 0 <= selected_index < len(mapped.legal):
+        warnings.append("best action 索引不属于 legal actions")
+    if len(candidates) != len(mapped.legal):
+        warnings.append("candidates 数量与 legal actions 不一致")
+    elif _move_signature(candidates[0].action) != _move_signature(
+        mapped.legal[selected_index]
+    ):
+        warnings.append("candidates[0] 与模型最终动作不一致")
+    if q_values is not None:
+        if len(q_values) != len(mapped.legal):
+            warnings.append("Q-value 数量与 legal actions 不一致")
+        if any(not np.isfinite(value) for value in q_values):
+            warnings.append("Q-value 中包含 NaN 或 Inf")
+        finite_q = [
+            candidate.q_value
+            for candidate in candidates
+            if candidate.q_value is not None
+        ]
+        if any(first < second for first, second in zip(finite_q, finite_q[1:])):
+            warnings.append("candidates 未按 Q-value 降序排列")
+    lead = observation.get("lead")
+    if lead is not None:
+        last_play = next(
+            (
+                event
+                for event in reversed(mapped.audit.get("history", []))
+                if isinstance(event, dict) and event.get("kind") == "play"
+            ),
+            None,
+        )
+        if not isinstance(last_play, dict) or last_play.get("player_id") != mapped.lead_owner:
+            warnings.append("lead_owner 与最新非 PASS 事件不一致")
+        if isinstance(last_play, dict) and last_play.get("move") != _move_audit(lead):
+            warnings.append("lead 与最新非 PASS 事件不一致")
+    return warnings
+
+
+def _decision_log_payload(
+    *,
+    timestamp: datetime,
+    engine_input: dict[str, object],
+    decision: dict[str, object],
+) -> dict[str, object]:
+    model_path = str(engine_input.get("model_path") or engine_input.get("path", ""))
+    return {
+        "schema": DECISION_LOG_SCHEMA,
+        "timestamp": timestamp.isoformat(timespec="seconds"),
+        "request_id": engine_input.get("request_id", ""),
+        "model_path": model_path,
+        "model_filename": Path(model_path).name,
+        "model_hash": engine_input.get("model_hash") or engine_input.get("digest"),
+        "backend": engine_input.get("backend"),
+        "model_status": engine_input.get("status"),
+        "player": engine_input.get("player"),
+        "player_mapping": engine_input.get("player_mapping"),
+        "player_mapping_labels": engine_input.get("player_mapping_labels"),
+        "level": engine_input.get("level"),
+        "level_text": engine_input.get("level_text"),
+        "hand": engine_input.get("hand"),
+        "hand_ids": engine_input.get("hand_ids"),
+        "left": engine_input.get("left"),
+        "left_by_player": engine_input.get("left_by_player"),
+        "lead": engine_input.get("lead"),
+        "lead_text": engine_input.get("lead_text"),
+        "lead_owner": engine_input.get("lead_owner"),
+        "lead_owner_seat": engine_input.get("lead_owner_seat"),
+        "done": engine_input.get("done"),
+        "history": engine_input.get("history"),
+        "events": engine_input.get("events"),
+        "legal_actions": engine_input.get("legal_actions"),
+        "legal_action_count": decision.get("legal_action_count"),
+        "q_values": engine_input.get("q_values"),
+        "candidates": decision.get("candidates"),
+        "best_action": decision.get("best_action"),
+        "best_action_text": decision.get("best_action_text"),
+        "best_q": decision.get("best_q"),
+        "second_q": decision.get("second_q"),
+        "q_gap": decision.get("q_gap"),
+        "encoding": engine_input.get("encoding"),
+        "validation_warnings": engine_input.get("validation_warnings"),
+        "project_snapshot": engine_input.get("project_snapshot"),
     }
 
 

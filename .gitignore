@@ -21,6 +21,7 @@ dist/
 .superpowers/
 
 # Project runtime output
+logs/
 data/profiles/*/screenshots/
 data/profiles/*/sessions/
 .codex/workflow/
