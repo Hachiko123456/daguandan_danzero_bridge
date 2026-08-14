@@ -33,3 +33,7 @@ data/profiles/*/sessions/
 *.code-workspace
 .DS_Store
 Thumbs.db
+
+.codex/
+.agents/
+AGENTS.md

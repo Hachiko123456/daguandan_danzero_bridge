@@ -1,0 +1,73 @@
+{
+  "schema": "guandan.truth/3",
+  "schema_version": 3,
+  "source_session_id": "game",
+  "source_video": {
+    "path": "video/game.avi",
+    "frame_index_path": "video/frame_index.jsonl"
+  },
+  "label_status": "draft",
+  "provenance": {
+    "source": "legacy_migration"
+  },
+  "initial_state": {
+    "round_level": "8",
+    "wild_rank": "8",
+    "lead_player": "self",
+    "my_hand": [
+      "2S",
+      "2H",
+      "2C",
+      "2D",
+      "3S",
+      "3H",
+      "3C",
+      "3D",
+      "4S",
+      "4H",
+      "4C",
+      "4D",
+      "5S",
+      "5H",
+      "5C",
+      "5D",
+      "6S",
+      "6H",
+      "6C",
+      "6D",
+      "7S",
+      "7H",
+      "7C",
+      "7D",
+      "8S",
+      "8H",
+      "8C"
+    ]
+  },
+  "outcome": {
+    "complete": false,
+    "finish_order": [],
+    "team_result": "unknown",
+    "reward": null,
+    "reward_scheme": ""
+  },
+  "turns": [
+    {
+      "turn_id": 1,
+      "trick_id": 1,
+      "actor": "self",
+      "is_pass": false,
+      "cards": [
+        "2S"
+      ],
+      "evidence": {
+        "frame_indices": []
+      },
+      "label_status": "draft",
+      "provenance": {
+        "source": "legacy_migration"
+      },
+      "uncertainty": []
+    }
+  ]
+}

@@ -118,7 +118,8 @@ class SessionPlaybackToolbar(QWidget):
         # The replay page may devote less than half of a 980px window to the
         # video pane.  At that size, use three short rows rather than allowing
         # any of the shared controls to overlap or disappear.
-        self._arrange_controls(compact=self.width() < 620)
+        compact_width = 720 if self._overlay_seek else 620
+        self._arrange_controls(compact=self.width() < compact_width)
 
     def _arrange_controls(self, *, compact: bool) -> None:
         if compact == self._compact_layout:
@@ -167,13 +168,15 @@ class SessionPlaybackToolbar(QWidget):
             self._layout.addWidget(self.frame_status, 1, 2, 1, 2)
             self._layout.setColumnStretch(3, 1)
             return
-        # The normal two-row surface is shared with the annotation page.
+        # Replay uses overlay seeking.  Keep its primary controls and frame
+        # context on one row when there is room; a second sparse row wastes
+        # vertical space directly below the video.
         self._layout.addWidget(self.play_button, 0, 0)
         self._layout.addWidget(self.step_button, 0, 1)
         self._layout.addWidget(self.speed_combo, 0, 2)
-        self._layout.addWidget(self.frame_spin, 1, 0, 1, 2)
-        self._layout.addWidget(self.frame_status, 1, 2, 1, 3)
-        self._layout.setColumnStretch(3, 1)
+        self._layout.addWidget(self.frame_spin, 0, 3)
+        self._layout.addWidget(self.frame_status, 0, 4)
+        self._layout.setColumnStretch(4, 1)
 
 
 class ReplayDecodeThread(QThread):

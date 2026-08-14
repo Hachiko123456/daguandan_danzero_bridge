@@ -94,7 +94,7 @@ class FrameInspectDialog(QDialog):
         frame_number: int | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("当前画面标注")
+        self.setWindowTitle("单图标注")
         self.resize(980, 900)
         self._frame = frame
         self._recognition_service = recognition
@@ -523,11 +523,8 @@ class ReplayPage(QWidget):
         selector_row = QHBoxLayout()
         self.session_combo = ComboBox()
         self.refresh_button = PushButton("刷新")
-        self.incident_combo = ComboBox()
-        self.incident_combo.addItem("事故跳转", userData=None)
         selector_row.addWidget(self.session_combo, 1)
         selector_row.addWidget(self.refresh_button)
-        selector_row.addWidget(self.incident_combo)
         selector_layout.addLayout(selector_row)
         self.session_summary = BodyLabel("尚未选择对局")
         self.session_summary.setWordWrap(True)
@@ -603,6 +600,11 @@ class ReplayPage(QWidget):
         # the shared toolbar used by the annotation page as well.
         self.play_button = self.playback_toolbar.play_button
         self.step_button = self.playback_toolbar.step_button
+        self.step_button.setText("单图标注")
+        self.step_button.setToolTip(
+            "打开当前显示画面的单图识别与模板标注；不会前进视频"
+        )
+        self.step_button.setAccessibleName("单图标注")
         self.rewind_button = self.playback_toolbar.rewind_button
         self.forward_button = self.playback_toolbar.forward_button
         self.frame_spin = self.playback_toolbar.frame_spin
@@ -610,15 +612,6 @@ class ReplayPage(QWidget):
         self.speed_combo = self.playback_toolbar.speed_combo
         self.frame_status = self.playback_toolbar.frame_status
         video_layout.addWidget(self.playback_toolbar)
-        annotation_row = QHBoxLayout()
-        annotation_row.addWidget(StrongBodyLabel("画面工具"))
-        self.inspect_frame_button = PushButton("当前画面标注")
-        self.inspect_frame_button.setToolTip(
-            "打开当前显示画面的单图识别与模板标注；不会前进到下一帧"
-        )
-        annotation_row.addWidget(self.inspect_frame_button)
-        annotation_row.addStretch(1)
-        video_layout.addLayout(annotation_row)
         self.content_layout.addWidget(video_card, 3)
 
         diagnostics_card = CardWidget()
@@ -710,9 +703,8 @@ class ReplayPage(QWidget):
 
         self.refresh_button.clicked.connect(self.refresh_sessions)
         self.session_combo.currentIndexChanged.connect(self._session_selected)
-        self.incident_combo.currentIndexChanged.connect(self._incident_selected)
         self.playback_toolbar.play_pause_requested.connect(self._toggle_play_pause)
-        self.playback_toolbar.step_requested.connect(self.step)
+        self.playback_toolbar.step_requested.connect(self.open_frame_inspect)
         self.playback_toolbar.seek_requested.connect(self.seek_to_frame)
         self.playback_toolbar.seek_seconds_requested.connect(self._seek_by_seconds)
         self.rewind_overlay_button.clicked.connect(
@@ -722,7 +714,6 @@ class ReplayPage(QWidget):
             lambda: self.playback_toolbar.seek_seconds_requested.emit(5.0)
         )
         self.playback_toolbar.speed_changed.connect(self._speed_changed)
-        self.inspect_frame_button.clicked.connect(self.open_frame_inspect)
         self.replay_mode_combo.currentIndexChanged.connect(self._replay_mode_changed)
         self.advisor_strategy_combo.currentIndexChanged.connect(
             self._advisor_strategy_changed
@@ -823,7 +814,6 @@ class ReplayPage(QWidget):
         )
         self._load_truth_log_for_session(manifest)
         self._set_session_actions(True, playable=playable)
-        self._load_incidents()
 
     def _session_selected(self, _index: int) -> None:
         value = self.session_combo.currentData()
@@ -879,7 +869,6 @@ class ReplayPage(QWidget):
             self.rewind_overlay_button,
             self.forward_overlay_button,
             self.speed_combo,
-            self.inspect_frame_button,
         ):
             widget.setEnabled(enabled and playable)
 
@@ -982,7 +971,7 @@ class ReplayPage(QWidget):
         if self.current_session is None:
             return
         if self._current_image is None:
-            self._show_error("请先播放或暂停到目标画面，再点『当前画面标注』")
+            self._show_error("请先播放或暂停到目标画面，再点『单图标注』")
             return
         frame_bgr = self._qimage_to_bgr(self._current_image)
         record = self._current_record
@@ -1200,6 +1189,7 @@ class ReplayPage(QWidget):
             self.current_session,
             self.truth_log,
             frame_provider=self._current_frame_bgr_and_index,
+            frame_scan_provider=self._frames_after_current,
         )
         editor.log_saved.connect(self._on_truth_log_saved)
         self._truth_editor = editor
@@ -1232,6 +1222,22 @@ class ReplayPage(QWidget):
             record.frame_index if record is not None else None,
             self._qimage_to_bgr(self._current_image),
         )
+
+    def _frames_after_current(self, frame_index: int):
+        """Read a small editor-only look-ahead without changing playback."""
+
+        if self.current_session is None:
+            return
+        source = VideoReplaySource(
+            self.current_session / "video" / "game.avi",
+            self.current_session / "video" / "frame_index.jsonl",
+        )
+        for count, (record, image) in enumerate(
+            source.frames(start_frame=int(frame_index) + 1), start=1
+        ):
+            yield record.frame_index, image
+            if count >= 24:
+                return
 
     def _recognition(self) -> ScreenshotRecognitionService:
         if self._recognition_service is None:
@@ -1740,49 +1746,6 @@ class ReplayPage(QWidget):
                 and (self.current_session / "video" / "game.avi").is_file()
                 and (self.current_session / "video" / "frame_index.jsonl").is_file()
             ),
-        )
-
-    def _load_incidents(self) -> None:
-        self.incident_combo.blockSignals(True)
-        self.incident_combo.clear()
-        self.incident_combo.addItem("事故跳转", userData=None)
-        if self.current_session is not None:
-            root = self.current_session / "incidents"
-            if root.is_dir():
-                for path in sorted(root.iterdir()):
-                    if path.is_dir():
-                        self.incident_combo.addItem(path.name, userData=str(path))
-        self.incident_combo.blockSignals(False)
-
-    def _incident_selected(self, _index: int) -> None:
-        value = self.incident_combo.currentData()
-        if not value:
-            return
-        path = Path(str(value))
-        report = path / "llm_report.md"
-        trigger_ms = None
-        incident_path = path / "incident.json"
-        media_path = path / "media.json"
-        try:
-            if incident_path.is_file():
-                trigger_ms = json.loads(incident_path.read_text("utf-8")).get(
-                    "trigger_ms"
-                )
-            if trigger_ms is None and media_path.is_file():
-                trigger_ms = json.loads(media_path.read_text("utf-8")).get(
-                    "trigger_ms"
-                )
-        except (OSError, json.JSONDecodeError):
-            trigger_ms = None
-        if trigger_ms is not None:
-            records = self._index_records()
-            record = next(
-                (item for item in records if item.monotonic_ms >= int(trigger_ms)),
-                records[-1] if records else None,
-            )
-            self._restart_decode_at(record, play=False)
-        self.diagnostics.setPlainText(
-            report.read_text("utf-8") if report.is_file() else f"事故目录：{path}"
         )
 
     def export_diagnostics(self) -> None:

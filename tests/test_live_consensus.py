@@ -162,15 +162,25 @@ def test_unknown_suit_self_action_is_reconciled_to_the_confirmed_hand():
     assert result.resolved_cards == ("2H", "3C", "4C", "5S", "AS")
 
 
-def test_play_that_does_not_beat_reconstructed_table_is_still_committed():
+def test_play_that_does_not_beat_reconstructed_table_is_rejected():
     result = BurstConsensus(min_votes=3).decide(
         [_play("6S") for _ in range(3)],
         context=_context(table_cards=("7S",)),
     )
 
+    assert result.status == "review_required"
+    assert not result.is_pass
+    assert "does_not_beat_table" in result.rejected_reasons
+
+
+def test_fresh_trick_allows_a_legal_lead_without_beating_a_prior_table():
+    result = BurstConsensus(min_votes=3).decide(
+        [_play("6S") for _ in range(3)],
+        context=_context(table_cards=()),
+    )
+
     assert result.status == "confirmed"
     assert result.cards == ("6S",)
-    assert "observed_table_mismatch" in result.integrity_warnings
 
 
 def test_stable_play_wins_over_a_pass_candidate_in_the_same_turn():

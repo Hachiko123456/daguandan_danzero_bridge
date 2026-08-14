@@ -10,7 +10,7 @@
   ],
   "auto_capture_interval_sec": 5.0,
   "schema_version": 2,
-  "advisor_strategy": "danzero",
+  "advisor_strategy": "fabledan",
   "aspect_ratio_tolerance": 0.03,
   "capture_backend": "auto",
   "allow_screen_fallback": true,

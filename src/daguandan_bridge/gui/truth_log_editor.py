@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -26,6 +27,11 @@ from PySide6.QtWidgets import (
 
 from ..annotation_service import AnnotationService
 from ..application.model_evaluation import EvaluationRunResult, ModelEvaluationService
+from ..application.placement_projection import (
+    PlacementProjection,
+    format_placement_summary,
+    project_recorded_placements,
+)
 from ..application.timeline_truth_migration import TimelineTruthMigrationService
 from ..danzero.state import RANKS, SEATS, SUITS
 from ..live.truth_log import (
@@ -38,6 +44,8 @@ from ..live.truth_log import (
 )
 from ..domain.truth import LabelProvenance, TruthEvidence
 from ..live.turns import TURN_ORDER
+from ..live.session_store import read_json_lines
+from ..live.suit_correction import SuitCorrectionTracker
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
 from .single_image_danzero_page import CardBadge
@@ -53,10 +61,10 @@ _PLAY_ROI_NAMES = {
     "opposite": "opposite_play",
     "left": "left_play",
 }
-
 _SUIT_ORDER = {"S": 0, "H": 1, "C": 2, "D": 3}
 # 逆序展示时同点数按 黑桃 > 红桃 > 梅花 > 方块。
 _SUIT_ORDER_DESC = {"S": 3, "H": 2, "C": 1, "D": 0}
+_SUIT_CORRECTION_SCAN_AHEAD_FRAMES = 24
 # 掼蛋牌力（逆序，大在前）：大王 > 小王 > 级牌 > A > K > … > 3 > 2。
 # 级牌按对局轮次传入（如级牌 10，则 10 仅次于大小王）。
 _JOKER_STRENGTH = {"big_joker": 18, "small_joker": 17}
@@ -176,6 +184,8 @@ class TruthLogEditor(QWidget):
         *,
         frame_provider: Callable[[], tuple[int | None, np.ndarray | None]]
         | None = None,
+        frame_scan_provider: Callable[[int], Iterable[tuple[int, np.ndarray]]]
+        | None = None,
         recognition_service: ScreenshotRecognitionService | None = None,
         evaluation_service: ModelEvaluationService | None = None,
         repair_service: TimelineTruthMigrationService | None = None,
@@ -184,8 +194,12 @@ class TruthLogEditor(QWidget):
         self.session = Path(session)
         self.truth_log = truth_log
         self._frame_provider = frame_provider
+        self._frame_scan_provider = frame_scan_provider
         self._recognition_service = recognition_service
         self._last_recognized_frame: int | None = None
+        self._placements = self._load_placements(truth_log)
+        self._placement_badges_by_turn = self._placement_badges(self._placements)
+        self._suit_correction_tracker = SuitCorrectionTracker()
         self.setObjectName("truthLogEditor")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -204,6 +218,14 @@ class TruthLogEditor(QWidget):
         else:
             self.resume_banner = None
             self.clear_button = None
+        self.placement_summary = QLabel()
+        self.placement_summary.setObjectName("placementSummary")
+        self.placement_summary.setWordWrap(True)
+        self.placement_summary.setStyleSheet(
+            "QLabel#placementSummary { color: #365c85; font-weight: 600; }"
+        )
+        self._refresh_placement_summary()
+        layout.addWidget(self.placement_summary)
         lead_row = QHBoxLayout()
         lead_row.addWidget(QLabel("首出玩家"))
         self.lead_combo = ScrollSafeComboBox()
@@ -250,10 +272,18 @@ class TruthLogEditor(QWidget):
         self._render_hand_badges()
         self.edit_hand_button.clicked.connect(self._edit_hand)
         self.recognize_hand_button.clicked.connect(self._recognize_hand)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ("序号", "玩家", "动作", "牌面", "牌墩", "状态", "模型推荐")
+            ("序号", "玩家", "牌面", "牌墩", "模型推荐")
         )
+        header = self.table.horizontalHeader()
+        for column in (0, 1, 3):
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        for column in (2, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table, 1)
@@ -400,20 +430,98 @@ class TruthLogEditor(QWidget):
             return False
         return saved.to_dict() == self.truth_log.to_dict()
 
+    def _load_placements(self, truth_log: TruthLog) -> tuple[PlacementProjection, ...]:
+        """Read one rank-ordered, evidence-safe projection from the timeline."""
+
+        timeline_path = self.session / "timeline.jsonl"
+        if not timeline_path.is_file():
+            return ()
+        try:
+            return project_recorded_placements(
+                read_json_lines(timeline_path),
+                truth_log.turns,
+            )
+        except Exception:
+            return ()
+
+    @staticmethod
+    def _placement_badges(
+        placements: tuple[PlacementProjection, ...],
+    ) -> dict[int, str]:
+        return {
+            item.anchor_turn_id: item.label
+            for item in placements
+            if item.anchor_turn_id is not None
+        }
+
+    def _refresh_placement_summary(self) -> None:
+        self.placement_summary.setText(
+            format_placement_summary(self._placements, _SEAT_LABELS)
+        )
+
+    def _clear_placement_badges(self) -> None:
+        """Keep timeline order visible, but remove stale row-level anchors."""
+
+        if not self._placement_badges_by_turn:
+            return
+        self._placement_badges_by_turn = {}
+        for row in range(self.table.rowCount()):
+            self.table.setCellWidget(
+                row,
+                2,
+                self._card_strip_widget(
+                    self._cards_from_row(row),
+                    is_pass=self._is_pass_from_row(row),
+                ),
+            )
+
     @staticmethod
     def _card_strip_widget(
-        cards: tuple[str, ...], *, is_pass: bool = False
+        cards: tuple[str, ...],
+        *,
+        is_pass: bool = False,
+        empty_label: str = "",
+        placement: str = "",
     ) -> QWidget:
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
         if not cards:
-            label = QLabel("不出" if is_pass else "等待画面识别…")
-            layout.addWidget(label)
+            label = QLabel(
+                "不出" if is_pass else (empty_label or "等待画面识别…")
+            )
+            if is_pass:
+                # A pass must remain as legible as a card strip when the model
+                # recommends cards in the neighbouring column.  A fixed badge
+                # also makes the table reserve a complete card-height row.
+                label.setObjectName("passBadge")
+                label.setMinimumSize(72, 72)
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                label.setStyleSheet(
+                    "QLabel#passBadge { background: #f5f8fc; "
+                    "border: 1px dashed #8ba2ba; border-radius: 6px; "
+                    "color: #365c85; font-size: 14px; font-weight: 600; }"
+                )
+                label.setToolTip("不出")
+            layout.addWidget(
+                label,
+                0,
+                Qt.AlignmentFlag.AlignVCenter,
+            )
         else:
             for card in cards:
                 layout.addWidget(CardBadge(card))
+        if placement:
+            badge = QLabel(placement)
+            badge.setObjectName("placementBadge")
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setStyleSheet(
+                "QLabel#placementBadge { background: #fff3d6; "
+                "border: 1px solid #e5b86e; border-radius: 6px; "
+                "color: #8a5a12; font-weight: 600; padding: 4px 7px; }"
+            )
+            layout.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addStretch(1)
         return widget
 
@@ -489,37 +597,21 @@ class TruthLogEditor(QWidget):
             )
         )
         self.table.setCellWidget(row, 1, player)
-        action = ScrollSafeComboBox()
-        action.addItems(("出牌", "不出"))
-        action.setCurrentIndex(1 if turn.is_pass else 0)
-        if not editable:
-            action.setEnabled(False)
-        action.currentIndexChanged.connect(
-            lambda _index, combo=action: self._action_changed(
-                self._row_for_widget(combo)
-            )
-        )
-        self.table.setCellWidget(row, 2, action)
         self.table.setCellWidget(
             row,
-            3,
-            self._card_strip_widget(turn.cards, is_pass=turn.is_pass),
+            2,
+            self._card_strip_widget(
+                turn.cards,
+                is_pass=turn.is_pass,
+                placement=self._placement_badges_by_turn.get(turn.index, ""),
+            ),
         )
-        metadata = (
-            QTableWidgetItem(str(turn.trick_id or "—")),
-            QTableWidgetItem(status or str(turn.label_status)),
-        )
-        for column, item in enumerate(metadata, 4):
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table.setItem(row, column, item)
-        if turn.actor == "self":
-            recommendation = QTableWidgetItem("")
-            recommendation.setFlags(
-                recommendation.flags() & ~Qt.ItemFlag.ItemIsEditable
-            )
-            self.table.setItem(row, 6, recommendation)
-        else:
-            self.table.takeItem(row, 6)
+        trick = QTableWidgetItem(str(turn.trick_id or "—"))
+        trick.setFlags(trick.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.table.setItem(row, 3, trick)
+        if status:
+            player.setToolTip(status)
+        self.table.removeCellWidget(row, 4)
 
     def _replace_row(
         self,
@@ -634,29 +726,13 @@ class TruthLogEditor(QWidget):
         self.table.horizontalScrollBar().setValue(horizontal)
         self.table.verticalScrollBar().setValue(vertical)
 
-    def _action_changed(self, row: int) -> None:
-        if row < 0:
-            return
-        combo = self.table.cellWidget(row, 2)
-        if combo is not None:
-            if combo.currentIndex() == 1:
-                self.table.setCellWidget(
-                    row, 3, self._card_strip_widget((), is_pass=True)
-                )
-            elif not self._cards_from_row(row):
-                self.table.setCellWidget(row, 3, self._card_strip_widget(()))
-            self._resize_table()
-        self._draft_mutated()
-
     def _player_changed(self, row: int) -> None:
         if row < 0:
             return
         player = self.table.cellWidget(row, 1)
         if player is not None and bool(player.property("sequenceConflict")):
             player.setProperty("sequenceConflict", False)
-            status = self.table.item(row, 5)
-            if status is not None:
-                status.setText("待编辑（已人工确认玩家）")
+            player.setToolTip("已人工确认玩家")
             self.save_status.setText("玩家顺序冲突已人工确认；出牌日志仍未保存")
         self._clear_recommendations()
         self._draft_mutated()
@@ -665,7 +741,7 @@ class TruthLogEditor(QWidget):
         for row in range(self.table.rowCount()):
             if any(
                 self.table.cellWidget(row, column) is widget
-                for column in (1, 2)
+                for column in (1,)
             ):
                 return row
         viewport_position = widget.mapTo(
@@ -678,7 +754,7 @@ class TruthLogEditor(QWidget):
         return
 
     def _cards_from_row(self, row: int) -> tuple[str, ...]:
-        widget = self.table.cellWidget(row, 3)
+        widget = self.table.cellWidget(row, 2)
         if widget is None or widget.layout() is None:
             return ()
         cards: list[str] = []
@@ -689,18 +765,26 @@ class TruthLogEditor(QWidget):
                 cards.append(badge.card_code)
         return tuple(cards)
 
+    def _is_pass_from_row(self, row: int) -> bool:
+        item = self.table.item(row, 0)
+        original = (
+            item.data(int(Qt.ItemDataRole.UserRole) + 1)
+            if item is not None
+            else None
+        )
+        return bool(original.is_pass) if isinstance(original, TruthTurn) else False
+
     def _build_log(self) -> TruthLog:
         turns: list[TruthTurn] = []
         for row in range(self.table.rowCount()):
             player = self.table.cellWidget(row, 1)
-            action = self.table.cellWidget(row, 2)
             if player is not None and bool(player.property("sequenceConflict")):
                 raise ValueError(
                     f"第 {row + 1} 条动作的前后玩家候选冲突，"
                     "请人工确认玩家后再保存"
                 )
             actor = player.currentData()
-            is_pass = action.currentIndex() == 1
+            is_pass = self._is_pass_from_row(row)
             cards = () if is_pass else self._cards_from_row(row)
             if not is_pass and not cards:
                 raise ValueError(f"第 {row + 1} 条动作还没有选择牌面")
@@ -770,8 +854,7 @@ class TruthLogEditor(QWidget):
         played: dict[str, int] = {}
         for row in range(max(0, min(stop_row, self.table.rowCount()))):
             player = self.table.cellWidget(row, 1)
-            action = self.table.cellWidget(row, 2)
-            if player is None or action is None or action.currentIndex() == 1:
+            if player is None or self._is_pass_from_row(row):
                 continue
             player_name = str(player.currentData())
             played[player_name] = played.get(player_name, 0) + len(
@@ -939,6 +1022,214 @@ class TruthLogEditor(QWidget):
                 f"识别后应轮到{expected_label}，下一行为{actual_label}"
             )
 
+    def _correct_unknown_suit_row(
+        self,
+        row: int,
+        frame_index: int | None,
+        image: np.ndarray,
+    ) -> bool:
+        """Apply the live listener's two-read suit correction to one old row."""
+
+        number_item = self.table.item(row, 0)
+        original = (
+            number_item.data(int(Qt.ItemDataRole.UserRole) + 1)
+            if number_item is not None
+            else None
+        )
+        if (
+            not isinstance(original, TruthTurn)
+            or original.is_pass
+            or not any(card.endswith("?") for card in original.cards)
+        ):
+            return False
+        if self._frame_scan_provider is not None and frame_index is not None:
+            return self._scan_unknown_suit_row(
+                row, original, int(frame_index), image
+            )
+        try:
+            result = self._recognition().recognize_play_region(
+                image,
+                original.actor,
+                wild_rank=str(self.round_level_combo.currentData()),
+                allow_unknown_suit=True,
+            )
+        except TypeError as exc:
+            if "allow_unknown_suit" not in str(exc):
+                raise
+            result = self._recognition().recognize_play_region(
+                image,
+                original.actor,
+                wild_rank=str(self.round_level_combo.currentData()),
+            )
+        if result is None or result.is_pass or result.player != original.actor:
+            self.recognition_hint.setText(
+                f"花色修正：第 {row + 1} 行未识别到可用的{_SEAT_LABELS[original.actor]}出牌；未修改"
+            )
+            return True
+        target_id = f"row:{row}:{original.index}:{'|'.join(original.cards)}"
+        observation = self._suit_correction_tracker.observe(
+            target_id,
+            original.cards,
+            tuple(str(card) for card in result.cards),
+        )
+        if not observation.cards:
+            self.recognition_hint.setText(
+                f"花色修正：第 {row + 1} 行候选与原动作的张数或点数不一致；未修改"
+            )
+            return True
+        if not observation.confirmed:
+            self.recognition_hint.setText(
+                f"花色修正：第 {row + 1} 行已得到候选牌面，请在下一帧再次识别确认；未修改"
+            )
+            return True
+        evidence_indices = tuple(
+            dict.fromkeys(
+                (*original.evidence.frame_indices,)
+                + ((frame_index,) if frame_index is not None else ())
+            )
+        )
+        corrected = TruthTurn(
+            original.index,
+            original.actor,
+            False,
+            observation.cards,
+            frame_index=frame_index,
+            monotonic_ms=original.monotonic_ms,
+            trick_id=original.trick_id,
+            evidence=replace(
+                original.evidence,
+                frame_indices=evidence_indices,
+                roi_name=original.evidence.roi_name
+                or _PLAY_ROI_NAMES[original.actor],
+            ),
+            label_status=original.label_status,
+            provenance=LabelProvenance(
+                source=f"suit_correction:{result.source or 'frame_recognition'}",
+                confidence=result.confidence,
+            ),
+            uncertainty=tuple(
+                item for item in original.uncertainty if item != "unknown_suit"
+            ),
+        )
+        self._suit_correction_tracker.clear(target_id)
+        self._replace_row(row, corrected, status="花色修正已确认")
+        self._resize_table()
+        self._last_recognized_frame = frame_index
+        self.recognition_hint.setText(
+            f"花色修正：已回填第 {row + 1} 行；请保存出牌日志后重新评测"
+        )
+        return True
+
+    def _scan_unknown_suit_row(
+        self,
+        row: int,
+        original: TruthTurn,
+        frame_index: int,
+        image: np.ndarray,
+    ) -> bool:
+        """Confirm one unknown-suit row from nearby replay frames only."""
+
+        assert self._frame_scan_provider is not None
+        target_id = f"row:{row}:{original.index}:{'|'.join(original.cards)}"
+        frames: list[tuple[int, np.ndarray]] = [(frame_index, image)]
+        try:
+            frames.extend(
+                (int(candidate_index), candidate_image)
+                for candidate_index, candidate_image in self._frame_scan_provider(
+                    frame_index
+                )
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.recognition_hint.setText(
+                f"花色修正：无法读取后续录像帧（{exc}）；未修改"
+            )
+            return True
+
+        confirmed_result = None
+        confirmed_frame_index: int | None = None
+        candidate_frame_indices: list[int] = []
+        for candidate_frame_index, candidate_image in frames[
+            : 1 + _SUIT_CORRECTION_SCAN_AHEAD_FRAMES
+        ]:
+            try:
+                result = self._recognition().recognize_play_region(
+                    candidate_image,
+                    original.actor,
+                    wild_rank=str(self.round_level_combo.currentData()),
+                    allow_unknown_suit=True,
+                )
+            except TypeError as exc:
+                if "allow_unknown_suit" not in str(exc):
+                    raise
+                result = self._recognition().recognize_play_region(
+                    candidate_image,
+                    original.actor,
+                    wild_rank=str(self.round_level_combo.currentData()),
+                )
+            if result is None or result.is_pass or result.player != original.actor:
+                continue
+            observation = self._suit_correction_tracker.observe(
+                target_id,
+                original.cards,
+                tuple(str(card) for card in result.cards),
+            )
+            if not observation.cards:
+                continue
+            candidate_frame_indices.append(candidate_frame_index)
+            if observation.confirmed:
+                confirmed_result = result
+                confirmed_frame_index = candidate_frame_index
+                break
+
+        if confirmed_result is None:
+            self._suit_correction_tracker.clear(target_id)
+            self.recognition_hint.setText(
+                f"花色修正：已检查当前帧后的 {_SUIT_CORRECTION_SCAN_AHEAD_FRAMES} 帧，"
+                "未得到两帧一致的完整花色；未修改"
+            )
+            return True
+
+        evidence_indices = tuple(
+            dict.fromkeys(
+                (*original.evidence.frame_indices, *candidate_frame_indices)
+            )
+        )
+        corrected = TruthTurn(
+            original.index,
+            original.actor,
+            False,
+            tuple(str(card) for card in confirmed_result.cards),
+            frame_index=confirmed_frame_index,
+            monotonic_ms=original.monotonic_ms,
+            trick_id=original.trick_id,
+            evidence=replace(
+                original.evidence,
+                frame_indices=evidence_indices,
+                roi_name=original.evidence.roi_name
+                or _PLAY_ROI_NAMES[original.actor],
+            ),
+            label_status=original.label_status,
+            provenance=LabelProvenance(
+                source=(
+                    "suit_correction:"
+                    f"{confirmed_result.source or 'frame_recognition'}"
+                ),
+                confidence=confirmed_result.confidence,
+            ),
+            uncertainty=tuple(
+                item for item in original.uncertainty if item != "unknown_suit"
+            ),
+        )
+        self._suit_correction_tracker.clear(target_id)
+        self._replace_row(row, corrected, status="花色修正已确认")
+        self._resize_table()
+        self._last_recognized_frame = confirmed_frame_index
+        self.recognition_hint.setText(
+            f"花色修正：已在后续帧确认并回填第 {row + 1} 行"
+            f"（确认帧 {confirmed_frame_index}）；请保存出牌日志后重新评测"
+        )
+        return True
+
     def _recognize_frame(self) -> None:
         if self._frame_provider is None:
             self.recognition_hint.setText(
@@ -959,6 +1250,8 @@ class TruthLogEditor(QWidget):
             return
         replacing = len(selected_rows) == 1
         target_row = selected_rows[0] if replacing else self.table.rowCount()
+        if replacing and self._correct_unknown_suit_row(target_row, frame_index, image):
+            return
         expected = self._expected_player_at(target_row)
         if expected is None:
             self.recognition_hint.setText(
@@ -988,12 +1281,11 @@ class TruthLogEditor(QWidget):
                 if item is None or item.data(Qt.ItemDataRole.UserRole) != frame_index:
                     continue
                 player = self.table.cellWidget(row, 1)
-                action = self.table.cellWidget(row, 2)
-                if player is None or action is None:
+                if player is None:
                     continue
                 existing = (
                     str(player.currentData()),
-                    action.currentIndex() == 1,
+                    self._is_pass_from_row(row),
                     self._cards_from_row(row),
                 )
                 if existing == signature:
@@ -1058,27 +1350,30 @@ class TruthLogEditor(QWidget):
             QLabel(str(exc), self).show()
 
     def _draft_mutated(self, *_args) -> None:
+        self._clear_placement_badges()
         panel = getattr(self, "evaluation_panel", None)
         if panel is not None:
             panel.invalidate_input()
         self.draft_changed.emit()
 
-    def _clear_recommendations(self) -> None:
+    def _clear_recommendations(self, *, resize: bool = True) -> None:
         for row in range(self.table.rowCount()):
-            player = self.table.cellWidget(row, 1)
-            is_self = player is not None and player.currentData() == "self"
-            item = self.table.item(row, 6)
-            if is_self and item is None:
-                item = QTableWidgetItem("")
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table.setItem(row, 6, item)
-            elif is_self:
-                item.setText("")
-            elif item is not None:
-                self.table.takeItem(row, 6)
+            self.table.removeCellWidget(row, 4)
+        if resize:
+            self._resize_table()
+
+    @staticmethod
+    def _recommendation_widget(value: object, *, error: str = "") -> QWidget:
+        if error:
+            return TruthLogEditor._card_strip_widget((), empty_label=error)
+        if not isinstance(value, dict):
+            return TruthLogEditor._card_strip_widget((), empty_label="—")
+        is_pass = bool(value.get("is_pass", False))
+        cards = tuple(str(card) for card in value.get("cards", ()))
+        return TruthLogEditor._card_strip_widget(cards, is_pass=is_pass)
 
     def _show_evaluation_result(self, result: EvaluationRunResult) -> None:
-        self._clear_recommendations()
+        self._clear_recommendations(resize=False)
         for decision in result.decisions:
             turn_id = decision.get("turn_id")
             if not isinstance(turn_id, int):
@@ -1090,15 +1385,17 @@ class TruthLogEditor(QWidget):
             if player is None or player.currentData() != "self":
                 continue
             predicted = decision.get("predicted_action")
-            text = _recommendation_text(predicted)
+            error = ""
             if decision.get("status") != "evaluated":
-                text = f"错误：{decision.get('error_code') or 'unknown'}"
-            item = self.table.item(row, 6)
-            if item is None:
-                item = QTableWidgetItem("")
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table.setItem(row, 6, item)
-            item.setText(text)
+                error = f"错误：{decision.get('error_code') or 'unknown'}"
+            self.table.setCellWidget(
+                row,
+                4,
+                self._recommendation_widget(predicted, error=error),
+            )
+        # Recommendations are added after the original pass-only rows were
+        # rendered.  Recompute once so model card badges can never be clipped.
+        self._resize_table()
 
     def _reload_repaired_truth(self, _result: object) -> None:
         try:
@@ -1110,6 +1407,9 @@ class TruthLogEditor(QWidget):
             self.save_status.setText(f"修复后重新载入失败：{exc}")
             return
         self.truth_log = repaired
+        self._placements = self._load_placements(repaired)
+        self._placement_badges_by_turn = self._placement_badges(self._placements)
+        self._refresh_placement_summary()
         self.lead_combo.setCurrentIndex(
             max(0, self.lead_combo.findData(repaired.initial_state.lead_player))
         )
@@ -1124,12 +1424,3 @@ class TruthLogEditor(QWidget):
 
     def shutdown(self) -> None:
         self.evaluation_panel.shutdown()
-
-
-def _recommendation_text(value: object) -> str:
-    if not isinstance(value, dict):
-        return "—"
-    if value.get("is_pass"):
-        return "不出"
-    cards = value.get("cards", ())
-    return " ".join(str(card) for card in cards)

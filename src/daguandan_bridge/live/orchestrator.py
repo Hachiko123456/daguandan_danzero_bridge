@@ -52,6 +52,7 @@ from .recognition_strategy import (
 from .models import LiveEvent, LiveSnapshot
 from .latest_worker import LatestOnlyWorker
 from .reducer import LiveReducer
+from .suit_correction import SuitCorrectionTracker
 from .turns import TURN_ORDER
 from .zone_lifecycle import ZoneFrameMetrics, ZoneLifecycle, ZonePhase
 
@@ -65,20 +66,6 @@ LiveStatus = Literal[
     "finalizing",
     "sealed",
 ]
-
-
-def _card_rank_counts(cards: tuple[str, ...]) -> Counter[str]:
-    """Compare action shapes while deliberately ignoring suit corrections."""
-
-    ranks = (
-        card
-        if card in {"small_joker", "big_joker"}
-        else card[:-1]
-        if len(card) >= 2
-        else card
-        for card in cards
-    )
-    return Counter(ranks)
 
 
 def _state_synchronized(method):
@@ -267,7 +254,7 @@ class LiveOrchestrator:
         # It is deliberately kept outside the reducer history.  The same
         # result must be observed twice before it becomes a visual correction.
         self._suit_corrected_event_ids: set[str] = set()
-        self._suit_correction_streaks: dict[str, tuple[tuple[str, ...], int]] = {}
+        self._suit_correction_tracker = SuitCorrectionTracker()
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -1355,27 +1342,17 @@ class LiveOrchestrator:
 
         if target is None or result is None or result.is_pass:
             return None
-        corrected_cards = tuple(sorted(str(card) for card in result.cards))
         target_cards = tuple(str(card) for card in target.payload.get("cards", ()))
-        if (
-            not corrected_cards
-            or any(is_unknown_suit_card(card) for card in corrected_cards)
-            or len(corrected_cards) != len(target_cards)
-            or _card_rank_counts(corrected_cards) != _card_rank_counts(target_cards)
-        ):
-            self._suit_correction_streaks.pop(target.event_id, None)
-            return None
-        previous = self._suit_correction_streaks.get(target.event_id)
-        streak = (
-            previous[1] + 1
-            if previous is not None and previous[0] == corrected_cards
-            else 1
+        observation = self._suit_correction_tracker.observe(
+            target.event_id,
+            target_cards,
+            tuple(str(card) for card in result.cards),
         )
-        self._suit_correction_streaks[target.event_id] = (corrected_cards, streak)
-        if streak < 2:
+        if not observation.confirmed:
             return None
+        corrected_cards = observation.cards
         self._suit_corrected_event_ids.add(target.event_id)
-        self._suit_correction_streaks.pop(target.event_id, None)
+        self._suit_correction_tracker.clear(target.event_id)
         return self._append_lifecycle_event(
             "suit_corrected",
             {
@@ -1831,7 +1808,12 @@ class LiveOrchestrator:
                         },
                     }
                 )
-        outcomes = self._append_action_outcomes(before, self.reducer.snapshot())
+        outcomes = self._append_action_outcomes(
+            before,
+            self.reducer.snapshot(),
+            trigger_action_event_id=published.event_id,
+            trigger_actor=published.actor,
+        )
         return published, outcomes
 
     @staticmethod
@@ -1852,6 +1834,9 @@ class LiveOrchestrator:
         self,
         before: LiveSnapshot,
         after: LiveSnapshot,
+        *,
+        trigger_action_event_id: str = "",
+        trigger_actor: Seat | None = None,
     ) -> tuple[LiveEvent, ...]:
         outcomes: list[LiveEvent] = []
         newly_finished = sorted(
@@ -1866,10 +1851,13 @@ class LiveOrchestrator:
             position = len(self._finish_order) - 1
             if position >= len(placement_names):
                 continue
+            payload: dict[str, object] = {"placement": placement_names[position]}
+            if player == trigger_actor and trigger_action_event_id:
+                payload["trigger_action_event_id"] = trigger_action_event_id
             outcomes.append(
                 self._append_lifecycle_event(
                     "player_finished",
-                    {"placement": placement_names[position]},
+                    payload,
                     actor=player,
                 )
             )

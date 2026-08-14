@@ -146,6 +146,29 @@ def test_fabledan_maps_complete_following_history_and_returns_a_legal_self_actio
     assert advice.engine_input["selected_action"] in advice.engine_input["legal_actions"]
 
 
+def test_fabledan_accepts_exact_suit_options_from_live_reducer(tmp_path):
+    """Concrete suit metadata from replay is not an ambiguous candidate."""
+
+    reducer = LiveReducer("replay-history")
+    reducer.confirm_initial_state(
+        round_level="8",
+        hand=HAND,
+        lead_player="right",
+        source="test",
+    )
+    reducer.record_play("right", ("3S",), source="test")
+    reducer.record_pass("opposite", source="test")
+    reducer.record_pass("left", source="test")
+
+    snapshot = reducer.to_guandan_state().local_snapshot()
+    assert snapshot.play_history[0].suit_options == (("S",),)
+    advice = FableDanAdvisor(tmp_path, "profile").recommend(
+        reducer.to_guandan_state(), request_id="exact-suit-options"
+    )
+
+    assert advice.engine_input["history"][0]["move"]["cards"] == ["3S"]
+
+
 def test_unknown_suit_is_audited_and_blocked_before_policy(tmp_path, monkeypatch):
     from daguandan_bridge.fabledan import advisor as module
 

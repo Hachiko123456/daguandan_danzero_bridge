@@ -8,9 +8,6 @@ import pytest
 
 from daguandan_bridge.advisor_strategy import build_evaluation_advisor
 from daguandan_bridge.application.model_evaluation import ModelEvaluationService
-from daguandan_bridge.application.timeline_truth_migration import (
-    TimelineTruthMigrationService,
-)
 from daguandan_bridge.danzero import DanzeroAdvisor
 from daguandan_bridge.domain.advice import AdviceResult
 from daguandan_bridge.fabledan import FableDanAdvisor
@@ -336,19 +333,12 @@ def test_two_representative_real_sessions_have_stable_preflight_outcomes():
     )
 
     valid = service.prepare(first, strategy_id="danzero_model")
-    before = (second / "truth_log.json").read_bytes()
-    invalid = service.prepare(second, strategy_id="danzero_model")
-    repair = TimelineTruthMigrationService().repair_existing_truth(second)
+    repaired_input = service.prepare(second, strategy_id="danzero_model")
 
     assert valid.ready
     assert valid.eligible_self_decisions == 14
-    assert not invalid.ready
-    assert any(
-        issue.code == "INPUT_PLAY_DOES_NOT_BEAT" and issue.turn_id == 66
-        for issue in invalid.issues
-    )
-    assert repair.status == "blocked"
-    assert (second / "truth_log.json").read_bytes() == before
+    assert repaired_input.ready
+    assert repaired_input.eligible_self_decisions == 17
 
 
 def test_strategy_independent_validation_does_not_initialize_model(tmp_path):

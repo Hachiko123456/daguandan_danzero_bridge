@@ -155,6 +155,30 @@ def test_visual_finish_badge_corrects_an_unknown_opponent_starting_count():
     assert LocalGuandanAdvisor._remaining_counts(strategy_snapshot)[1] == 0
 
 
+def test_finished_player_partner_catches_wind_after_active_opponent_passes():
+    """A finished leader's partner does not need to emit a fake pass."""
+
+    reducer = LiveReducer("wind-catch")
+    reducer.confirm_initial_state(
+        round_level="2",
+        hand=INITIAL_HAND,
+        lead_player="left",
+    )
+    reducer.confirm_player_finished("left", placement="head")
+    reducer.record_play("self", INITIAL_HAND)
+
+    # Self has just finished. Right is the only active opponent who must
+    # decline; opposite catches the wind and immediately leads the next trick.
+    reducer.record_pass("right")
+
+    snapshot = reducer.snapshot()
+    assert snapshot.finished_seats == frozenset({"left", "self"})
+    assert snapshot.trick_plays == ()
+    assert snapshot.trick_id == 2
+    assert snapshot.lead_player == "opposite"
+    assert snapshot.current_player == "opposite"
+
+
 def test_correction_rebuild_matches_clean_history():
     corrected = _started_reducer()
     original = corrected.record_play("right", ("7S", "7H"))

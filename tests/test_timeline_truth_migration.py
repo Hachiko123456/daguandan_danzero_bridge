@@ -150,3 +150,83 @@ def test_existing_repair_blocks_timeline_integrity_warning_without_writes(
     assert truth_path.read_bytes() == before
     assert not (session / "truth_log.repair.json").exists()
     assert not list(session.glob("truth_log.repair.*.json"))
+
+
+def test_existing_repair_reindexes_only_stale_trick_ids(tmp_path: Path):
+    session = tmp_path / "sessions" / "stale-trick"
+    session.mkdir(parents=True)
+    (session / "timeline.jsonl").write_text("", encoding="utf-8")
+    truth = TruthLog(
+        "stale-trick",
+        TruthInitialState("8", "self", HAND),
+        (
+            TruthTurn(1, "self", False, ("3S",), trick_id=1),
+            TruthTurn(2, "right", True, (), trick_id=1),
+            TruthTurn(3, "opposite", True, (), trick_id=1),
+            TruthTurn(4, "left", True, (), trick_id=1),
+            # The old reducer kept the cleared trick open, so this legal lead
+            # was persisted under its stale id instead of trick 2.
+            TruthTurn(5, "self", False, ("4S",), trick_id=1),
+        ),
+    )
+    truth_path = session / "truth_log.json"
+    truth_path.write_text(
+        json.dumps(truth.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+    before = truth_path.read_bytes()
+
+    inspection = TimelineTruthMigrationService().inspect_existing_truth_repair(session)
+
+    assert inspection.status == "candidate"
+    assert inspection.code == "safe_to_repair_trick_context"
+    assert inspection.replacement is not None
+    assert inspection.replacement.turns[4].trick_id == 2
+    assert inspection.context_repairs == (
+        "turn 5: trick 1 -> 2 after replayed wind catch",
+    )
+    result = TimelineTruthMigrationService().repair_existing_truth(session)
+    assert result.status == "repaired"
+    assert result.backup_path is not None
+    assert result.backup_path.read_bytes() == before
+    receipt = json.loads((session / "truth_log.repair.json").read_text(encoding="utf-8"))
+    assert receipt["validation"]["context_repairs"] == list(inspection.context_repairs)
+    repaired = load_truth_log(truth_path, session_id="stale-trick")
+    assert repaired.turns[4].trick_id == 2
+    assert [(turn.actor, turn.cards) for turn in repaired.turns] == [
+        (turn.actor, turn.cards) for turn in truth.turns
+    ]
+
+
+def test_source_replay_normalizes_proven_wind_catch_context(tmp_path: Path):
+    session = tmp_path / "sessions" / "wind-catch"
+    reducer = LiveReducer("wind-catch")
+    initial = reducer.confirm_initial_state(
+        round_level="8", hand=HAND, lead_player="left"
+    )
+    left_finished = reducer.record_play("left", HAND)
+    self_finished = reducer.record_play("self", HAND)
+    declined = reducer.record_pass("right")
+    catch = reducer.record_play("opposite", ("3S",))
+    stale_catch = replace(
+        catch,
+        trick_id=catch.trick_id - 1,
+        payload={
+            **catch.payload,
+            "integrity_warnings": ["observed_table_mismatch"],
+            "beats_table": False,
+        },
+    )
+    _write_timeline(
+        session,
+        [initial, left_finished, self_finished, declined, stale_catch],
+    )
+    normalized, context_repairs = TimelineTruthMigrationService()._normalize_source_actions(
+        "wind-catch",
+        (initial, left_finished, self_finished, declined, stale_catch),
+        (left_finished, self_finished, declined, stale_catch),
+    )
+
+    assert context_repairs == (
+        "EVT-000005: trick 1 -> 2 after proven wind catch",
+    )
+    assert normalized[-1].trick_id == 2

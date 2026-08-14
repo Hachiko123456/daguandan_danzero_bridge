@@ -671,10 +671,16 @@ def test_finished_player_and_wind_catch_are_emitted_to_the_timeline(tmp_path):
         remaining_cards={"self": 27, "left": 27, "opposite": 27, "right": 0},
         finished_seats=frozenset({"right"}),
     )
-    finished = orchestrator._append_action_outcomes(before, after_finish)
+    finished = orchestrator._append_action_outcomes(
+        before,
+        after_finish,
+        trigger_action_event_id="EVT-RIGHT-FINAL",
+        trigger_actor="right",
+    )
     assert any(
         event.event_type == "player_finished"
         and event.payload["placement"] == "head"
+        and event.payload["trigger_action_event_id"] == "EVT-RIGHT-FINAL"
         and event.actor == "right"
         for event in finished
     )

@@ -482,13 +482,22 @@ class LiveReducer:
             return
         leader = self._trick_plays[last_non_pass_index].player
         active = set(TURN_ORDER) - self._finished_seats
-        required_passes = active - {leader}
+        # A player who just emptied their hand cannot lead the next trick. In
+        # the wind-catch case their partner receives that lead automatically,
+        # so the partner is not expected to emit a synthetic pass. Only the
+        # still-active opponents must decline the completed play.
+        next_leader = (
+            _PARTNER_SEAT.get(leader, leader)
+            if leader in self._finished_seats
+            else leader
+        )
+        required_passes = active - {next_leader}
         later = self._trick_plays[last_non_pass_index + 1 :]
         passed = {event.player for event in later if event.is_pass}
         if required_passes and required_passes.issubset(passed):
             if leader in self._finished_seats:
                 # 赢家已出完：接风给队友，而不是按轮转给下一家
-                leader = _PARTNER_SEAT.get(leader, leader)
+                leader = next_leader
             self._trick_plays.clear()
             self._lead_player = leader
             self._current_player = leader

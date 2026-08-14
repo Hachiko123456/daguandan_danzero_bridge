@@ -257,17 +257,32 @@ class BurstConsensus:
                 actions_for_cards(variant, context.level_rank)
                 for variant in variants
             ):
-                # This is a structural OCR guard only.  A legal action that
-                # does not beat the reconstructed table is still accepted;
-                # ``does_not_beat_table`` is never a rejection reason.
                 return "illegal_pattern"
         except (ImportError, ModuleNotFoundError, ValueError):
             return "illegal_pattern"
-        # Rule interpretation is deliberately not a commit gate.  Once the
-        # game UI has shown a stable non-empty action, the action happened.
-        # Whether its reconstructed cards form a known pattern or beat the
-        # reconstructed table is captured by ``integrity_warnings`` below and
-        # must never turn the action into PASS or block the turn.
+        if context.table_cards:
+            try:
+                inferences = tuple(
+                    infer_best_action(
+                        variant,
+                        context.table_cards,
+                        context.level_rank,
+                    )
+                    for variant in variants
+                )
+            except (ImportError, ModuleNotFoundError, ValueError):
+                return "illegal_pattern"
+            if not any(
+                inference.action is not None and inference.beats_table
+                for inference in inferences
+            ):
+                # A responding player cannot legally place a non-pass action
+                # that loses to the current table.  This is a candidate gate,
+                # rather than an audit warning: visual effects and UI text can
+                # otherwise be committed as a plausible-looking single card.
+                # A fresh trick and a wind catch have no table cards, so they
+                # deliberately bypass this branch.
+                return "does_not_beat_table"
         return ""
 
     @staticmethod

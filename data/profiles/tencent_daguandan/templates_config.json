@@ -2449,6 +2449,30 @@
         1280,
         720
       ]
+    },
+    {
+      "sample_id": "effect_straight_flush_001",
+      "kind": "effect",
+      "label": "straight_flush",
+      "file": "templates/effect/straight_flush.png",
+      "source_image": "sessions/game_20260814_004447_aab3dc/video/game.avi#frame=622",
+      "source_role": "generic",
+      "abs_box": [
+        490,
+        111,
+        299,
+        99
+      ],
+      "ratio_box": [
+        0.382812,
+        0.154167,
+        0.233594,
+        0.1375
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
     }
   ]
 }

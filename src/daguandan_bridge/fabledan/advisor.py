@@ -504,7 +504,11 @@ def _validate_standard_snapshot(snapshot: LocalStrategySnapshot) -> None:
             raise FableDanStateError(f"第 {index} 条不出历史含牌面")
         if not event.is_pass and not event.cards:
             raise FableDanStateError(f"第 {index} 条出牌历史没有牌面")
-        if any(event.suit_options):
+        # ``LiveReducer.record_play`` preserves the exact suit of a concrete
+        # card as a one-item tuple, e.g. ``("D",)``.  Only multiple choices
+        # are ambiguous; treating every non-empty tuple as ambiguous blocks
+        # every replayed, fully-known history before the model can run.
+        if any(len(options) > 1 for options in event.suit_options):
             raise FableDanStateError(
                 f"第 {index} 条历史仍含花色候选，不能唯一解释"
             )

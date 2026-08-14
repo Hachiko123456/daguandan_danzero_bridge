@@ -136,10 +136,35 @@ def test_replay_page_can_load_recorded_session(tmp_path):
     assert page.frame_spin.maximum() == 2
     assert page.playback_toolbar.play_button is page.play_button
     assert page.playback_toolbar.rewind_button is page.rewind_button
-    assert page.step_button.text() == "下一帧"
-    assert page.inspect_frame_button.text() == "当前画面标注"
+    assert page.step_button.text() == "单图标注"
+    assert not hasattr(page, "inspect_frame_button")
+    assert not hasattr(page, "incident_combo")
     assert "game-test" in page.session_summary.text()
     assert "3" in page.session_summary.text()
+    page.shutdown()
+    page.close()
+
+
+def test_replay_page_single_image_annotation_button_does_not_step_video(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        ReplayPage,
+        "open_frame_inspect",
+        lambda page: calls.append(page.current_session),
+    )
+    app = _app()
+    session = _recorded_session(tmp_path)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    app.processEvents()
+
+    page.step_button.click()
+
+    assert calls == [session.resolve()]
+    assert page._decode_thread is None
     page.shutdown()
     page.close()
 
@@ -179,6 +204,29 @@ def test_replay_page_uses_overlay_seek_and_hysteretic_responsive_layout(tmp_path
     page.frame_spin.setValue(1)
     page.frame_spin.lineEdit().returnPressed.emit()
     assert requested_frames[-1] == 1
+    page.shutdown()
+    page.close()
+
+
+def test_replay_toolbar_uses_one_compact_row_when_video_pane_is_wide(tmp_path):
+    app = _app()
+    session = _recorded_session(tmp_path)
+    page = ReplayPage(session.parent)
+    page.show()
+    page.playback_toolbar.resize(900, 100)
+    app.processEvents()
+
+    layout = page.playback_toolbar._layout
+    for widget in (
+        page.play_button,
+        page.step_button,
+        page.speed_combo,
+        page.frame_spin,
+        page.frame_status,
+    ):
+        index = layout.indexOf(widget)
+        row, _column, _row_span, _column_span = layout.getItemPosition(index)
+        assert row == 0
     page.shutdown()
     page.close()
 
@@ -252,7 +300,8 @@ def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
     editor = page._truth_editor
     assert editor is not None
     assert editor.table.rowCount() == 1
-    assert editor.table.item(0, 5).text() == "扫描确认"
+    assert editor.table.columnCount() == 5
+    assert editor._frame_scan_provider == page._frames_after_current
 
     page._collect_truth_scan_turn(
         {
@@ -265,7 +314,6 @@ def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
         }
     )
     assert editor.table.rowCount() == 2
-    assert editor.table.item(1, 5).text() == "扫描确认"
     assert [turn.actor for turn in page.truth_log.turns] == ["self", "right"]
     assert not (session / "truth_log.json").exists()
     page.shutdown()
@@ -468,7 +516,7 @@ def test_frame_inspect_dialog_shows_frame_and_recognizes():
     app.processEvents()
 
     assert dialog.page._source_image is frame
-    assert dialog.windowTitle() == "当前画面标注"
+    assert dialog.windowTitle() == "单图标注"
     assert dialog.save_frame_button.text() == "保存当前画面为截图"
     assert not dialog.page.isWindow(), "embedded page must not be a separate window"
     assert dialog.page.image_preview.pixmap() is not None

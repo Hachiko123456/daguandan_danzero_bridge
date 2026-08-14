@@ -23,6 +23,12 @@ _SCHEMA_VERSION = 3
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _SUIT_LABELS = {"S": "黑桃", "H": "红桃", "C": "梅花", "D": "方块"}
 _LABEL_TO_SUIT = {value: key for key, value in _SUIT_LABELS.items()}
+_PARTNER_SEAT = {
+    "self": "opposite",
+    "opposite": "self",
+    "right": "left",
+    "left": "right",
+}
 
 
 def card_code_to_text(card: str) -> str:
@@ -416,7 +422,15 @@ def _with_inferred_trick_ids(
         }
         active = set(SEATS) - finished
         if leader is not None:
-            required = active - {leader}
+            # Keep inferred trick ids consistent with LiveReducer: once the
+            # table winner has finished, their partner catches the wind and is
+            # therefore not required to record a pass.
+            next_leader = (
+                _PARTNER_SEAT.get(leader, leader)
+                if leader in finished
+                else leader
+            )
+            required = active - {next_leader}
             if required and required.issubset(passed):
                 current_trick = assigned + 1
                 leader = None

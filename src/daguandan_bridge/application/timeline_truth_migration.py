@@ -16,6 +16,7 @@ from ..domain.truth import LabelProvenance, TruthEvidence
 from ..live.models import LiveEvent
 from ..live.reducer import LiveReducer
 from ..live.session_store import read_json_lines
+from ..live.suit_correction import validate_suit_correction
 from ..live.truth_log import (
     TruthInitialState,
     TruthLog,
@@ -49,6 +50,7 @@ class TimelineTruthSessionInspection:
     action_count: int = 0
     event_type_counts: tuple[tuple[str, int], ...] = ()
     draft: TruthLog | None = None
+    context_repairs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,7 @@ class ExistingTruthRepairInspection:
     replacement_sha256: str = ""
     turn_count: int = 0
     replacement: TruthLog | None = None
+    context_repairs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -188,7 +191,7 @@ class TimelineTruthMigrationService:
         }
         try:
             events = tuple(LiveEvent.from_dict(raw) for raw in raw_events)
-            draft = self._build_and_validate(session_path.name, events)
+            draft, context_repairs = self._build_and_validate(session_path.name, events)
         except _BlockedMigration as exc:
             return self._blocked(session_path, exc.code, str(exc), **base)
         except Exception as exc:
@@ -204,6 +207,7 @@ class TimelineTruthMigrationService:
             code="safe_to_migrate",
             message="timeline deterministically replays as a draft TruthLog",
             draft=draft,
+            context_repairs=context_repairs,
             **base,
         )
 
@@ -254,33 +258,64 @@ class TimelineTruthMigrationService:
                 existing_sha256=existing_sha,
             )
         try:
+            timeline_bytes = timeline_path.read_bytes()
             raw_events = read_json_lines(timeline_path)
         except Exception as exc:
             return self._repair_blocked(
                 session_path, "timeline_read_failed", f"could not read timeline.jsonl: {exc}",
                 existing_sha256=existing_sha,
             )
-        unsafe: list[str] = []
-        for position, raw in enumerate(raw_events, start=1):
-            if str(raw.get("event_type", "")) not in _ACTION_TYPES:
-                continue
-            payload = raw.get("payload")
-            if not isinstance(payload, dict):
-                unsafe.append(f"event {position} has no action payload")
-                continue
-            warnings = payload.get("integrity_warnings")
-            if isinstance(warnings, (list, tuple)) and warnings:
-                unsafe.append(f"event {position} has integrity_warnings")
-            if payload.get("beats_table") is False:
-                unsafe.append(f"event {position} has beats_table=false")
-            if payload.get("interpretation_ambiguous") is True:
-                unsafe.append(f"event {position} is interpretation_ambiguous")
-        if unsafe:
-            return self._repair_blocked(
-                session_path,
-                "unsafe_timeline_integrity",
-                "; ".join(unsafe[:3]),
+        timeline_sha = hashlib.sha256(timeline_bytes).hexdigest()
+
+        # Prefer repairing the saved TruthLog itself.  The older timeline may
+        # contain recognition diagnostics that are unrelated to the saved
+        # action chain; replacing that chain would discard a human correction.
+        # A repair is allowed only when current strict validation identifies a
+        # stale trick id and replaying the exact same actions produces a fully
+        # valid, trick-id-only replacement.
+        existing_validation = validate_evaluation_truth(session_path, existing)
+        if any(issue.code == "INPUT_TRICK_MISMATCH" for issue in existing_validation.issues):
+            try:
+                replacement, context_repairs = self._reindex_truth_tricks(
+                    session_path.name,
+                    existing,
+                )
+            except Exception as exc:
+                return self._repair_blocked(
+                    session_path,
+                    "truth_reducer_replay_failed",
+                    f"could not replay the saved TruthLog: {exc}",
+                    existing_sha256=existing_sha,
+                    timeline_sha256=timeline_sha,
+                )
+            strict = validate_evaluation_truth(session_path, replacement)
+            if not strict.ready:
+                first = strict.issues[0]
+                turn = f" at turn {first.turn_id}" if first.turn_id is not None else ""
+                return self._repair_blocked(
+                    session_path,
+                    "replacement_strict_validation_failed",
+                    f"{first.code}{turn}: {first.message}",
+                    existing_sha256=existing_sha,
+                    timeline_sha256=timeline_sha,
+                    turn_count=len(existing.turns),
+                )
+            replacement_document = truth_log_from_dict(replacement.to_dict()).to_dict()
+            replacement_text = json.dumps(
+                replacement_document, ensure_ascii=False, indent=2
+            ) + "\n"
+            replacement_bytes = replacement_text.replace("\n", os.linesep).encode("utf-8")
+            return ExistingTruthRepairInspection(
+                session=session_path,
+                status="candidate",
+                code="safe_to_repair_trick_context",
+                message="saved TruthLog has a proven stale trick context and can be reindexed",
                 existing_sha256=existing_sha,
+                timeline_sha256=timeline_sha,
+                replacement_sha256=hashlib.sha256(replacement_bytes).hexdigest(),
+                turn_count=len(existing.turns),
+                replacement=replacement,
+                context_repairs=context_repairs,
             )
         schema = str(raw_truth.get("schema", ""))
         try:
@@ -292,11 +327,17 @@ class TimelineTruthMigrationService:
                 "existing TruthLog has an invalid schema_version",
                 existing_sha256=existing_sha,
             )
-        if schema == "guandan.truth/3" or version >= 3:
+        migrated_draft = (
+            existing.label_status == "draft"
+            and existing.provenance.source == MIGRATION_SOURCE
+            and all(turn.provenance.source == MIGRATION_SOURCE for turn in existing.turns)
+        )
+        legacy_truth = schema != "guandan.truth/3" or version < 3
+        if not legacy_truth and not migrated_draft:
             return self._repair_blocked(
                 session_path,
                 "not_legacy_truth_log",
-                "only legacy TruthLogs are eligible for automatic repair",
+                "only legacy or timeline-migrated draft TruthLogs are eligible for automatic repair",
                 existing_sha256=existing_sha,
             )
         if existing.label_status == "verified" or any(
@@ -311,9 +352,14 @@ class TimelineTruthMigrationService:
 
         timeline = self.inspect_session(session_path, force=True)
         if timeline.status != "candidate" or timeline.draft is None:
+            code = (
+                timeline.code
+                if timeline.code == "unsafe_timeline_integrity"
+                else f"timeline_{timeline.code}"
+            )
             return self._repair_blocked(
                 session_path,
-                f"timeline_{timeline.code}",
+                code,
                 timeline.message,
                 existing_sha256=existing_sha,
                 timeline_sha256=timeline.timeline_sha256,
@@ -331,6 +377,7 @@ class TimelineTruthMigrationService:
                 existing_sha256=existing_sha,
                 timeline_sha256=timeline.timeline_sha256,
                 turn_count=len(existing.turns),
+                context_repairs=timeline.context_repairs,
             )
         strict = validate_evaluation_truth(session_path, replacement)
         if not strict.ready:
@@ -361,6 +408,7 @@ class TimelineTruthMigrationService:
             replacement_sha256=hashlib.sha256(replacement_bytes).hexdigest(),
             turn_count=len(existing.turns),
             replacement=replacement,
+            context_repairs=timeline.context_repairs,
         )
 
     def repair_existing_truth(
@@ -425,10 +473,10 @@ class TimelineTruthMigrationService:
                     "turn_count": inspection.turn_count,
                 },
                 "validation": {
-                    "legacy_source": True,
+                    "legacy_or_migrated_draft_source": True,
                     "same_action_coverage": True,
-                    "no_timeline_integrity_warnings": True,
                     "strict_evaluation_input": True,
+                    "context_repairs": list(inspection.context_repairs),
                 },
             }
             self._atomic_create_json(receipt_path, receipt)
@@ -531,6 +579,7 @@ class TimelineTruthMigrationService:
                 "truth_log_roundtrip": True,
                 "source_reducer_replay": True,
                 "truth_reducer_replay": True,
+                "context_repairs": list(inspection.context_repairs),
                 "player_finished_replayed_for_sequence_check": bool(
                     event_type_counts.get("player_finished", 0)
                 ),
@@ -611,11 +660,47 @@ class TimelineTruthMigrationService:
             **values,  # type: ignore[arg-type]
         )
 
+    @staticmethod
+    def _reindex_truth_tricks(
+        session_id: str,
+        truth: TruthLog,
+    ) -> tuple[TruthLog, tuple[str, ...]]:
+        """Recompute trick ids while preserving every saved action field."""
+
+        reducer = LiveReducer(session_id)
+        reducer.confirm_initial_state(
+            round_level=truth.initial_state.round_level,
+            hand=truth.initial_state.my_hand,
+            lead_player=truth.initial_state.lead_player,
+            source="truth_log_repair",
+        )
+        repaired_turns: list[TruthTurn] = []
+        context_repairs: list[str] = []
+        for turn in truth.turns:
+            expected_trick = reducer.snapshot().trick_id
+            if turn.trick_id != expected_trick:
+                context_repairs.append(
+                    f"turn {turn.index}: trick {turn.trick_id} -> {expected_trick} "
+                    "after replayed wind catch"
+                )
+            repaired_turns.append(replace(turn, trick_id=expected_trick))
+            if turn.is_pass:
+                reducer.record_pass(turn.actor, source="truth_log_repair")
+            else:
+                reducer.record_play(
+                    turn.actor,
+                    turn.cards,
+                    source="truth_log_repair",
+                )
+        if not context_repairs:
+            raise ValueError("saved TruthLog has no stale trick ids")
+        return replace(truth, turns=tuple(repaired_turns)), tuple(context_repairs)
+
     def _build_and_validate(
         self,
         session_id: str,
         events: tuple[LiveEvent, ...],
-    ) -> TruthLog:
+    ) -> tuple[TruthLog, tuple[str, ...]]:
         if not session_id:
             raise _BlockedMigration("invalid_session_id", "session directory name is empty")
         for event in events:
@@ -679,9 +764,14 @@ class TimelineTruthMigrationService:
             raise _BlockedMigration("invalid_initial_hand", "initial hand is not an array")
 
         effective_actions = self._effective_actions(events)
+        normalized_actions, context_repairs = self._normalize_source_actions(
+            session_id,
+            events,
+            effective_actions,
+        )
         turns = tuple(
             self._turn_from_event(index, event)
-            for index, event in enumerate(effective_actions, start=1)
+            for index, event in enumerate(normalized_actions, start=1)
         )
         try:
             draft = truth_log_from_dict(
@@ -702,8 +792,8 @@ class TimelineTruthMigrationService:
                 "truth_log_validation_failed",
                 f"draft TruthLog failed schema validation: {exc}",
             ) from exc
-        self._validate_replays(session_id, events, effective_actions, draft)
-        return draft
+        self._validate_truth_replay(session_id, normalized_actions, draft)
+        return draft, context_repairs
 
     @staticmethod
     def _resolve_lead(
@@ -790,6 +880,17 @@ class TimelineTruthMigrationService:
                     "suit_correction_targets_pass",
                     f"suit correction {correction.event_id} targets a pass",
                 )
+            elif correction.event_type == "suit_corrected":
+                target_cards = tuple(str(card) for card in target.payload.get("cards", ()))
+                corrected_cards = correction.payload.get("cards", ())
+                if not isinstance(corrected_cards, (list, tuple)) or validate_suit_correction(
+                    target_cards,
+                    tuple(str(card) for card in corrected_cards),
+                ) is None:
+                    raise _BlockedMigration(
+                        "invalid_suit_correction",
+                        f"suit correction {correction.event_id} does not prove the same action",
+                    )
             corrections[target_id] = correction
 
         effective: list[LiveEvent] = []
@@ -864,14 +965,26 @@ class TimelineTruthMigrationService:
         )
 
     @staticmethod
-    def _validate_replays(
+    def _normalize_source_actions(
         session_id: str,
         events: tuple[LiveEvent, ...],
         actions: tuple[LiveEvent, ...],
-        draft: TruthLog,
-    ) -> None:
+    ) -> tuple[tuple[LiveEvent, ...], tuple[str, ...]]:
+        """Replay source actions and canonically repair one proven wind offset.
+
+        A historical reducer used to leave the completed play on the table when
+        its owner had just finished.  The corresponding timeline therefore
+        carries an old trick id, and its first legal wind-catch lead is marked
+        ``observed_table_mismatch``/``beats_table=false``.  This is safe to
+        normalize only when the corrected reducer proves a one-trick offset and
+        the actor is already the new lead.  Any other warning remains blocking.
+        """
+
         effective_by_id = {event.event_id: event for event in actions}
         source = LiveReducer(session_id)
+        normalized: list[LiveEvent] = []
+        context_repairs: list[str] = []
+        accepted_offset: int | None = None
         action_index = 0
         for event in events:
             if event.event_type in _CORRECTION_TYPES:
@@ -880,13 +993,52 @@ class TimelineTruthMigrationService:
                 event = effective_by_id[event.event_id]
                 action_index += 1
                 snapshot = source.snapshot()
-                if snapshot.turn_id != event.turn_id or snapshot.trick_id != event.trick_id:
+                if snapshot.turn_id != event.turn_id:
                     raise _BlockedMigration(
                         "source_replay_position_mismatch",
-                        f"source action {action_index} expects turn/trick "
-                        f"{event.turn_id}/{event.trick_id}, reducer has "
-                        f"{snapshot.turn_id}/{snapshot.trick_id}",
+                        f"source action {action_index} expects turn {event.turn_id}, "
+                        f"reducer has {snapshot.turn_id}",
                     )
+                offset = snapshot.trick_id - event.trick_id
+                payload = event.payload
+                warnings = tuple(
+                    str(value)
+                    for value in payload.get("integrity_warnings", ())
+                    if str(value)
+                )
+                observed_mismatch = (
+                    "observed_table_mismatch" in warnings
+                    and payload.get("beats_table") is False
+                )
+                valid_wind_origin = (
+                    offset == 1
+                    and observed_mismatch
+                    and event.actor == snapshot.current_player
+                    and event.actor == snapshot.lead_player
+                    and not bool(payload.get("is_pass", False))
+                )
+                if accepted_offset is None and valid_wind_origin:
+                    accepted_offset = offset
+                    context_repairs.append(
+                        f"{event.event_id}: trick {event.trick_id} -> "
+                        f"{snapshot.trick_id} after proven wind catch"
+                    )
+                if offset != (accepted_offset or 0):
+                    raise _BlockedMigration(
+                        "source_replay_position_mismatch",
+                        f"source action {action_index} expects trick {event.trick_id}, "
+                        f"reducer has {snapshot.trick_id}",
+                    )
+                if warnings or payload.get("beats_table") is False or payload.get(
+                    "interpretation_ambiguous"
+                ) is True:
+                    if not valid_wind_origin:
+                        raise _BlockedMigration(
+                            "unsafe_timeline_integrity",
+                            f"source action {action_index} has unresolved integrity evidence",
+                        )
+                event = replace(event, trick_id=snapshot.trick_id)
+                normalized.append(event)
             elif event.event_type not in {
                 "initial_state_confirmed",
                 "lead_player_confirmed",
@@ -900,7 +1052,14 @@ class TimelineTruthMigrationService:
                     "source_reducer_replay_failed",
                     f"source reducer rejected {event.event_id}: {exc}",
                 ) from exc
+        return tuple(normalized), tuple(context_repairs)
 
+    @staticmethod
+    def _validate_truth_replay(
+        session_id: str,
+        actions: tuple[LiveEvent, ...],
+        draft: TruthLog,
+    ) -> None:
         truth = LiveReducer(session_id)
         truth_events = draft.to_events(session_id=session_id)
         try:

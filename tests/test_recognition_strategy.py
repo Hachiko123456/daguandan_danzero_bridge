@@ -135,6 +135,52 @@ def test_best_effort_burst_prefers_a_visible_play_over_later_pass_markers():
     assert "candidate_conflict_resolved_best_effort" in result.integrity_warnings
 
 
+def test_best_effort_discards_an_unbeatable_play_and_keeps_the_pass_marker():
+    samples = (
+        _sample("6S"),
+        _sample("6S"),
+        RecognitionSample((), True, 0.99, "pass_template"),
+    )
+
+    result = decide_best_effort_candidate(
+        samples,
+        context=replace(_context(), table_cards=("7S",)),
+    )
+
+    assert result is not None
+    assert result.is_pass
+    assert result.cards == ()
+    assert "does_not_beat_table" in result.rejected_reasons
+
+
+def test_two_valid_streak_discards_effect_text_before_confirmed_pass():
+    """A rank-like effect read must not outrank the later real pass marker."""
+
+    effect_read = RecognitionSample(
+        cards=("J?",),
+        suit_options=(("H", "D"),),
+        is_pass=False,
+        confidence=0.65,
+        source="effect-covered-play-region",
+    )
+    pass_read = RecognitionSample((), True, 0.99, "pass_template")
+
+    result = decide_recognition_strategy(
+        "two_valid_streak",
+        (effect_read, effect_read, pass_read, pass_read),
+        context=replace(
+            _context(),
+            level_rank="6",
+            table_cards=("10C", "6C", "6H", "7C", "9C"),
+        ),
+    )
+
+    assert result is not None
+    assert result.is_pass
+    assert result.cards == ()
+    assert "does_not_beat_table" in result.rejected_reasons
+
+
 def test_next_turn_evidence_commits_an_unresolved_non_pass_instead_of_blocking():
     context = replace(_context(), next_turn_evidence=True)
 
