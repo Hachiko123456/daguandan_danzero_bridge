@@ -1,1 +1,1 @@
-"""Qt application for the DanZero assistant and annotation tools."""
+"""Qt application for the Guandan assistant and annotation tools."""

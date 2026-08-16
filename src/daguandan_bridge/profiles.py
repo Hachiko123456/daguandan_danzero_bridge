@@ -155,7 +155,7 @@ class ProfileConfig:
     viewport_aspect_ratio: float = 16 / 9
     match_settings: MatchSettings = field(default_factory=MatchSettings)
     counter_settings: CounterSettings = field(default_factory=CounterSettings)
-    advisor_strategy: str = "danzero"
+    advisor_strategy: str = "fabledan"
 
     def normalized(self) -> "ProfileConfig":
         base_size = (int(self.base_size[0]), int(self.base_size[1]))

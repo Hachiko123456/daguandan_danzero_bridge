@@ -140,6 +140,7 @@ def test_best_effort_discards_an_unbeatable_play_and_keeps_the_pass_marker():
         _sample("6S"),
         _sample("6S"),
         RecognitionSample((), True, 0.99, "pass_template"),
+        RecognitionSample((), True, 0.99, "pass_template"),
     )
 
     result = decide_best_effort_candidate(
@@ -151,6 +152,15 @@ def test_best_effort_discards_an_unbeatable_play_and_keeps_the_pass_marker():
     assert result.is_pass
     assert result.cards == ()
     assert "does_not_beat_table" in result.rejected_reasons
+
+
+def test_best_effort_never_promotes_a_single_pass_marker():
+    result = decide_best_effort_candidate(
+        (RecognitionSample((), True, 0.99, "pass_template"),),
+        context=replace(_context(), next_turn_evidence=True),
+    )
+
+    assert result is None
 
 
 def test_two_valid_streak_discards_effect_text_before_confirmed_pass():
@@ -181,7 +191,7 @@ def test_two_valid_streak_discards_effect_text_before_confirmed_pass():
     assert "does_not_beat_table" in result.rejected_reasons
 
 
-def test_next_turn_evidence_commits_an_unresolved_non_pass_instead_of_blocking():
+def test_next_turn_evidence_never_commits_an_illegal_animation_fragment():
     context = replace(_context(), next_turn_evidence=True)
 
     result = decide_best_effort_candidate(
@@ -189,7 +199,27 @@ def test_next_turn_evidence_commits_an_unresolved_non_pass_instead_of_blocking()
         context=context,
     )
 
+    assert result is None
+
+
+def test_latest_steel_plate_waits_past_illegal_fragments_for_complete_cards():
+    fragments = (
+        _sample("2H", "3D", "3C"),
+        _sample("2H", "3D"),
+        _sample("2H", "3S"),
+        _sample("2H", "3C"),
+        _sample("2H", "3S"),
+    )
+    complete = _sample("2H", "2H", "2C", "3D", "3C", "3S")
+    context = replace(_context(), level_rank="6", next_turn_evidence=True)
+
+    assert decide_best_effort_candidate(fragments, context=context) is None
+    result = decide_recognition_strategy(
+        "two_valid_streak",
+        (*fragments, complete, complete),
+        context=context,
+    )
+
     assert result is not None
-    assert not result.is_pass
-    assert result.cards == ("3S", "4H")
-    assert "observed_pattern_unresolved" in result.integrity_warnings
+    assert result.cards == tuple(sorted(complete.cards))
+    assert result.vote_count == 2

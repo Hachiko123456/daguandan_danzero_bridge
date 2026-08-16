@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+# 开发时使用仓库根目录；PyInstaller 打包后则始终使用启动 exe 所在目录。
+# 运行数据需要可写，因此不能把它放在 PyInstaller 的 _internal 临时运行目录。
+PROJECT_ROOT: Path = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[2]
+)
 DATA_DIR: Path = PROJECT_ROOT / "data"
 PROFILES_ROOT: Path = DATA_DIR / "profiles"
 

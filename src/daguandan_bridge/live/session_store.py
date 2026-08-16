@@ -77,6 +77,8 @@ def read_json_lines(path: Path) -> list[dict[str, object]]:
 class LiveSessionStore:
     """Own all append-only diagnostics for exactly one game session."""
 
+    persistence_enabled = True
+
     @classmethod
     def recover_incomplete_sessions(
         cls,
@@ -484,3 +486,76 @@ class LiveSessionStore:
             f"证据={', '.join(event.evidence_refs) or '无'}"
         )
         return f"{prefix} {event_action_text(event)}，{details}"
+
+
+class InMemoryLiveSessionStore:
+    """SessionPersistencePort implementation that intentionally writes nothing.
+
+    It keeps the real-time state machine fully functional while the user has
+    disabled local game-data saving.  ``directory`` points to the existing
+    profile root only for read-only disk-space checks; no session directory is
+    created and none of the port methods persist a file.
+    """
+
+    persistence_enabled = False
+
+    def __init__(self, profiles_root: Path, profile_name: str) -> None:
+        self.profile_name = normalize_profile_name(profile_name)
+        self.session_id = f"memory_{uuid4().hex[:12]}"
+        self.directory = Path(profiles_root) / self.profile_name
+
+    def start(self, manifest: dict[str, object]) -> None:
+        del manifest
+
+    def append_event(self, event: LiveEvent) -> None:
+        del event
+
+    def append_advice(self, record: dict[str, object]) -> None:
+        del record
+
+    def append_observation(self, record: dict[str, object]) -> None:
+        del record
+
+    def upsert_decision(self, record: dict[str, object]) -> None:
+        del record
+
+    def create_incident(
+        self,
+        *,
+        reason: str,
+        state_before: dict[str, object],
+        state_after: dict[str, object],
+        observations: list[dict[str, object]],
+        frame_paths: Iterable[Path] = (),
+        engine_input: dict[str, object] | None = None,
+        trigger_ms: int | None = None,
+    ) -> Path:
+        del (
+            reason,
+            state_before,
+            state_after,
+            observations,
+            frame_paths,
+            engine_input,
+            trigger_ms,
+        )
+        return self.directory
+
+    def append_incident_occurrence(
+        self,
+        incident_directory: Path,
+        *,
+        monotonic_ms: int,
+        reason: str,
+    ) -> None:
+        del incident_directory, monotonic_ms, reason
+
+    def seal(
+        self,
+        *,
+        frame_count: int,
+        dropped_frames: int,
+        metrics: dict[str, object] | None = None,
+        incident_media_failures: Iterable[dict[str, object]] = (),
+    ) -> None:
+        del frame_count, dropped_frames, metrics, incident_media_failures

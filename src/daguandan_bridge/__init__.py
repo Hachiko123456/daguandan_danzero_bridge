@@ -1,4 +1,4 @@
-"""Tencent DaGuandan screenshot recorder and DanZero bridge."""
+"""Tencent DaGuandan recognition and local strategy assistant."""
 
 __all__ = ["__version__"]
 

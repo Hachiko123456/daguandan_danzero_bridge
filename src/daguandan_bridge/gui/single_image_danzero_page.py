@@ -170,7 +170,7 @@ class CardBadge(CardWidget):
 
 
 class SingleImageDanzeroPage(QDialog):
-    """Review one screenshot, correct recognition, and test DanZero."""
+    """Review one screenshot, correct recognition, and test a selected advisor."""
 
     test_requested = Signal(object)
     state_built = Signal(object)
@@ -182,7 +182,7 @@ class SingleImageDanzeroPage(QDialog):
         image_path: Path | None = None,
         parent=None,
         *,
-        advisor_strategy: str = "danzero",
+        advisor_strategy: str = "fabledan",
     ):
         super().__init__(parent)
         self.advisor_strategy = normalize_advisor_strategy(advisor_strategy)
@@ -194,7 +194,7 @@ class SingleImageDanzeroPage(QDialog):
         self.recognition_elapsed_ms: float | None = None
         self.hand_card_widgets: list[CardBadge] = []
         self.setObjectName("singleImageDanzeroPage")
-        self.setWindowTitle("单图标注 / 测试 DanZero")
+        self.setWindowTitle("单图识别 / 策略测试")
         self.resize(980, 900)
         self.setMinimumSize(820, 720)
         self._build_ui()
@@ -221,7 +221,7 @@ class SingleImageDanzeroPage(QDialog):
         header.setSpacing(12)
         heading = QVBoxLayout()
         heading.setSpacing(3)
-        heading.addWidget(SubtitleLabel("单图标注与 DanZero"))
+        heading.addWidget(SubtitleLabel("单图识别与策略测试"))
         self.image_info_label = CopyableLabel()
         self.image_info_label.setWordWrap(True)
         heading.addWidget(self.image_info_label)
@@ -271,7 +271,7 @@ class SingleImageDanzeroPage(QDialog):
         hand_layout.setContentsMargins(18, 16, 18, 16)
         hand_layout.setSpacing(8)
         hand_layout.addWidget(StrongBodyLabel("我方手牌"))
-        hand_layout.addWidget(CaptionLabel("上方是识别结果预览；DanZero 实际使用下方的标准牌面代码。"))
+        hand_layout.addWidget(CaptionLabel("上方是识别结果预览；当前策略使用下方的标准牌面代码。"))
         self.hand_card_scroll = ScrollArea()
         self.hand_card_scroll.setWidgetResizable(True)
         self.hand_card_scroll.setHorizontalScrollBarPolicy(
@@ -289,10 +289,10 @@ class SingleImageDanzeroPage(QDialog):
         self.hand_card_scroll.setMaximumHeight(116)
         hand_layout.addWidget(self.hand_card_scroll)
         code_header = QHBoxLayout()
-        code_header.addWidget(StrongBodyLabel("DanZero 手牌代码"))
+        code_header.addWidget(StrongBodyLabel("手牌代码"))
         code_header.addStretch(1)
         self.copy_hand_code_button = PushButton("复制代码")
-        self.copy_hand_code_button.setToolTip("复制当前 DanZero 手牌参数")
+        self.copy_hand_code_button.setToolTip("复制当前策略输入使用的手牌代码")
         code_header.addWidget(self.copy_hand_code_button)
         hand_layout.addLayout(code_header)
         self.my_hand_edit = CopyableLineEdit()
@@ -310,7 +310,7 @@ class SingleImageDanzeroPage(QDialog):
         parameter_layout = QVBoxLayout(parameter_card)
         parameter_layout.setContentsMargins(18, 16, 18, 16)
         parameter_layout.setSpacing(8)
-        parameter_layout.addWidget(StrongBodyLabel("DanZero 参数"))
+        parameter_layout.addWidget(StrongBodyLabel("策略参数"))
         parameter_layout.addWidget(CaptionLabel("模板识别会自动填入；请在运行前确认。"))
         context_form = QFormLayout()
         self.round_level_combo = self._rank_combo()
@@ -395,7 +395,7 @@ class SingleImageDanzeroPage(QDialog):
         diagnostic_layout.addWidget(self.state_summary)
         actions = QHBoxLayout()
         self.build_button = PushButton("构建参数")
-        self.test_button = PrimaryPushButton("测试 DanZero")
+        self.test_button = PrimaryPushButton("运行策略测试")
         self.close_button = PushButton("关闭")
         actions.addWidget(self.build_button)
         actions.addWidget(self.test_button)
@@ -408,10 +408,10 @@ class SingleImageDanzeroPage(QDialog):
         result_layout = QVBoxLayout(result_card)
         result_layout.setContentsMargins(18, 16, 18, 16)
         result_layout.setSpacing(8)
-        result_layout.addWidget(StrongBodyLabel("DanZero 返回值"))
+        result_layout.addWidget(StrongBodyLabel("策略结果"))
         self.result_text = CopyablePlainTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setPlaceholderText("DanZero 返回值会显示在这里")
+        self.result_text.setPlaceholderText("策略结果会显示在这里")
         self.result_text.setMinimumHeight(140)
         result_layout.addWidget(self.result_text)
         root.addWidget(result_card)
@@ -616,7 +616,7 @@ class SingleImageDanzeroPage(QDialog):
             self.status.setText("暂无可复制的手牌代码")
             return
         QGuiApplication.clipboard().setText(hand_code)
-        self.status.setText("DanZero 手牌代码已复制到剪贴板")
+        self.status.setText("手牌代码已复制到剪贴板")
 
     @staticmethod
     def _rank_combo() -> ScrollSafeComboBox:
@@ -831,16 +831,16 @@ class SingleImageDanzeroPage(QDialog):
             missing.append(RECOGNITION_FIELD_LABELS["my_hand"])
         if missing:
             self.incomplete_status.setText(
-                "⚠ 参数不完整：" + "、".join(missing) + "。请补充后再测试 DanZero。"
+                "⚠ 参数不完整：" + "、".join(missing) + "。请补充后再运行策略测试。"
             )
             self.incomplete_status.setStyleSheet("color: #b42318; font-weight: 600;")
         elif self.current_player_combo.currentData() != "self":
             self.incomplete_status.setText(
-                "⚠ 参数已填写，但当前行动者不是我方；DanZero 可能无法生成我方建议。"
+                "⚠ 参数已填写，但当前行动者不是我方；当前策略可能无法生成我方建议。"
             )
             self.incomplete_status.setStyleSheet("color: #9a6700; font-weight: 600;")
         else:
-            self.incomplete_status.setText("✓ 参数完整，可以构建参数并测试 DanZero。")
+            self.incomplete_status.setText("✓ 参数完整，可以构建参数并运行策略测试。")
             self.incomplete_status.setStyleSheet("color: #18794e; font-weight: 600;")
 
     def build_state(self) -> GuanDanState:
@@ -871,7 +871,7 @@ class SingleImageDanzeroPage(QDialog):
             self._update_completion_status()
             raise
         self.state_summary.setPlainText(state.summary())
-        self.status.setText("参数已构建，可以测试 DanZero")
+        self.status.setText("参数已构建，可以运行策略测试")
         self._update_completion_status()
         self.state_built.emit(state)
         return state
@@ -905,12 +905,12 @@ class SingleImageDanzeroPage(QDialog):
         ):
             widget.setEnabled(not busy)
         if busy:
-            self.status.setText("正在调用 DanZero……")
+            self.status.setText("正在调用策略模型……")
 
     def show_test_result(self, text: str) -> None:
         self.result_text.setPlainText(text)
-        self.status.setText("DanZero 测试完成")
+        self.status.setText("策略测试完成")
 
     def show_test_error(self, text: str) -> None:
         self.result_text.setPlainText(text)
-        self.status.setText("DanZero 测试失败")
+        self.status.setText("策略测试失败")

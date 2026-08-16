@@ -9,7 +9,7 @@ history or double-deck accounting.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 from ..danzero.state import GuanDanState, PlayEvent
@@ -17,6 +17,14 @@ from ..danzero.state import GuanDanState, PlayEvent
 
 SUITS: tuple[str, ...] = ("S", "H", "C", "D")
 _SUIT_SET = frozenset(SUITS)
+
+
+@dataclass(frozen=True)
+class SuitStateVariants:
+    states: tuple[GuanDanState, ...]
+    truncated: bool = False
+    limit: int = 32
+    used_relaxed_suits: bool = False
 
 
 def is_unknown_suit_card(card: str) -> bool:
@@ -273,6 +281,17 @@ def state_variants_for_unknown_suits(
     original ``?`` and candidate suits for later audit/correction.
     """
 
+    return state_variants_for_unknown_suits_detailed(state, limit=limit).states
+
+
+def state_variants_for_unknown_suits_detailed(
+    state: GuanDanState,
+    *,
+    limit: int = 32,
+) -> SuitStateVariants:
+    """Return temporary states plus an explicit cap/truncation audit."""
+
+    max_variants = max(1, int(limit))
     history = tuple(state.play_history)
     unknown_positions = [
         (event_index, card_index, card, options)
@@ -282,7 +301,7 @@ def state_variants_for_unknown_suits(
         for options in (normalized_suit_options(event.cards, event.suit_options)[card_index],)
     ]
     if not unknown_positions:
-        return (state,)
+        return SuitStateVariants(states=(state,), limit=max_variants)
 
     counts: Counter[str] = Counter(
         card for card in state.my_hand if not is_unknown_suit_card(card)
@@ -290,17 +309,26 @@ def state_variants_for_unknown_suits(
     for event in history:
         counts.update(card for card in event.cards if not is_unknown_suit_card(card))
     if any(value > 2 for value in counts.values()):
-        return ()
+        return SuitStateVariants(states=(), limit=max_variants)
 
-    def build_variants(*, relax_unknown_suits: bool) -> tuple[GuanDanState, ...]:
+    def build_variants(
+        *,
+        relax_unknown_suits: bool,
+    ) -> tuple[tuple[GuanDanState, ...], bool]:
         resolved = [list(event.cards) for event in history]
         branch_counts = counts.copy()
         variants: list[GuanDanState] = []
+        seen: set[tuple[tuple[str, ...], ...]] = set()
+        collection_limit = max_variants + 1
 
         def visit(index: int) -> None:
-            if len(variants) >= max(1, int(limit)):
+            if len(variants) >= collection_limit:
                 return
             if index == len(unknown_positions):
+                signature = tuple(tuple(cards) for cards in resolved)
+                if signature in seen:
+                    return
+                seen.add(signature)
                 concrete_history = [
                     replace(event, cards=tuple(resolved[event_index]), suit_options=())
                     for event_index, event in enumerate(history)
@@ -327,7 +355,19 @@ def state_variants_for_unknown_suits(
                 branch_counts[concrete] -= 1
 
         visit(0)
-        return tuple(variants)
+        return tuple(variants[:max_variants]), len(variants) > max_variants
 
-    strict = build_variants(relax_unknown_suits=False)
-    return strict or build_variants(relax_unknown_suits=True)
+    strict, strict_truncated = build_variants(relax_unknown_suits=False)
+    if strict:
+        return SuitStateVariants(
+            states=strict,
+            truncated=strict_truncated,
+            limit=max_variants,
+        )
+    relaxed, relaxed_truncated = build_variants(relax_unknown_suits=True)
+    return SuitStateVariants(
+        states=relaxed,
+        truncated=relaxed_truncated,
+        limit=max_variants,
+        used_relaxed_suits=True,
+    )

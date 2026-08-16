@@ -143,7 +143,7 @@ def test_finish_runs_sealing_work_outside_gui_thread(tmp_path):
     assert controller.orchestrator is None
 
 
-def test_controller_warms_one_reusable_danzero_advisor_in_background(tmp_path):
+def test_controller_warms_one_reusable_default_advisor_in_background(tmp_path):
     app = _app()
     advisor = _WarmAdvisor()
     controller = LiveAssistantController(
@@ -162,8 +162,8 @@ def test_controller_warms_one_reusable_danzero_advisor_in_background(tmp_path):
     controller._start_danzero_warmup()
 
     assert advisor.initialize_calls == 1
-    assert statuses[0] == "DanZero 模型预热中"
-    assert statuses[-1].startswith("DanZero 模型已就绪")
+    assert statuses[0] == "FableDan 模型预热中"
+    assert statuses[-1].startswith("FableDan 模型已就绪")
 
 
 def _initial_recognition(hand, *, round_level="2"):

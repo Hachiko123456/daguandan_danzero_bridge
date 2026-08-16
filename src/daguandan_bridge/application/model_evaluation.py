@@ -33,11 +33,24 @@ FinalStatus = Literal[
 FINAL_STATUSES = frozenset(
     {"completed", "completed_with_errors", "blocked", "cancelled", "failed"}
 )
-_DISPLAY_NAMES = dict(EVALUATION_STRATEGY_OPTIONS)
+_DISPLAY_NAMES = {
+    **dict(EVALUATION_STRATEGY_OPTIONS),
+    # 保留历史评测结果和自动化回归所需的内部策略，但不把它放进用户下拉框。
+    "fabledan_rule": "FableDan RuleAgent 规则基线",
+}
 _BINDINGS = {
     "danzero_model": ("danzero", "danzero"),
     "fabledan_model": ("fabledan-numpy", "numpy"),
     "fabledan_rule": ("fabledan-rule", "rule"),
+}
+_ERROR_CODE_LABELS = {
+    "STRATEGY_DECISION_FAILED": "策略决策失败",
+    "BACKEND_IDENTITY_DRIFT": "模型后端身份不一致",
+    "INPUT_SESSION_MISSING": "会话目录不存在",
+    "INPUT_TRUTH_UNREADABLE": "TruthLog 无法读取",
+    "INPUT_UNKNOWN_SUIT": "动作花色未知",
+    "INPUT_WILDCARD_AMBIGUOUS": "逢人配动作语义不唯一",
+    "INPUT_REPLAY_FAILED": "TruthLog 状态回放失败",
 }
 
 
@@ -361,7 +374,7 @@ class ModelEvaluationService:
                         "running",
                         len(decisions),
                         prepared.eligible_self_decisions,
-                        f"turn {turn.index}",
+                        f"第 {turn.index} 手",
                     )
                     if fatal:
                         break
@@ -920,8 +933,8 @@ def _render_report(
             root = group["root"]
             affected = ", ".join(str(value) for value in group["affected"])
             lines.append(
-                f"- root cause: history turn {source_turn} wildcard ambiguity；"
-                f"affected decisions: {affected}；原因：{root.get('reason')}"
+                f"- 根因：第 {source_turn} 条历史存在 wildcard 多解；"
+                f"受影响决策：{affected}；原因：{root.get('reason')}"
             )
         lines.append("")
     errors = summary.get("errors", [])
@@ -935,7 +948,9 @@ def _render_report(
             item for item in errors if item.get("turn_id") not in affected
         ]
         lines.extend(
-            f"- `{item.get('code')}` turn={item.get('turn_id', '-')}：{item.get('message')}"
+            f"- {_ERROR_CODE_LABELS.get(str(item.get('code')), '未分类错误')} "
+            f"(`{item.get('code')}`)，第 {item.get('turn_id', '-')} 手："
+            f"{item.get('message')}"
             for item in remaining_errors
         )
         if not remaining_errors and not wildcard_roots:
@@ -959,11 +974,11 @@ def _render_report(
         diagnostics = trace.get("diagnostics", {}) if isinstance(trace, dict) else {}
         lead = observation.get("lead") if isinstance(observation, dict) else None
         diagnostic_status = (
-            "ERROR"
+            "错误"
             if isinstance(diagnostics, dict) and diagnostics.get("errors")
-            else "WARN"
+            else "警告"
             if isinstance(diagnostics, dict) and diagnostics.get("warnings")
-            else "OK"
+            else "正常"
         )
         lines.append(
             "| {turn_id} | {context} | {lead} | {owner} | {teammate} | {legal} | {predicted} | {selected_q} | {second_q} | {margin} | {diagnostics} |".format(

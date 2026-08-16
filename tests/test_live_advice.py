@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from daguandan_bridge.danzero.advisor import LocalAdvice
+from daguandan_bridge.fabledan.advisor import FableDanStateError
 from daguandan_bridge.live.orchestrator import LiveOrchestrator
 from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.live.reducer import LiveReducer
@@ -19,6 +20,35 @@ HAND = tuple(
     for rank in ("2", "3", "4", "5", "6", "7")
     for suit in "SHCD"
 ) + ("8S", "8H", "8C")
+OCCLUDED_FULL_HOUSE_HAND = (
+    "10C",
+    "10H",
+    "10S",
+    "2D",
+    "3C",
+    "5C",
+    "5C",
+    "5H",
+    "6C",
+    "6D",
+    "6S",
+    "6S",
+    "8D",
+    "8S",
+    "AC",
+    "AC",
+    "AH",
+    "AS",
+    "JC",
+    "JS",
+    "JS",
+    "KC",
+    "KH",
+    "KS",
+    "QC",
+    "QH",
+    "big_joker",
+)
 
 
 class LeftPlayRecognition:
@@ -108,7 +138,137 @@ class SuitAwareAdvisor(FakeAdvisor):
         )
 
 
-def _build(tmp_path, advisor, *, on_update=None):
+class ExactSuitFableDanAdvisor(FakeAdvisor):
+    strategy_id = "fabledan"
+    display_name = "FableDan"
+    requires_exact_history_suits = True
+
+    def __init__(self):
+        super().__init__()
+        self.observed_histories = []
+
+    def decision_input_fingerprint(self, _state, *, request_id=""):
+        del request_id
+        return ("same-fabledan-input",)
+
+    def recommend(self, state, *, request_id=""):
+        self.calls += 1
+        self.called.set()
+        history = tuple(tuple(event.cards) for event in state.play_history)
+        assert all(not card.endswith("?") for cards in history for card in cards)
+        self.observed_histories.append(history)
+        return LocalAdvice(
+            strategy="fabledan-numpy",
+            cards=("2D",),
+            play_type="Single",
+            is_pass=False,
+            state_revision=state.revision,
+            elapsed_ms=1.0,
+            request_id=request_id,
+            engine_input={"request_id": request_id},
+            timings={},
+        )
+
+
+class SemanticBranchAdvisor(FakeAdvisor):
+    strategy_id = "fabledan"
+    display_name = "FableDan"
+
+    def __init__(self, *, conflicting: bool) -> None:
+        super().__init__()
+        self.conflicting = conflicting
+        self.observed_choices: list[dict[str, object]] = []
+
+    def recommend(self, state, *, request_id=""):
+        self.calls += 1
+        self.called.set()
+        metadata = state.play_history[-1].action_metadata or {}
+        selected = metadata.get("selected_interpretation")
+        assert isinstance(selected, dict)
+        self.observed_choices.append(dict(selected))
+        cards = (
+            ("2H",)
+            if self.conflicting and str(selected.get("key")) == "2"
+            else ("2S",)
+        )
+        return LocalAdvice(
+            strategy="fabledan-numpy",
+            cards=cards,
+            play_type="SINGLE",
+            is_pass=False,
+            state_revision=state.revision,
+            elapsed_ms=1.0,
+            request_id=request_id,
+            engine_input={"request_id": request_id},
+            timings={},
+        )
+
+
+class HistoryConstrainedSemanticBranchAdvisor(SemanticBranchAdvisor):
+    def __init__(self, *, reject_all: bool = False) -> None:
+        super().__init__(conflicting=False)
+        self.reject_all = reject_all
+
+    def decision_input_fingerprint(self, state, *, request_id=""):
+        del request_id
+        metadata = state.play_history[-1].action_metadata or {}
+        selected = metadata.get("selected_interpretation")
+        assert isinstance(selected, dict)
+        if str(selected.get("key")) == "2":
+            raise FableDanStateError(
+                "第 38 条历史动作 222JJ 不能压过右家的 55533",
+                diagnostic={
+                    "code": "history_move_does_not_beat_lead",
+                    "source_turn_id": 38,
+                    "physical_cards": ["2D", "2S", "6H", "JC", "JH"],
+                },
+            )
+        if self.reject_all:
+            raise FableDanStateError(
+                "第 43 条历史不是合法牌型（实体牌 2H 3S）",
+                diagnostic={
+                    "code": "observed_move_invalid",
+                    "source_turn_id": 43,
+                    "physical_cards": ["2H", "3S"],
+                },
+            )
+        return ("valid-j-branch",)
+
+
+def _ambiguous_full_house_metadata() -> dict[str, object]:
+    return {
+        "interpretation_ambiguous": True,
+        "candidate_interpretations": [
+            {
+                "move_type": "ThreeWithTwo",
+                "key": "J",
+                "logical_label": "JJJ22",
+                "wildcard_assignments": [
+                    {"physical_card": "9H", "as_rank": "J"}
+                ],
+            },
+            {
+                "move_type": "ThreeWithTwo",
+                "key": "2",
+                "logical_label": "222JJ",
+                "wildcard_assignments": [
+                    {"physical_card": "9H", "as_rank": "2"}
+                ],
+            },
+        ],
+        "selected_interpretation": None,
+        "selection_source": "unresolved",
+    }
+
+
+def _build(
+    tmp_path,
+    advisor,
+    *,
+    on_update=None,
+    hand=HAND,
+    round_level="2",
+):
     store = LiveSessionStore(tmp_path / "profiles", "tencent_daguandan", session_id="advice")
     store.start(
         {
@@ -131,8 +291,8 @@ def _build(tmp_path, advisor, *, on_update=None):
         on_update=on_update,
     )
     orchestrator.start(
-        round_level="2",
-        hand=HAND,
+        round_level=round_level,
+        hand=hand,
         lead_player="left",
         monotonic_ms=0,
     )
@@ -222,6 +382,7 @@ def test_trusted_action_uses_live_turn_transition_and_waits_for_advice(tmp_path)
     assert update.event.source == "trusted_log_replay"
     assert update.event.evidence_refs == ("TRUTH-000001",)
     assert orchestrator.snapshot.current_player == "self"
+    orchestrator.finish()
 
 
 def test_self_decision_correlates_pre_state_advice_and_actual_action(tmp_path):
@@ -280,6 +441,213 @@ def test_advice_expands_occluded_suit_only_in_temporary_variants(tmp_path):
     assert advice.advice_agrees_across_variants is False
     assert advisor.calls == 2
     assert orchestrator.snapshot.play_history[-1].cards == ("8?",)
+    orchestrator.finish()
+
+
+def test_fabledan_evaluates_occluded_full_house_with_exact_temporary_suits(
+    tmp_path,
+):
+    advisor = ExactSuitFableDanAdvisor()
+    orchestrator = _build(
+        tmp_path,
+        advisor,
+        hand=OCCLUDED_FULL_HOUSE_HAND,
+        round_level="9",
+    )
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("3C", "3D", "3H", "5?", "5D"),
+        suit_options=(("C",), ("D",), ("H",), ("S", "C"), ("D",)),
+        is_pass=False,
+        monotonic_ms=100,
+    )
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advice.suit_uncertain is True
+    assert advice.variant_count == 1
+    assert advice.advice_agrees_across_variants is True
+    assert advisor.calls == 1
+    assert {history[-1][3] for history in advisor.observed_histories} == {"5S"}
+    assert orchestrator.snapshot.play_history[-1].cards == (
+        "3C",
+        "3D",
+        "3H",
+        "5?",
+        "5D",
+    )
+    requested = next(
+        event for event in orchestrator.events if event.event_type == "advice_requested"
+    )
+    assert requested.payload["advisor_strategy"] == "fabledan"
+    assert requested.payload["advisor_name"] == "FableDan"
+    orchestrator.finish()
+
+
+def test_fabledan_deduplicates_suit_states_with_identical_model_semantics(tmp_path):
+    advisor = ExactSuitFableDanAdvisor()
+    orchestrator = _build(tmp_path, advisor)
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("8?",),
+        suit_options=(("S", "C"),),
+        is_pass=False,
+        monotonic_ms=100,
+    )
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advice.suit_uncertain is True
+    assert advice.suit_variant_count == 2
+    assert advice.suit_equivalence_class_count == 1
+    assert advice.variant_count == 1
+    assert advice.advice_agrees_across_variants is True
+    assert advisor.calls == 1
+    ready = next(
+        item
+        for item in read_json_lines(orchestrator.store.advice_path)
+        if item.get("status") == "ready"
+    )
+    assert ready["suit_variant_count"] == 2
+    assert ready["suit_equivalence_class_count"] == 1
+    orchestrator.finish()
+
+
+def test_semantic_branches_continue_when_every_model_recommendation_agrees(tmp_path):
+    advisor = SemanticBranchAdvisor(conflicting=False)
+    orchestrator = _build(tmp_path, advisor, round_level="9")
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("2D", "2H", "9H", "JC", "JD"),
+        is_pass=False,
+        monotonic_ms=100,
+        action_metadata=_ambiguous_full_house_metadata(),
+    )
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advice.semantic_uncertain is True
+    assert advice.semantic_source_history_indices == (1,)
+    assert advice.semantic_variant_count == 2
+    assert advice.variant_count == 2
+    assert advice.advice_agrees_across_variants is True
+    assert advisor.calls == 2
+    assert {str(item["key"]) for item in advisor.observed_choices} == {"J", "2"}
+    assert (
+        orchestrator.snapshot.play_history[-1].action_metadata[
+            "selected_interpretation"
+        ]
+        is None
+    )
+    ready = next(
+        item
+        for item in read_json_lines(orchestrator.store.advice_path)
+        if item.get("status") == "ready"
+    )
+    assert ready["semantic_uncertain"] is True
+    assert ready["semantic_source_history_indices"] == [1]
+    assert len(ready["uncertainty_diagnostics"]["branch_results"]) == 2
+    orchestrator.finish()
+
+
+def test_complete_history_eliminates_impossible_semantic_branch(tmp_path):
+    advisor = HistoryConstrainedSemanticBranchAdvisor()
+    orchestrator = _build(tmp_path, advisor, round_level="9")
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("2D", "2H", "9H", "JC", "JD"),
+        is_pass=False,
+        monotonic_ms=100,
+        action_metadata=_ambiguous_full_house_metadata(),
+    )
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advisor.calls == 1
+    assert [str(item["key"]) for item in advisor.observed_choices] == ["J"]
+    ready = next(
+        item
+        for item in read_json_lines(orchestrator.store.advice_path)
+        if item.get("status") == "ready"
+    )
+    diagnostics = ready["uncertainty_diagnostics"]
+    assert diagnostics["input_variant_count_before_validation"] == 2
+    assert diagnostics["valid_encoded_input_count"] == 1
+    assert diagnostics["eliminated_variant_count"] == 1
+    assert diagnostics["eliminated_variants"][0]["diagnostic"]["source_turn_id"] == 38
+    orchestrator.finish()
+
+
+def test_all_invalid_semantic_branches_report_deepest_source_error(tmp_path):
+    advisor = HistoryConstrainedSemanticBranchAdvisor(reject_all=True)
+    orchestrator = _build(tmp_path, advisor, round_level="9")
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("2D", "2H", "9H", "JC", "JD"),
+        is_pass=False,
+        monotonic_ms=100,
+        action_metadata=_ambiguous_full_house_metadata(),
+    )
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "failed"
+    assert advisor.calls == 0
+    assert "2 个候选状态全部被完整牌局历史排除" in advice.error
+    assert "最深可达根因：第 43 条历史不是合法牌型" in advice.error
+    assert "第 38 条历史动作 222JJ 不能压过右家的 55533" in advice.error
+    assert "模型未被调用" in advice.error
+    orchestrator.finish()
+
+
+def test_semantic_branches_block_with_chinese_details_when_advice_conflicts(
+    tmp_path,
+):
+    advisor = SemanticBranchAdvisor(conflicting=True)
+    orchestrator = _build(tmp_path, advisor, round_level="9")
+
+    update = orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("2D", "2H", "9H", "JC", "JD"),
+        is_pass=False,
+        monotonic_ms=100,
+        action_metadata=_ambiguous_full_house_metadata(),
+    )
+    advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
+
+    assert advice is not None
+    assert advice.status == "failed"
+    assert advice.semantic_uncertain is True
+    assert advice.semantic_source_history_indices == (1,)
+    assert advice.variant_count == 2
+    assert advice.advice_agrees_across_variants is False
+    assert "历史第 1 条动作存在多种合法语义" in advice.error
+    assert "分支 1" in advice.error
+    assert "分支 2" in advice.error
+    assert "主牌局历史未被改写" in advice.error
+    failed = next(
+        item
+        for item in read_json_lines(orchestrator.store.advice_path)
+        if item.get("status") == "failed"
+    )
+    diagnostics = failed["uncertainty_diagnostics"]
+    assert diagnostics["semantic_source_history_indices"] == [1]
+    assert {item["status"] for item in diagnostics["branch_results"]} == {"ready"}
+    assert (
+        orchestrator.snapshot.play_history[-1].action_metadata[
+            "selected_interpretation"
+        ]
+        is None
+    )
     orchestrator.finish()
 
 

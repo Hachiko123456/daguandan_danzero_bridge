@@ -33,6 +33,8 @@ class FakeRuntime(QObject):
 
     def __init__(self):
         super().__init__()
+        self.session_data_recording_enabled = True
+        self.session_data_recording_updates = []
         self.started = None
         self.listening_started = 0
         self.confirmed_candidate_id = None
@@ -76,6 +78,10 @@ class FakeRuntime(QObject):
     def finish(self):
         pass
 
+    def set_session_data_recording_enabled(self, enabled):
+        self.session_data_recording_enabled = bool(enabled)
+        self.session_data_recording_updates.append(bool(enabled))
+
     def shutdown(self):
         pass
 
@@ -118,6 +124,20 @@ def test_live_page_starts_persistent_listener_without_manual_start_button():
 
     assert runtime.listening_started == 1
     assert not hasattr(page, "start_session_button")
+    page.close()
+
+
+def test_live_page_persists_session_data_switch_for_the_next_game():
+    app = _app()
+    runtime = FakeRuntime()
+    page = LiveAssistantPage(runtime)
+
+    assert page.session_data_switch.isChecked()
+    page.session_data_switch.setChecked(False)
+    app.processEvents()
+
+    assert runtime.session_data_recording_updates == [False]
+    assert runtime.session_data_recording_enabled is False
     page.close()
 
 
@@ -260,8 +280,8 @@ def test_live_page_formats_lead_turn_and_advice_events():
             payload={"reason": "pass_not_allowed,insufficient_consensus"},
         )
     )
-    assert "DanZero 开始计算建议" in LiveAssistantPage._event_text(
-        _event("advice_requested")
+    assert "FableDan 开始计算建议" in LiveAssistantPage._event_text(
+        _event("advice_requested", payload={"advisor_name": "FableDan"})
     )
     assert "等待自己回合旁证" in LiveAssistantPage._event_text(
         _event("advice_ready", payload={"visible": False})
@@ -401,6 +421,33 @@ def test_live_page_renders_one_compact_entry_when_advice_becomes_visible():
     page.close()
 
 
+def test_live_page_labels_fabledan_failure_without_danzero_wording():
+    app = _app()
+    runtime = FakeRuntime()
+    runtime.advisor_strategy = "fabledan"
+    page = LiveAssistantPage(runtime)
+    failed = LiveAdvice(
+        key=AdviceRequestKey("session", 2, 3),
+        status="failed",
+        error="FableDan model 执行失败",
+    )
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self", trick_id=1, turn_id=2),
+            advice=failed,
+        )
+    )
+    app.processEvents()
+
+    text = page.timeline.toPlainText()
+    assert "FableDan 计算失败" in text
+    assert "DanZero" not in text
+    assert page.danzero_warmup_status.text() == "FableDan 模型准备中"
+    page.close()
+
+
 def test_live_page_renders_all_action_and_outcome_events_from_one_update():
     app = _app()
     page = LiveAssistantPage(FakeRuntime())
@@ -486,6 +533,7 @@ def test_live_page_renders_initial_hand_as_cards_without_internal_codes():
     assert page.hand_edit.isHidden()
     assert "2D" not in page.initial_hand_cards.toolTip()
     assert "方块2" in page.initial_hand_cards.toolTip()
+    assert all(badge.width() == 36 and badge.height() == 50 for badge in page.initial_hand_badges)
     page.close()
 
 
@@ -544,18 +592,18 @@ def test_live_page_clears_only_transient_timeline_when_a_new_session_starts():
     page.close()
 
 
-def test_live_page_uses_compact_hand_strip_and_has_no_quick_correction_controls():
+def test_live_page_uses_readable_hand_strip_and_has_no_quick_correction_controls():
     app = _app()
     page = LiveAssistantPage(FakeRuntime())
 
-    assert page.initial_hand_scroll.height() <= 52
+    assert page.initial_hand_scroll.height() >= 64
     assert not hasattr(page, "correct_cards_button")
     assert not hasattr(page, "correct_pass_button")
     assert page.timeline_title.text() == "对局动态"
     page.close()
 
 
-def test_live_page_shows_fabledan_top_five_and_reuses_detail_payload():
+def test_live_page_shows_fabledan_top_three_and_reuses_detail_payload():
     app = _app()
     page = LiveAssistantPage(FakeRuntime())
     candidates = [
@@ -587,7 +635,7 @@ def test_live_page_shows_fabledan_top_five_and_reuses_detail_payload():
         request_id="fabledan-debug",
         engine_input={
             "debug": True,
-            "top_n": 5,
+            "top_n": 3,
             "model_path": "models/fabledan/best.npz",
             "player": 0,
             "level": 3,
@@ -618,18 +666,63 @@ def test_live_page_shows_fabledan_top_five_and_reuses_detail_payload():
     assert page.fabledan_q_value.text() == "Q值：1.3274"
     assert page.fabledan_q_gap.text() == "Top1 - Top2：0.4153"
     assert "当前需要压：55" in page.fabledan_context.text()
+    assert "不是可直接解读为百分比" in page.fabledan_top_three_hint.text()
     assert page.fabledan_candidates.text().splitlines() == [
         "1. 9999    Q=1.3274",
         "2. PASS    Q=0.9121",
         "3. 66    Q=0.8473",
-        "4. 77    Q=0.8036",
-        "5. 88    Q=0.7625",
     ]
+    assert "77" not in page.fabledan_candidates.text()
     assert "1010" not in page.fabledan_candidates.text()
     assert '"model_path": "models/fabledan/best.npz"' in page.fabledan_detail.toPlainText()
     page.fabledan_detail_button.click()
     assert not page.fabledan_detail.isHidden()
-    assert page.fabledan_detail_button.text() == "收起详细调试"
+    assert page.fabledan_detail_button.text() == "收起模型诊断"
+    page.close()
+
+
+def test_live_page_shows_compact_fabledan_top_three_without_diagnostics():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    advice = LocalAdvice(
+        strategy="fabledan-numpy",
+        cards=("9S", "9H", "9D", "9C"),
+        play_type="BOMB",
+        is_pass=False,
+        state_revision=2,
+        elapsed_ms=12.0,
+        request_id="fabledan-compact",
+        engine_input={
+            "debug": False,
+            "top_n": 3,
+            "level_text": "6",
+            "lead_text": "55",
+            "decision": {
+                "best_action_text": "9999",
+                "best_q": 1.3274,
+                "second_q": 0.9121,
+                "q_gap": 0.4153,
+                "candidates": [
+                    {"rank": 1, "action_text": "9999", "q": 1.3274},
+                    {"rank": 2, "action_text": "PASS", "q": 0.9121},
+                    {"rank": 3, "action_text": "66", "q": 0.8473},
+                ],
+            },
+        },
+        timings={},
+    )
+
+    page._show_fabledan_decision(advice)
+    app.processEvents()
+
+    assert not page.fabledan_debug_card.isHidden()
+    assert not page.fabledan_detail_button.isVisible()
+    assert page.fabledan_detail.isHidden()
+    assert page.fabledan_candidates.text().splitlines() == [
+        "1. 9999    Q=1.3274",
+        "2. PASS    Q=0.9121",
+        "3. 66    Q=0.8473",
+    ]
     page.close()
 
 

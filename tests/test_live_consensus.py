@@ -173,6 +173,36 @@ def test_play_that_does_not_beat_reconstructed_table_is_rejected():
     assert "does_not_beat_table" in result.rejected_reasons
 
 
+def test_table_suit_candidates_allow_a_bomb_to_beat_an_unknown_straight():
+    """A retained ``J?`` must not make the next confirmed play illegal."""
+
+    cards = ("AH", "AH", "AD", "AC")
+    result = BurstConsensus(min_votes=2).decide(
+        [_play(*cards), _play(*cards)],
+        context=_context(
+            known_hand=cards,
+            known_cards=cards,
+            candidate_already_known=True,
+            table_cards=("10C", "7H", "8S", "9D", "J?"),
+            table_suit_options=(
+                ("C",),
+                ("H",),
+                ("S",),
+                ("D",),
+                ("H", "D"),
+            ),
+        ),
+    )
+
+    assert result.status == "confirmed"
+    assert not result.is_pass
+    assert result.vote_count == 2
+    assert sorted(result.cards) == sorted(cards)
+    assert sorted(result.resolved_cards) == sorted(cards)
+    assert "observed_pattern_unresolved" not in result.integrity_warnings
+    assert "observed_table_mismatch" not in result.integrity_warnings
+
+
 def test_fresh_trick_allows_a_legal_lead_without_beating_a_prior_table():
     result = BurstConsensus(min_votes=3).decide(
         [_play("6S") for _ in range(3)],

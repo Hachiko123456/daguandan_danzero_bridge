@@ -390,7 +390,7 @@ class AnnotationPage(QWidget):
         self.show_selected_button.setToolTip("再次点击可隐藏当前选中区域的标记框")
         self.show_selected_button.clicked.connect(self._show_selected_regions)
         header.addWidget(self.show_selected_button)
-        self.single_image_test_button = PrimaryPushButton("单图标注 / 测试 DanZero")
+        self.single_image_test_button = PrimaryPushButton("单图识别 / 策略测试")
         self.single_image_test_button.setEnabled(False)
         self.single_image_test_button.clicked.connect(self._open_single_image_danzero)
         for control in (
@@ -1581,7 +1581,7 @@ class AnnotationPage(QWidget):
     def _danzero_warmup_failed(self, message: str) -> None:
         if self.single_image_danzero_page is not None:
             self.single_image_danzero_page.status.setText(
-                f"DanZero 模型预加载失败，测试时会重试：{message}"
+                f"策略模型预加载失败，测试时会重试：{message}"
             )
 
     def _start_template_recognition(self) -> None:
@@ -1687,7 +1687,7 @@ class AnnotationPage(QWidget):
     def _run_danzero_test(self, state: object) -> None:
         if self._danzero_thread is not None and self._danzero_thread.isRunning():
             if self.single_image_danzero_page is not None:
-                self.single_image_danzero_page.status.setText("正在调用 DanZero……")
+                self.single_image_danzero_page.status.setText("正在调用策略模型……")
             return
         if self.single_image_danzero_page is None:
             return

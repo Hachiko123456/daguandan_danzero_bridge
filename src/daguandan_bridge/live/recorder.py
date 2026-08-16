@@ -364,3 +364,53 @@ class SessionRecorder:
 
     def __exit__(self, *_: Any) -> None:
         self.close()
+
+
+class InMemorySessionRecorder:
+    """RecordingPort that keeps live processing metrics but never writes media."""
+
+    def __init__(self, session_directory: Path) -> None:
+        self.session_directory = Path(session_directory)
+        self._frame_count = 0
+        self._closed = False
+
+    @property
+    def frame_count(self) -> int:
+        return self._frame_count
+
+    def write_frame(
+        self,
+        frame: np.ndarray,
+        captured_monotonic_ms: int,
+        wall_time: str,
+    ) -> RecorderWarning | None:
+        del frame, captured_monotonic_ms, wall_time
+        if self._closed:
+            raise RuntimeError("录像器已经关闭")
+        self._frame_count += 1
+        return None
+
+    def save_evidence_frame(self, path: Path, frame: np.ndarray) -> Path:
+        del frame
+        return Path(path)
+
+    def schedule_incident_media(
+        self,
+        incident_directory: Path,
+        *,
+        trigger_ms: int,
+        before_ms: int = 5_000,
+        after_ms: int = 5_000,
+    ) -> None:
+        del incident_directory, trigger_ms, before_ms, after_ms
+        if self._closed:
+            raise RuntimeError("录像器已经关闭")
+
+    def close(self) -> RecordingResult:
+        self._closed = True
+        return RecordingResult(
+            video_path=self.session_directory / "video" / "game.avi",
+            index_path=self.session_directory / "video" / "frame_index.jsonl",
+            frame_count=self._frame_count,
+            dropped_frames=0,
+        )

@@ -200,12 +200,20 @@ def _is_legal_engine_action(
 class LocalGuandanAdvisor:
     """Run a selected rlcard-guandan agent entirely inside this process."""
 
-    def __init__(self, strategy: str = DEFAULT_STRATEGY) -> None:
+    def __init__(
+        self,
+        strategy: str = DEFAULT_STRATEGY,
+        *,
+        danzero_checkpoint: Path | None = None,
+    ) -> None:
         if strategy not in _STRATEGIES:
             raise ValueError(
                 f"未知本地策略：{strategy}；可选：{', '.join(_STRATEGIES)}"
             )
         self.strategy = strategy
+        self.danzero_checkpoint = (
+            Path(danzero_checkpoint) if danzero_checkpoint is not None else None
+        )
         self._agent: Any | None = None
         self._agent_lock = Lock()
 
@@ -390,11 +398,14 @@ class LocalGuandanAdvisor:
                 f"无法初始化本地策略 {self.strategy}：{exc}"
             ) from exc
 
-    @staticmethod
-    def _danzero_checkpoint_path() -> Path:
+    def _danzero_checkpoint_path(self) -> Path:
         configured = os.environ.get("DAGUANDAN_DANZERO_CKPT")
         if configured:
             checkpoint = Path(configured)
+            bundled_checkpoint = False
+        elif self.danzero_checkpoint is not None and self.danzero_checkpoint.is_file():
+            checkpoint = self.danzero_checkpoint
+            bundled_checkpoint = False
         else:
             checkpoint = Path(
                 files("daguandan_bridge.danzero._vendor.guandan_rlcard").joinpath(
@@ -403,10 +414,11 @@ class LocalGuandanAdvisor:
                     "q_network.ckpt",
                 )
             )
+            bundled_checkpoint = True
         if not checkpoint.is_file():
             raise LocalStrategyError(f"未找到本地 DanZero 权重：{checkpoint}")
         digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-        if digest != _DANZERO_CHECKPOINT_SHA256:
+        if bundled_checkpoint and digest != _DANZERO_CHECKPOINT_SHA256:
             raise LocalStrategyError("本地 DanZero 权重校验失败，已拒绝加载")
         return checkpoint
 

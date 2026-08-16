@@ -7,7 +7,8 @@ Included runtime files:
 - fabledan/encode.py
 - fabledan/agents.py
 - fabledan/model_np.py
+- fabledan/engine.py (fixed offline benchmark only)
 
-The upstream engine, ring runner, torch/training/evaluation code, and Botzone
+The upstream ring runner, torch/training/evaluation code, and Botzone
 integration are intentionally excluded. The vendored runtime remains subject to
 FABLEDAN_LICENSE in this directory.

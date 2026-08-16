@@ -15,6 +15,7 @@ from qfluentwidgets import (
     qconfig,
 )
 
+from ..advisor_strategy import ADVISOR_OPTIONS
 from ..live.display_text import compact_cards_text, live_status_text, seat_text
 from ..live.orchestrator import LiveAdvice, LiveUpdate
 from .single_image_danzero_page import CardBadge
@@ -157,7 +158,7 @@ class RecommendationFloatWindow(QWidget):
         self._backend = ""
         self._card_badges: list[CardBadge] = []
         self.setObjectName("recommendationFloatWindow")
-        self.setWindowTitle("DanZero 极简推荐")
+        self.setWindowTitle(f"{self._advisor_display_name()} 极简推荐")
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.WindowStaysOnTopHint
@@ -241,6 +242,8 @@ class RecommendationFloatWindow(QWidget):
         self.trick_strip.apply_palette(dark=isDarkTheme(), accent=accent)
 
     def apply_update(self, update: LiveUpdate) -> None:
+        advisor_name = self._advisor_display_name()
+        self.setWindowTitle(f"{advisor_name} 极简推荐")
         player = getattr(update.snapshot, "current_player", None)
         self.trick_strip.set_snapshot(update.snapshot, update.status)
         if update.status == "paused":
@@ -263,7 +266,7 @@ class RecommendationFloatWindow(QWidget):
             return
         if raw.status == "requested":
             self.suggestion_label.setText("正在计算建议")
-            self.detail_label.setText("DanZero 正在使用最新手牌")
+            self.detail_label.setText(f"{advisor_name} 正在使用最新手牌")
             self._render_cards(())
             return
         if raw.status != "ready" or raw.advice is None:
@@ -296,6 +299,10 @@ class RecommendationFloatWindow(QWidget):
             agreement = "各花色分支建议一致" if raw.advice_agrees_across_variants else "花色分支建议有差异"
             details.append(agreement)
         self.detail_label.setText(" · ".join(details))
+
+    def _advisor_display_name(self) -> str:
+        strategy = str(getattr(self.runtime, "advisor_strategy", "") or "")
+        return dict(ADVISOR_OPTIONS).get(strategy, "建议模型")
 
     def apply_frame(self, snapshot: object) -> None:
         frame = getattr(snapshot, "frame", None)

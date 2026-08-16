@@ -16,6 +16,7 @@ env/
 htmlcov/
 build/
 dist/
+release/
 *.egg-info/
 .worktrees/
 .superpowers/
@@ -24,6 +25,7 @@ dist/
 logs/
 data/profiles/*/screenshots/
 data/profiles/*/sessions/
+data/profiles/*/models/benchmarks/
 .codex/workflow/
 *.log
 

@@ -16,6 +16,11 @@ from daguandan_bridge.application.replay_turn_draft import ReplayTurnDraftAssemb
 from daguandan_bridge.gui.main_window import DaguandanBridgeWindow
 from daguandan_bridge.gui.replay_page import FrameInspectDialog, ReplayPage
 from daguandan_bridge.live.recorder import SessionRecorder
+from daguandan_bridge.live.truth_log import (
+    TruthInitialState,
+    TruthLog,
+    save_truth_log,
+)
 from daguandan_bridge.recognition_service import RecognitionResult, RecognizedEvent
 
 
@@ -320,6 +325,52 @@ def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
     page.close()
 
 
+def test_streamed_suit_correction_replaces_draft_row_without_overwriting_saved_log(tmp_path):
+    _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("2", "3", "4", "5", "6", "7")
+        for suit in "SHCD"
+    ) + ("8S", "8H", "8C")
+    source = TruthLog("game-test", TruthInitialState("2", "self", hand), ())
+    truth_path = session / "truth_log.json"
+    save_truth_log(truth_path, source)
+    source_bytes = truth_path.read_bytes()
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    baseline = page._truth_log_for_video_scan()
+    page._truth_scan_base = baseline
+    page._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
+    page.truth_log = baseline
+    page._show_truth_log_editor()
+
+    page._collect_truth_scan_turn(
+        {
+            "kind": "action",
+            "turn_id": 1,
+            "actor": "self",
+            "recognized_pass": False,
+            "recognized_cards": ["J?"],
+        }
+    )
+    page._collect_truth_scan_turn(
+        {
+            "kind": "suit_corrected",
+            "target_turn_id": 1,
+            "actor": "self",
+            "recognized_cards": ["JD"],
+        }
+    )
+
+    assert page._truth_editor is not None
+    assert page._truth_editor.table.rowCount() == 1
+    assert page.truth_log.turns[0].cards == ("JD",)
+    assert truth_path.read_bytes() == source_bytes
+    page.shutdown()
+    page.close()
+
+
 def test_replay_page_reuses_existing_button_for_trusted_advisor_mode(tmp_path):
     app = _app()
     session = _recorded_session(tmp_path)
@@ -367,7 +418,7 @@ def test_replay_page_only_exposes_live_replay_modes(tmp_path):
 
     assert modes == {
         "pipeline": "状态机管线（实时同核心）",
-        "trusted_advisor": "可信日志驱动（测试实时 DanZero）",
+        "trusted_advisor": "可信日志驱动（测试实时策略）",
     }
     page.shutdown()
     page.close()

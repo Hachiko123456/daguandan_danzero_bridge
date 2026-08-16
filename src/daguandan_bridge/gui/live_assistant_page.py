@@ -27,6 +27,7 @@ from qfluentwidgets import (
     PushButton,
     ScrollArea,
     StrongBodyLabel,
+    SwitchButton,
     TitleLabel,
     isDarkTheme,
     qconfig,
@@ -128,6 +129,13 @@ class LiveAssistantPage(ScrollArea):
         )
         self.timeline.setStyleSheet(self._timeline_style())
 
+    def _advisor_display_name(self) -> str:
+        strategy = str(getattr(self.runtime, "advisor_strategy", "") or "")
+        combo = getattr(self, "advisor_strategy_combo", None)
+        if combo is not None and combo.currentData():
+            strategy = str(combo.currentData())
+        return dict(ADVISOR_OPTIONS).get(strategy, "建议模型")
+
     @staticmethod
     def _timeline_style() -> str:
         if isDarkTheme():
@@ -144,7 +152,7 @@ class LiveAssistantPage(ScrollArea):
         root = QVBoxLayout(self._content)
         root.setContentsMargins(28, 24, 28, 28)
         root.setSpacing(16)
-        root.addWidget(TitleLabel("实时 DanZero 助手"))
+        root.addWidget(TitleLabel("实时出牌助手"))
         subtitle = BodyLabel(
             "持续监听页面：程序只观察与建议，不会点击游戏；稳定识别两次相同的 27 张手牌后自动开始。"
         )
@@ -183,6 +191,24 @@ class LiveAssistantPage(ScrollArea):
         self.advisor_strategy_combo.setToolTip(
             "只影响下一局；实时对局开始后锁定，结束后可重新选择。"
         )
+        self.session_data_switch = SwitchButton()
+        self.session_data_switch.setOnText("开启")
+        self.session_data_switch.setOffText("关闭")
+        self.session_data_switch.setChecked(
+            bool(getattr(self.runtime, "session_data_recording_enabled", True))
+        )
+        self.session_data_switch.setToolTip(
+            "默认开启并会记住你的选择。关闭后仍提供实时识别和建议，"
+            "但不会创建新的 sessions 目录、录像、时间线、建议日志、事故资料或训练样本。"
+        )
+        session_data_row = QWidget()
+        session_data_layout = QHBoxLayout(session_data_row)
+        session_data_layout.setContentsMargins(0, 0, 0, 0)
+        session_data_layout.addWidget(self.session_data_switch)
+        session_data_layout.addWidget(
+            CaptionLabel("关闭后仅本次实时使用，不保存完整回放资料")
+        )
+        session_data_layout.addStretch(1)
         # Internal normalized codes remain here for the state machine; the
         # user edits the visible card strip through the existing picker.
         self.hand_edit = LineEdit(self)
@@ -191,7 +217,10 @@ class LiveAssistantPage(ScrollArea):
         self.initial_hand_scroll = ScrollArea()
         self.initial_hand_scroll.setObjectName("liveInitialHandCards")
         self.initial_hand_scroll.setWidgetResizable(False)
-        self.initial_hand_scroll.setFixedHeight(50)
+        # CardBadge(compact=True) is 36 x 50.  The old 50-pixel scroll area
+        # then forced every badge down to 27 x 40, clipping ranks and suits
+        # even though the recognized 27-card data was correct.
+        self.initial_hand_scroll.setFixedHeight(64)
         self.initial_hand_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
@@ -209,6 +238,7 @@ class LiveAssistantPage(ScrollArea):
         form.addRow("首发候选（实时会再次验证）", self.lead_player_combo)
         form.addRow("动作识别策略", self.recognition_strategy_combo)
         form.addRow("建议模型（下一局）", self.advisor_strategy_combo)
+        form.addRow("保存对局数据（下一局）", session_data_row)
         form.addRow("初始手牌（点击牌面可修改）", self.initial_hand_scroll)
         initial_layout.addLayout(form)
         initial_actions = QHBoxLayout()
@@ -219,7 +249,9 @@ class LiveAssistantPage(ScrollArea):
         self.initialization_status = CaptionLabel()
         self.initialization_status.setWordWrap(True)
         initial_layout.addWidget(self.initialization_status)
-        self.danzero_warmup_status = CaptionLabel("DanZero 模型准备中")
+        self.danzero_warmup_status = CaptionLabel(
+            f"{self._advisor_display_name()} 模型准备中"
+        )
         self.danzero_warmup_status.setWordWrap(True)
         initial_layout.addWidget(self.danzero_warmup_status)
         root.addWidget(self.initial_card)
@@ -256,7 +288,7 @@ class LiveAssistantPage(ScrollArea):
         self.timeline.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.timeline.setMinimumHeight(280)
         self.timeline.setPlaceholderText(
-            "动作、DanZero 建议与异常会依次显示在这里；可直接框选并复制。"
+            "动作、模型建议与异常会依次显示在这里；可直接框选并复制。"
         )
         state_layout.addWidget(self.timeline, 1)
         control_row = QHBoxLayout()
@@ -277,9 +309,9 @@ class LiveAssistantPage(ScrollArea):
         debug_layout.setContentsMargins(18, 16, 18, 16)
         debug_layout.setSpacing(10)
         debug_header = QHBoxLayout()
-        debug_header.addWidget(StrongBodyLabel("FableDan AI"))
+        debug_header.addWidget(StrongBodyLabel("FableDan 模型评分"))
         debug_header.addStretch(1)
-        self.fabledan_detail_button = PushButton("查看详细调试")
+        self.fabledan_detail_button = PushButton("查看模型诊断")
         debug_header.addWidget(self.fabledan_detail_button)
         debug_layout.addLayout(debug_header)
 
@@ -296,7 +328,12 @@ class LiveAssistantPage(ScrollArea):
         debug_summary.addWidget(self.fabledan_q_gap, 1, 1)
         debug_summary.addWidget(self.fabledan_context, 2, 0, 1, 2)
         debug_layout.addLayout(debug_summary)
-        debug_layout.addWidget(StrongBodyLabel("候选动作（按 Q 值降序）"))
+        debug_layout.addWidget(StrongBodyLabel("模型评分前三（Q 值由高到低）"))
+        self.fabledan_top_three_hint = CaptionLabel(
+            "Q 值用于模型排序，并不是可直接解读为百分比的真实胜率。"
+        )
+        self.fabledan_top_three_hint.setWordWrap(True)
+        debug_layout.addWidget(self.fabledan_top_three_hint)
         self.fabledan_candidates = BodyLabel("-")
         self.fabledan_candidates.setWordWrap(True)
         self.fabledan_candidates.setTextInteractionFlags(
@@ -361,6 +398,9 @@ class LiveAssistantPage(ScrollArea):
         )
         self.advisor_strategy_combo.currentIndexChanged.connect(
             self._update_advisor_strategy
+        )
+        self.session_data_switch.checkedChanged.connect(
+            self._update_session_data_recording
         )
         self._update_recognition_strategy()
         self._set_live_controls(False)
@@ -436,6 +476,22 @@ class LiveAssistantPage(ScrollArea):
         except Exception as exc:
             self.show_error(str(exc))
 
+    def _update_session_data_recording(self, enabled: bool) -> None:
+        if self._session_active:
+            return
+        setter = getattr(self.runtime, "set_session_data_recording_enabled", None)
+        if not callable(setter):
+            return
+        try:
+            setter(bool(enabled))
+        except Exception as exc:
+            self.show_error(str(exc))
+            self.session_data_switch.blockSignals(True)
+            self.session_data_switch.setChecked(
+                bool(getattr(self.runtime, "session_data_recording_enabled", True))
+            )
+            self.session_data_switch.blockSignals(False)
+
     def apply_initial_recognition(self, result: object, snapshot: object | None) -> None:
         level = getattr(result, "round_level", None)
         lead = getattr(result, "lead_player", None) or getattr(
@@ -471,6 +527,7 @@ class LiveAssistantPage(ScrollArea):
         self.lead_player_combo.setEnabled(enabled)
         self.recognition_strategy_combo.setEnabled(enabled)
         self.advisor_strategy_combo.setEnabled(enabled)
+        self.session_data_switch.setEnabled(enabled)
 
     def _render_initial_hand_cards(self, cards: tuple[str, ...]) -> None:
         while self.initial_hand_cards_layout.count():
@@ -487,12 +544,12 @@ class LiveAssistantPage(ScrollArea):
             return
         for card in cards:
             badge = CardBadge(card, compact=True)
-            badge.setFixedSize(27, 40)
+            badge.setFixedSize(36, 50)
             badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self.initial_hand_badges.append(badge)
             self.initial_hand_cards_layout.addWidget(badge)
         self.initial_hand_cards_layout.addStretch(1)
-        self.initial_hand_cards.setMinimumWidth(max(240, len(cards) * 30 + 12))
+        self.initial_hand_cards.setMinimumWidth(max(240, len(cards) * 39 + 12))
         self.initial_hand_cards.setToolTip("、".join(card_code_to_text(card) for card in cards))
 
     def _edit_initial_hand(self) -> None:
@@ -603,20 +660,22 @@ class LiveAssistantPage(ScrollArea):
         elif raw.status == "failed":
             self._append_advice_timeline_entry(
                 raw,
-                f"DanZero 建议计算失败：{raw.error}",
+                f"错误：{raw.error}",
             )
 
     def _show_fabledan_decision(self, advice: object) -> None:
         engine_input = getattr(advice, "engine_input", None)
-        decision = (
-            engine_input.get("decision")
-            if isinstance(engine_input, dict) and engine_input.get("debug") is True
-            else None
-        )
+        decision = engine_input.get("decision") if isinstance(engine_input, dict) else None
         if not isinstance(decision, dict):
             self.fabledan_debug_card.hide()
             self.fabledan_detail.hide()
             return
+
+        has_full_diagnostics = engine_input.get("debug") is True
+        self.fabledan_detail_button.setVisible(has_full_diagnostics)
+        if not has_full_diagnostics:
+            self.fabledan_detail.hide()
+            self.fabledan_detail.clear()
 
         best_action_text = str(decision.get("best_action_text") or "-")
         self.fabledan_recommendation.setText(best_action_text)
@@ -631,10 +690,9 @@ class LiveAssistantPage(ScrollArea):
             f"当前级牌：{engine_input.get('level_text') or '-'}"
         )
         candidates = decision.get("candidates")
-        top_n = int(engine_input.get("top_n", 5) or 5)
         lines: list[str] = []
         if isinstance(candidates, list):
-            for candidate in candidates[:top_n]:
+            for candidate in candidates[:3]:
                 if not isinstance(candidate, dict):
                     continue
                 lines.append(
@@ -643,16 +701,17 @@ class LiveAssistantPage(ScrollArea):
                     f"Q={self._format_q_value(candidate.get('q'))}"
                 )
         self.fabledan_candidates.setText("\n".join(lines) or "无候选动作")
-        self.fabledan_detail.setPlainText(
-            json.dumps(engine_input, ensure_ascii=False, indent=2, sort_keys=True)
-        )
+        if has_full_diagnostics:
+            self.fabledan_detail.setPlainText(
+                json.dumps(engine_input, ensure_ascii=False, indent=2, sort_keys=True)
+            )
         self.fabledan_debug_card.show()
 
     def _toggle_fabledan_details(self) -> None:
         visible = not self.fabledan_detail.isVisible()
         self.fabledan_detail.setVisible(visible)
         self.fabledan_detail_button.setText(
-            "收起详细调试" if visible else "查看详细调试"
+            "收起模型诊断" if visible else "查看模型诊断"
         )
 
     @staticmethod
@@ -697,20 +756,54 @@ class LiveAssistantPage(ScrollArea):
             raw.suit_uncertain,
             raw.variant_count,
             raw.advice_agrees_across_variants,
+            raw.semantic_uncertain,
+            raw.semantic_source_history_indices,
+            raw.suit_variant_count,
+            raw.suit_equivalence_class_count,
+            raw.semantic_variant_count,
         )
         if key == self._last_advice_timeline_key:
             return
         self._last_advice_timeline_key = key
         cards_html = self._cards_html(cards) if cards else ""
+        advisor_name = self._advisor_display_name()
         if raw.status == "failed":
-            accent, background, title = "#B91C1C", "#FEF2F2", "DanZero 计算失败"
+            accent, background, title = (
+                "#B91C1C",
+                "#FEF2F2",
+                f"{advisor_name} 计算失败",
+            )
         else:
-            accent, background, title = "#0F766E", "#E7F6F2", "DanZero 建议"
+            accent, background, title = (
+                "#0F766E",
+                "#E7F6F2",
+                f"{advisor_name} 建议",
+            )
             if advice is not None:
                 detail += f"　{advice.elapsed_ms:.0f} ms"
         if raw.suit_uncertain:
             agreement = "建议一致" if raw.advice_agrees_across_variants else "建议存在分歧"
-            detail += f"；花色遮挡：已评估 {raw.variant_count} 个可行分支，{agreement}"
+            if raw.suit_equivalence_class_count < raw.suit_variant_count:
+                detail += (
+                    f"；花色遮挡：{raw.suit_variant_count} 个实体牌状态归并为 "
+                    f"{raw.suit_equivalence_class_count} 个模型等价输入，"
+                    f"实际评估 {raw.variant_count} 个完整状态，{agreement}"
+                )
+            else:
+                detail += (
+                    f"；花色遮挡：生成 {raw.suit_variant_count} 个花色分支，"
+                    f"共评估 {raw.variant_count} 个完整状态，{agreement}"
+                )
+        if raw.semantic_uncertain:
+            source_text = "、".join(
+                str(index) for index in raw.semantic_source_history_indices
+            )
+            agreement = "建议一致" if raw.advice_agrees_across_variants else "建议存在分歧"
+            detail += (
+                f"；动作语义多解（历史第 {source_text} 条）："
+                f"生成 {raw.semantic_variant_count} 个语义分支，"
+                f"共评估 {raw.variant_count} 个完整状态，{agreement}"
+            )
         self._append_timeline_html(
             "<div style='margin:5px 0 9px 0; padding:6px; "
             f"background:{background}; border-left:4px solid {accent};'>"
@@ -838,7 +931,7 @@ class LiveAssistantPage(ScrollArea):
             self.review_bar.show()
             return
         self.review_reason.setText(
-            f"原因：{reasons_text(review.reason)}。录像继续，但状态和 DanZero 已暂停推进。"
+            f"原因：{reasons_text(review.reason)}。录像继续，但状态和建议模型已暂停推进。"
         )
         for candidate in review.candidates:
             text = "不出" if candidate.is_pass else "、".join(

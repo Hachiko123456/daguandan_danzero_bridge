@@ -286,6 +286,7 @@ def replay_truth_through_live_advisor(
                     is_pass=turn.is_pass,
                     monotonic_ms=turn.monotonic_ms or turn.index,
                     evidence_refs=(f"TRUTH-{turn.index:06d}",),
+                    action_metadata=turn.move_semantics,
                 )
                 processed_turn_count += 1
                 consume_advice(update, store)
@@ -439,6 +440,8 @@ def _event_to_turn_data(
         and _cards_match(expected.cards, cards)
     )
     return {
+        "kind": "action",
+        "event_id": event.event_id,
         "turn_id": event.turn_id,
         "trick_id": event.trick_id,
         "frame_index": frame_index,
@@ -845,18 +848,44 @@ def replay_video_through_live_pipeline(
                     )
                 last_record = record
                 frame_count += 1
-                if (
-                    on_turn is not None
-                    and update.event is not None
-                    and update.event.event_type in _ACTION_TYPES
-                ):
-                    on_turn(
-                        _event_to_turn_data(
-                            update.event,
-                            record.frame_index,
-                            truth_log,
+                if on_turn is not None:
+                    turn_id_by_event_id: dict[str, int] = {
+                        event.event_id: event.turn_id
+                        for event in runner.events
+                        if event.event_type in _ACTION_TYPES
+                    }
+                    for event in update_events:
+                        if event.event_type in _ACTION_TYPES:
+                            on_turn(
+                                _event_to_turn_data(
+                                    event,
+                                    record.frame_index,
+                                    truth_log,
+                                )
+                            )
+                            continue
+                        if event.event_type != "suit_corrected":
+                            continue
+                        target_event_id = str(
+                            event.payload.get("target_event_id", "")
                         )
-                    )
+                        target_turn_id = turn_id_by_event_id.get(target_event_id)
+                        if target_turn_id is None:
+                            # A correction is auxiliary evidence.  Never turn
+                            # an unresolvable target into a new action.
+                            continue
+                        on_turn(
+                            {
+                                "kind": "suit_corrected",
+                                "target_turn_id": target_turn_id,
+                                "actor": event.actor,
+                                "recognized_cards": list(
+                                    event.payload.get("cards", ())
+                                ),
+                                "confidence": round(float(event.confidence), 4),
+                                "frame_index": record.frame_index,
+                            }
+                        )
         finally:
             close_frames = getattr(frames, "close", None)
             if close_frames is not None:

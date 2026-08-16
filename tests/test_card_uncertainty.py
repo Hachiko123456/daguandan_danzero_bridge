@@ -4,6 +4,7 @@ from daguandan_bridge.live.card_uncertainty import (
     feasible_action_variants,
     feasible_self_hand_variants,
     state_variants_for_unknown_suits,
+    state_variants_for_unknown_suits_detailed,
 )
 from daguandan_bridge.live.consensus import canonical_candidate
 from daguandan_bridge.danzero.state import GuanDanState
@@ -98,6 +99,27 @@ def test_unknown_suit_is_kept_as_multiple_temporary_advice_variants():
         ("8S",),
         ("8C",),
     }
+
+
+def test_unknown_suit_variant_cap_is_reported_instead_of_silent_truncation():
+    state = GuanDanState(
+        round_level="2",
+        wild_rank="2",
+        current_player="self",
+        lead_player="left",
+        my_hand=("3S",),
+    )
+    state.record_play(
+        "left",
+        ("8?", "9?"),
+        suit_options=(("S", "H", "C", "D"), ("S", "H", "C", "D")),
+    )
+
+    result = state_variants_for_unknown_suits_detailed(state, limit=2)
+
+    assert len(result.states) == 2
+    assert result.truncated is True
+    assert result.limit == 2
 
 
 def test_sorting_cards_keeps_their_suit_options_attached():

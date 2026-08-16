@@ -155,6 +155,19 @@ def test_visual_finish_badge_corrects_an_unknown_opponent_starting_count():
     assert LocalGuandanAdvisor._remaining_counts(strategy_snapshot)[1] == 0
 
 
+def test_teammates_finishing_first_and_second_ends_round_without_finished_turn():
+    reducer = _started_reducer()
+
+    reducer.confirm_player_finished("right", placement="head")
+    reducer.confirm_player_finished("left", placement="second")
+
+    snapshot = reducer.snapshot()
+    assert snapshot.finished_seats == frozenset({"right", "left"})
+    assert snapshot.current_player is None
+    assert snapshot.trick_plays == ()
+    assert snapshot.current_player not in snapshot.finished_seats
+
+
 def test_finished_player_partner_catches_wind_after_active_opponent_passes():
     """A finished leader's partner does not need to emit a fake pass."""
 

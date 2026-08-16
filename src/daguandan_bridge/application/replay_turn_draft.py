@@ -1,11 +1,131 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from ..live.truth_log import TruthLog, TruthTurn
+from ..live.truth_log import TruthInitialState, TruthLog, TruthTurn
 
 
 _SEATS = {"self", "right", "opposite", "left"}
+_TURN_ORDER = ("self", "right", "opposite", "left")
+_PARTNER_SEAT = {
+    "self": "opposite",
+    "opposite": "self",
+    "right": "left",
+    "left": "right",
+}
+_TEAMS = (
+    frozenset({"self", "opposite"}),
+    frozenset({"right", "left"}),
+)
+
+
+@dataclass(frozen=True)
+class _ActorAction:
+    actor: str
+    is_pass: bool
+
+
+def _next_active_player(actor: str, finished: set[str]) -> str | None:
+    if actor not in _SEATS:
+        return None
+    index = _TURN_ORDER.index(actor)
+    for offset in range(1, len(_TURN_ORDER) + 1):
+        candidate = _TURN_ORDER[(index + offset) % len(_TURN_ORDER)]
+        if candidate not in finished:
+            return candidate
+    return None
+
+
+def _round_is_decided(finished: set[str]) -> bool:
+    return len(finished) >= 3 or any(team.issubset(finished) for team in _TEAMS)
+
+
+def next_actor_after_prefix(
+    initial_state: TruthInitialState,
+    turns: tuple[TruthTurn, ...] | list[TruthTurn],
+) -> str | None:
+    """Validate a prefix and return the next expected actor.
+
+    This intentionally derives turns from their ordered actions and card
+    counts, not from the informational ``trick_id`` field.  A stale trick id
+    is editable only indirectly in the GUI and must never make a valid actor
+    chain unsaveable (or make an invalid chain look valid).
+    """
+
+    lead = getattr(initial_state, "lead_player", None)
+    if lead not in _SEATS:
+        raise ValueError("首出玩家无效")
+    hand = tuple(getattr(initial_state, "my_hand", ()))
+    remaining = {seat: 27 for seat in _TURN_ORDER}
+    remaining["self"] = len(hand)
+    finished: set[str] = set()
+    trick: list[_ActorAction] = []
+    expected: str | None = str(lead)
+
+    for position, turn in enumerate(turns, start=1):
+        actor = str(turn.actor)
+        if actor not in _SEATS:
+            raise ValueError(f"第 {position} 条动作的玩家无效")
+        if expected is None:
+            raise ValueError(f"第 {position} 条动作发生在对局已经结束之后")
+        if actor != expected:
+            raise ValueError(
+                f"第 {position} 条动作玩家顺序错误："
+                f"应为 {expected}，实际为 {actor}"
+            )
+        if not turn.is_pass:
+            played = len(turn.cards)
+            if played > remaining[actor]:
+                raise ValueError(f"第 {position} 条动作的出牌数量超过 {actor} 的剩余手牌")
+            remaining[actor] -= played
+            if remaining[actor] == 0:
+                finished.add(actor)
+        trick.append(_ActorAction(actor, bool(turn.is_pass)))
+        if _round_is_decided(finished):
+            expected = None
+            continue
+
+        expected = _next_active_player(actor, finished)
+        last_play_index = next(
+            (index for index in range(len(trick) - 1, -1, -1) if not trick[index].is_pass),
+            None,
+        )
+        if last_play_index is None:
+            continue
+        leader = trick[last_play_index].actor
+        next_leader = leader
+        if leader in finished:
+            next_leader = _PARTNER_SEAT[leader]
+            if next_leader in finished:
+                next_leader = _next_active_player(next_leader, finished)
+        if next_leader is None:
+            expected = None
+            continue
+        required_passes = set(_TURN_ORDER) - finished - {next_leader}
+        passed = {
+            action.actor
+            for action in trick[last_play_index + 1 :]
+            if action.is_pass
+        }
+        if required_passes and required_passes.issubset(passed):
+            expected = next_leader
+            trick.clear()
+    return expected
+
+
+# Kept for callers that imported the former private helper while the editor
+# migrates to the supported prefix-derivation API.
+def _actor_chain_after(
+    initial_state: TruthInitialState,
+    turns: tuple[TruthTurn, ...] | list[TruthTurn],
+) -> str | None:
+    return next_actor_after_prefix(initial_state, turns)
+
+
+def validate_turn_actor_chain(log: TruthLog) -> None:
+    """Raise when a truth-log action sequence does not follow turn ownership."""
+
+    next_actor_after_prefix(log.initial_state, log.turns)
 
 
 @dataclass(frozen=True)
@@ -24,6 +144,15 @@ class ReplayTurnDraftAssembler:
         self._baseline = baseline
         self._turns = list(baseline.turns)
         self._source_turn_ids = {turn.index for turn in baseline.turns}
+        self._row_by_source_turn_id = {
+            turn.index: row for row, turn in enumerate(baseline.turns)
+        }
+        # A pre-existing baseline is rare for scans, but validate it once so
+        # an unsafe scan cannot silently extend a broken actor sequence.
+        self._next_actor = next_actor_after_prefix(
+            baseline.initial_state,
+            self._turns,
+        )
 
     @property
     def truth_log(self) -> TruthLog:
@@ -39,6 +168,8 @@ class ReplayTurnDraftAssembler:
         )
 
     def append(self, raw: dict[str, object]) -> ReplayTurnDraftAppend:
+        if str(raw.get("kind", "action")) == "suit_corrected":
+            return self.apply_suit_correction(raw)
         try:
             source_turn_id = int(raw.get("turn_id", 0) or 0)
             frame_index = (
@@ -67,6 +198,13 @@ class ReplayTurnDraftAssembler:
             return self._rejected("该回合已确认")
         if actor not in _SEATS:
             return self._rejected(f"回合 {source_turn_id} 的 actor 无效")
+        if self._next_actor is None:
+            return self._rejected("对局已结束，不能追加新的动作")
+        if actor != self._next_actor:
+            return self._rejected(
+                f"回合 {source_turn_id} 的玩家顺序错误："
+                f"应为 {self._next_actor}，实际为 {actor}"
+            )
         if is_pass and cards:
             return self._rejected(f"回合 {source_turn_id} 的不出动作不能带牌")
         if not is_pass and not cards:
@@ -81,6 +219,23 @@ class ReplayTurnDraftAssembler:
         )
         self._turns.append(turn)
         self._source_turn_ids.add(source_turn_id)
+        self._row_by_source_turn_id[source_turn_id] = len(self._turns) - 1
+        try:
+            self._next_actor = next_actor_after_prefix(
+                self._baseline.initial_state,
+                self._turns,
+            )
+        except ValueError as exc:
+            # Keep the in-memory draft transaction-like: rejected input cannot
+            # leave a half-appended row that shifts every later recognition.
+            self._turns.pop()
+            self._source_turn_ids.remove(source_turn_id)
+            self._row_by_source_turn_id.pop(source_turn_id, None)
+            self._next_actor = next_actor_after_prefix(
+                self._baseline.initial_state,
+                self._turns,
+            )
+            return self._rejected(str(exc))
         return ReplayTurnDraftAppend(
             True,
             "",
@@ -89,5 +244,49 @@ class ReplayTurnDraftAssembler:
             "扫描确认",
         )
 
+    def apply_suit_correction(self, raw: dict[str, object]) -> ReplayTurnDraftAppend:
+        """Replace one already-drafted action after a confirmed suit reread.
+
+        A correction is not another turn.  It must preserve both the row count
+        and the original actor; only suit information on a rank-equivalent
+        non-pass action is allowed to change.
+        """
+
+        try:
+            source_turn_id = int(raw.get("target_turn_id", 0) or 0)
+        except (TypeError, ValueError):
+            return self._rejected("花色修正缺少有效目标回合")
+        row = self._row_by_source_turn_id.get(source_turn_id)
+        if row is None:
+            return self._rejected(f"花色修正找不到第 {source_turn_id} 手原动作")
+        original = self._turns[row]
+        raw_cards = raw.get("recognized_cards", raw.get("cards", ())) or ()
+        cards = tuple(str(card) for card in raw_cards)
+        actor = str(raw.get("actor", original.actor))
+        if original.is_pass or not cards:
+            return self._rejected("花色修正只能回填已有的出牌动作")
+        if actor != original.actor:
+            return self._rejected("花色修正玩家与原动作不一致")
+        if _rank_signature(cards) != _rank_signature(original.cards):
+            return self._rejected("花色修正不能改变原动作的点数或张数")
+        corrected = replace(original, cards=cards)
+        self._turns[row] = corrected
+        return ReplayTurnDraftAppend(
+            True,
+            "",
+            corrected,
+            self.truth_log,
+            "花色修正已回填",
+        )
+
     def _rejected(self, reason: str) -> ReplayTurnDraftAppend:
         return ReplayTurnDraftAppend(False, reason, None, self.truth_log, "已忽略")
+
+
+def _rank_signature(cards: tuple[str, ...]) -> tuple[str, ...]:
+    def rank(card: str) -> str:
+        if card in {"small_joker", "big_joker"}:
+            return card
+        return card[:-1] if len(card) >= 2 else card
+
+    return tuple(sorted(rank(card) for card in cards))

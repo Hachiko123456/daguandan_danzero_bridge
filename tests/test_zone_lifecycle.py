@@ -66,6 +66,25 @@ def test_pass_marker_enters_action_window_without_waiting_for_clear():
     assert decision.phase == ZonePhase.SETTLING
 
 
+def test_content_only_action_is_sampled_when_compact_cards_miss_occupancy_threshold():
+    zone = ZoneLifecycle(
+        expected_player="self",
+        activated_at_ms=0,
+        settle_ms=0,
+    )
+
+    # A small central bomb can alter the content fingerprint while its mean
+    # ROI difference remains below the coarse occupancy cutoff.  It must not
+    # enter SETTLING and immediately be discarded before recognition runs.
+    first = zone.observe(_metrics(100, occupied=False, content_changed=True))
+    second = zone.observe(_metrics(200, occupied=False))
+
+    assert first.phase == ZonePhase.BURST_READ
+    assert first.collect_sample
+    assert second.phase == ZonePhase.BURST_READ
+    assert second.collect_sample
+
+
 def test_effect_visibility_restarts_the_settle_delay():
     zone = ZoneLifecycle(
         expected_player="right",

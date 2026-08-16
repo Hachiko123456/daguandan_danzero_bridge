@@ -16,6 +16,11 @@ from daguandan_bridge.advisor_strategy import (
     save_profile_advisor_strategy,
 )
 from daguandan_bridge.application.ports import AdvicePort
+from daguandan_bridge.danzero.rules import (
+    infer_best_action,
+    logical_action_label,
+    wildcard_substitutions,
+)
 from daguandan_bridge.danzero.state import GuanDanState
 from daguandan_bridge.domain.advice import StrategyExecutionTrace
 from daguandan_bridge.fabledan import (
@@ -23,7 +28,12 @@ from daguandan_bridge.fabledan import (
     FableDanDecisionResult,
     FableDanStateError,
 )
-from daguandan_bridge.fabledan.advisor import _base_card_id, _card_code
+from daguandan_bridge.fabledan.advisor import (
+    _PhysicalCards,
+    _base_card_id,
+    _card_code,
+    _unique_observed_move,
+)
 from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.truth_log import truth_log_from_dict
 
@@ -123,6 +133,37 @@ def _install_counting_runtime(advisor: FableDanAdvisor, tmp_path):
     return model
 
 
+def _realtime_action_metadata(
+    cards: tuple[str, ...],
+    *,
+    level: str,
+    preferred_play_type: str,
+) -> dict[str, object]:
+    inference = infer_best_action(
+        cards,
+        (),
+        level,
+        preferred_play_type=preferred_play_type,
+    )
+    assert inference.action is not None
+    action = inference.action
+    selected = {
+        "move_type": str(action[0]),
+        "key": str(action[1]),
+        "logical_label": logical_action_label(action, level),
+        "wildcard_assignments": [
+            {"physical_card": card, "as_rank": rank}
+            for card, rank in wildcard_substitutions(action, level)
+        ],
+    }
+    return {
+        "play_type": str(action[0]),
+        "candidate_interpretations": [selected],
+        "selected_interpretation": selected,
+        "selection_source": "realtime_semantics",
+    }
+
+
 def test_fabledan_is_an_advice_port_and_missing_weights_use_rule_agent(tmp_path):
     advisor = FableDanAdvisor(tmp_path, "profile")
 
@@ -137,7 +178,7 @@ def test_fabledan_is_an_advice_port_and_missing_weights_use_rule_agent(tmp_path)
     assert advice.engine_input["backend"] == "rule"
     assert advice.engine_input["status"] == "missing"
     assert advice.engine_input["path"] == str(
-        tmp_path / "profile" / "models" / "fabledan_weights.npz"
+        tmp_path / "profile" / "models" / "best.npz"
     )
     assert advice.engine_input["digest"] is None
     assert advice.engine_input["upstream_commit"] == (
@@ -150,7 +191,7 @@ def test_fabledan_is_an_advice_port_and_missing_weights_use_rule_agent(tmp_path)
 
 
 def test_fabledan_invalid_fixed_npz_falls_back_without_searching_other_paths(tmp_path):
-    fixed = tmp_path / "profile" / "models" / "fabledan_weights.npz"
+    fixed = tmp_path / "profile" / "models" / "best.npz"
     fixed.parent.mkdir(parents=True)
     fixed.write_bytes(b"not an npz")
     alternate = tmp_path / "FableDan" / "best.npz"
@@ -181,6 +222,133 @@ def test_fabledan_card_map_round_trips_both_decks(code: str, base: int):
     assert _base_card_id(code) == base
     assert _card_code(base) == code
     assert _card_code(base + 54) == code
+
+
+@pytest.mark.parametrize(
+    ("project_type", "cards", "fabledan_type"),
+    (
+        ("Single", ("3S",), "SINGLE"),
+        ("Pair", ("3S", "3H"), "PAIR"),
+        ("Trips", ("3S", "3H", "3D"), "TRIPLE"),
+        ("ThreeWithTwo", ("3S", "3H", "3D", "4S", "4H"), "FULL"),
+        ("Straight", ("3S", "4H", "5D", "6C", "7S"), "STRAIGHT"),
+        ("ThreePair", ("3S", "3H", "4S", "4H", "5D", "5C"), "PLATE"),
+        ("TwoTrips", ("3S", "3H", "3D", "4S", "4H", "4D"), "TUBE"),
+        ("Bomb", ("3S", "3H", "3D", "3C"), "BOMB"),
+        ("StraightFlush", ("3S", "4S", "5S", "6S", "7S"), "SFLUSH"),
+    ),
+)
+def test_realtime_action_semantics_match_fabledan_types_and_internal_keys(
+    project_type: str,
+    cards: tuple[str, ...],
+    fabledan_type: str,
+):
+    allocation = _PhysicalCards()
+    card_ids = tuple(allocation.allocate(card) for card in cards)
+
+    move, resolution = _unique_observed_move(
+        card_ids,
+        "J",
+        1,
+        _realtime_action_metadata(
+            cards,
+            level="J",
+            preferred_play_type=project_type,
+        ),
+    )
+
+    assert resolution["selected_interpretation"]["type"] == fabledan_type
+    assert resolution["selection_source"] == "realtime_semantics"
+    assert "metadata_warning" not in resolution
+    assert move.type == resolution["selected_interpretation"]["type_id"]
+
+
+def test_unique_non_wildcard_move_ignores_bad_metadata_with_chinese_warning():
+    allocation = _PhysicalCards()
+    card_ids = tuple(allocation.allocate(card) for card in ("3S", "3H"))
+
+    move, resolution = _unique_observed_move(
+        card_ids,
+        "J",
+        1,
+        {
+            "selected_interpretation": {
+                "move_type": "ThreePair",
+                "key": "6",
+            },
+            "selection_source": "realtime_semantics",
+        },
+    )
+
+    assert resolution["selected_interpretation"]["type"] == "PAIR"
+    warning = resolution["metadata_warning"]
+    assert warning["code"] == "unique_physical_move_metadata_mismatch"
+    assert "第 1 条历史不含逢人配" in warning["message"]
+    assert "记录牌型" in "；".join(warning["mismatch_reasons"])
+    assert move.type == resolution["selected_interpretation"]["type_id"]
+
+
+def test_latest_session_opening_three_pair_reaches_model_without_warning(tmp_path):
+    state = GuanDanState()
+    state.set_context(
+        round_level="J",
+        wild_rank="J",
+        current_player="self",
+        lead_player="self",
+    )
+    state.confirm_hand(
+        (
+            "10D", "10H", "10S", "3C", "3D", "3H", "3S", "3S",
+            "5C", "5H", "6S", "AD", "AH", "JC", "KH", "KH", "KS",
+            "QD", "QH", "QS", "big_joker",
+        )
+    )
+    first_cards = ("6D", "6D", "7H", "7H", "8D", "8S")
+    state.record_play(
+        "self",
+        first_cards,
+        action_metadata=_realtime_action_metadata(
+            first_cards,
+            level="J",
+            preferred_play_type="ThreePair",
+        ),
+    )
+    state.record_pass("right")
+    opposite_cards = ("7C", "7D", "8C", "8D", "9D", "9S")
+    state.record_play(
+        "opposite",
+        opposite_cards,
+        action_metadata=_realtime_action_metadata(
+            opposite_cards,
+            level="J",
+            preferred_play_type="ThreePair",
+        ),
+    )
+    state.record_play("left", ("10H", "10S", "8H", "8S", "9H", "9S"))
+    state.remaining_cards = {
+        "self": 21,
+        "right": 27,
+        "opposite": 21,
+        "left": 21,
+    }
+    advisor = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        diagnostics="full",
+        write_decision_log=False,
+    )
+    model = _install_counting_runtime(advisor, tmp_path)
+
+    result = advisor.recommend_detailed(state, request_id="latest-opening-turn-5")
+    events = result.advice.engine_input["fabledan_trace"][
+        "adapter_observation"
+    ]["events"]
+
+    assert model.calls == 1
+    assert events[0]["move"]["type"] == "PLATE"
+    assert events[0]["semantic_resolution"]["selection_source"] == "realtime_semantics"
+    assert events[2]["move"]["type"] == "PLATE"
+    assert result.warnings == ()
 
 
 def test_fabledan_maps_complete_following_history_and_returns_a_legal_self_action(
@@ -224,6 +392,26 @@ def test_fabledan_accepts_exact_suit_options_from_live_reducer(tmp_path):
     )
 
     assert advice.engine_input["history"][0]["move"]["cards"] == ["3S"]
+
+
+def test_fabledan_input_fingerprint_merges_only_identical_encoded_inputs(tmp_path):
+    advisor = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        runtime_policy="rule_only",
+        write_decision_log=False,
+    )
+
+    assert advisor.decision_input_fingerprint(
+        _following_state(("9S",)),
+    ) == advisor.decision_input_fingerprint(
+        _following_state(("9C",)),
+    )
+    assert advisor.decision_input_fingerprint(
+        _following_state(("3S", "4S", "5S", "6S", "7S")),
+    ) != advisor.decision_input_fingerprint(
+        _following_state(("3S", "4H", "5D", "6C", "7S")),
+    )
 
 
 def test_unknown_suit_is_audited_and_blocked_before_policy(tmp_path, monkeypatch):
@@ -276,6 +464,60 @@ def test_ambiguous_wildcard_history_is_blocked_before_policy(tmp_path, monkeypat
     assert len(root["candidate_interpretations"]) >= 2
     assert root["selected_interpretation"] is None
     assert root["selection_source"] == "unresolved"
+
+
+def test_wildcard_semantic_mismatch_reports_cards_candidates_and_differences(
+    tmp_path,
+    monkeypatch,
+):
+    from daguandan_bridge.fabledan import advisor as module
+
+    monkeypatch.setattr(
+        module.RuleAgent,
+        "act",
+        lambda *_args: pytest.fail("语义不一致时不应调用模型"),
+    )
+    state = _following_state(("JC", "JD", "9H", "2D", "2H"), level="9")
+    original = state.play_history[0]
+    invalid = replace(
+        original,
+        action_metadata={
+            "selected_interpretation": {
+                "move_type": "ThreePair",
+                "key": "6",
+                "wildcard_assignments": [
+                    {"physical_card": "9H", "as_rank": "6"}
+                ],
+            },
+            "selection_source": "realtime_semantics",
+        },
+    )
+    state.play_history[0] = invalid
+    state.trick_plays[0] = invalid
+    trace = StrategyExecutionTrace("wildcard-mismatch")
+
+    with pytest.raises(
+        FableDanStateError,
+        match="第 1 条历史动作语义不一致：实体牌",
+    ):
+        FableDanAdvisor(tmp_path, "profile", diagnostics="full").recommend(
+            state,
+            request_id="wildcard-mismatch",
+            trace=trace,
+        )
+
+    root = trace.snapshot()["engine_input"]["fabledan_trace"]["diagnostics"][
+        "root_cause"
+    ]
+    assert root["code"] == "action_semantics_mismatch"
+    assert root["source_turn_id"] == 1
+    assert root["physical_cards"] == ["2D", "2H", "9H", "JC", "JD"]
+    assert root["wildcard_count"] == 1
+    assert len(root["candidate_interpretations"]) >= 2
+    assert all(
+        item["mismatch_reasons"]
+        for item in root["candidate_match_diagnostics"]
+    )
 
 
 def test_explicit_truth_semantics_resolves_wildcard_without_guessing(tmp_path):
@@ -436,7 +678,7 @@ def test_debug_can_embed_complete_trace_without_appending_jsonl(tmp_path):
     assert trace["diagnostics"]["errors"] == []
 
 
-def test_debug_false_preserves_recommend_api_without_writing_logs(tmp_path):
+def test_debug_false_exposes_compact_top_three_without_writing_logs(tmp_path):
     log_directory = tmp_path / "logs" / "fabledan_decisions"
     advisor = FableDanAdvisor(
         tmp_path,
@@ -451,7 +693,19 @@ def test_debug_false_preserves_recommend_api_without_writing_logs(tmp_path):
     assert model.calls == 1
     assert advice.strategy == "fabledan-numpy"
     assert advice.engine_input["debug"] is False
-    assert "decision" not in advice.engine_input
+    assert advice.engine_input["top_n"] == 3
+    candidates = advice.engine_input["decision"]["candidates"]
+    assert 1 <= len(candidates) <= 3
+    assert [candidate["rank"] for candidate in candidates] == list(
+        range(1, len(candidates) + 1)
+    )
+    training_input = advice.engine_input["fabledan_training_input"]
+    assert training_input["feature_schema"] == "fabledan-token48-feat80/v1"
+    assert training_input["tokens"]
+    assert len(training_input["features"]) == advice.engine_input["decision"]["legal_action_count"]
+    assert all(len(row) == 80 for row in training_input["features"])
+    assert training_input["tokens_sha256"]
+    assert training_input["features_sha256"]
     assert "fabledan_trace" not in advice.engine_input
     assert not log_directory.exists()
 
@@ -503,7 +757,7 @@ def test_real_left_55_state_exposes_all_legal_q_values_without_changing_choice(
     tmp_path,
 ):
     profiles_root = Path(__file__).parents[1] / "data" / "profiles"
-    weights = profiles_root / "tencent_daguandan" / "models" / "fabledan_weights.npz"
+    weights = profiles_root / "tencent_daguandan" / "models" / "best.npz"
     if not weights.is_file():
         pytest.skip("repository FableDan weights are unavailable")
     advisor = FableDanAdvisor(
@@ -532,13 +786,18 @@ def test_profile_strategy_builds_fabledan_and_persists_default(tmp_path):
         encoding="utf-8",
     )
 
-    assert load_profile_advisor_strategy(tmp_path, "profile") == "danzero"
+    assert load_profile_advisor_strategy(tmp_path, "profile") == "fabledan"
     assert save_profile_advisor_strategy(tmp_path, "profile", "FableDan") == "fabledan"
     assert load_profile_advisor_strategy(tmp_path, "profile") == "fabledan"
-    assert isinstance(
-        build_advisor("fabledan", profiles_root=tmp_path, profile_name="profile"),
-        FableDanAdvisor,
+    advisor = build_advisor(
+        "fabledan",
+        profiles_root=tmp_path,
+        profile_name="profile",
     )
+    assert isinstance(advisor, FableDanAdvisor)
+    assert advisor.runtime_policy == "model_required"
+    assert advisor.audit_info()["backend"] == "numpy"
+    assert advisor.audit_info()["status"] == "missing"
 
     profile_data = json.loads((profile / "profile.json").read_text("utf-8"))
     profile_data["fabledan_debug"] = True
@@ -585,6 +844,7 @@ def test_vendor_contains_only_approved_runtime_and_notice_files():
         "encode.py",
         "agents.py",
         "model_np.py",
+        "engine.py",
     }
     assert {path.name for path in vendor.iterdir() if path.is_file()} == {
         "FABLEDAN_LICENSE",

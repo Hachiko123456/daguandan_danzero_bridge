@@ -1,0 +1,24 @@
+大掼蛋智能助手 · 模型替换说明
+================================
+
+请先退出程序，再替换模型文件；替换完成后重新启动程序。
+
+1. FableDan（默认策略）
+   文件：data\profiles\tencent_daguandan\models\best.npz
+   操作：用兼容的 FableDan .npz 模型覆盖 best.npz。
+   注意：程序不支持 best.pt；把 .pt 文件直接改名为 .npz 并不是格式转换，仍无法加载。
+
+2. DanZero
+   文件：data\profiles\tencent_daguandan\models\danzero\q_network.ckpt
+   操作：用兼容的 DanZero .ckpt 模型覆盖 q_network.ckpt。
+
+建议：替换前先在同一目录保留备份，例如 best.backup.npz。
+程序只读取上述固定文件名；请不要改目录名或文件名。
+若模型格式不兼容，程序会显示加载或推理失败的具体原因；恢复备份即可回退。
+
+替换 FableDan 模型后，可双击发布目录中的 `Run_FableDan_Fixed_Benchmark.bat`。
+它固定进行 200 局无进贡、座位互换的对战，并将结果写入
+`models/benchmarks/`；该结果只用于可复现比较，不会自动训练或替换模型。
+
+不要把录像、截图或 sessions 目录放进发布包；仅当实时助手的“保存对局数据”
+开关开启时，它们才会在程序运行后按需生成。

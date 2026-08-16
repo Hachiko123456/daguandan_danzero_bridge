@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 import shutil
 
@@ -269,7 +270,7 @@ def test_missing_fabledan_npz_is_blocked_before_any_decision(tmp_path):
     assert result.summary["evaluated_decisions"] == 0
     assert result.decisions == ()
 
-    weights = tmp_path / "profiles" / "profile" / "models" / "fabledan_weights.npz"
+    weights = tmp_path / "profiles" / "profile" / "models" / "best.npz"
     weights.parent.mkdir(parents=True)
     weights.write_bytes(b"not-a-valid-npz")
     invalid = service.prepare(session, strategy_id="fabledan_model")
@@ -400,7 +401,7 @@ def test_real_session_fabledan_model_publishes_complete_decision_traces(tmp_path
         profiles
         / "tencent_daguandan"
         / "models"
-        / "fabledan_weights.npz"
+        / "best.npz"
     )
     if not source.is_dir() or not weights.is_file():
         pytest.skip("真实会话或 FableDan 权重不可用")
@@ -441,7 +442,7 @@ def test_real_session_fabledan_model_publishes_complete_decision_traces(tmp_path
     for record, trace in zip(records, traces):
         assert record["fabledan_trace_ref"]["decision_id"] == record["decision_id"]
         assert trace["schema"] == "fabledan-trace/1"
-        assert trace["model_output"]["model_path"].endswith("fabledan_weights.npz")
+        assert trace["model_output"]["model_path"].endswith("best.npz")
         assert len(trace["model_output"]["q_values"]) == trace["legal_actions"][
             "legal_count_after_cap"
         ]
@@ -461,7 +462,7 @@ def test_target_session_explains_t0002_t0014_and_turn23_wildcard(tmp_path):
         / "sessions"
         / "game_20260814_004447_aab3dc"
     )
-    weights = profiles / "tencent_daguandan" / "models" / "fabledan_weights.npz"
+    weights = profiles / "tencent_daguandan" / "models" / "best.npz"
     if not source.is_dir() or not weights.is_file():
         pytest.skip("目标真实会话或 FableDan 权重不可用")
     session = tmp_path / "profiles" / "profile" / "sessions" / source.name
@@ -504,9 +505,14 @@ def test_target_session_explains_t0002_t0014_and_turn23_wildcard(tmp_path):
     }
     assert t2_actions["QQ"]["type"] == "PAIR"
     assert t2_actions["9999"]["type"] == "BOMB"
-    assert t2_q["QQ"] == pytest.approx(-0.09601562415502184)
-    assert t2_q["9999"] == pytest.approx(-0.06028293120130538)
-    assert t2["model_output"]["selected_action"]["readable_action"] == "9999"
+    # The profile deliberately supports replacing best.npz.  Q values and the
+    # winning action therefore belong to the selected checkpoint, whereas the
+    # adapter contract is that all legal actions are scored and argmax chooses
+    # one of them.  Keep this fixture valid when the user replaces the model.
+    assert all(math.isfinite(value) for value in t2_q.values())
+    selected_t2 = t2["model_output"]["selected_action"]["readable_action"]
+    assert selected_t2 in t2_q
+    assert t2_q[selected_t2] == max(t2_q.values())
     assert t2["model_output"]["selection_reason"].startswith("np.argmax")
 
     t14 = by_turn[14]
@@ -520,9 +526,10 @@ def test_target_session_explains_t0002_t0014_and_turn23_wildcard(tmp_path):
         row["readable_action"]: row["q"]
         for row in t14["model_output"]["q_values"]
     }
-    assert t14_q["PASS"] == pytest.approx(0.07069822211305947)
-    assert t14_q["JJJJ"] == pytest.approx(0.11479588589067691)
-    assert t14["model_output"]["selected_action"]["readable_action"] == "JJJJ"
+    assert all(math.isfinite(value) for value in t14_q.values())
+    selected_t14 = t14["model_output"]["selected_action"]["readable_action"]
+    assert selected_t14 in t14_q
+    assert t14_q[selected_t14] == max(t14_q.values())
 
     root = by_turn[26]["diagnostics"]["root_cause"]
     assert root["code"] == "wildcard_ambiguity"
@@ -535,8 +542,8 @@ def test_target_session_explains_t0002_t0014_and_turn23_wildcard(tmp_path):
     assert root["selected_interpretation"] is None
     assert root["selection_source"] == "unresolved"
     report = (result.report_directory / "report.md").read_text("utf-8")
-    assert report.count("history turn 23 wildcard ambiguity") == 1
-    assert "affected decisions: 26, 30, 34" in report
+    assert report.count("第 23 条历史存在 wildcard 多解") == 1
+    assert "受影响决策：26, 30, 34" in report
 
 
 def test_strategy_independent_validation_does_not_initialize_model(tmp_path):
@@ -574,7 +581,7 @@ def test_fabledan_strict_runtime_policies_never_implicitly_mix_backends(
     assert required.audit_info()["backend"] == "numpy"
     assert required.audit_info()["status"] == "missing"
 
-    weights = tmp_path / "profile" / "models" / "fabledan_weights.npz"
+    weights = tmp_path / "profile" / "models" / "best.npz"
     weights.parent.mkdir(parents=True)
     weights.write_bytes(b"broken")
     invalid = FableDanAdvisor(tmp_path, "profile", runtime_policy="model_required")

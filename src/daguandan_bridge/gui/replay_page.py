@@ -197,7 +197,7 @@ class FrameInspectDialog(QDialog):
 
     def _run_danzero_test(self, state: object) -> None:
         if self._danzero_thread is not None and self._danzero_thread.isRunning():
-            self.page.status.setText("正在调用 DanZero……")
+            self.page.status.setText("正在调用策略模型……")
             return
         operation = lambda: self._danzero_advisor.recommend(state)
         self.page.set_test_busy(True)
@@ -647,7 +647,7 @@ class ReplayPage(QWidget):
         self.replay_mode_combo = ComboBox()
         self.replay_mode_combo.addItem("状态机管线（实时同核心）", userData="pipeline")
         self.replay_mode_combo.addItem(
-            "可信日志驱动（测试实时 DanZero）",
+            "可信日志驱动（测试实时策略）",
             userData="trusted_advisor",
         )
         mode_row.addWidget(self.replay_mode_combo)
@@ -1436,7 +1436,7 @@ class ReplayPage(QWidget):
         else:
             detail = status
         self.diagnostics.insertPlainText(
-            f"[实时 DanZero] 第 {turn_id} 手　请求 {request_id}　{detail}\n"
+            f"[实时策略] 第 {turn_id} 手　请求 {request_id}　{detail}\n"
         )
         scrollbar = self.diagnostics.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -1564,6 +1564,36 @@ class ReplayPage(QWidget):
 
     def _collect_truth_scan_turn(self, data: object) -> None:
         record = dict(data)
+        kind = str(record.get("kind", "action"))
+        if kind == "suit_corrected":
+            if self._truth_draft_assembler is None and self._truth_scan_base is not None:
+                self._truth_draft_assembler = ReplayTurnDraftAssembler(
+                    self._truth_scan_base
+                )
+            if self._truth_draft_assembler is None:
+                return
+            corrected = self._truth_draft_assembler.apply_suit_correction(record)
+            if not corrected.accepted or corrected.turn is None:
+                return
+            self._truth_scan_turns.append(record)
+            self.truth_log = corrected.truth_log
+            if self._truth_editor is not None:
+                self._truth_editor.replace_confirmed_turn(
+                    corrected.turn,
+                    status=corrected.status,
+                )
+            seat = self._REPLAY_SEAT_LABELS.get(
+                str(record.get("actor")),
+                "未知座位",
+            )
+            cards = " ".join(str(card) for card in record.get("recognized_cards", ()))
+            self.diagnostics.insertPlainText(
+                f"\n[逐帧分析] 花色修正　第 {record.get('target_turn_id', '?')} 手"
+                f"　{seat} {cards}"
+            )
+            scrollbar = self.diagnostics.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+            return
         cards = tuple(str(card) for card in record.get("recognized_cards", ()))
         is_pass = bool(record.get("recognized_pass"))
         if not is_pass and not cards:
@@ -1683,13 +1713,13 @@ class ReplayPage(QWidget):
     def _trusted_completed(self, value: object) -> None:
         result = value
         self.diagnostics.insertPlainText(
-            "\n实时 DanZero 可信日志测试完成\n"
+            "\n实时策略可信日志测试完成\n"
             f"源对局：{result.source_session_id}\n"
             f"动作进度：{result.processed_turn_count}/{result.turn_count}\n"
-            f"DanZero 请求：{result.advice_requested}；成功：{result.advice_ready}；"
+            f"策略请求：{result.advice_requested}；成功：{result.advice_ready}；"
             f"失败：{result.advice_failed}；过期：{result.advice_stale}；"
             f"超时：{result.advice_timeouts}\n"
-            f"未知花色仅在 DanZero 输入副本中补全：{result.unknown_card_resolutions} 条\n"
+            f"未知花色仅在策略输入副本中补全：{result.unknown_card_resolutions} 条\n"
             f"结果目录：{result.run_directory}\n"
             f"建议明细：{result.output_path}\n"
             f"汇总：{result.summary_path}\n"

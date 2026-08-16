@@ -213,14 +213,15 @@ def decide_best_effort_candidate(
 
     Exact consecutive agreement remains the normal path.  When animation or
     suit flicker exhausts the bounded burst, select the strongest observed
-    physical candidate instead of emitting ``conflicting_valid_candidates``.
+    *legal* candidate instead of emitting ``conflicting_valid_candidates``.
     A non-pass candidate always outranks a pass marker in the same turn.
+
+    Illegal fragments are never promoted merely because the timer has moved
+    to the next player.  Card-type animations can temporarily expose only a
+    few ranks; committing that fragment would poison every later decision.
     """
 
     grouped: dict[tuple[bool, tuple[str, ...]], list[tuple[int, RecognitionSample]]] = (
-        defaultdict(list)
-    )
-    unresolved: dict[tuple[bool, tuple[str, ...]], list[tuple[int, RecognitionSample]]] = (
         defaultdict(list)
     )
     rejected: list[str] = []
@@ -238,26 +239,6 @@ def decide_best_effort_candidate(
         )
         if reason:
             rejected.append(reason)
-            if (
-                reason == "illegal_pattern"
-                and context.next_turn_evidence
-                and not sample.is_pass
-                and cards
-            ):
-                unresolved[(False, cards)].append(
-                    (
-                        index,
-                        RecognitionSample(
-                            cards=cards,
-                            is_pass=False,
-                            confidence=sample.confidence,
-                            source=sample.source,
-                            evidence_ref=sample.evidence_ref,
-                            suit_options=suit_options,
-                            post_hand=sample.post_hand,
-                        ),
-                    )
-                )
             continue
         normalized = RecognitionSample(
             cards=cards,
@@ -269,8 +250,6 @@ def decide_best_effort_candidate(
             post_hand=sample.post_hand,
         )
         grouped[_key(normalized)].append((index, normalized))
-    if not grouped and unresolved:
-        grouped = unresolved
     if not grouped:
         return None
 
@@ -284,6 +263,14 @@ def decide_best_effort_candidate(
         ),
     )
     winner = [item for _index, item in winner_items]
+    # A pass marker is particularly prone to bleeding over from the outgoing
+    # player's UI.  Unlike a complete card read, a single marker has no
+    # physical-card evidence to cross-check, so a best-effort fallback must
+    # never turn one such frame into a state-changing pass.  The normal
+    # strategies already require corroboration; retain that same minimum here
+    # when the burst is exhausted by next-turn evidence.
+    if winner[-1].is_pass and len(winner) < 2:
+        return None
     sample = _conservative_unknown_sample(winner)
     confidence = sum(item.confidence for item in winner) / len(winner)
     warnings = list(
@@ -296,8 +283,6 @@ def decide_best_effort_candidate(
     )
     if len(grouped) > 1:
         warnings.append("candidate_conflict_resolved_best_effort")
-    if unresolved and grouped is unresolved:
-        warnings.append("observed_pattern_unresolved")
     candidate = ConsensusCandidate(
         cards=sample.cards,
         is_pass=sample.is_pass,

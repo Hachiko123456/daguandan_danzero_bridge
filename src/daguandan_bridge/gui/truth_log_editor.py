@@ -24,9 +24,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from qfluentwidgets import CardWidget, CaptionLabel, PrimaryPushButton, PushButton
 
 from ..annotation_service import AnnotationService
+from ..application.fabledan_training_data import FableDanTrainingDataService
 from ..application.model_evaluation import EvaluationRunResult, ModelEvaluationService
+from ..application.replay_turn_draft import (
+    next_actor_after_prefix,
+    validate_turn_actor_chain,
+)
 from ..application.placement_projection import (
     PlacementProjection,
     format_placement_summary,
@@ -189,6 +195,7 @@ class TruthLogEditor(QWidget):
         recognition_service: ScreenshotRecognitionService | None = None,
         evaluation_service: ModelEvaluationService | None = None,
         repair_service: TimelineTruthMigrationService | None = None,
+        training_data_service: FableDanTrainingDataService | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = Path(session)
@@ -196,6 +203,8 @@ class TruthLogEditor(QWidget):
         self._frame_provider = frame_provider
         self._frame_scan_provider = frame_scan_provider
         self._recognition_service = recognition_service
+        self._training_data_service = training_data_service or FableDanTrainingDataService()
+        self._training_review_result = None
         self._last_recognized_frame: int | None = None
         self._placements = self._load_placements(truth_log)
         self._placement_badges_by_turn = self._placement_badges(self._placements)
@@ -314,11 +323,37 @@ class TruthLogEditor(QWidget):
         self.save_status = QLabel("未保存（保存后写入 truth_log.json）")
         self.save_status.setWordWrap(True)
         layout.addWidget(self.save_status)
+        self.fabledan_training_card = CardWidget(self)
+        training_layout = QVBoxLayout(self.fabledan_training_card)
+        training_layout.setContentsMargins(12, 10, 12, 10)
+        training_layout.addWidget(CaptionLabel("FableDan 真实对局训练数据"))
+        self.fabledan_training_status = QLabel(
+            "先核对回放，再检查训练资格。导出只生成离线样本，不会训练或替换当前模型。"
+        )
+        self.fabledan_training_status.setWordWrap(True)
+        training_layout.addWidget(self.fabledan_training_status)
+        training_buttons = QHBoxLayout()
+        self.inspect_fabledan_training_button = PushButton("检查训练资格")
+        self.confirm_fabledan_training_button = PrimaryPushButton(
+            "确认并导出 FableDan 样本"
+        )
+        self.confirm_fabledan_training_button.setEnabled(False)
+        training_buttons.addWidget(self.inspect_fabledan_training_button)
+        training_buttons.addWidget(self.confirm_fabledan_training_button)
+        training_buttons.addStretch(1)
+        training_layout.addLayout(training_buttons)
+        layout.addWidget(self.fabledan_training_card)
         self.add_button.clicked.connect(self.add_row)
         self.insert_button.clicked.connect(self.insert_row)
         self.remove_button.clicked.connect(self.remove_row)
         self.recognize_frame_button.clicked.connect(self._recognize_frame)
         self.save_button.clicked.connect(self._save)
+        self.inspect_fabledan_training_button.clicked.connect(
+            self._inspect_fabledan_training
+        )
+        self.confirm_fabledan_training_button.clicked.connect(
+            self._confirm_fabledan_training
+        )
         self.table.cellChanged.connect(self._cell_changed)
         self._render()
         self.evaluation_panel = ModelEvaluationPanel(
@@ -640,6 +675,31 @@ class TruthLogEditor(QWidget):
         self._resize_table()
         return row
 
+    def replace_confirmed_turn(
+        self,
+        turn: TruthTurn,
+        *,
+        status: str = "花色修正已回填",
+    ) -> int:
+        """Replace a scanned draft row without creating a second action."""
+
+        row: int | None = None
+        for index in range(self.table.rowCount()):
+            number_item = self.table.item(index, 0)
+            original = (
+                number_item.data(int(Qt.ItemDataRole.UserRole) + 1)
+                if number_item is not None
+                else None
+            )
+            if isinstance(original, TruthTurn) and original.index == turn.index:
+                row = index
+                break
+        if row is None:
+            raise ValueError(f"找不到第 {turn.index} 条待回填的扫描草稿")
+        self._replace_row(row, turn, status=status)
+        self._resize_table()
+        return row
+
     def _renumber_rows(self) -> None:
         for index in range(self.table.rowCount()):
             item = self.table.item(index, 0)
@@ -666,38 +726,20 @@ class TruthLogEditor(QWidget):
             self.add_row()
             return
         scroll = self._table_scroll_position()
-        before = self._expected_player_at(row)
-        after_actor = self._player_at(row)
-        after = (
-            self._previous_active_player(
-                after_actor,
-                self._out_players_before(row),
-            )
-            if after_actor is not None
-            else None
-        )
-        actor = before or after or "self"
-        conflict = bool(before and after and before != after)
-        status = "待确认：前后玩家候选冲突" if conflict else "待编辑"
+        # An inserted blank row has no action kind yet, so the following row
+        # cannot reliably be reverse-derived.  Use the sole reliable fact:
+        # the actor expected after the prefix before this row.  The complete
+        # chain is still validated on Save once the row has been filled in.
+        actor = self._expected_player_at(row) or "self"
         self._append_row(
             TruthTurn(self.table.rowCount() + 1, actor, False, ()),
             row=row,
             editable=True,
-            status=status,
+            status="待编辑",
         )
-        player = self.table.cellWidget(row, 1)
-        if player is not None:
-            player.setProperty("sequenceConflict", conflict)
         self._resize_table()
         self.table.selectRow(row)
         self._restore_table_scroll(scroll)
-        if conflict:
-            self.save_status.setText(
-                "插入位置前后玩家候选冲突："
-                f"前序推断为{_SEAT_LABELS[str(before)]}，"
-                f"后序反推为{_SEAT_LABELS[str(after)]}；"
-                "请人工选择玩家确认后再保存"
-            )
 
     def remove_row(self) -> None:
         row = self.table.currentRow()
@@ -830,7 +872,7 @@ class TruthLogEditor(QWidget):
         hand = _sort_hand_cards(self._hand, round_level)
         if not hand:
             raise ValueError("我方手牌不能为空")
-        return TruthLog(
+        log = TruthLog(
             source_session_id=self.truth_log.source_session_id,
             initial_state=TruthInitialState(str(round_level), lead, hand),
             turns=tuple(turns),
@@ -840,6 +882,13 @@ class TruthLogEditor(QWidget):
             provenance=self.truth_log.provenance,
             outcome=self.truth_log.outcome,
         )
+        # ``trick_id`` is display/provenance data in the editor.  Saving must
+        # instead re-derive the complete action chain so a stale id cannot
+        # conceal a direct seat jump (for example left -> right, skipping
+        # self).  The validator also skips players whose recorded cards are
+        # exhausted, matching the reducer's live turn ownership.
+        validate_turn_actor_chain(log)
+        return log
 
     def _recognition(self) -> ScreenshotRecognitionService:
         if self._recognition_service is None:
@@ -890,37 +939,41 @@ class TruthLogEditor(QWidget):
         actor = str(player.currentData())
         return actor if actor in TURN_ORDER else None
 
-    @staticmethod
-    def _next_active_player(actor: str, out: set[str]) -> str | None:
-        if actor not in TURN_ORDER:
-            return None
-        index = TURN_ORDER.index(actor)
-        for offset in range(1, len(TURN_ORDER) + 1):
-            seat = TURN_ORDER[(index + offset) % len(TURN_ORDER)]
-            if seat not in out:
-                return seat
-        return None
+    def _current_initial_state(self) -> TruthInitialState:
+        return TruthInitialState(
+            str(self.round_level_combo.currentData()),
+            str(self.lead_combo.currentData()),
+            tuple(self._hand),
+        )
 
-    @staticmethod
-    def _previous_active_player(actor: str, out: set[str]) -> str | None:
-        if actor not in TURN_ORDER:
-            return None
-        index = TURN_ORDER.index(actor)
-        for offset in range(1, len(TURN_ORDER) + 1):
-            seat = TURN_ORDER[(index - offset) % len(TURN_ORDER)]
-            if seat not in out:
-                return seat
-        return None
+    def _prefix_turns(self, stop_row: int) -> tuple[TruthTurn, ...]:
+        """Read the editable table prefix without trusting ``trick_id``."""
+
+        turns: list[TruthTurn] = []
+        for row in range(max(0, min(stop_row, self.table.rowCount()))):
+            actor = self._player_at(row)
+            if actor is None:
+                raise ValueError(f"第 {row + 1} 条动作的玩家无效")
+            is_pass = self._is_pass_from_row(row)
+            turns.append(
+                TruthTurn(
+                    row + 1,
+                    actor,
+                    is_pass,
+                    () if is_pass else self._cards_from_row(row),
+                )
+            )
+        return tuple(turns)
 
     def _expected_player_at(self, row: int) -> str | None:
         row = max(0, min(row, self.table.rowCount()))
-        if row == 0:
-            lead = self.lead_combo.currentData()
-            return str(lead) if lead in TURN_ORDER else None
-        actor = self._player_at(row - 1)
-        if actor is None:
+        try:
+            return next_actor_after_prefix(
+                self._current_initial_state(),
+                self._prefix_turns(row),
+            )
+        except ValueError:
             return None
-        return self._next_active_player(actor, self._out_players_before(row))
 
     def _expected_next_player(self) -> str | None:
         return self._expected_player_at(self.table.rowCount())
@@ -983,7 +1036,7 @@ class TruthLogEditor(QWidget):
         *,
         target_row: int,
         replacing: bool,
-    ) -> None:
+    ) -> str:
         expected = self._expected_player_at(target_row)
         if expected is None:
             raise ValueError("无法从当前位置前的有效记录推断玩家")
@@ -1004,24 +1057,26 @@ class TruthLogEditor(QWidget):
             card_code_to_text(card)
 
         if not replacing or target_row + 1 >= self.table.rowCount():
-            return
-        played = self._played_card_counts_before(target_row)
-        if not candidate.is_pass:
-            played[candidate.actor] = played.get(candidate.actor, 0) + len(
-                candidate.cards
-            )
-        expected_after = self._next_active_player(
+            return ""
+        replacement = TruthTurn(
+            target_row + 1,
             candidate.actor,
-            self._finished_players(played),
+            candidate.is_pass,
+            candidate.cards,
+        )
+        expected_after = next_actor_after_prefix(
+            self._current_initial_state(),
+            (*self._prefix_turns(target_row), replacement),
         )
         actual_after = self._player_at(target_row + 1)
         if expected_after != actual_after:
             expected_label = _SEAT_LABELS.get(str(expected_after), "无")
             actual_label = _SEAT_LABELS.get(str(actual_after), "无")
-            raise ValueError(
-                "识别结果与下一行上下文冲突："
-                f"识别后应轮到{expected_label}，下一行为{actual_label}"
+            return (
+                f"下一行待修正：识别后应轮到{expected_label}，"
+                f"第 {target_row + 2} 行当前为{actual_label}"
             )
+        return ""
 
     def _correct_unknown_suit_row(
         self,
@@ -1266,7 +1321,7 @@ class TruthLogEditor(QWidget):
                     f"识别当前画面：{source_note}；未写入"
                 )
                 return
-            self._validate_recognition_context(
+            downstream_warning = self._validate_recognition_context(
                 candidate,
                 target_row=target_row,
                 replacing=replacing,
@@ -1332,6 +1387,7 @@ class TruthLogEditor(QWidget):
             self.recognition_hint.setText(
                 f"识别当前画面：已原子回填第 {target_row + 1} 行"
                 f"（{source_note}），行数和相邻行未改变"
+                + (f"；{downstream_warning}" if downstream_warning else "")
             )
         else:
             self.recognition_hint.setText(
@@ -1349,6 +1405,47 @@ class TruthLogEditor(QWidget):
         except Exception as exc:
             self.save_status.setText(f"保存失败：{exc}")
             QLabel(str(exc), self).show()
+
+    def _inspect_fabledan_training(self) -> None:
+        """Refresh the sealed-session eligibility; this never changes weights."""
+
+        try:
+            result = self._training_data_service.inspect_session(self.session)
+        except Exception as exc:
+            self._training_review_result = None
+            self.confirm_fabledan_training_button.setEnabled(False)
+            self.fabledan_training_status.setText(f"训练数据检查失败：{exc}")
+            return
+        self._training_review_result = result
+        self.confirm_fabledan_training_button.setEnabled(result.can_confirm)
+        if result.status == "not_applicable":
+            text = result.message
+        elif result.status == "verified":
+            text = (
+                f"训练数据：已人工确认；可导出样本 {result.eligible_count} 条。"
+                "当前模型未被修改。"
+            )
+        else:
+            text = (
+                f"训练数据：候选决策 {result.candidate_count} 条，"
+                f"可导出 {result.eligible_count} 条。{result.message}"
+            )
+            if result.skipped:
+                text += f" 已排除 {len(result.skipped)} 条不完整或无法唯一映射的记录。"
+        self.fabledan_training_status.setText(text)
+
+    def _confirm_fabledan_training(self) -> None:
+        try:
+            result = self._training_data_service.confirm_and_export(self.session)
+        except Exception as exc:
+            self.confirm_fabledan_training_button.setEnabled(False)
+            self.fabledan_training_status.setText(f"训练样本未导出：{exc}")
+            return
+        self.confirm_fabledan_training_button.setEnabled(False)
+        self.fabledan_training_status.setText(
+            f"训练数据：已确认并导出 {result.sample_count} 条 FableDan 离线样本。"
+            "模型权重保持不变。"
+        )
 
     def _draft_mutated(self, *_args) -> None:
         self._clear_placement_badges()
@@ -1388,7 +1485,9 @@ class TruthLogEditor(QWidget):
             predicted = decision.get("predicted_action")
             error = ""
             if decision.get("status") != "evaluated":
-                error = f"错误：{decision.get('error_code') or 'unknown'}"
+                code = str(decision.get("error_code") or "UNKNOWN")
+                message = str(decision.get("error_message") or "没有记录具体错误原因")
+                error = f"错误：{message}（错误代码：{code}）"
             self.table.setCellWidget(
                 row,
                 4,

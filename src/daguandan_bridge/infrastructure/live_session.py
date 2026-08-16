@@ -13,10 +13,11 @@ from ..application.ports import (
     LiveSessionConstruction,
     RecognitionPort,
 )
+from ..advisor_strategy import load_profile_session_data_recording_enabled
 from ..live.orchestrator import LiveOrchestrator
-from ..live.recorder import SessionRecorder
+from ..live.recorder import InMemorySessionRecorder, SessionRecorder
 from ..live.reducer import LiveReducer
-from ..live.session_store import LiveSessionStore
+from ..live.session_store import InMemoryLiveSessionStore, LiveSessionStore
 
 
 class DefaultLiveSessionFactory:
@@ -52,31 +53,46 @@ class DefaultLiveSessionFactory:
         recognition_strategy: str,
         on_update: Callable[[Any], None] | None = None,
     ) -> LiveSessionConstruction:
-        store: LiveSessionStore | None = None
-        recorder: SessionRecorder | None = None
+        store: LiveSessionStore | InMemoryLiveSessionStore | None = None
+        recorder: SessionRecorder | InMemorySessionRecorder | None = None
         source = None
         try:
             loaded = self.capture.load_profile(self.profile_name)
-            store = LiveSessionStore(self.capture.profiles_root, self.profile_name)
-            manifest = build_session_manifest(
-                loaded.paths.profile_config_path,
-                loaded.paths.templates_config_path,
+            save_session_data = load_profile_session_data_recording_enabled(
+                self.capture.profiles_root,
+                self.profile_name,
             )
-            manifest["recognition_strategy"] = recognition_strategy
-            audit_info = getattr(self.advisor, "audit_info", None)
-            if callable(audit_info):
-                manifest["advisor"] = audit_info()
+            if save_session_data:
+                store = LiveSessionStore(
+                    self.capture.profiles_root,
+                    self.profile_name,
+                )
+                manifest = build_session_manifest(
+                    loaded.paths.profile_config_path,
+                    loaded.paths.templates_config_path,
+                )
+                manifest["recognition_strategy"] = recognition_strategy
+                audit_info = getattr(self.advisor, "audit_info", None)
+                if callable(audit_info):
+                    manifest["advisor"] = audit_info()
+                else:
+                    manifest["advisor"] = {
+                        "backend": type(self.advisor).__name__ if self.advisor else "none",
+                        "standard_no_tribute": True,
+                    }
+                store.start(manifest)
+                recorder = SessionRecorder(
+                    store.directory,
+                    size=loaded.config.base_size,
+                    fps=10,
+                )
             else:
-                manifest["advisor"] = {
-                    "backend": type(self.advisor).__name__ if self.advisor else "none",
-                    "standard_no_tribute": True,
-                }
-            store.start(manifest)
-            recorder = SessionRecorder(
-                store.directory,
-                size=loaded.config.base_size,
-                fps=10,
-            )
+                store = InMemoryLiveSessionStore(
+                    self.capture.profiles_root,
+                    self.profile_name,
+                )
+                store.start({})
+                recorder = InMemorySessionRecorder(store.directory)
             orchestrator = LiveOrchestrator(
                 reducer=LiveReducer(store.session_id),
                 store=store,

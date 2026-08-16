@@ -31,6 +31,10 @@ _PARTNER_SEAT = {
     "right": "left",
     "left": "right",
 }
+_TEAMS = (
+    frozenset({"self", "opposite"}),
+    frozenset({"right", "left"}),
+)
 
 
 class LiveReducer:
@@ -360,9 +364,8 @@ class LiveReducer:
             return
         self._remaining_cards[player] = 0
         self._finished_seats.add(player)
-        if len(self._finished_seats) >= 3:
-            self._trick_plays.clear()
-            self._current_player = None
+        if self._round_is_decided():
+            self._close_round()
             return
         if self._current_player == player:
             self._current_player = next_active_seat(
@@ -452,12 +455,10 @@ class LiveReducer:
             if self._remaining_cards[player] == 0:
                 self._finished_seats.add(player)
 
-        # 产生第三名即已能确定四个名次：尚未出完者自然为末游。
-        # 不再把不存在的第四名强行排入下一回合，否则会伪造“不出”、
-        # 接风和一个无效的 DanZero 请求。
-        if len(self._finished_seats) >= 3:
-            self._trick_plays.clear()
-            self._current_player = None
+        # 头游和二游为队友时已经形成双下；否则产生第三名后也能确定末游。
+        # 两种情况都不能再伪造后续行动者、PASS 或模型请求。
+        if self._round_is_decided():
+            self._close_round()
             self._turn_id += 1
             return
 
@@ -487,11 +488,17 @@ class LiveReducer:
         # the wind-catch case their partner receives that lead automatically,
         # so the partner is not expected to emit a synthetic pass. Only the
         # still-active opponents must decline the completed play.
-        next_leader = (
-            _PARTNER_SEAT.get(leader, leader)
-            if leader in self._finished_seats
-            else leader
-        )
+        next_leader = leader
+        if leader in self._finished_seats:
+            next_leader = _PARTNER_SEAT.get(leader, leader)
+            if next_leader in self._finished_seats:
+                if self._round_is_decided():
+                    self._close_round()
+                    return
+                next_leader = next_active_seat(
+                    next_leader,
+                    frozenset(self._finished_seats),
+                )
         required_passes = active - {next_leader}
         later = self._trick_plays[last_non_pass_index + 1 :]
         passed = {event.player for event in later if event.is_pass}
@@ -503,6 +510,14 @@ class LiveReducer:
             self._lead_player = leader
             self._current_player = leader
             self._trick_id += 1
+
+    def _round_is_decided(self) -> bool:
+        finished = frozenset(self._finished_seats)
+        return len(finished) >= 3 or any(team.issubset(finished) for team in _TEAMS)
+
+    def _close_round(self) -> None:
+        self._trick_plays.clear()
+        self._current_player = None
 
     def snapshot(self) -> LiveSnapshot:
         return LiveSnapshot(

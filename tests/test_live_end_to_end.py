@@ -65,6 +65,9 @@ class ScriptedRecognition:
 
 
 class FakeAdvisor:
+    strategy_id = "danzero"
+    display_name = "DanZero"
+
     def __init__(self):
         self.calls = 0
 

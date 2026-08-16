@@ -11,7 +11,7 @@
 - 评测方法固定为 teacher-forced，不允许模型预测改变后续状态。
 - “正式完整局评测”和“草稿诊断”是两种明确分开的输入模式，结果不可混合汇总。
 - 受试策略显式选择为 DanZero、FableDan 模型或 FableDan RuleAgent 规则基线。
-- FableDan 模型必须实际加载有效的 `fabledan_weights.npz`；缺失、损坏或运行时退化为 RuleAgent 时，不能记为 FableDan 模型成绩。
+- FableDan 模型必须实际加载有效的 `best.npz`；缺失、损坏或运行时退化为 RuleAgent 时，不能记为 FableDan 模型成绩。
 - 每次运行写入会话目录下不可覆盖的独立报告目录。
 
 ## 2. 目标与非目标
@@ -93,7 +93,7 @@
 | strategy_id | 展示名 | 必需资源 | 允许的实际后端 |
 | --- | --- | --- | --- |
 | `danzero_model` | DanZero | DanZero 依赖和模型权重可加载 | DanZero 模型 |
-| `fabledan_model` | FableDan 模型 | `<profile>/models/fabledan_weights.npz` 存在、可读、结构校验通过 | `numpy` |
+| `fabledan_model` | FableDan 模型 | `<profile>/models/best.npz` 存在、可读、结构校验通过 | `numpy` |
 | `fabledan_rule` | FableDan RuleAgent 规则基线 | vendored RuleAgent 可初始化 | `rule` |
 
 运行前保存策略 ID、模型路径、文件摘要、适配器 schema、代码版本和实际 backend。DanZero 或 FableDan 模型资源缺失、不可读或初始化失败时，运行状态为 `blocked`。
@@ -225,7 +225,7 @@ for turn in frozen_truth.turns:
 │ 对局 [session 下拉] [刷新]  输入 [正式完整局 / 草稿诊断]     │
 │ 资格  已验证完整局 / 3 个阻断项 [查看详情]                   │
 │ 策略  (●) DanZero  ( ) FableDan 模型  ( ) RuleAgent 基线    │
-│ 模型  <profile>/models/fabledan_weights.npz  [校验]          │
+│ 模型  <profile>/models/best.npz  [校验]                      │
 │ [开始整局评测] [取消]                  状态：running 12/28   │
 ├─────────────────────────────────────────────────────────────┤
 │ coverage  exact  pass/play  lead  follow  p50/p95 latency   │

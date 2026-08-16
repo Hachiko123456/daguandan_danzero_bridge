@@ -72,6 +72,12 @@ class ZoneLifecycle:
         self._settle_started_ms: int | None = None
         self._stable_since_ms: int | None = None
         self._effect_last_seen_ms: int | None = None
+        # Some compact centre-region plays (notably four-of-a-kind) change the
+        # content fingerprint reliably but cover too little of the full ROI to
+        # cross the occupancy threshold.  Remember that *content-only* start
+        # long enough to read its burst; ordinary occupied actions retain the
+        # existing disappearance behaviour below.
+        self._content_only_action = False
 
     def observe(self, metrics: ZoneFrameMetrics) -> ZoneDecision:
         now = int(metrics.monotonic_ms)
@@ -85,7 +91,7 @@ class ZoneLifecycle:
                 timed_out=True,
             )
 
-        action_visible = bool(metrics.occupied or metrics.pass_visible)
+        reported_visible = bool(metrics.occupied or metrics.pass_visible)
         initial_occupied = bool(
             not self._activation_observed
             and self._accept_initial_occupied
@@ -102,15 +108,25 @@ class ZoneLifecycle:
         if self.phase == ZonePhase.WAIT_ACTION:
             if not changed:
                 return ZoneDecision(self.phase)
+            if metrics.content_changed and not reported_visible:
+                self._content_only_action = True
             self.phase = ZonePhase.SETTLING
             self._settle_started_ms = now
             self._stable_since_ms = now
+
+        # A content-only start is genuine evidence that a previously static
+        # expected-seat ROI changed.  Without this latch the same frame opens
+        # SETTLING and immediately closes it as ``action_disappeared`` before
+        # recognition can inspect the cards.  Do not make this global: a
+        # normally occupied region still resets as soon as it disappears.
+        action_visible = bool(reported_visible or self._content_only_action)
 
         if self.phase == ZonePhase.SETTLING:
             if not action_visible:
                 self.phase = ZonePhase.WAIT_ACTION
                 self._settle_started_ms = None
                 self._stable_since_ms = None
+                self._content_only_action = False
                 return ZoneDecision(
                     self.phase,
                     discard_burst=True,
@@ -146,6 +162,7 @@ class ZoneLifecycle:
                 self.phase = ZonePhase.WAIT_ACTION
                 self._settle_started_ms = None
                 self._stable_since_ms = None
+                self._content_only_action = False
                 return ZoneDecision(
                     self.phase,
                     discard_burst=True,

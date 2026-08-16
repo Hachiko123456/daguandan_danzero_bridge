@@ -114,6 +114,30 @@ def test_float_window_shows_fabledan_q_summary_from_existing_result():
     window.hide()
 
 
+def test_float_window_uses_selected_fabledan_name_while_requesting():
+    app = _app()
+    runtime = FakeRuntime()
+    runtime.advisor_strategy = "fabledan"
+    window = RecommendationFloatWindow(runtime)
+    request = LiveAdvice(
+        key=AdviceRequestKey("session", 7, 8),
+        status="requested",
+    )
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self"),
+            advice=request,
+        )
+    )
+    app.processEvents()
+
+    assert window.windowTitle() == "FableDan 极简推荐"
+    assert window.detail_label.text() == "FableDan 正在使用最新手牌"
+    window.hide()
+
+
 def test_float_window_keeps_its_size_and_shows_the_current_trick():
     app = _app()
     runtime = FakeRuntime()

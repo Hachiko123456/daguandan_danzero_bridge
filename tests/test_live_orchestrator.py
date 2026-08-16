@@ -455,6 +455,142 @@ def test_empty_action_window_timeout_rearms_silently(tmp_path):
     orchestrator.finish()
 
 
+def test_first_action_confirmation_survives_a_transient_zone_reset(tmp_path):
+    """A live queue may put two reads of the same opening play in two bursts."""
+
+    orchestrator = _orchestrator(
+        tmp_path,
+        [_play("3D"), _play("3D")],
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=100,
+        wall_time="opening-read-1",
+        metrics=ZoneFrameMetrics(100, True, 0.20, False, False),
+    )
+    # The effect/ROI change clears the ordinary burst between the two samples.
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=200,
+        wall_time="opening-transition",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+    update = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=300,
+        wall_time="opening-read-2",
+        metrics=ZoneFrameMetrics(300, True, 0.20, False, False),
+    )
+
+    assert update.event is not None
+    assert update.event.event_type == "player_played"
+    assert update.event.actor == "right"
+    assert update.event.payload["cards"] == ["3D"]
+    assert orchestrator.snapshot.current_player == "opposite"
+    orchestrator.finish()
+
+
+def test_first_action_timeout_keeps_observed_cards_and_opening_guard(tmp_path):
+    """A failed opening read must be diagnosable and continue as an opening turn."""
+
+    invalid = PlayRegionResult(
+        player="right",
+        cards=("3S", "4S"),
+        is_pass=False,
+        confidence=0.94,
+        diagnostics=(),
+        annotations=(),
+        source="fake-invalid-opening",
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [invalid, _play("7S"), _play("7S")],
+        settle_ms=0,
+        action_timeout_ms=300,
+        recognition_strategy="two_valid_streak",
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=100,
+        wall_time="invalid-opening-read",
+        metrics=ZoneFrameMetrics(100, True, 0.20, False, False),
+    )
+    retry = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=301,
+        wall_time="opening-timeout",
+        metrics=ZoneFrameMetrics(301, True, 0.0, False, False),
+    )
+
+    assert retry.event is not None
+    assert retry.event.event_type == "recognition_retry"
+    assert retry.event.payload["reason"] == "action_timeout"
+    assert "3S 4S" in retry.event.payload["message"]
+    assert "没有可用候选" not in retry.event.payload["message"]
+    assert orchestrator._first_action_pending
+
+    for timestamp in (400, 500):
+        update = orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"opening-recovery-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.20, False, False),
+        )
+
+    assert update.event is not None
+    assert update.event.event_type == "player_played"
+    assert not orchestrator._first_action_pending
+    assert orchestrator.snapshot.current_player == "opposite"
+    orchestrator.finish()
+
+
+def test_timeout_commits_two_matching_legal_first_action_reads(tmp_path, monkeypatch):
+    """Do not discard stable first-play evidence merely because the timer won."""
+
+    orchestrator = _orchestrator(
+        tmp_path,
+        [_play("7D", "7S"), _play("7D", "7S")],
+        settle_ms=0,
+        action_timeout_ms=300,
+        recognition_strategy="two_valid_streak",
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    # Simulate a live handoff whose ordinary per-frame decision was
+    # invalidated after samples were logged but before it could commit.
+    monkeypatch.setattr(orchestrator, "_decide_if_ready", lambda *_args: None)
+    for timestamp in (100, 200):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"deferred-first-read-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.20, False, False),
+        )
+
+    update = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=301,
+        wall_time="deferred-first-timeout",
+        metrics=ZoneFrameMetrics(301, True, 0.0, False, False),
+    )
+
+    assert update.event is not None
+    assert update.event.event_type == "player_played"
+    assert update.event.actor == "right"
+    assert update.event.payload["cards"] == ["7D", "7S"]
+    assert not any(
+        event.event_type == "recognition_retry" for event in orchestrator.events
+    )
+    assert orchestrator.snapshot.current_player == "opposite"
+    orchestrator.finish()
+
+
 def test_new_action_window_ignores_stale_pixels_from_the_same_player_region(tmp_path):
     recognition = FakeRecognitionService([_play("7S")] * 4)
     orchestrator = _orchestrator(tmp_path, [], recognition=recognition)
@@ -760,6 +896,45 @@ def test_visual_head_badge_recovers_finish_and_wind_after_two_frames(tmp_path):
         and event.payload == {"from_player": "left", "to_player": "right"}
         for event in update.events
     )
+    orchestrator.finish()
+
+
+def test_visual_second_teammate_ends_round_without_turning_to_finished_head(tmp_path):
+    orchestrator = _orchestrator(
+        tmp_path,
+        [_play("7S")],
+        lead_player="right",
+    )
+    orchestrator.reducer.confirm_player_finished(
+        "right",
+        placement="head",
+        source="test",
+    )
+    orchestrator._finish_order.append("right")
+    fast = FastSignalResult(
+        expected_player="opposite",
+        active_player="opposite",
+        pass_visible=False,
+        self_action_buttons_visible=False,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="left",
+                placement="second",
+                confidence=0.99,
+                source="template:second",
+            ),
+        ),
+    )
+
+    assert orchestrator._apply_visual_placements(fast) == ()
+    events = orchestrator._apply_visual_placements(fast)
+
+    assert len(events) == 1
+    assert events[0].event_type == "player_finished"
+    assert events[0].actor == "left"
+    assert orchestrator.snapshot.current_player is None
+    assert "right" in orchestrator.snapshot.finished_seats
     orchestrator.finish()
 
 
@@ -1490,6 +1665,17 @@ def test_waiting_lead_auto_confirms_from_first_play_marker(tmp_path):
     assert "lead_player_confirmed" in event_types
     assert "turn_started" in event_types
     orchestrator.finish()
+
+
+def test_opening_self_action_buttons_do_not_identify_self_as_lead():
+    signal = OpeningSignal(
+        super_double_visible=False,
+        marker_player=None,
+        active_player=None,
+        self_action_buttons_visible=True,
+    )
+
+    assert LiveOrchestrator._lead_candidate_from_opening(signal) is None
 
 
 def test_lead_confirmation_preserves_opening_baseline_for_the_first_action(tmp_path):

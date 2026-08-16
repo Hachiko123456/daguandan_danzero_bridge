@@ -71,7 +71,7 @@ class LiveCaptureSource:
                     raise LiveCaptureInterrupted(
                         "屏幕采集已暂停：目标牌桌被其他窗口遮挡"
                         f"（{names}）。请把推荐浮窗和完整助手移到牌桌客户区外，"
-                        "再点击继续；被遮挡帧不会进入识别或 DanZero。"
+                        "再点击继续；被遮挡帧不会进入识别或策略计算。"
                     )
         except LiveCaptureInterrupted:
             raise

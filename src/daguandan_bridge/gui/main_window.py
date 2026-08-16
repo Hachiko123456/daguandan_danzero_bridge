@@ -49,7 +49,7 @@ class DaguandanBridgeWindow(FluentWindow):
             FluentIcon.VIDEO,
             "对局回放",
         )
-        self.setWindowTitle("大掼蛋 DanZero 桥接器")
+        self.setWindowTitle("大掼蛋智能助手")
         self.resize(1220, 820)
         self.setMinimumSize(980, 700)
 

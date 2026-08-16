@@ -554,7 +554,7 @@ def test_single_image_page_displays_colored_cards_and_annotation_boxes():
     app.processEvents()
 
 
-def test_single_image_page_exposes_hand_as_copyable_danzero_code():
+def test_single_image_page_exposes_hand_as_copyable_strategy_code():
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication
     from daguandan_bridge.gui.single_image_danzero_page import SingleImageDanzeroPage
@@ -564,7 +564,7 @@ def test_single_image_page_exposes_hand_as_copyable_danzero_code():
     page.my_hand_edit.setText("3S 4H small_joker")
     page.copy_hand_code_button.click()
 
-    assert "DanZero" in page.copy_hand_code_button.toolTip()
+    assert "策略输入" in page.copy_hand_code_button.toolTip()
     assert QGuiApplication.clipboard().text() == "3S 4H small_joker"
     assert "mono" in page.my_hand_edit.font().family().lower()
     assert page.form_splitter.orientation() == Qt.Orientation.Horizontal
@@ -730,7 +730,7 @@ def test_single_image_state_form_rejects_invalid_cards(tmp_path):
     app.processEvents()
 
 
-def test_annotation_page_opens_single_image_danzero_test_page(tmp_path):
+def test_annotation_page_opens_single_image_strategy_test_page(tmp_path):
     root = tmp_path / "profiles"
     shutil.copytree(
         PROFILES_ROOT / "tencent_daguandan",
@@ -744,7 +744,7 @@ def test_annotation_page_opens_single_image_danzero_test_page(tmp_path):
     app = QApplication.instance() or QApplication([])
 
     page = AnnotationPage(AnnotationService(root))
-    assert page.single_image_test_button.text() == "单图标注 / 测试 DanZero"
+    assert page.single_image_test_button.text() == "单图识别 / 策略测试"
     page.single_image_test_button.click()
     app.processEvents()
 
@@ -947,7 +947,7 @@ def test_single_image_danzero_test_shows_error_and_restores_button(tmp_path):
 
     assert _wait_until(lambda: dialog.test_button.isEnabled())
     assert "模拟 DanZero 异常" in dialog.result_text.toPlainText()
-    assert dialog.status.text() == "DanZero 测试失败"
+    assert dialog.status.text() == "策略测试失败"
 
     dialog.close()
     page.close()

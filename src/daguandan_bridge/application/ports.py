@@ -51,6 +51,7 @@ class AdvicePort(Protocol):
 class SessionPersistencePort(Protocol):
     session_id: str
     directory: Path
+    persistence_enabled: bool
 
     def start(self, manifest: dict[str, object]) -> None: ...
     def append_event(self, event: LiveEvent) -> None: ...

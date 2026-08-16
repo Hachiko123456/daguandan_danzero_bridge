@@ -45,19 +45,19 @@ class _Advisor:
         self.initialize_count += 1
 
     def audit_info(self):
-        return {"backend": "danzero", "status": "loaded", "digest": "a" * 64}
+        return {"backend": "numpy", "status": "loaded", "digest": "a" * 64}
 
     def recommend(self, state, *, request_id="", trace=None):
         del trace
         return AdviceResult(
-            strategy="danzero",
+            strategy="fabledan-numpy",
             cards=("2S",),
             play_type="SINGLE",
             is_pass=False,
             state_revision=state.revision,
             elapsed_ms=0.1,
             request_id=request_id,
-            engine_input={"backend": "danzero"},
+            engine_input={"backend": "numpy"},
         )
 
 

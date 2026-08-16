@@ -13,6 +13,7 @@ from typing import Any, Iterable, Literal
 
 import numpy as np
 
+from ..action_semantics import canonical_fabledan_type
 from ..config import PROFILES_ROOT
 from ..danzero.state import (
     GameStateError,
@@ -24,7 +25,7 @@ from ..danzero.state import (
 )
 from ..domain.advice import AdviceResult, StrategyExecutionTrace
 from ._vendor.fabledan.agents import NumpyAgent, RuleAgent
-from ._vendor.fabledan.cards import RANK_NAMES, is_wildcard, rank_of
+from ._vendor.fabledan.cards import RANK_NAMES, is_wildcard, order_of, rank_of
 from ._vendor.fabledan.combos import (
     PASS,
     TYPE_NAMES,
@@ -50,6 +51,7 @@ UPSTREAM_COMMIT = "7cc5e311b9860bc44f76c082d9c1b21fc8b2d3ec"
 ADAPTER_SCHEMA = "fabledan-adapter/v1"
 STANDARD_NO_TRIBUTE = True
 DECISION_TRACE_SCHEMA = "fabledan-trace/1"
+DEFAULT_WEIGHTS_FILENAME = "best.npz"
 DiagnosticsMode = Literal["off", "basic", "full"]
 _TURN_ORDER: tuple[Seat, ...] = ("self", "right", "opposite", "left")
 _SEAT_TO_PLAYER: dict[Seat, int] = {
@@ -174,6 +176,8 @@ class _PhysicalCards:
 class FableDanAdvisor:
     """Adapt confirmed ``GuanDanState`` snapshots to vendored FableDan."""
 
+    strategy_id = "fabledan"
+    display_name = "FableDan"
     requires_exact_history_suits = True
 
     def __init__(
@@ -186,12 +190,12 @@ class FableDanAdvisor:
         diagnostics: DiagnosticsMode | None = None,
         write_decision_log: bool = True,
         log_directory: Path | str | None = None,
-        top_n: int = 5,
+        top_n: int = 3,
     ) -> None:
         if runtime_policy not in {"auto", "model_required", "rule_only"}:
-            raise ValueError(f"unsupported FableDan runtime policy: {runtime_policy}")
+            raise ValueError(f"不支持的 FableDan 运行策略：{runtime_policy}")
         if int(top_n) < 1:
-            raise ValueError("top_n must be at least 1")
+            raise ValueError("top_n 至少必须为 1")
         self.profiles_root = Path(profiles_root)
         self.profile_name = str(profile_name)
         self.runtime_policy = runtime_policy
@@ -212,7 +216,7 @@ class FableDanAdvisor:
             self.profiles_root
             / self.profile_name
             / "models"
-            / "fabledan_weights.npz"
+            / DEFAULT_WEIGHTS_FILENAME
         )
         self._runtime: _PolicyRuntime | None = None
         self._runtime_lock = Lock()
@@ -221,6 +225,24 @@ class FableDanAdvisor:
     def initialize(self) -> None:
         runtime = self._ensure_runtime()
         self._require_model_runtime(runtime)
+
+    def decision_input_fingerprint(
+        self,
+        state: GuanDanState,
+        *,
+        request_id: str = "fabledan-input-fingerprint",
+    ) -> tuple[str, str, int]:
+        """Hash the exact encoded FableDan input without running the model."""
+
+        mapped = self._map_snapshot(state.local_snapshot(), request_id=request_id)
+        tokens, features = encode_decision(mapped.observation)
+        token_array = np.asarray(tokens, dtype=np.int64)
+        feature_array = np.ascontiguousarray(features)
+        return (
+            sha256(token_array.tobytes()).hexdigest(),
+            sha256(feature_array.tobytes()).hexdigest(),
+            len(mapped.legal),
+        )
 
     def audit_info(self) -> dict[str, object]:
         runtime = self._ensure_runtime()
@@ -359,6 +381,16 @@ class FableDanAdvisor:
         engine_input["selected_action_index"] = selected_index
         engine_input["selected_action"] = _move_audit(move)
         engine_input.update(self._runtime_audit(active_runtime))
+        # Keep the exact model input needed for offline training even when the
+        # optional, much larger diagnostic trace is disabled.  This snapshot is
+        # intentionally independent from Q values: real-game labels must come
+        # from the confirmed final result, never from the model's own output.
+        engine_input["fabledan_training_input"] = _training_input_payload(
+            mapped=mapped,
+            runtime=active_runtime,
+            tokens=tokens,
+            features=features,
+        )
         engine_input["debug"] = self.debug
         engine_input["diagnostics_mode"] = self.diagnostics
         decision_audit = {
@@ -368,9 +400,17 @@ class FableDanAdvisor:
             "second_q": second_q,
             "q_gap": q_gap,
             "legal_action_count": len(mapped.legal),
-            "candidates": [candidate.to_dict() for candidate in candidates],
+            # Keep the normal runtime payload compact.  The complete ranking is
+            # still retained in the full diagnostic trace below when requested.
+            "candidates": [
+                candidate.to_dict() for candidate in candidates[: self.top_n]
+            ],
             "warnings": list(warnings),
         }
+        # The UI can show the model's best alternatives without enabling the
+        # much larger token/feature/Q-value diagnostics payload.
+        engine_input["top_n"] = self.top_n
+        engine_input["decision"] = decision_audit
         if self.debug:
             trace_payload = _decision_trace_payload(
                 request_id=request_id,
@@ -386,10 +426,8 @@ class FableDanAdvisor:
             )
             engine_input.update(
                 {
-                    "top_n": self.top_n,
                     "encoding": trace_payload.get("encoding", {}),
                     "q_values": _q_values_audit(mapped.legal, q_values),
-                    "decision": decision_audit,
                     "validation_warnings": list(warnings),
                     "fabledan_trace": trace_payload,
                 }
@@ -500,7 +538,7 @@ class FableDanAdvisor:
                     "missing",
                     path,
                     None,
-                    "weights file does not exist",
+                    "模型权重文件不存在",
                 )
                 return self._runtime
             try:
@@ -568,7 +606,7 @@ class FableDanAdvisor:
             runtime.backend != "numpy" or runtime.status != "loaded"
         ):
             raise RuntimeError(
-                "FableDan model_required requires a valid fabledan_weights.npz: "
+                f"FableDan model_required（模型模式）要求 {DEFAULT_WEIGHTS_FILENAME} 可用："
                 f"{runtime.error or runtime.status}"
             )
 
@@ -632,8 +670,30 @@ class FableDanAdvisor:
                 if trick_lead is not None and not beats(
                     move, trick_lead, RANK_NAMES.index(snapshot.round_level)
                 ):
+                    move_audit = _move_audit(
+                        move,
+                        level=RANK_NAMES.index(snapshot.round_level),
+                    )
+                    lead_audit = _move_audit(
+                        trick_lead,
+                        level=RANK_NAMES.index(snapshot.round_level),
+                    )
+                    diagnostic = {
+                        "code": "history_move_does_not_beat_lead",
+                        "source_turn_id": index,
+                        "player": event.player,
+                        "physical_cards": list(event.cards),
+                        "declared_move": move_audit,
+                        "lead_owner": trick_leader,
+                        "lead_move": lead_audit,
+                        "reason": "该动作声明按掼蛋牌型比较不能压过当前桌面",
+                    }
                     raise FableDanStateError(
-                        f"第 {index} 条历史声明不能压过当前桌面"
+                        f"第 {index} 条历史动作 {TYPE_NAMES[move.type]} "
+                        f"{_move_text(move)}（实体牌 {' '.join(event.cards)}）"
+                        f"不能压过 {trick_leader} 的 {TYPE_NAMES[trick_lead.type]} "
+                        f"{_move_text(trick_lead)}",
+                        diagnostic=diagnostic,
                     )
                 counts[event.player] -= len(card_ids)
                 if counts[event.player] < 0:
@@ -912,36 +972,97 @@ def _unique_observed_move(
         )
     selected_semantics = _selected_move_semantics(action_metadata)
     if selected_semantics is not None:
-        matches = [
-            move
+        selection_source = str(
+            (action_metadata or {}).get("selection_source", "exact_engine_state")
+        )
+        candidate_checks = [
+            (
+                move,
+                _move_semantics_mismatches(
+                    move,
+                    selected_semantics,
+                    level=level,
+                    selection_source=selection_source,
+                ),
+            )
             for move in by_declaration.values()
-            if _move_matches_semantics(move, selected_semantics, level=level)
         ]
+        matches = [move for move, reasons in candidate_checks if not reasons]
         if len(matches) == 1:
             return matches[0], {
-                "selection_source": str(
-                    (action_metadata or {}).get("selection_source", "exact_engine_state")
-                ),
+                "selection_source": selection_source,
                 "ambiguity": len(by_declaration) > 1,
                 "selected_interpretation": _move_audit(matches[0], level=level),
                 "candidate_interpretations": [
                     _move_audit(move, level=level) for move in by_declaration.values()
                 ],
             }
+        mismatch_details = [
+            {
+                "candidate": _move_audit(move, level=level),
+                "mismatch_reasons": reasons,
+            }
+            for move, reasons in candidate_checks
+        ]
+        physical_cards = sorted(_card_code(card) for card in card_ids)
+        wildcard_count = sum(is_wildcard(card, level) for card in card_ids)
+        if len(by_declaration) == 1 and wildcard_count == 0:
+            move = next(iter(by_declaration.values()))
+            reasons = mismatch_details[0]["mismatch_reasons"]
+            reason_text = "；".join(str(reason) for reason in reasons)
+            warning = {
+                "code": "unique_physical_move_metadata_mismatch",
+                "message": (
+                    f"第 {history_index} 条历史不含逢人配，实体牌仅有一个合法解释；"
+                    f"已采用 FableDan 唯一候选 {TYPE_NAMES[move.type]}，忽略不一致的动作语义元数据。"
+                    f"差异：{reason_text}"
+                ),
+                "provided_interpretation": selected_semantics,
+                "selected_interpretation": _move_audit(move, level=level),
+                "mismatch_reasons": reasons,
+            }
+            return move, {
+                "selection_source": "inferred_unique_after_metadata_warning",
+                "provided_selection_source": selection_source,
+                "ambiguity": False,
+                "selected_interpretation": _move_audit(move, level=level),
+                "candidate_interpretations": [_move_audit(move, level=level)],
+                "metadata_warning": warning,
+            }
+        candidate_text = "；".join(
+            f"{item['candidate']['type']} key={item['candidate']['key']}："
+            + "、".join(str(reason) for reason in item["mismatch_reasons"])
+            for item in mismatch_details
+        )
+        code = (
+            "action_semantics_not_unique"
+            if len(matches) > 1
+            else "action_semantics_mismatch"
+        )
+        reason = (
+            "已记录语义仍匹配多个 FableDan 候选，无法唯一确定动作"
+            if len(matches) > 1
+            else "已记录语义不能匹配任何 FableDan 候选"
+        )
         diagnostic = {
-            "code": "wildcard_semantics_mismatch",
+            "code": code,
             "source_turn_id": history_index,
-            "physical_cards": sorted(_card_code(card) for card in card_ids),
+            "physical_cards": physical_cards,
             "level": level_rank,
             "wild_rank": level_rank,
+            "wildcard_count": wildcard_count,
             "provided_interpretation": selected_semantics,
             "candidate_interpretations": [
                 _move_audit(move, level=level) for move in by_declaration.values()
             ],
-            "reason": "已记录语义不能唯一匹配 FableDan 候选声明",
+            "candidate_match_diagnostics": mismatch_details,
+            "reason": reason,
         }
         raise FableDanStateError(
-            f"第 {history_index} 条历史的 wildcard 语义与 FableDan 候选不一致",
+            f"第 {history_index} 条历史动作语义不一致：实体牌 "
+            f"{' '.join(physical_cards)}；记录语义 "
+            f"{json.dumps(selected_semantics, ensure_ascii=False, sort_keys=True)}；"
+            f"{reason}。候选差异：{candidate_text}",
             diagnostic=diagnostic,
         )
     if len(by_declaration) != 1:
@@ -973,10 +1094,13 @@ def _unique_observed_move(
             ],
             "selected_interpretation": None,
             "selection_source": "unresolved",
-            "reason": "旧 TruthLog 只有实体牌，多个 wildcard 声明消费同一组实体牌",
+            "reason": "只有实体牌信息，多个 wildcard 声明会消费同一组实体牌，不能静默选择",
         }
         raise FableDanStateError(
-            f"第 {history_index} 条历史的 wildcard 声明不唯一：{declarations}",
+            f"第 {history_index} 条历史的 wildcard 声明不唯一：实体牌 "
+            f"{' '.join(diagnostic['physical_cards'])} 在级牌 {level_rank} 下有 "
+            f"{len(by_declaration)} 种解释（{declarations}）；"
+            "缺少已确认的动作语义，不能替模型静默选择",
             diagnostic=diagnostic,
         )
     move = next(iter(by_declaration.values()))
@@ -1010,66 +1134,143 @@ def _move_matches_semantics(
     semantics: dict[str, object],
     *,
     level: int,
+    selection_source: str = "exact_engine_state",
 ) -> bool:
+    return not _move_semantics_mismatches(
+        move,
+        semantics,
+        level=level,
+        selection_source=selection_source,
+    )
+
+
+def _move_semantics_mismatches(
+    move: Move,
+    semantics: dict[str, object],
+    *,
+    level: int,
+    selection_source: str,
+) -> list[str]:
+    mismatches: list[str] = []
+    actual_type = TYPE_NAMES[move.type]
     type_id = semantics.get("type_id")
     if type_id is not None:
         try:
             if int(type_id) != move.type:
-                return False
+                mismatches.append(
+                    f"记录 type_id={type_id}，候选 type_id={move.type}（{actual_type}）"
+                )
         except (TypeError, ValueError):
-            return False
+            mismatches.append(f"记录 type_id={type_id!r} 不是有效整数")
     move_type = semantics.get("move_type", semantics.get("play_type"))
     if move_type is not None:
-        aliases = {
-            "straightflush": "SFLUSH",
-            "straight_flush": "SFLUSH",
-            "bomb": "BOMB",
-            "straight": "STRAIGHT",
-            "pair": "PAIR",
-            "single": "SINGLE",
-            "triple": "TRIPLE",
-            "fullhouse": "FULL",
-            "full_house": "FULL",
-            "plate": "PLATE",
-            "tube": "TUBE",
-            "rocket": "ROCKET",
-        }
-        normalized = str(move_type).replace("-", "_").replace(" ", "_").lower()
-        expected = aliases.get(normalized, str(move_type).upper())
-        if expected != TYPE_NAMES[move.type]:
-            return False
+        expected = canonical_fabledan_type(move_type)
+        if expected is None:
+            mismatches.append(f"记录牌型 {move_type!r} 无法识别")
+        elif expected != actual_type:
+            mismatches.append(
+                f"记录牌型 {move_type!r} 归一化为 {expected}，候选牌型为 {actual_type}"
+            )
     claim_ranks = semantics.get("claim_ranks")
     if isinstance(claim_ranks, (list, tuple)) and claim_ranks:
-        normalized_claims = sorted(str(value) for value in claim_ranks)
-        if normalized_claims != sorted(RANK_NAMES[int(rank)] for rank in move.claim_ranks):
-            return False
+        normalized_claims = sorted(_normalize_semantic_rank(value) for value in claim_ranks)
+        actual_claims = sorted(RANK_NAMES[int(rank)] for rank in move.claim_ranks)
+        if normalized_claims != actual_claims:
+            mismatches.append(
+                f"记录声明点数={normalized_claims}，候选声明点数={actual_claims}"
+            )
     assignments = semantics.get(
         "wildcard_assignments", semantics.get("wildcard_substitutions")
     )
     if isinstance(assignments, (list, tuple)) and assignments:
         expected_assignments = sorted(
-            str(item.get("as_rank", ""))
+            _normalize_semantic_rank(item.get("as_rank", ""))
             for item in assignments
             if isinstance(item, dict)
         )
         actual_assignments = sorted(
-            str(item["as_rank"])
+            _normalize_semantic_rank(item["as_rank"])
             for item in _move_audit(move, level=level).get(
                 "wildcard_assignments", ()
             )
             if isinstance(item, dict)
         )
         if expected_assignments and actual_assignments != expected_assignments:
-            return False
+            mismatches.append(
+                f"记录 wildcard 代替点数={expected_assignments}，"
+                f"候选代替点数={actual_assignments}"
+            )
     key = semantics.get("key")
     if key is not None:
+        normalized_key, key_error = _normalized_semantic_key(
+            key,
+            move_type=actual_type,
+            level=level,
+            semantics=semantics,
+            selection_source=selection_source,
+        )
+        if key_error:
+            mismatches.append(key_error)
+        elif normalized_key != int(move.key):
+            mismatches.append(
+                f"记录 key={key!r} 转换为 FableDan key={normalized_key}，"
+                f"候选 key={int(move.key)}"
+            )
+    return mismatches
+
+
+def _normalized_semantic_key(
+    value: object,
+    *,
+    move_type: str,
+    level: int,
+    semantics: dict[str, object],
+    selection_source: str,
+) -> tuple[int | None, str | None]:
+    source = selection_source.strip().casefold()
+    project_sources = {
+        "realtime_semantics",
+        "ui_detection",
+        "candidate_branch",
+        "inferred_unique",
+    }
+    if semantics.get("type_id") is not None and source not in project_sources:
         try:
-            if int(key) != int(move.key):
-                return False
+            return int(value), None
         except (TypeError, ValueError):
-            # DanZero 可能保存可读点数；已有牌型或声明点数时仍可精确区分。
-            pass
-    return True
+            return None, f"记录的 FableDan 内部 key={value!r} 不是有效整数"
+    if move_type in {"PASS", "ROCKET"}:
+        return 0, None
+    rank_name = _normalize_semantic_rank(value)
+    if rank_name not in RANK_NAMES:
+        return None, (
+            f"记录 key={value!r} 无法按牌型 {move_type} 转换为 FableDan 点数"
+        )
+    rank = RANK_NAMES.index(rank_name)
+    if move_type in {"STRAIGHT", "PLATE", "TUBE", "SFLUSH"}:
+        if rank >= 13:
+            return None, f"序列牌型 {move_type} 的 key 不能是王：{value!r}"
+        return 1 if rank == 0 else rank + 1, None
+    return order_of(rank, level), None
+
+
+def _normalize_semantic_rank(value: object) -> str:
+    raw = str(value).strip()
+    aliases = {
+        "T": "10",
+        "t": "10",
+        "B": "sj",
+        "b": "sj",
+        "小王": "sj",
+        "small_joker": "sj",
+        "SJ": "sj",
+        "R": "BJ",
+        "r": "BJ",
+        "大王": "BJ",
+        "big_joker": "BJ",
+        "bj": "BJ",
+    }
+    return aliases.get(raw, raw.upper() if raw.upper() in RANK_NAMES else raw)
 
 
 def _move_signature(move: Move) -> tuple[object, ...]:
@@ -1295,14 +1496,19 @@ def _decision_diagnostics(
         invariants["lead_matches_latest_play"] = True
     for name, passed in invariants.items():
         if passed is False:
-            errors.append(f"invariant failed: {name}")
+            errors.append(f"诊断不变量未通过：{name}")
     for item in history if isinstance(history, list) else []:
         if not isinstance(item, dict):
             continue
         resolution = item.get("semantic_resolution")
-        if isinstance(resolution, dict) and resolution.get("ambiguity"):
+        if not isinstance(resolution, dict):
+            continue
+        metadata_warning = resolution.get("metadata_warning")
+        if isinstance(metadata_warning, dict) and metadata_warning.get("message"):
+            warnings.append(str(metadata_warning["message"]))
+        if resolution.get("ambiguity"):
             warnings.append(
-                f"history turn {item.get('source_turn_id')} 使用显式语义消解 wildcard 候选"
+                f"第 {item.get('source_turn_id')} 条历史使用显式动作语义消解了 wildcard 多候选"
             )
     return {"warnings": warnings, "errors": errors, "invariants": invariants}
 
@@ -1517,6 +1723,47 @@ def _encoding_trace(
     return {"tokens": token_trace, "features": feature_trace}
 
 
+def _training_input_payload(
+    *,
+    mapped: _MappedState,
+    runtime: _PolicyRuntime,
+    tokens: list[int] | None,
+    features: np.ndarray | None,
+) -> dict[str, object]:
+    """Return the compact, self-contained input required for offline labels.
+
+    The values are serialized directly rather than reconstructed from a later
+    game state.  That makes training samples reproducible if card-recognition
+    or action-semantic logic changes after a real game was recorded.
+    """
+
+    token_values = [int(value) for value in tokens or ()]
+    if features is None:
+        feature_values: list[list[float]] = []
+    else:
+        matrix = np.asarray(features, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape != (len(mapped.legal), FEAT_DIM):
+            raise RuntimeError("FableDan 编码特征维度与合法动作集合不一致")
+        feature_values = matrix.tolist()
+    token_array = np.asarray(token_values, dtype="<i8")
+    feature_array = np.ascontiguousarray(
+        np.asarray(feature_values, dtype="<f4")
+    )
+    return {
+        "schema": "fabledan-decision-input/1",
+        "feature_schema": "fabledan-token48-feat80/v1",
+        "tokens": token_values,
+        "tokens_sha256": sha256(token_array.tobytes()).hexdigest(),
+        "features": feature_values,
+        "features_sha256": sha256(feature_array.tobytes()).hexdigest(),
+        "legal_action_count": len(mapped.legal),
+        "model_hash": runtime.digest,
+        "adapter_schema": ADAPTER_SCHEMA,
+        "upstream_commit": UPSTREAM_COMMIT,
+        "standard_no_tribute": STANDARD_NO_TRIBUTE,
+    }
+
+
 def _feature_summary(
     observation: dict[str, object], move: Move, legal_index: int
 ) -> dict[str, object]:
@@ -1611,7 +1858,7 @@ def _blocked_trace_payload(
 def _normalize_diagnostics_mode(value: object) -> DiagnosticsMode:
     normalized = str(value or "off").strip().lower()
     if normalized not in {"off", "basic", "full"}:
-        raise ValueError(f"unsupported FableDan diagnostics mode: {value}")
+        raise ValueError(f"不支持的 FableDan 诊断模式：{value}")
     return normalized  # type: ignore[return-value]
 
 
@@ -1685,9 +1932,9 @@ def _validate_numpy_model(model: NumpyModel) -> None:
     }
     missing = sorted(required - set(model.w))
     if missing:
-        raise ValueError("missing arrays: " + ", ".join(missing))
+        raise ValueError("模型缺少数组：" + ", ".join(missing))
     if model.n_blocks < 1 or model.n_heads < 1 or model.qk < 2 or model.v < 1:
-        raise ValueError("invalid FableDan model configuration")
+        raise ValueError("FableDan 模型配置无效")
     for index in range(model.n_blocks):
         prefix = f"blocks.{index}."
         block_required = {
@@ -1705,11 +1952,11 @@ def _validate_numpy_model(model: NumpyModel) -> None:
         }
         missing = sorted(block_required - set(model.w))
         if missing:
-            raise ValueError("missing arrays: " + ", ".join(missing))
+            raise ValueError("模型缺少数组：" + ", ".join(missing))
     if not any(key.startswith("hand_mlp.") for key in model.w):
-        raise ValueError("missing hand_mlp arrays")
+        raise ValueError("模型缺少 hand_mlp 数组")
     if not any(key.startswith("q_head.") for key in model.w):
-        raise ValueError("missing q_head arrays")
+        raise ValueError("模型缺少 q_head 数组")
 
 
 def _safe_digest(path: Path) -> str | None:

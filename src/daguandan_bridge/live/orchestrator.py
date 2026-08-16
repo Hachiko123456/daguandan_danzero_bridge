@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import logging
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -13,6 +14,7 @@ from typing import Any, Callable, Literal
 import cv2
 import numpy as np
 
+from ..action_semantics import project_play_type
 from ..application.ports import (
     AdvicePort,
     RecognitionPort,
@@ -33,6 +35,7 @@ from ..danzero.rules import (
     wildcard_substitutions,
 )
 from ..danzero.state import GuanDanState, Seat
+from .action_uncertainty import state_variants_for_action_semantics
 from .consensus import (
     BurstConsensus,
     ConsensusCandidate,
@@ -43,8 +46,9 @@ from .consensus import (
 from .card_uncertainty import (
     is_unknown_suit_card,
     normalized_suit_options,
-    state_variants_for_unknown_suits,
+    state_variants_for_unknown_suits_detailed,
 )
+from .display_text import reasons_text
 from .recognition_strategy import (
     RecognitionStrategy,
     coerce_recognition_strategy,
@@ -70,6 +74,10 @@ LiveStatus = Literal[
     "finalizing",
     "sealed",
 ]
+
+_MAX_ADVICE_STATE_VARIANTS = 32
+_MAX_SUIT_STATE_VARIANTS = 256
+_LOGGER = logging.getLogger(__name__)
 
 
 def _state_synchronized(method):
@@ -136,6 +144,11 @@ class LiveAdvice:
     suit_uncertain: bool = False
     variant_count: int = 1
     advice_agrees_across_variants: bool = True
+    semantic_uncertain: bool = False
+    semantic_source_history_indices: tuple[int, ...] = ()
+    suit_variant_count: int = 1
+    suit_equivalence_class_count: int = 1
+    semantic_variant_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -172,6 +185,194 @@ class _AdviceCompletion:
     suit_uncertain: bool = False
     variant_count: int = 1
     advice_agrees_across_variants: bool = True
+    semantic_uncertain: bool = False
+    semantic_source_history_indices: tuple[int, ...] = ()
+    suit_variant_count: int = 1
+    suit_equivalence_class_count: int = 1
+    semantic_variant_count: int = 1
+    uncertainty_diagnostics: dict[str, object] | None = None
+
+
+def _state_semantic_choices(
+    state: GuanDanState,
+    source_history_indices: tuple[int, ...],
+) -> list[dict[str, object]]:
+    choices: list[dict[str, object]] = []
+    for history_index in source_history_indices:
+        if not 1 <= history_index <= len(state.play_history):
+            continue
+        event = state.play_history[history_index - 1]
+        metadata = event.action_metadata or {}
+        selected = metadata.get("selected_interpretation")
+        choices.append(
+            {
+                "source_history_index": history_index,
+                "physical_cards": list(event.cards),
+                "selected_interpretation": (
+                    dict(selected) if isinstance(selected, dict) else None
+                ),
+            }
+        )
+    return choices
+
+
+def _readable_advice(advice: LocalAdvice) -> str:
+    if advice.is_pass:
+        return "PASS（不出）"
+    cards = " ".join(advice.cards) or "无牌面"
+    return f"{advice.play_type}：{cards}"
+
+
+def _recognition_retry_message(
+    reason: str,
+    observations: list[dict[str, object]],
+) -> str:
+    candidates: list[str] = []
+    for item in reversed(observations):
+        cards = tuple(str(card) for card in item.get("cards", ()))
+        if bool(item.get("is_pass", False)):
+            readable = "PASS（不出）"
+        elif cards:
+            readable = " ".join(cards)
+        else:
+            readable = "未识别到牌面"
+        if readable not in candidates:
+            candidates.append(readable)
+        if len(candidates) >= 3:
+            break
+    candidate_text = "、".join(candidates) if candidates else "没有可用候选"
+    return (
+        f"{reasons_text(reason)}；最近读取到：{candidate_text}。"
+        "这些结果未通过确认，未写入正式牌局历史"
+    )
+
+
+def _deduplicate_advisor_input_variants(
+    states: tuple[GuanDanState, ...],
+    advisor: AdvicePort,
+) -> tuple[GuanDanState, ...]:
+    fingerprint = getattr(advisor, "decision_input_fingerprint", None)
+    if not callable(fingerprint):
+        return states
+    unique: dict[object, GuanDanState] = {}
+    for index, state in enumerate(states, start=1):
+        try:
+            key = fingerprint(
+                state,
+                request_id=f"suit-equivalence-{index}",
+            )
+        except Exception:
+            # Keep unmappable states separate so normal inference records the
+            # exact branch-specific error instead of hiding it during dedup.
+            key = ("unmappable", index)
+        unique.setdefault(key, state)
+    return tuple(unique.values())
+
+
+_RULE_CONTRADICTION_CODES = {
+    "history_move_does_not_beat_lead",
+    "observed_move_invalid",
+}
+
+
+def _validate_and_deduplicate_encoded_advice_variants(
+    variants: list[tuple[GuanDanState, int, int]],
+    advisor: AdvicePort,
+    source_indices: tuple[int, ...],
+) -> tuple[
+    list[tuple[GuanDanState, int, int]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    fingerprint = getattr(advisor, "decision_input_fingerprint", None)
+    if not callable(fingerprint):
+        return variants, [], []
+    unique: dict[object, tuple[GuanDanState, int, int]] = {}
+    eliminated: list[dict[str, object]] = []
+    validation_errors: list[dict[str, object]] = []
+    for index, variant in enumerate(variants, start=1):
+        try:
+            key = fingerprint(
+                variant[0],
+                request_id=f"complete-equivalence-{index}",
+            )
+        except Exception as exc:
+            raw_diagnostic = getattr(exc, "diagnostic", None)
+            diagnostic = (
+                dict(raw_diagnostic) if isinstance(raw_diagnostic, dict) else {}
+            )
+            item = {
+                "input_variant_index": index,
+                "suit_variant_index": variant[1],
+                "semantic_variant_index": variant[2],
+                "semantic_choices": _state_semantic_choices(
+                    variant[0],
+                    source_indices,
+                ),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "diagnostic": diagnostic,
+            }
+            if diagnostic.get("code") in _RULE_CONTRADICTION_CODES:
+                item["status"] = "eliminated_by_complete_history"
+                eliminated.append(item)
+            else:
+                item["status"] = "input_validation_failed"
+                validation_errors.append(item)
+            continue
+        unique.setdefault(key, variant)
+    return list(unique.values()), eliminated, validation_errors
+
+
+def _semantic_choice_text(item: dict[str, object]) -> str:
+    choices = item.get("semantic_choices", ())
+    labels: list[str] = []
+    if isinstance(choices, (list, tuple)):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            selected = choice.get("selected_interpretation")
+            if not isinstance(selected, dict):
+                continue
+            history_index = choice.get("source_history_index", "?")
+            label = str(selected.get("logical_label", "") or "").strip()
+            if not label:
+                label = (
+                    f"{selected.get('move_type', '未知牌型')}"
+                    f"(key={selected.get('key', '?')})"
+                )
+            labels.append(f"历史第 {history_index} 条={label}")
+    return "、".join(labels) or "无显式语义选择"
+
+
+def _compact_input_failure_text(
+    failures: list[dict[str, object]],
+) -> tuple[str, str]:
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in failures:
+        signature = (_semantic_choice_text(item), str(item.get("error", "")))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(item)
+
+    def history_index(item: dict[str, object]) -> int:
+        diagnostic = item.get("diagnostic")
+        if not isinstance(diagnostic, dict):
+            return 0
+        try:
+            return int(diagnostic.get("source_turn_id", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    primary = max(unique, key=history_index, default={})
+    primary_text = str(primary.get("error", "无法还原合法模型输入"))
+    details = "；".join(
+        f"{_semantic_choice_text(item)}：{item.get('error', '未知错误')}"
+        for item in unique
+    )
+    return primary_text, details
 
 
 class LiveOrchestrator:
@@ -249,6 +450,12 @@ class LiveOrchestrator:
         self._lead_confirmation_frame: tuple[int, np.ndarray] | None = None
         self._lead_stability_frames: deque[tuple[int, np.ndarray]] = deque(maxlen=3)
         self._first_action_pending = False
+        # The normal recognition burst is deliberately short-lived: it is
+        # discarded whenever the UI effect or action-zone lifecycle changes.
+        # Keep a small, independent evidence window for the opening play so a
+        # queued live frame cannot split its two confirmation reads across a
+        # burst reset.  It is never used after the first action is committed.
+        self._first_action_samples: list[RecognitionSample] = []
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = False
         self._game_end_detected = False
@@ -323,6 +530,7 @@ class LiveOrchestrator:
         self._game_end_detected = False
         self._finish_order = []
         self._placement_streaks.clear()
+        self._clear_first_action_candidates()
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
             hand=hand,
@@ -534,17 +742,31 @@ class LiveOrchestrator:
                 )
             decision = self._zone.observe(current_metrics)
             had_observations = bool(self._observations)
-            if decision.discard_burst:
-                self._clear_burst()
             if decision.timed_out:
-                # A previous transient candidate may already have reset this
-                # window.  If the new window has not produced one observation,
-                # there is no failed action to report: keep listening for the
-                # player instead of emitting a red timeout every 28 seconds.
-                if not had_observations:
+                timeout_consensus = self._decide_timeout_candidate(
+                    current_metrics,
+                    fast,
+                )
+                if timeout_consensus is not None:
+                    event, events = self._commit_consensus(
+                        timeout_consensus,
+                        monotonic_ms,
+                        fast=fast,
+                    )
+                    return self._update(
+                        event=event,
+                        events=events,
+                        fast_signals=fast,
+                    )
+                # Keep the rejected burst intact until _require_review has
+                # written its diagnostics.  Clearing it first made a genuine
+                # observed play look like "no available candidates".
+                if not had_observations and not self._first_action_samples:
                     self._activate_zone(monotonic_ms)
                     return self._update(fast_signals=fast)
                 return self._require_review(decision.reason, monotonic_ms, fast)
+            if decision.discard_burst:
+                self._clear_burst()
             if not decision.collect_sample or not self._sample_due(monotonic_ms):
                 return self._update(fast_signals=fast)
             snapshot = self.reducer.snapshot()
@@ -699,6 +921,7 @@ class LiveOrchestrator:
             actor=lead,
         )
         self._clear_burst()
+        self._clear_first_action_candidates()
         self._first_action_pending = True
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = lead != "self"
@@ -781,8 +1004,11 @@ class LiveOrchestrator:
             return signal.marker_player
         if signal.active_player is not None:
             return signal.active_player
-        if signal.self_action_buttons_visible:
-            return "self"
+        # The local action buttons only say that this client may act.  They do
+        # not identify the opening lead: during the transition out of the
+        # doubling screen they can remain visible after another seat has
+        # already been selected.  Do not manufacture a self lead from that
+        # one-sided control; wait for a marker or an active-player signal.
         return None
 
     def _recognize_fast_signals(
@@ -877,6 +1103,8 @@ class LiveOrchestrator:
             evidence_refs=review.evidence_refs,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
+        self._first_action_pending = False
+        self._clear_first_action_candidates()
         self._append_lifecycle_event(
             "review_resolved",
             {
@@ -905,12 +1133,13 @@ class LiveOrchestrator:
         monotonic_ms: int,
         evidence_refs: tuple[str, ...] = (),
         suit_options: tuple[tuple[str, ...], ...] = (),
+        action_metadata: dict[str, object] | None = None,
     ) -> LiveUpdate:
         """Commit a trusted action through the same post-action live path.
 
         Trusted replay deliberately bypasses vision and consensus because the
         source event has already been confirmed.  State advancement, event
-        publication, turn lifecycle, and DanZero scheduling remain the same as
+        publication, turn lifecycle, and selected-strategy scheduling remain the same as
         a live consensus commit.
         """
 
@@ -929,9 +1158,11 @@ class LiveOrchestrator:
             source="trusted_log_replay",
             evidence_refs=evidence_refs,
             suit_options=suit_options,
+            action_metadata=action_metadata,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
         self._first_action_pending = False
+        self._clear_first_action_candidates()
         self._activate_zone(int(monotonic_ms))
         turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
@@ -957,6 +1188,8 @@ class LiveOrchestrator:
             source="manual_minimal_editor",
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
+        self._first_action_pending = False
+        self._clear_first_action_candidates()
         self._append_lifecycle_event(
             "review_resolved",
             {
@@ -1018,6 +1251,7 @@ class LiveOrchestrator:
             self.status = "paused"
             self._analysis_epoch += 1
             self._clear_burst()
+            self._clear_first_action_candidates()
             self._zone = None
             self._append_lifecycle_event("session_paused", {})
         return self._update()
@@ -1043,6 +1277,7 @@ class LiveOrchestrator:
         self._accept_advice_results = False
         self._zone = None
         self._clear_burst()
+        self._clear_first_action_candidates()
         return self._update()
 
     @_state_synchronized
@@ -1103,6 +1338,7 @@ class LiveOrchestrator:
             return self._update(fast_signals=fast)
         self._game_end_detected = True
         self._clear_burst()
+        self._clear_first_action_candidates()
         event = self._append_lifecycle_event(
             "game_end_detected",
             {"control": control},
@@ -1169,7 +1405,19 @@ class LiveOrchestrator:
             self.status = "sealed"
             self._zone = None
             self._clear_burst()
-            return self._update()
+            self._clear_first_action_candidates()
+            update = self._update()
+        # Creating a review is intentionally best-effort and happens only
+        # after sealing.  A data-export problem must never make a real game
+        # appear unsealed or disturb live-session finalisation.
+        if bool(getattr(self.store, "persistence_enabled", True)):
+            try:
+                from ..application.fabledan_training_data import FableDanTrainingDataService
+
+                FableDanTrainingDataService().initialize_review(self.store.directory)
+            except Exception:
+                _LOGGER.warning("FableDan 训练数据待确认文件创建失败", exc_info=True)
+        return update
 
     def _self_lead_waiting_for_action(
         self,
@@ -1399,6 +1647,7 @@ class LiveOrchestrator:
                     "status": "requested",
                     "turn_id": key.turn_id,
                     "state_revision": key.state_revision,
+                    **self._advisor_identity(),
                 }
             )
             self.store.upsert_decision(
@@ -1428,47 +1677,331 @@ class LiveOrchestrator:
             return key
 
     def _run_advice(self, job: _AdviceJob) -> _AdviceCompletion:
-        variants = state_variants_for_unknown_suits(job.state)
+        suit_expansion = state_variants_for_unknown_suits_detailed(
+            job.state,
+            limit=_MAX_SUIT_STATE_VARIANTS,
+        )
+        raw_suit_variants = suit_expansion.states
         has_unknown_suit = any(
             is_unknown_suit_card(card)
             for event in job.state.play_history
             for card in event.cards
         )
-        if has_unknown_suit and bool(
-            getattr(self.advisor, "requires_exact_history_suits", False)
-        ):
-            engine_input = self._fallback_engine_input(job)
-            audit_info = getattr(self.advisor, "audit_info", None)
-            if callable(audit_info):
-                engine_input.update(audit_info())
+        if not raw_suit_variants:
             return _AdviceCompletion(
                 job.key,
-                error="FableDan 不接受未知花色历史；请先完成可审计的花色确认",
-                engine_input=engine_input,
-                suit_uncertain=True,
-                variant_count=0,
-                advice_agrees_across_variants=False,
-            )
-        if not variants:
-            return _AdviceCompletion(
-                job.key,
-                error="未知花色与已知双副牌数量冲突",
+                error=(
+                    "牌局历史中的未知花色无法分配：候选花色与当前手牌及双副牌"
+                    "每张实体牌最多两张的约束冲突"
+                ),
                 engine_input=self._fallback_engine_input(job),
                 suit_uncertain=has_unknown_suit,
                 variant_count=0,
                 advice_agrees_across_variants=False,
+                suit_variant_count=0,
+                suit_equivalence_class_count=0,
+            )
+        if suit_expansion.truncated:
+            uncertainty = {
+                "max_suit_variant_count": _MAX_SUIT_STATE_VARIANTS,
+                "suit_uncertain": has_unknown_suit,
+                "generated_suit_variant_count": len(raw_suit_variants),
+                "suit_variants_truncated": True,
+                "used_relaxed_suits": suit_expansion.used_relaxed_suits,
+            }
+            engine_input = self._fallback_engine_input(job)
+            engine_input["uncertainty_diagnostics"] = uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    f"{self._advisor_display_name()} 计算已阻断：未知花色至少产生 "
+                    f"{_MAX_SUIT_STATE_VARIANTS + 1} 个可行实体牌状态，超过安全上限 "
+                    f"{_MAX_SUIT_STATE_VARIANTS}；为避免遗漏花色解释，本次未调用模型"
+                ),
+                engine_input=engine_input,
+                suit_uncertain=has_unknown_suit,
+                variant_count=0,
+                advice_agrees_across_variants=False,
+                suit_variant_count=len(raw_suit_variants),
+                suit_equivalence_class_count=0,
+                uncertainty_diagnostics=uncertainty,
             )
 
+        equivalence_strategy = (
+            "advisor_encoded_input_fingerprint"
+            if callable(getattr(self.advisor, "decision_input_fingerprint", None))
+            else "none"
+        )
+        suit_variants = _deduplicate_advisor_input_variants(
+            raw_suit_variants,
+            self.advisor,
+        )
+        suit_variant_count = len(raw_suit_variants)
+        suit_equivalence_class_count = len(suit_variants)
+        if (
+            suit_equivalence_class_count > _MAX_ADVICE_STATE_VARIANTS
+            and equivalence_strategy == "none"
+        ):
+            uncertainty = {
+                "max_variant_count": _MAX_ADVICE_STATE_VARIANTS,
+                "suit_uncertain": has_unknown_suit,
+                "suit_variant_count": suit_variant_count,
+                "suit_equivalence_class_count": suit_equivalence_class_count,
+                "suit_equivalence_strategy": equivalence_strategy,
+                "suit_variants_truncated": False,
+                "used_relaxed_suits": suit_expansion.used_relaxed_suits,
+            }
+            engine_input = self._fallback_engine_input(job)
+            engine_input["uncertainty_diagnostics"] = uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    f"{self._advisor_display_name()} 计算已阻断：{suit_variant_count} 个"
+                    f"花色状态仍形成 {suit_equivalence_class_count} 个模型非等价输入，"
+                    f"超过推理上限 {_MAX_ADVICE_STATE_VARIANTS}；本次未执行部分评估"
+                ),
+                engine_input=engine_input,
+                suit_uncertain=has_unknown_suit,
+                variant_count=0,
+                advice_agrees_across_variants=False,
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                uncertainty_diagnostics=uncertainty,
+            )
+
+        variants: list[tuple[GuanDanState, int, int]] = []
+        semantic_diagnostics: list[dict[str, object]] = []
+        semantic_source_indices: set[int] = set()
+        semantic_variant_count = 1
+        for suit_index, suit_state in enumerate(suit_variants, start=1):
+            semantic = state_variants_for_action_semantics(
+                suit_state,
+                limit=_MAX_ADVICE_STATE_VARIANTS,
+            )
+            diagnostic = semantic.to_diagnostic()
+            diagnostic["suit_variant_index"] = suit_index
+            semantic_diagnostics.append(diagnostic)
+            semantic_source_indices.update(semantic.source_history_indices)
+            semantic_variant_count = max(
+                semantic_variant_count,
+                semantic.total_variant_count,
+            )
+            if semantic.error:
+                uncertainty = {
+                    "max_variant_count": _MAX_ADVICE_STATE_VARIANTS,
+                    "suit_uncertain": has_unknown_suit,
+                    "suit_variant_count": suit_variant_count,
+                    "suit_equivalence_class_count": suit_equivalence_class_count,
+                    "suit_equivalence_strategy": equivalence_strategy,
+                    "semantic_uncertain": semantic.is_uncertain,
+                    "semantic_source_history_indices": list(
+                        semantic.source_history_indices
+                    ),
+                    "semantic_expansions": semantic_diagnostics,
+                }
+                engine_input = self._fallback_engine_input(job)
+                engine_input["uncertainty_diagnostics"] = uncertainty
+                return _AdviceCompletion(
+                    job.key,
+                    error=f"{self._advisor_display_name()} 计算已阻断：{semantic.error}",
+                    engine_input=engine_input,
+                    suit_uncertain=has_unknown_suit,
+                    variant_count=0,
+                    advice_agrees_across_variants=False,
+                    semantic_uncertain=semantic.is_uncertain,
+                    semantic_source_history_indices=semantic.source_history_indices,
+                    suit_variant_count=suit_variant_count,
+                    suit_equivalence_class_count=suit_equivalence_class_count,
+                    semantic_variant_count=semantic.total_variant_count,
+                    uncertainty_diagnostics=uncertainty,
+                )
+            if (
+                len(variants) + len(semantic.states) > _MAX_ADVICE_STATE_VARIANTS
+                and equivalence_strategy == "none"
+            ):
+                sources = sorted(semantic_source_indices)
+                source_text = "、".join(str(index) for index in sources) or "无"
+                uncertainty = {
+                    "max_variant_count": _MAX_ADVICE_STATE_VARIANTS,
+                    "suit_uncertain": has_unknown_suit,
+                    "suit_variant_count": suit_variant_count,
+                    "suit_equivalence_class_count": suit_equivalence_class_count,
+                    "suit_equivalence_strategy": equivalence_strategy,
+                    "semantic_uncertain": bool(sources),
+                    "semantic_source_history_indices": sources,
+                    "semantic_expansions": semantic_diagnostics,
+                }
+                engine_input = self._fallback_engine_input(job)
+                engine_input["uncertainty_diagnostics"] = uncertainty
+                return _AdviceCompletion(
+                    job.key,
+                    error=(
+                        f"{self._advisor_display_name()} 计算已阻断：花色与动作语义组合后的"
+                        f"完整状态超过 {_MAX_ADVICE_STATE_VARIANTS} 个；涉及历史第 "
+                        f"{source_text} 条。为避免只评估部分分支，本次未调用模型"
+                    ),
+                    engine_input=engine_input,
+                    suit_uncertain=has_unknown_suit,
+                    variant_count=0,
+                    advice_agrees_across_variants=False,
+                    semantic_uncertain=bool(sources),
+                    semantic_source_history_indices=tuple(sources),
+                    suit_variant_count=suit_variant_count,
+                    suit_equivalence_class_count=suit_equivalence_class_count,
+                    semantic_variant_count=semantic_variant_count,
+                    uncertainty_diagnostics=uncertainty,
+                )
+            variants.extend(
+                (state, suit_index, semantic_index)
+                for semantic_index, state in enumerate(semantic.states, start=1)
+            )
+
+        semantic_uncertain = bool(semantic_source_indices)
+        source_indices = tuple(sorted(semantic_source_indices))
+        input_variant_count = len(variants)
+        variants, eliminated_variants, input_validation_errors = (
+            _validate_and_deduplicate_encoded_advice_variants(
+                variants,
+                self.advisor,
+                source_indices,
+            )
+        )
+        validation_uncertainty: dict[str, object] = {
+            "max_variant_count": _MAX_ADVICE_STATE_VARIANTS,
+            "suit_uncertain": has_unknown_suit,
+            "suit_variant_count": suit_variant_count,
+            "suit_equivalence_class_count": suit_equivalence_class_count,
+            "suit_equivalence_strategy": equivalence_strategy,
+            "semantic_uncertain": semantic_uncertain,
+            "semantic_source_history_indices": list(source_indices),
+            "semantic_variant_count": semantic_variant_count,
+            "input_variant_count_before_validation": input_variant_count,
+            "valid_encoded_input_count": len(variants),
+            "eliminated_variant_count": len(eliminated_variants),
+            "eliminated_variants": eliminated_variants,
+            "input_validation_errors": input_validation_errors,
+            "semantic_expansions": semantic_diagnostics,
+        }
+        if input_validation_errors:
+            primary, details = _compact_input_failure_text(input_validation_errors)
+            validation_uncertainty["branch_results"] = input_validation_errors
+            engine_input = self._fallback_engine_input(job)
+            engine_input["uncertainty_diagnostics"] = validation_uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    f"{self._advisor_display_name()} 计算已阻断：模型输入预校验发生"
+                    f"不能安全忽略的异常。首个错误：{primary}。"
+                    f"分支详情：{details}。本次未调用模型，主牌局历史未被改写"
+                ),
+                engine_input=engine_input,
+                suit_uncertain=has_unknown_suit,
+                variant_count=0,
+                advice_agrees_across_variants=False,
+                semantic_uncertain=semantic_uncertain,
+                semantic_source_history_indices=source_indices,
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                semantic_variant_count=semantic_variant_count,
+                uncertainty_diagnostics=validation_uncertainty,
+            )
+        if not variants and eliminated_variants:
+            primary, details = _compact_input_failure_text(eliminated_variants)
+            validation_uncertainty["branch_results"] = eliminated_variants
+            validation_uncertainty["root_cause"] = {
+                "kind": "no_legal_complete_state",
+                "message": primary,
+            }
+            engine_input = self._fallback_engine_input(job)
+            engine_input["uncertainty_diagnostics"] = validation_uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    f"{self._advisor_display_name()} 计算已阻断：{input_variant_count} 个"
+                    "候选状态全部被完整牌局历史排除，模型未被调用。"
+                    f"最深可达根因：{primary}。分支消歧：{details}。"
+                    "请先修正最深可达根因对应的原始出牌识别"
+                ),
+                engine_input=engine_input,
+                suit_uncertain=has_unknown_suit,
+                variant_count=0,
+                advice_agrees_across_variants=False,
+                semantic_uncertain=semantic_uncertain,
+                semantic_source_history_indices=source_indices,
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                semantic_variant_count=semantic_variant_count,
+                uncertainty_diagnostics=validation_uncertainty,
+            )
+        if len(variants) > _MAX_ADVICE_STATE_VARIANTS:
+            sources = list(source_indices)
+            source_text = "、".join(str(index) for index in sources) or "无"
+            uncertainty = {
+                "max_variant_count": _MAX_ADVICE_STATE_VARIANTS,
+                "suit_uncertain": has_unknown_suit,
+                "suit_variant_count": suit_variant_count,
+                "suit_equivalence_class_count": suit_equivalence_class_count,
+                "suit_equivalence_strategy": equivalence_strategy,
+                "semantic_uncertain": bool(sources),
+                "semantic_source_history_indices": sources,
+                "encoded_input_class_count": len(variants),
+                "input_variant_count_before_validation": input_variant_count,
+                "eliminated_variant_count": len(eliminated_variants),
+                "eliminated_variants": eliminated_variants,
+                "semantic_expansions": semantic_diagnostics,
+            }
+            engine_input = self._fallback_engine_input(job)
+            engine_input["uncertainty_diagnostics"] = uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    f"{self._advisor_display_name()} 计算已阻断：完整分支归并后仍有 "
+                    f"{len(variants)} 个不同的真实编码输入，超过推理上限 "
+                    f"{_MAX_ADVICE_STATE_VARIANTS}；涉及历史第 {source_text} 条，"
+                    "本次未执行部分评估"
+                ),
+                engine_input=engine_input,
+                suit_uncertain=has_unknown_suit,
+                variant_count=0,
+                advice_agrees_across_variants=False,
+                semantic_uncertain=bool(sources),
+                semantic_source_history_indices=tuple(sources),
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                semantic_variant_count=semantic_variant_count,
+                uncertainty_diagnostics=uncertainty,
+            )
+
+        uncertainty: dict[str, object] = {
+            "max_variant_count": _MAX_ADVICE_STATE_VARIANTS,
+            "suit_uncertain": has_unknown_suit,
+            "suit_variant_count": suit_variant_count,
+            "suit_equivalence_class_count": suit_equivalence_class_count,
+            "suit_equivalence_strategy": equivalence_strategy,
+            "semantic_uncertain": semantic_uncertain,
+            "semantic_source_history_indices": list(source_indices),
+            "semantic_variant_count": semantic_variant_count,
+            "encoded_input_class_count": len(variants),
+            "evaluated_variant_count": len(variants),
+            "input_variant_count_before_validation": input_variant_count,
+            "valid_encoded_input_count": len(variants),
+            "eliminated_variant_count": len(eliminated_variants),
+            "eliminated_variants": eliminated_variants,
+            "input_validation_errors": input_validation_errors,
+            "semantic_expansions": semantic_diagnostics,
+            "branch_results": list(eliminated_variants),
+        }
         advice_groups: dict[tuple[bool, tuple[str, ...], str], list[LocalAdvice]] = {}
         first_trace: dict[str, object] | None = None
         first_engine_input: dict[str, object] | None = None
         errors: list[str] = []
+        branch_results: list[dict[str, object]] = list(eliminated_variants)
         parameters = signature(self.advisor.recommend).parameters
-        for index, state in enumerate(variants, start=1):
+        for index, (state, suit_index, semantic_index) in enumerate(variants, start=1):
             request_id = (
                 job.key.request_id
                 if len(variants) == 1
-                else f"{job.key.request_id}/suit-{index}"
+                else f"{job.key.request_id}/variant-{index}"
             )
             trace = StrategyExecutionTrace(request_id)
             try:
@@ -1477,7 +2010,21 @@ class LiveOrchestrator:
                     kwargs["trace"] = trace
                 advice = self.advisor.recommend(state, **kwargs)
             except Exception as exc:
-                errors.append(str(exc))
+                error = f"{type(exc).__name__}: {exc}"
+                errors.append(error)
+                branch_results.append(
+                    {
+                        "variant_index": index,
+                        "suit_variant_index": suit_index,
+                        "semantic_variant_index": semantic_index,
+                        "semantic_choices": _state_semantic_choices(
+                            state,
+                            source_indices,
+                        ),
+                        "status": "failed",
+                        "error": error,
+                    }
+                )
                 trace_snapshot = trace.snapshot()
                 if first_trace is None:
                     first_trace = trace_snapshot
@@ -1487,21 +2034,116 @@ class LiveOrchestrator:
                 continue
             key = (advice.is_pass, tuple(advice.cards), advice.play_type)
             advice_groups.setdefault(key, []).append(advice)
+            branch_results.append(
+                {
+                    "variant_index": index,
+                    "suit_variant_index": suit_index,
+                    "semantic_variant_index": semantic_index,
+                    "semantic_choices": _state_semantic_choices(
+                        state,
+                        source_indices,
+                    ),
+                    "status": "ready",
+                    "advice": {
+                        "is_pass": advice.is_pass,
+                        "cards": list(advice.cards),
+                        "play_type": advice.play_type,
+                        "readable": _readable_advice(advice),
+                    },
+                }
+            )
             if first_trace is None:
                 first_trace = trace.snapshot()
                 candidate_input = first_trace.get("engine_input")
                 if isinstance(candidate_input, dict):
                     first_engine_input = candidate_input
 
-        if not advice_groups:
+        uncertainty["branch_results"] = branch_results
+        if semantic_uncertain and errors:
+            failed = [
+                item for item in branch_results if item.get("status") == "failed"
+            ]
+            failed_text = "；".join(
+                f"分支 {item['variant_index']}：{item['error']}" for item in failed
+            )
+            engine_input = dict(
+                first_engine_input or self._fallback_engine_input(job)
+            )
+            engine_input["uncertainty_diagnostics"] = uncertainty
             return _AdviceCompletion(
                 job.key,
-                error=errors[0] if errors else "DanZero 未返回建议",
-                engine_input=first_engine_input or self._fallback_engine_input(job),
+                error=(
+                    f"{self._advisor_display_name()} 计算已阻断：历史第 "
+                    f"{'、'.join(str(value) for value in source_indices)} 条动作存在多种语义，"
+                    f"但 {len(failed)} 个模型分支执行失败，无法比较全部候选。{failed_text}"
+                ),
+                engine_input=engine_input,
                 trace=first_trace,
                 suit_uncertain=has_unknown_suit,
                 variant_count=len(variants),
                 advice_agrees_across_variants=False,
+                semantic_uncertain=True,
+                semantic_source_history_indices=source_indices,
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                semantic_variant_count=semantic_variant_count,
+                uncertainty_diagnostics=uncertainty,
+            )
+        if not advice_groups:
+            engine_input = dict(
+                first_engine_input or self._fallback_engine_input(job)
+            )
+            engine_input["uncertainty_diagnostics"] = uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    errors[0]
+                    if errors
+                    else f"{self._advisor_display_name()} 未返回建议"
+                ),
+                engine_input=engine_input,
+                trace=first_trace,
+                suit_uncertain=has_unknown_suit,
+                variant_count=len(variants),
+                advice_agrees_across_variants=False,
+                semantic_uncertain=semantic_uncertain,
+                semantic_source_history_indices=source_indices,
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                semantic_variant_count=semantic_variant_count,
+                uncertainty_diagnostics=uncertainty,
+            )
+        if semantic_uncertain and len(advice_groups) > 1:
+            ready_results = [
+                item for item in branch_results if item.get("status") == "ready"
+            ]
+            result_text = "；".join(
+                f"分支 {item['variant_index']}：{item['advice']['readable']}"
+                for item in ready_results
+            )
+            engine_input = dict(
+                first_engine_input or self._fallback_engine_input(job)
+            )
+            engine_input["uncertainty_diagnostics"] = uncertainty
+            return _AdviceCompletion(
+                job.key,
+                error=(
+                    f"{self._advisor_display_name()} 无法给出唯一建议：历史第 "
+                    f"{'、'.join(str(value) for value in source_indices)} 条动作存在多种合法语义，"
+                    f"{len(ready_results)} 个完整状态分支给出了不同建议（{result_text}）。"
+                    "主牌局历史未被改写，请确认该历史动作的逢人配声明"
+                ),
+                engine_input=engine_input,
+                trace=first_trace,
+                suit_uncertain=has_unknown_suit,
+                variant_count=len(variants),
+                advice_agrees_across_variants=False,
+                semantic_uncertain=True,
+                semantic_source_history_indices=source_indices,
+                suit_variant_count=suit_variant_count,
+                suit_equivalence_class_count=suit_equivalence_class_count,
+                semantic_variant_count=semantic_variant_count,
+                uncertainty_diagnostics=uncertainty,
             )
         winner = max(advice_groups.values(), key=len)
         return _AdviceCompletion(
@@ -1510,6 +2152,12 @@ class LiveOrchestrator:
             suit_uncertain=has_unknown_suit,
             variant_count=len(variants),
             advice_agrees_across_variants=len(advice_groups) == 1,
+            semantic_uncertain=semantic_uncertain,
+            semantic_source_history_indices=source_indices,
+            suit_variant_count=suit_variant_count,
+            suit_equivalence_class_count=suit_equivalence_class_count,
+            semantic_variant_count=semantic_variant_count,
+            uncertainty_diagnostics=uncertainty,
         )
 
     @staticmethod
@@ -1552,6 +2200,11 @@ class LiveOrchestrator:
                         "error": completion.error,
                         "engine_input": completion.engine_input,
                         "trace": completion.trace,
+                        "semantic_uncertain": completion.semantic_uncertain,
+                        "semantic_source_history_indices": list(
+                            completion.semantic_source_history_indices
+                        ),
+                        "evaluated_variant_count": completion.variant_count,
                     }
                 )
                 self._append_advice_event(
@@ -1569,11 +2222,22 @@ class LiveOrchestrator:
                         status="stale",
                         advice=completion.advice,
                         error=completion.error,
+                        suit_uncertain=completion.suit_uncertain,
+                        variant_count=completion.variant_count,
+                        advice_agrees_across_variants=completion.advice_agrees_across_variants,
+                        semantic_uncertain=completion.semantic_uncertain,
+                        semantic_source_history_indices=completion.semantic_source_history_indices,
+                        suit_variant_count=completion.suit_variant_count,
+                        suit_equivalence_class_count=completion.suit_equivalence_class_count,
+                        semantic_variant_count=completion.semantic_variant_count,
                     )
                 self._signal_advice_completion(key)
                 return
             if completion.error or completion.advice is None:
-                error = completion.error or "DanZero 未返回建议"
+                error = (
+                    completion.error
+                    or f"{self._advisor_display_name()} 未返回建议"
+                )
                 # Publish the incident before exposing the failed advice state.
                 # Consumers use the state transition as the readiness signal and
                 # must never observe ``status=failed`` while its evidence bundle
@@ -1587,6 +2251,14 @@ class LiveOrchestrator:
                     key=key,
                     status="failed",
                     error=error,
+                    suit_uncertain=completion.suit_uncertain,
+                    variant_count=completion.variant_count,
+                    advice_agrees_across_variants=completion.advice_agrees_across_variants,
+                    semantic_uncertain=completion.semantic_uncertain,
+                    semantic_source_history_indices=completion.semantic_source_history_indices,
+                    suit_variant_count=completion.suit_variant_count,
+                    suit_equivalence_class_count=completion.suit_equivalence_class_count,
+                    semantic_variant_count=completion.semantic_variant_count,
                 )
                 self.store.append_advice(
                     {
@@ -1597,6 +2269,18 @@ class LiveOrchestrator:
                         "error": error,
                         "engine_input": completion.engine_input,
                         "trace": completion.trace,
+                        "suit_uncertain": completion.suit_uncertain,
+                        "suit_variant_count": completion.suit_variant_count,
+                        "suit_equivalence_class_count": completion.suit_equivalence_class_count,
+                        "semantic_uncertain": completion.semantic_uncertain,
+                        "semantic_source_history_indices": list(
+                            completion.semantic_source_history_indices
+                        ),
+                        "semantic_variant_count": completion.semantic_variant_count,
+                        "evaluated_variant_count": completion.variant_count,
+                        "advice_agrees_across_variants": completion.advice_agrees_across_variants,
+                        "uncertainty_diagnostics": completion.uncertainty_diagnostics,
+                        **self._advisor_identity(),
                     }
                 )
                 self._append_advice_event(
@@ -1604,6 +2288,11 @@ class LiveOrchestrator:
                     {
                         "request_id": key.request_id,
                         "error": error,
+                        "semantic_uncertain": completion.semantic_uncertain,
+                        "semantic_source_history_indices": list(
+                            completion.semantic_source_history_indices
+                        ),
+                        "evaluated_variant_count": completion.variant_count,
                     },
                     confidence=0.0,
                 )
@@ -1614,11 +2303,22 @@ class LiveOrchestrator:
             missing_cards = Counter(advice.cards) - Counter(snapshot.my_hand)
             if not advice.is_pass and missing_cards:
                 missing_text = " ".join(sorted(missing_cards.elements()))
-                error = f"DanZero 建议包含当前手牌中不存在的牌：{missing_text}"
+                error = (
+                    f"{self._advisor_display_name()} 建议包含当前手牌中不存在的牌："
+                    f"{missing_text}"
+                )
                 self.latest_advice = LiveAdvice(
                     key=key,
                     status="failed",
                     error=error,
+                    suit_uncertain=completion.suit_uncertain,
+                    variant_count=completion.variant_count,
+                    advice_agrees_across_variants=completion.advice_agrees_across_variants,
+                    semantic_uncertain=completion.semantic_uncertain,
+                    semantic_source_history_indices=completion.semantic_source_history_indices,
+                    suit_variant_count=completion.suit_variant_count,
+                    suit_equivalence_class_count=completion.suit_equivalence_class_count,
+                    semantic_variant_count=completion.semantic_variant_count,
                 )
                 self.store.append_advice(
                     {
@@ -1627,6 +2327,7 @@ class LiveOrchestrator:
                         "turn_id": key.turn_id,
                         "state_revision": key.state_revision,
                         "error": error,
+                        **self._advisor_identity(),
                     }
                 )
                 self._append_advice_event(
@@ -1652,6 +2353,11 @@ class LiveOrchestrator:
                 suit_uncertain=completion.suit_uncertain,
                 variant_count=completion.variant_count,
                 advice_agrees_across_variants=completion.advice_agrees_across_variants,
+                semantic_uncertain=completion.semantic_uncertain,
+                semantic_source_history_indices=completion.semantic_source_history_indices,
+                suit_variant_count=completion.suit_variant_count,
+                suit_equivalence_class_count=completion.suit_equivalence_class_count,
+                semantic_variant_count=completion.semantic_variant_count,
             )
             self.store.append_advice(
                 {
@@ -1668,8 +2374,17 @@ class LiveOrchestrator:
                     "elapsed_ms": advice.elapsed_ms,
                     "visible": visible,
                     "suit_uncertain": completion.suit_uncertain,
-                    "suit_variant_count": completion.variant_count,
-                    "advice_agrees_across_suit_variants": completion.advice_agrees_across_variants,
+                    "suit_variant_count": completion.suit_variant_count,
+                    "suit_equivalence_class_count": completion.suit_equivalence_class_count,
+                    "semantic_uncertain": completion.semantic_uncertain,
+                    "semantic_source_history_indices": list(
+                        completion.semantic_source_history_indices
+                    ),
+                    "semantic_variant_count": completion.semantic_variant_count,
+                    "evaluated_variant_count": completion.variant_count,
+                    "advice_agrees_across_variants": completion.advice_agrees_across_variants,
+                    "uncertainty_diagnostics": completion.uncertainty_diagnostics,
+                    **self._advisor_identity(),
                 }
             )
             engine_input = advice.engine_input or {}
@@ -1680,6 +2395,9 @@ class LiveOrchestrator:
                     "legal_actions": list(engine_input.get("legal_actions", ())),
                     "feature_schema": engine_input.get("feature_schema"),
                     "features_567": engine_input.get("features_567"),
+                    "fabledan_training_input": engine_input.get(
+                        "fabledan_training_input"
+                    ),
                     "model_advice": {
                         "cards": list(advice.cards),
                         "is_pass": advice.is_pass,
@@ -1698,8 +2416,15 @@ class LiveOrchestrator:
                     "state_revision": key.state_revision,
                     "visible": visible,
                     "suit_uncertain": completion.suit_uncertain,
-                    "suit_variant_count": completion.variant_count,
-                    "advice_agrees_across_suit_variants": completion.advice_agrees_across_variants,
+                    "suit_variant_count": completion.suit_variant_count,
+                    "suit_equivalence_class_count": completion.suit_equivalence_class_count,
+                    "semantic_uncertain": completion.semantic_uncertain,
+                    "semantic_source_history_indices": list(
+                        completion.semantic_source_history_indices
+                    ),
+                    "semantic_variant_count": completion.semantic_variant_count,
+                    "evaluated_variant_count": completion.variant_count,
+                    "advice_agrees_across_variants": completion.advice_agrees_across_variants,
                 },
             )
             self._signal_advice_completion(key)
@@ -1740,6 +2465,11 @@ class LiveOrchestrator:
                 suit_uncertain=current.suit_uncertain,
                 variant_count=current.variant_count,
                 advice_agrees_across_variants=current.advice_agrees_across_variants,
+                semantic_uncertain=current.semantic_uncertain,
+                semantic_source_history_indices=current.semantic_source_history_indices,
+                suit_variant_count=current.suit_variant_count,
+                suit_equivalence_class_count=current.suit_equivalence_class_count,
+                semantic_variant_count=current.semantic_variant_count,
             )
             self._set_advice_visible_latency(current.key)
             self._append_advice_event(
@@ -1755,6 +2485,8 @@ class LiveOrchestrator:
         confidence: float = 1.0,
     ) -> LiveEvent:
         snapshot = self.snapshot
+        event_payload = self._advisor_identity()
+        event_payload.update(payload)
         self._aux_event_sequence += 1
         event = LiveEvent(
             event_id=f"AUX-{self._aux_event_sequence:06d}",
@@ -1766,13 +2498,26 @@ class LiveOrchestrator:
             trick_id=max(1, snapshot.trick_id),
             turn_id=max(1, snapshot.turn_id),
             actor="self",
-            payload=dict(payload),
+            payload=event_payload,
             confidence=float(confidence),
             source="live_advice_coordinator",
             state_revision_before=snapshot.revision,
             state_revision_after=snapshot.revision,
         )
         return self._publish_event(event)
+
+    def _advisor_identity(self) -> dict[str, object]:
+        strategy = str(getattr(self.advisor, "strategy_id", "") or "").strip()
+        display_name = str(
+            getattr(self.advisor, "display_name", "") or ""
+        ).strip()
+        return {
+            "advisor_strategy": strategy or "unknown",
+            "advisor_name": display_name or "建议模型",
+        }
+
+    def _advisor_display_name(self) -> str:
+        return str(self._advisor_identity()["advisor_name"])
 
     def _publish_event(self, event: LiveEvent) -> LiveEvent:
         with self._advice_lock:
@@ -2078,6 +2823,12 @@ class LiveOrchestrator:
         }
         self._samples.append(sample)
         self._observations.append(record)
+        if self._is_first_action_turn(result.player):
+            self._first_action_samples.append(sample)
+            # This buffer only bridges a short async handoff.  Bound it so a
+            # genuinely unresolved opening play cannot bias later retries.
+            first_action_limit = max(12, self.burst_sample_limit * 3)
+            del self._first_action_samples[:-first_action_limit]
         self.store.append_observation(record)
         self._last_sample_ms = int(monotonic_ms)
 
@@ -2092,19 +2843,22 @@ class LiveOrchestrator:
         fast: FastSignalResult,
     ) -> ConsensusResult | None:
         context = self._consensus_context(metrics, fast)
+        samples = self._samples
+        if self._is_first_action_turn():
+            samples = self._first_action_samples
         result = decide_recognition_strategy(
             self.recognition_strategy,
-            self._samples,
+            samples,
             context=context,
         )
         if (
             result is not None
-            or len(self._samples) < self.burst_sample_limit
+            or len(samples) < self.burst_sample_limit
             or not context.next_turn_evidence
         ):
             return result
         return decide_best_effort_candidate(
-            self._samples,
+            samples,
             context=context,
         )
 
@@ -2114,13 +2868,54 @@ class LiveOrchestrator:
         fast: FastSignalResult,
     ) -> str | None:
         context = self._consensus_context(metrics, fast)
+        samples = (
+            self._first_action_samples
+            if self._is_first_action_turn()
+            else self._samples
+        )
         if has_exhausted_valid_candidates(
-            self._samples,
+            samples,
             context=context,
             limit=self.burst_sample_limit,
         ):
             return "conflicting_valid_candidates"
         return None
+
+    def _decide_timeout_candidate(
+        self,
+        metrics: ZoneFrameMetrics,
+        fast: FastSignalResult,
+    ) -> ConsensusResult | None:
+        """Commit only corroborated evidence when an action window expires.
+
+        A capture/analysis handoff can let samples reach the append-only log
+        while the normal decision pass is invalidated by an intervening UI
+        update.  Before emitting a timeout, retry the exact same rule-aware
+        strategy against the retained first-action evidence.  The fallback is
+        intentionally limited to two matching legal reads: it rescues a
+        visible stable play such as ``7D 7S`` without promoting a lone
+        animation fragment or pass marker into game state.
+        """
+
+        context = self._consensus_context(metrics, fast)
+        samples = (
+            self._first_action_samples
+            if self._is_first_action_turn() and self._first_action_samples
+            else self._samples
+        )
+        if not samples:
+            return None
+        strategy_result = decide_recognition_strategy(
+            self.recognition_strategy,
+            samples,
+            context=context,
+        )
+        if strategy_result is not None and strategy_result.status == "confirmed":
+            return strategy_result
+        best_effort = decide_best_effort_candidate(samples, context=context)
+        if best_effort is None or best_effort.vote_count < 2:
+            return None
+        return best_effort
 
     def _consensus_context(
         self,
@@ -2201,7 +2996,9 @@ class LiveOrchestrator:
                 == AdviceRequestKey(before.session_id, before.turn_id, before.revision)
                 and Counter(current_advice.advice.cards) == Counter(commit_cards)
             ):
-                preferred_play_type = current_advice.advice.play_type
+                preferred_play_type = project_play_type(
+                    current_advice.advice.play_type
+                )
             try:
                 inference = infer_best_action(
                     commit_cards,
@@ -2278,6 +3075,7 @@ class LiveOrchestrator:
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
         self._first_action_pending = False
+        self._clear_first_action_candidates()
         after = self.reducer.snapshot()
         self._activate_zone(
             monotonic_ms,
@@ -2336,13 +3134,9 @@ class LiveOrchestrator:
             if player == "self" and not self._self_lead_controls_cleared:
                 self._reset_waiting_self_lead(monotonic_ms)
                 return self._update(fast_signals=fast)
-            self._first_action_pending = False
-            if reason in {
-                "empty_play,insufficient_consensus",
-                "no_valid_candidates",
-                "conflicting_valid_candidates",
-            }:
-                reason = "first_action_not_captured"
+            # Recognition retries are not a completed first action.  Retain
+            # the opening-play guard and continuity samples until a consensus
+            # or a user-confirmed action formally advances the reducer.
         candidates = tuple(
             f"CAND-{index}"
             for index, _candidate in enumerate(
@@ -2356,6 +3150,7 @@ class LiveOrchestrator:
         # Otherwise a timeout incident says "no observations" precisely when
         # the user needs to inspect the cards that were seen under an effect.
         incident_observations = list(self._observations)
+        message = _recognition_retry_message(reason, incident_observations)
         self._clear_burst()
         if player is not None and self.status == "running":
             self._activate_zone(monotonic_ms)
@@ -2363,6 +3158,7 @@ class LiveOrchestrator:
             "recognition_retry",
             {
                 "reason": str(reason),
+                "message": message,
                 "candidate_ids": list(candidates),
             },
             actor=player,
@@ -2529,6 +3325,18 @@ class LiveOrchestrator:
         self._samples.clear()
         self._observations.clear()
         self._last_sample_ms = None
+
+    def _is_first_action_turn(self, player: Seat | None = None) -> bool:
+        snapshot = self.snapshot
+        return bool(
+            self._first_action_pending
+            and snapshot.lead_player is not None
+            and (player is None or player == snapshot.lead_player)
+            and snapshot.current_player == snapshot.lead_player
+        )
+
+    def _clear_first_action_candidates(self) -> None:
+        self._first_action_samples.clear()
 
     def _update(
         self,

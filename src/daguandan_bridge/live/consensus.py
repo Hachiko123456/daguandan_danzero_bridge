@@ -17,6 +17,36 @@ from .card_uncertainty import (
 ConsensusStatus = Literal["confirmed", "needs_confirmation", "review_required"]
 
 
+def _feasible_table_assignments(context: "ConsensusContext") -> tuple[tuple[str, ...], ...]:
+    """Resolve the current table only for rule checks.
+
+    A confirmed visual event can intentionally retain an unknown suit (for
+    example ``J?``) together with its colour-constrained candidates.  The
+    rules engine only accepts concrete physical cards, so every consumer of
+    its result must test the same bounded set of possible table assignments.
+    This never changes the canonical table event or its suit metadata.
+    """
+
+    if not context.table_cards:
+        return ((),)
+    return feasible_action_variants(
+        cards=context.table_cards,
+        suit_options=context.table_suit_options,
+    )
+
+
+def _inferences_against_feasible_table(
+    cards: tuple[str, ...],
+    context: "ConsensusContext",
+) -> tuple[object, ...]:
+    """Evaluate one candidate against every feasible current-table variant."""
+
+    return tuple(
+        infer_best_action(cards, table_cards, context.level_rank)
+        for table_cards in _feasible_table_assignments(context)
+    )
+
+
 @dataclass(frozen=True)
 class RecognitionSample:
     cards: tuple[str, ...]
@@ -263,14 +293,16 @@ class BurstConsensus:
         if context.table_cards:
             try:
                 inferences = tuple(
-                    infer_best_action(
-                        variant,
-                        context.table_cards,
-                        context.level_rank,
-                    )
+                    inference
                     for variant in variants
+                    for inference in _inferences_against_feasible_table(
+                        variant,
+                        context,
+                    )
                 )
             except (ImportError, ModuleNotFoundError, ValueError):
+                return "illegal_pattern"
+            if not inferences:
                 return "illegal_pattern"
             if not any(
                 inference.action is not None and inference.beats_table
@@ -305,16 +337,17 @@ class BurstConsensus:
         ranked: list[tuple[int, int, tuple[str, ...]]] = []
         for variant in variants:
             try:
-                inference = infer_best_action(
-                    variant,
-                    context.table_cards,
-                    context.level_rank,
-                )
                 ranked.append(
-                    (
-                        int(inference.beats_table),
-                        int(inference.action is not None),
-                        variant,
+                    max(
+                        (
+                            int(inference.beats_table),
+                            int(inference.action is not None),
+                            variant,
+                        )
+                        for inference in _inferences_against_feasible_table(
+                            variant,
+                            context,
+                        )
                     )
                 )
             except (ImportError, ModuleNotFoundError, ValueError):
@@ -360,12 +393,12 @@ class BurstConsensus:
             )
         try:
             inferences = tuple(
-                infer_best_action(
-                    variant,
-                    context.table_cards,
-                    context.level_rank,
-                )
+                inference
                 for variant in variants
+                for inference in _inferences_against_feasible_table(
+                    variant,
+                    context,
+                )
             )
         except (ImportError, ModuleNotFoundError, ValueError):
             inferences = ()
@@ -373,7 +406,6 @@ class BurstConsensus:
             warnings.append("observed_pattern_unresolved")
         elif (
             context.table_cards
-            and not any(is_unknown_suit_card(card) for card in context.table_cards)
             and not any(inference.beats_table for inference in inferences)
         ):
             warnings.append("observed_table_mismatch")

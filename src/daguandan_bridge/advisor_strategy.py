@@ -10,21 +10,21 @@ from .storage import atomic_write_json
 
 
 ADVISOR_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("danzero", "DanZero"),
     ("fabledan", "FableDan"),
+    ("danzero", "DanZero"),
 )
 EVALUATION_STRATEGY_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("danzero_model", "DanZero"),
     ("fabledan_model", "FableDan 模型"),
-    ("fabledan_rule", "FableDan RuleAgent 规则基线"),
+    ("danzero_model", "DanZero"),
 )
-DEFAULT_ADVISOR_STRATEGY = "danzero"
+DEFAULT_ADVISOR_STRATEGY = "fabledan"
 DEFAULT_FABLEDAN_DEBUG = False
 DEFAULT_FABLEDAN_DIAGNOSTICS = "off"
+DEFAULT_SESSION_DATA_RECORDING_ENABLED = True
 _VALID_ADVISORS = {value for value, _label in ADVISOR_OPTIONS}
 _VALID_EVALUATION_STRATEGIES = {
     value for value, _label in EVALUATION_STRATEGY_OPTIONS
-}
+} | {"fabledan_rule"}
 
 
 def normalize_advisor_strategy(value: object) -> str:
@@ -61,6 +61,23 @@ def load_profile_fabledan_debug(
         return DEFAULT_FABLEDAN_DEBUG
     value = raw.get("fabledan_debug", DEFAULT_FABLEDAN_DEBUG)
     return value if isinstance(value, bool) else DEFAULT_FABLEDAN_DEBUG
+
+
+def load_profile_session_data_recording_enabled(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> bool:
+    """Return whether new live games should create session/replay artifacts."""
+
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_SESSION_DATA_RECORDING_ENABLED
+    if not isinstance(raw, dict):
+        return DEFAULT_SESSION_DATA_RECORDING_ENABLED
+    value = raw.get("save_session_data", DEFAULT_SESSION_DATA_RECORDING_ENABLED)
+    return value if isinstance(value, bool) else DEFAULT_SESSION_DATA_RECORDING_ENABLED
 
 
 def normalize_fabledan_diagnostics(value: object) -> str:
@@ -115,6 +132,29 @@ def save_profile_advisor_strategy(
     return normalized
 
 
+def save_profile_session_data_recording_enabled(
+    profiles_root: Path | str,
+    profile_name: str,
+    enabled: object,
+) -> bool:
+    """Persist the next-live-game recording preference in ``profile.json``."""
+
+    if not isinstance(enabled, bool):
+        raise ValueError("保存对局数据开关必须为布尔值")
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"缺少 profile 配置：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"profile 配置已损坏：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("profile.json 顶层结构必须是 JSON 对象")
+    raw["save_session_data"] = enabled
+    atomic_write_json(path, raw)
+    return enabled
+
+
 def build_advisor(
     strategy: object,
     *,
@@ -139,11 +179,12 @@ def build_advisor(
         return FableDanAdvisor(
             profiles_root,
             profile_name,
+            runtime_policy="model_required",
             diagnostics=diagnostics,
         )
     from .danzero import DanzeroAdvisor
 
-    return DanzeroAdvisor()
+    return DanzeroAdvisor(profiles_root, profile_name)
 
 
 def normalize_evaluation_strategy(value: object) -> str:
@@ -175,4 +216,4 @@ def build_evaluation_advisor(
         )
     from .danzero import DanzeroAdvisor
 
-    return DanzeroAdvisor()
+    return DanzeroAdvisor(profiles_root, profile_name)

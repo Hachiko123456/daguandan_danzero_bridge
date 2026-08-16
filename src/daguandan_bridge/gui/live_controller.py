@@ -14,8 +14,10 @@ from ..application.ports import (
 from ..advisor_strategy import (
     build_advisor,
     load_profile_advisor_strategy,
+    load_profile_session_data_recording_enabled,
     normalize_advisor_strategy,
     save_profile_advisor_strategy,
+    save_profile_session_data_recording_enabled,
 )
 from ..capture_service import FrameSnapshot
 from ..danzero.state import GuanDanState, RANKS
@@ -81,6 +83,12 @@ class LiveAssistantController(QObject):
             )
         )
         self.session_factory = session_factory
+        self.session_data_recording_enabled = (
+            load_profile_session_data_recording_enabled(
+                self.capture_service.profiles_root,
+                self.profile_name,
+            )
+        )
         self.orchestrator: LiveOrchestrator | None = None
         self._live_source = None
         self._capture_worker: WorkerHandle | None = None
@@ -168,6 +176,19 @@ class LiveAssistantController(QObject):
         self._danzero_warmup_complete = False
         if not self._danzero_warmup_running:
             self._start_danzero_warmup()
+
+    def set_session_data_recording_enabled(self, enabled: bool) -> None:
+        """Persist whether the next live game writes any session artifacts."""
+
+        if self.orchestrator is not None:
+            raise RuntimeError("实时对局开始后不能切换对局数据保存")
+        self.session_data_recording_enabled = (
+            save_profile_session_data_recording_enabled(
+                self.capture_service.profiles_root,
+                self.profile_name,
+                enabled,
+            )
+        )
 
     def start_listening(self) -> None:
         """Continuously inspect the current page and start only on a stable deal."""

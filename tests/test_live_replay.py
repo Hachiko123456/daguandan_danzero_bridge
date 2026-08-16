@@ -127,7 +127,20 @@ def test_trusted_truth_replay_uses_live_advisor_path_without_video(tmp_path):
         source_session_id="trusted-source",
         initial_state=TruthInitialState("2", "right", HAND),
         turns=(
-            TruthTurn(1, "right", False, ("7S",), monotonic_ms=100),
+            TruthTurn(
+                1,
+                "right",
+                False,
+                ("7S",),
+                monotonic_ms=100,
+                move_semantics={
+                    "selected_interpretation": {
+                        "move_type": "Single",
+                        "key": "7",
+                    },
+                    "selection_source": "exact_engine_state",
+                },
+            ),
             TruthTurn(2, "opposite", True, (), monotonic_ms=200),
             TruthTurn(3, "left", True, (), monotonic_ms=300),
             TruthTurn(4, "self", False, ("8S",), monotonic_ms=400),
@@ -152,6 +165,10 @@ def test_trusted_truth_replay_uses_live_advisor_path_without_video(tmp_path):
     assert result.advice_failed == 0
     assert result.advice_stale == 0
     assert advisor.calls == 1
+    assert advisor.states[0].play_history[0].action_metadata == {
+        "selected_interpretation": {"move_type": "Single", "key": "7"},
+        "selection_source": "exact_engine_state",
+    }
     assert result.output_path.is_file()
     assert result.summary_path.is_file()
     assert summary["completed"] is True

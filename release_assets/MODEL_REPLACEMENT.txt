@@ -1,0 +1,22 @@
+Daguandan Assistant - Model replacement
+========================================
+
+Exit the application before replacing a model. Restart it after the replacement.
+
+1. FableDan (the default strategy)
+   File: data\profiles\tencent_daguandan\models\best.npz
+   Action: overwrite best.npz with a compatible FableDan .npz model.
+   Note: best.pt is not supported. Renaming a .pt file to .npz does not
+   convert it and will not make it loadable.
+
+2. DanZero
+   File: data\profiles\tencent_daguandan\models\danzero\q_network.ckpt
+   Action: overwrite q_network.ckpt with a compatible DanZero .ckpt model.
+
+Keep a backup in the same folder before replacement, for example best.backup.npz.
+The application reads only the fixed file names above. Do not rename the folders
+or model files. If a model is incompatible, restore the backup.
+
+After replacing FableDan, run "Run_FableDan_Fixed_Benchmark.bat" in the release
+folder to compare it with the fixed no-tribute RuleAgent baseline. It never
+trains or replaces the model automatically.
