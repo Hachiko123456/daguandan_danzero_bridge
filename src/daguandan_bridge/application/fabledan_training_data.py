@@ -291,6 +291,13 @@ def _sample_from_decision(
     decision_id = str(decision.get("decision_id", "")).strip()
     if not decision_id:
         raise ValueError("缺少 decision_id")
+    if outcome.get("status") != "complete":
+        raise ValueError("终局标签未完成，不能导出 FableDan 训练样本")
+    raw_reward = outcome.get("raw_team_reward")
+    if type(raw_reward) is not int:
+        raise ValueError("终局奖励缺失或不是整数")
+    if raw_reward not in {-3, -2, -1, 1, 2, 3}:
+        raise ValueError("终局奖励不符合掼蛋计分规则")
     actual = decision.get("actual_action")
     if not isinstance(actual, dict) or not decision.get("actual_action_event_id"):
         raise ValueError("缺少已关联的实际动作")
@@ -307,9 +314,6 @@ def _sample_from_decision(
     if chosen_index is None:
         raise ValueError("实际动作无法唯一映射到当时的 FableDan 合法动作")
     selected = legal[chosen_index]
-    raw_reward = int(outcome["raw_team_reward"])
-    if raw_reward not in {-3, -2, -1, 1, 2, 3}:
-        raise ValueError("终局奖励不符合掼蛋计分规则")
     return {
         "schema": TRAINING_SAMPLE_SCHEMA,
         "sample_id": f"{session.name}:{decision_id}",
@@ -490,27 +494,126 @@ def _infer_outcome(timeline: list[dict[str, object]]) -> dict[str, object]:
         actor = event.get("actor")
         payload = event.get("payload")
         placement = payload.get("placement") if isinstance(payload, dict) else None
+        placement = "first" if placement == "head" else placement
         if actor not in _SEATS or placement not in {"first", "second", "third", "last"}:
             continue
         if placement in placements and placements[placement] != actor:
             return {"status": "incomplete", "reason": "终局名次记录互相冲突。"}
         placements[str(placement)] = str(actor)
+    if len(set(placements.values())) != len(placements):
+        return {"status": "incomplete", "reason": "同一玩家被记录为多个终局名次。"}
+
+    # A complete explicit ranking is authoritative.  In particular, corrupt
+    # or stale terminal-control evidence must never rewrite it.
+    if all(name in placements for name in ("first", "second", "third", "last")):
+        order = [placements[name] for name in ("first", "second", "third", "last")]
+        return _outcome_payload(
+            first=order[0],
+            finish_order=order,
+            terminal_kind="full_ranking",
+        )
+
     first = placements.get("first")
     second = placements.get("second")
     if first and second and _PARTNER[first] == second:
+        terminal_counts, terminal_evidence_error = _terminal_remaining_cards(timeline)
+        if terminal_counts is not None:
+            remaining = [seat for seat in _SEATS if seat not in {first, second}]
+            if len(remaining) != 2 or _PARTNER[remaining[0]] != remaining[1]:
+                return {
+                    "status": "incomplete",
+                    "reason": "双下后的剩余玩家不是同一队，不能推断三四名。",
+                    "recorded_placements": placements,
+                }
+            if terminal_counts[first] != 0 or terminal_counts[second] != 0:
+                return {
+                    "status": "incomplete",
+                    "reason": "终局剩余手牌快照与已完成的前两名不一致。",
+                    "recorded_placements": placements,
+                }
+            inferred_third, inferred_last = sorted(
+                remaining,
+                key=lambda seat: (terminal_counts[seat], _SEATS.index(seat)),
+            )
+            explicit_third = placements.get("third")
+            explicit_last = placements.get("last")
+            if explicit_third is not None or explicit_last is not None:
+                # A trusted visible placement is stronger than later terminal
+                # counters.  Complete the other of the two remaining seats
+                # mechanically; do not let conflicting counts replace it.
+                third = explicit_third or next(
+                    seat for seat in remaining if seat != explicit_last
+                )
+                last = explicit_last or next(
+                    seat for seat in remaining if seat != explicit_third
+                )
+                outcome = _outcome_payload(
+                    first=first,
+                    finish_order=[first, second, third, last],
+                    terminal_kind="double_down",
+                )
+                outcome["placement_inference"] = {
+                    "source": "explicit_player_finished",
+                    "counts": dict(terminal_counts),
+                    "inferred": {"third": third, "last": last},
+                    "tie_breaker": None,
+                }
+                return outcome
+            tied = terminal_counts[inferred_third] == terminal_counts[inferred_last]
+            outcome = _outcome_payload(
+                first=first,
+                finish_order=[first, second, inferred_third, inferred_last],
+                terminal_kind="double_down",
+            )
+            outcome["placement_inference"] = {
+                "source": "game_end_detected.remaining_cards",
+                "counts": dict(terminal_counts),
+                "inferred": {"third": inferred_third, "last": inferred_last},
+                "tie_breaker": "TURN_ORDER:self,right,opposite,left" if tied else None,
+            }
+            return outcome
+        if terminal_evidence_error is not None:
+            return {
+                "status": "incomplete",
+                "reason": terminal_evidence_error,
+                "recorded_placements": placements,
+            }
+        # Old sessions did not snapshot terminal counts.  Preserve the
+        # established double-down outcome instead of inventing third/last.
         return _outcome_payload(
             first=first,
             finish_order=[first, second],
             terminal_kind="double_down",
         )
-    if all(name in placements for name in ("first", "second", "third", "last")):
-        order = [placements[name] for name in ("first", "second", "third", "last")]
-        return _outcome_payload(first=order[0], finish_order=order, terminal_kind="full_ranking")
     return {
         "status": "incomplete",
         "reason": "未识别到完整终局名次，或无法确认双下。",
         "recorded_placements": placements,
     }
+
+
+def _terminal_remaining_cards(
+    timeline: list[dict[str, object]],
+) -> tuple[dict[str, int] | None, str | None]:
+    """Return the latest valid terminal count snapshot, without guessing."""
+
+    saw_terminal_counts = False
+    for event in reversed(timeline):
+        if event.get("event_type") != "game_end_detected":
+            continue
+        payload = event.get("payload")
+        raw = payload.get("remaining_cards") if isinstance(payload, dict) else None
+        if raw is None:
+            continue
+        saw_terminal_counts = True
+        if not isinstance(raw, dict) or set(raw) != set(_SEATS):
+            continue
+        if any(type(raw[seat]) is not int or raw[seat] < 0 for seat in _SEATS):
+            continue
+        return {seat: int(raw[seat]) for seat in _SEATS}, None
+    if saw_terminal_counts:
+        return None, "终局剩余手牌快照无效，不能推断三四名。"
+    return None, None
 
 
 def _outcome_payload(*, first: str, finish_order: list[str], terminal_kind: str) -> dict[str, object]:

@@ -789,6 +789,14 @@ def test_continue_game_control_emits_one_game_end_event(tmp_path):
     assert first.event is not None
     assert first.event.event_type == "game_end_detected"
     assert first.event.payload["control"] == "continue_game"
+    assert set(first.event.payload["remaining_cards"]) == {
+        "self", "right", "opposite", "left"
+    }
+    assert all(
+        type(count) is int
+        for count in first.event.payload["remaining_cards"].values()
+    )
+    assert isinstance(first.event.payload["finished_seats"], list)
     assert second.event is None
     orchestrator.finish()
 
@@ -1917,6 +1925,18 @@ class FakeSelfThenRightRecognitionService(FakeSelfLeadRecognitionService):
         )
 
 
+class CountingAdviceService:
+    strategy_id = "counting_test"
+    display_name = "计数测试建议"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def recommend(self, _state, *, request_id: str):
+        self.calls += 1
+        raise AssertionError(f"suppressed advice must not run: {request_id}")
+
+
 def test_self_first_play_handoff_captures_already_visible_right_play(tmp_path):
     recognition = FakeSelfThenRightRecognitionService(cards=("7C",))
     orchestrator, _update = _lead_orchestrator(tmp_path, recognition)
@@ -2021,6 +2041,147 @@ def test_self_lead_commits_after_action_controls_clear(tmp_path):
         event.event_type == "player_played" and event.actor == "self"
         for event in orchestrator.events
     )
+    orchestrator.finish()
+
+
+def test_self_lead_active_next_seat_overrides_stale_action_buttons(tmp_path):
+    cards = ("4S", "4H", "4D", "8S", "8H")
+    recognition = FakeSelfLeadRecognitionService(cards=cards)
+    recognition.active_player = "right"
+    orchestrator, _update = _lead_orchestrator(tmp_path, recognition)
+    frame = np.zeros((32, 64, 3), np.uint8)
+    reset_calls: list[int] = []
+    original_reset = orchestrator._reset_waiting_self_lead
+
+    def capture_reset(*args, **kwargs):
+        reset_calls.append(1)
+        return original_reset(*args, **kwargs)
+
+    orchestrator._reset_waiting_self_lead = capture_reset
+    for timestamp in (100, 200, 300):
+        orchestrator.ingest_frame(frame, monotonic_ms=timestamp, wall_time=f"lead-{timestamp}")
+    for index, timestamp in enumerate((400, 500, 600, 700, 800, 900, 1000, 1100)):
+        update = orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"stale-buttons-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if index == 0 else 0.001,
+                False,
+                False,
+            ),
+        )
+
+    actions = [event for event in orchestrator.events if event.event_type == "player_played"]
+    assert reset_calls == []
+    assert [(event.actor, tuple(event.payload["cards"])) for event in actions] == [
+        ("self", tuple(sorted(cards))),
+    ]
+    assert update.snapshot.current_player == "right"
+    assert len(update.snapshot.my_hand) == 22
+    assert orchestrator.latest_review is None
+    orchestrator.finish()
+
+
+def test_visual_finish_withholds_advice_without_starting_an_advice_job(tmp_path):
+    advisor = CountingAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="left",
+        advisor=advisor,
+    )
+    fast = FastSignalResult(
+        expected_player="left",
+        active_player="self",
+        pass_visible=False,
+        self_action_buttons_visible=False,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="left",
+                placement="head",
+                confidence=0.99,
+                source="template:head",
+            ),
+        ),
+    )
+
+    assert orchestrator._apply_visual_placements(fast) == ()
+    assert len(orchestrator._apply_visual_placements(fast)) == 1
+    assert orchestrator.snapshot.current_player == "self"
+    assert orchestrator._request_advice_if_needed() is None
+    assert orchestrator._request_advice_if_needed() is None
+
+    assert orchestrator.latest_advice is not None
+    assert orchestrator.latest_advice.status == "withheld"
+    assert advisor.calls == 0
+    events = [event.event_type for event in orchestrator.events]
+    assert events.count("advice_withheld") == 1
+    assert "advice_requested" not in events
+    records = read_json_lines(orchestrator.store.directory / "advice.jsonl")
+    assert [record["status"] for record in records] == ["withheld"]
+    assert records[0]["reason"] == "visual_finish_without_complete_history"
+    orchestrator.finish()
+
+
+def test_manual_correction_can_clear_withhold_after_reconstructing_counts(tmp_path):
+    advisor = CountingAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="left",
+        advisor=advisor,
+    )
+    # First create the exact scenario the visual fallback protects: the
+    # latest known left action did not account for the finish badge.
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(
+        actor="left",
+        cards=("3S",),
+        is_pass=False,
+        monotonic_ms=1,
+    )
+    orchestrator.advisor = advisor
+    fast = FastSignalResult(
+        expected_player="self",
+        active_player="self",
+        pass_visible=False,
+        self_action_buttons_visible=True,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="left",
+                placement="head",
+                confidence=0.99,
+                source="template:head",
+            ),
+        ),
+    )
+    assert orchestrator._apply_visual_placements(fast) == ()
+    assert len(orchestrator._apply_visual_placements(fast)) == 1
+    assert orchestrator.latest_advice is not None
+    assert orchestrator.latest_advice.status == "withheld"
+
+    submitted: list[object] = []
+    worker = orchestrator._advice_worker
+    assert worker is not None
+    worker.submit = submitted.append
+    update = orchestrator.correct_latest(
+        cards=HAND,
+        is_pass=False,
+        reason="manual_complete_left_history",
+    )
+
+    assert orchestrator._advice_history_is_complete(update.snapshot)
+    assert update.advice is not None
+    assert update.advice.status == "requested"
+    assert len(submitted) == 1
+    assert [
+        event.event_type for event in orchestrator.events
+    ].count("advice_withhold_cleared") == 1
     orchestrator.finish()
 
 

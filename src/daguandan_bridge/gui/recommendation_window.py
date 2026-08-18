@@ -155,6 +155,7 @@ class RecommendationFloatWindow(QWidget):
         super().__init__(parent)
         self.runtime = runtime
         self._last_request_id = ""
+        self._preselection_by_request_id: dict[str, object] = {}
         self._backend = ""
         self._card_badges: list[CardBadge] = []
         self.setObjectName("recommendationFloatWindow")
@@ -221,6 +222,12 @@ class RecommendationFloatWindow(QWidget):
         error_signal = getattr(self.runtime, "error", None)
         if error_signal is not None:
             error_signal.connect(self.show_error)
+        preselection_signal = getattr(self.runtime, "preselection_result", None)
+        if preselection_signal is not None:
+            preselection_signal.connect(self.apply_preselection_result)
+        latest = getattr(self.runtime, "latest_preselection_result", None)
+        if latest is not None:
+            self.apply_preselection_result(latest)
 
     def _apply_theme(self, *_args) -> None:
         if isDarkTheme():
@@ -246,9 +253,15 @@ class RecommendationFloatWindow(QWidget):
         self.setWindowTitle(f"{advisor_name} 极简推荐")
         player = getattr(update.snapshot, "current_player", None)
         self.trick_strip.set_snapshot(update.snapshot, update.status)
+        raw = update.advice
         if update.status == "paused":
             self.suggestion_label.setText("识别已暂停")
             self.detail_label.setText("请排除窗口遮挡后，在完整助手中点击继续")
+            self._render_cards(())
+            return
+        if isinstance(raw, LiveAdvice) and raw.status == "withheld":
+            self.suggestion_label.setText("牌局历史不完整，暂停推荐")
+            self.detail_label.setText(raw.error or "请在完整助手中补正缺失动作后再继续")
             self._render_cards(())
             return
         if update.status == "running" and player != "self":
@@ -256,8 +269,10 @@ class RecommendationFloatWindow(QWidget):
             self.detail_label.setText(f"当前轮到{seat_text(player, unknown='其他玩家')}")
             self._render_cards(())
             return
-        raw = update.advice
         if not isinstance(raw, LiveAdvice):
+            self.suggestion_label.setText("等待建议")
+            self.detail_label.setText("确认轮到自己后才显示推荐")
+            self._render_cards(())
             return
         if raw.status == "failed":
             self.suggestion_label.setText("建议计算失败")
@@ -270,6 +285,17 @@ class RecommendationFloatWindow(QWidget):
             self._render_cards(())
             return
         if raw.status != "ready" or raw.advice is None:
+            self.suggestion_label.setText("等待建议")
+            self.detail_label.setText("推荐已失效或尚未准备完成")
+            self._render_cards(())
+            return
+        # The orchestrator may finish model inference before it has
+        # corroborated that the local player may act.  Never show or act on
+        # that draft recommendation in this companion window.
+        if not raw.visible:
+            self.suggestion_label.setText("正在确认自己回合")
+            self.detail_label.setText("确认轮到自己后才显示并预选推荐牌")
+            self._render_cards(())
             return
         if raw.key.request_id == self._last_request_id:
             return
@@ -298,7 +324,26 @@ class RecommendationFloatWindow(QWidget):
         if raw.suit_uncertain:
             agreement = "各花色分支建议一致" if raw.advice_agrees_across_variants else "花色分支建议有差异"
             details.append(agreement)
+        preselection = self._preselection_by_request_id.get(raw.key.request_id)
+        if preselection is not None:
+            detail = str(getattr(preselection, "detail", "") or "")
+            if detail:
+                details.append(detail)
         self.detail_label.setText(" · ".join(details))
+
+    def apply_preselection_result(self, result: object) -> None:
+        request_id = str(getattr(result, "request_id", "") or "")
+        if not request_id:
+            return
+        self._preselection_by_request_id[request_id] = result
+        if request_id != self._last_request_id:
+            return
+        detail = str(getattr(result, "detail", "") or "")
+        if detail:
+            current = self.detail_label.text()
+            self.detail_label.setText(
+                " · ".join(item for item in (current, detail) if item)
+            )
 
     def _advisor_display_name(self) -> str:
         strategy = str(getattr(self.runtime, "advisor_strategy", "") or "")

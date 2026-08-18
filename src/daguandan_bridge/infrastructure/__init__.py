@@ -1,1 +1,1 @@
-"""Concrete adapters for capture, recognition, strategy, media and persistence."""
+"""Concrete operating-system adapters kept outside GUI and game logic."""

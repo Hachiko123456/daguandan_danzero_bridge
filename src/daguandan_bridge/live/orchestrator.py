@@ -77,6 +77,8 @@ LiveStatus = Literal[
 
 _MAX_ADVICE_STATE_VARIANTS = 32
 _MAX_SUIT_STATE_VARIANTS = 256
+_VISUAL_FINISH_WITHHOLD_REASON = "visual_finish_without_complete_history"
+_VISUAL_FINISH_WITHHOLD_TEXT = "牌局历史不完整，暂停推荐"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -137,7 +139,7 @@ class AdviceRequestKey:
 @dataclass(frozen=True)
 class LiveAdvice:
     key: AdviceRequestKey
-    status: Literal["requested", "ready", "stale", "failed"]
+    status: Literal["requested", "ready", "stale", "failed", "withheld"]
     advice: LocalAdvice | None = None
     visible: bool = False
     error: str = ""
@@ -438,6 +440,9 @@ class LiveOrchestrator:
         self._review_count = 0
         self._advice_requested_at_ms: dict[AdviceRequestKey, int] = {}
         self._advice_visible_latency_ms: int | None = None
+        self._advice_withhold_reason: str | None = None
+        self._advice_withhold_revision: int | None = None
+        self._advice_withhold_finish_event_id: str | None = None
         self._accept_advice_results = True
         self._status_before_pause: LiveStatus | None = None
         self._analysis_epoch = 0
@@ -458,6 +463,7 @@ class LiveOrchestrator:
         self._first_action_samples: list[RecognitionSample] = []
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = False
+        self._first_action_gate_reason = "not_started"
         self._game_end_detected = False
         self._finish_order: list[Seat] = []
         self._placement_streaks: dict[Seat, tuple[str, int]] = {}
@@ -530,6 +536,10 @@ class LiveOrchestrator:
         self._game_end_detected = False
         self._finish_order = []
         self._placement_streaks.clear()
+        self._advice_withhold_reason = None
+        self._advice_withhold_revision = None
+        self._advice_withhold_finish_event_id = None
+        self._first_action_gate_reason = "not_started"
         self._clear_first_action_candidates()
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
@@ -797,7 +807,7 @@ class LiveOrchestrator:
                 left_correction_target,
                 left_correction_result,
             )
-            self._append_sample(result, monotonic_ms)
+            self._append_sample(result, monotonic_ms, fast=fast)
             consensus = self._decide_if_ready(current_metrics, fast)
             if consensus is not None:
                 if consensus.status == "confirmed":
@@ -1339,9 +1349,23 @@ class LiveOrchestrator:
         self._game_end_detected = True
         self._clear_burst()
         self._clear_first_action_candidates()
+        snapshot = self.reducer.snapshot()
         event = self._append_lifecycle_event(
             "game_end_detected",
-            {"control": control},
+            {
+                "control": control,
+                # Terminal UI evidence must carry a self-contained copy of
+                # the final card counts.  The training sidecar may use it to
+                # order the two players left after a double-down; it never
+                # feeds back into the reducer.
+                "remaining_cards": {
+                    seat: int(snapshot.remaining_cards[seat])
+                    for seat in TURN_ORDER
+                },
+                "finished_seats": [
+                    seat for seat in TURN_ORDER if seat in snapshot.finished_seats
+                ],
+            },
         )
         return self._update(event=event, fast_signals=fast)
 
@@ -1429,21 +1453,30 @@ class LiveOrchestrator:
             or expected != "self"
             or self.snapshot.lead_player != "self"
         ):
+            self._first_action_gate_reason = "not_self_opening_turn"
+            return False
+        # A visible local action bar can be left over for a frame after a
+        # successful first play.  A timer that has already moved to another
+        # seat is stronger, affirmative evidence than that stale decoration.
+        # Check it first so the baseline is retained and the opening action
+        # can be recognised from the current frame.
+        if fast.active_player not in (None, "self"):
+            self._self_lead_controls_cleared = True
+            self._first_action_gate_reason = "active_player_not_self"
             return False
         if fast.self_action_buttons_visible:
             self._self_lead_controls_seen = True
+            self._first_action_gate_reason = "self_action_buttons_visible"
             return True
         if not self._self_lead_controls_seen:
-            # The analysis worker intentionally drops stale frames.  It can
-            # therefore see lead confirmation and then resume only after the
-            # local action controls have disappeared.  A timer already on the
-            # next seat is positive evidence that self did act; do not wait
-            # forever for a controls-visible frame which is no longer queued.
-            if fast.active_player not in (None, "self"):
-                self._self_lead_controls_cleared = True
-                return False
+            # The analysis worker can resume after all opening-control frames
+            # have been dropped.  Without positive next-seat evidence, keep
+            # waiting instead of treating a missing control as a submitted
+            # opening action.
+            self._first_action_gate_reason = "awaiting_self_action_evidence"
             return True
         self._self_lead_controls_cleared = True
+        self._first_action_gate_reason = "self_action_controls_cleared"
         return False
 
     def _reset_waiting_self_lead(
@@ -1617,6 +1650,98 @@ class LiveOrchestrator:
             source="two_frame_left_sidecar_probe",
         )
 
+    def _advice_history_is_complete(self, snapshot: LiveSnapshot) -> bool:
+        """Require every remaining-card count to be derivable from actions.
+
+        A visual placement badge is useful to keep the live display moving,
+        but it does not say which cards were played.  Advice is safe again
+        only after a later trusted/manual revision makes all four counts
+        reproducible from the immutable action history.
+        """
+
+        played_by_seat = {seat: 0 for seat in TURN_ORDER}
+        for event in snapshot.play_history:
+            if not event.is_pass:
+                played_by_seat[event.player] += len(event.cards)
+        return all(
+            snapshot.remaining_cards[seat] == 27 - played_by_seat[seat]
+            for seat in TURN_ORDER
+        )
+
+    def _activate_visual_finish_advice_withhold(
+        self,
+        finish_event: LiveEvent,
+    ) -> None:
+        """Persist one conservative advice-stop when a badge fills a gap."""
+
+        if self._advice_withhold_reason is not None:
+            return
+        snapshot = self.snapshot
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        self._advice_withhold_reason = _VISUAL_FINISH_WITHHOLD_REASON
+        self._advice_withhold_revision = snapshot.revision
+        self._advice_withhold_finish_event_id = finish_event.event_id
+        self.latest_advice = LiveAdvice(
+            key=key,
+            status="withheld",
+            error=_VISUAL_FINISH_WITHHOLD_TEXT,
+        )
+        self.store.append_advice(
+            {
+                "request_id": key.request_id,
+                "status": "withheld",
+                "reason": _VISUAL_FINISH_WITHHOLD_REASON,
+                "finish_event_id": finish_event.event_id,
+                "turn_id": key.turn_id,
+                "state_revision": key.state_revision,
+                **self._advisor_identity(),
+            }
+        )
+        self._append_advice_event(
+            "advice_withheld",
+            {
+                "request_id": key.request_id,
+                "reason": _VISUAL_FINISH_WITHHOLD_REASON,
+                "finish_event_id": finish_event.event_id,
+                "state_revision": key.state_revision,
+            },
+            confidence=0.0,
+        )
+        self._notify_update_listener()
+
+    def _clear_advice_withhold_if_reconstructed(
+        self,
+        snapshot: LiveSnapshot,
+    ) -> bool:
+        """Clear a visual-fallback stop only for a newer complete revision."""
+
+        held_revision = self._advice_withhold_revision
+        if self._advice_withhold_reason is None:
+            return True
+        if (
+            held_revision is None
+            or snapshot.revision <= held_revision
+            or not self._advice_history_is_complete(snapshot)
+        ):
+            return False
+        self._append_advice_event(
+            "advice_withhold_cleared",
+            {
+                "reason": self._advice_withhold_reason,
+                "finish_event_id": self._advice_withhold_finish_event_id,
+                "withheld_state_revision": held_revision,
+                "state_revision": snapshot.revision,
+            },
+        )
+        self._advice_withhold_reason = None
+        self._advice_withhold_revision = None
+        self._advice_withhold_finish_event_id = None
+        return True
+
     def _request_advice_if_needed(self) -> AdviceRequestKey | None:
         if self.advisor is None or self.status != "running":
             return None
@@ -1633,6 +1758,16 @@ class LiveOrchestrator:
             snapshot.revision,
         )
         with self._advice_lock:
+            if not self._clear_advice_withhold_if_reconstructed(snapshot):
+                # The placement path emits the single audit record.  Repeated
+                # frames must be inert: no AdviceJob, FableDan trace, or
+                # duplicate withheld event is permitted for this revision.
+                self.latest_advice = LiveAdvice(
+                    key=key,
+                    status="withheld",
+                    error=_VISUAL_FINISH_WITHHOLD_TEXT,
+                )
+                return None
             if key in self._requested_advice:
                 return key
             state = self.reducer.to_guandan_state()
@@ -2190,6 +2325,12 @@ class LiveOrchestrator:
                 snapshot.turn_id,
                 snapshot.revision,
             )
+            if not self._clear_advice_withhold_if_reconstructed(snapshot):
+                # A worker may have started just before the visual fallback.
+                # Its result is intentionally discarded without a trace so a
+                # lossily reconstructed turn can never surface as advice.
+                self._signal_advice_completion(key)
+                return
             if snapshot.current_player != "self" or key != current_key:
                 self.store.append_advice(
                     {
@@ -2445,6 +2586,8 @@ class LiveOrchestrator:
 
     def _apply_fast_signal(self, fast: FastSignalResult) -> None:
         if self.snapshot.current_player != "self":
+            return
+        if fast.active_player not in (None, "self"):
             return
         corroborated = (
             fast.active_player == "self" or fast.self_action_buttons_visible
@@ -2715,7 +2858,12 @@ class LiveOrchestrator:
                 confidence=float(signal.confidence),
                 source=f"two_frame_placement:{signal.source}",
             )
-            completed.append(self._publish_event(event))
+            published = self._publish_event(event)
+            completed.append(published)
+            # This is a display-only fallback, not a reconstructed card
+            # action.  Stop advice before the surrounding frame can request
+            # another job for a turn that now depends on unknown history.
+            self._activate_visual_finish_advice_withhold(published)
             if player not in self._finish_order:
                 self._finish_order.append(player)
 
@@ -2787,7 +2935,13 @@ class LiveOrchestrator:
                 self._last_monotonic_ms - requested_at,
             )
 
-    def _append_sample(self, result: PlayRegionResult, monotonic_ms: int) -> None:
+    def _append_sample(
+        self,
+        result: PlayRegionResult,
+        monotonic_ms: int,
+        *,
+        fast: FastSignalResult,
+    ) -> None:
         self._observation_sequence += 1
         observation_id = f"OBS-{self._observation_sequence:06d}"
         sample = RecognitionSample(
@@ -2814,6 +2968,26 @@ class LiveOrchestrator:
             "phase": "burst_read",
             "self_action_controls_seen": self._self_lead_controls_seen,
             "self_action_controls_cleared": self._self_lead_controls_cleared,
+            "first_action_gate": {
+                "reason": self._first_action_gate_reason,
+                "pending": self._first_action_pending,
+            },
+            "analysis_window": {
+                "epoch": self._analysis_epoch,
+                "sample_count_before": len(self._samples),
+                "first_action_sample_count_before": len(self._first_action_samples),
+                "recognition_strategy": self.recognition_strategy.value,
+            },
+            "fast_signals": {
+                "active_player": fast.active_player,
+                "self_action_buttons_visible": fast.self_action_buttons_visible,
+                "pass_visible": fast.pass_visible,
+                "effect_visible": fast.effect_visible,
+            },
+            "zone": {
+                "expected_player": self._zone.expected_player if self._zone else None,
+                "phase": self._zone.phase.value if self._zone else None,
+            },
             "hand_card_count_before": len(self.snapshot.my_hand)
             if result.player == "self"
             else None,

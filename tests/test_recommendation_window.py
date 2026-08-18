@@ -77,6 +77,57 @@ def test_float_window_shows_one_prominent_suggestion_for_one_request():
     window.hide()
 
 
+def test_float_window_hides_unconfirmed_recommendation_cards():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    snapshot = SimpleNamespace(current_player="self")
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            advice=_ready_advice(visible=False),
+        )
+    )
+    app.processEvents()
+
+    assert window.suggestion_label.text() == "正在确认自己回合"
+    assert window._card_badges == []
+    window.hide()
+
+
+def test_float_window_clears_recommendation_when_history_is_withheld():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    snapshot = SimpleNamespace(current_player="self")
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            advice=_ready_advice(visible=True),
+        )
+    )
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            advice=LiveAdvice(
+                key=AdviceRequestKey("session", 8, 9),
+                status="withheld",
+                error="牌局历史不完整，暂停推荐",
+            ),
+        )
+    )
+    app.processEvents()
+
+    assert window.suggestion_label.text() == "牌局历史不完整，暂停推荐"
+    assert window._card_badges == []
+    window.hide()
+
+
 def test_float_window_marks_capture_backend_and_occlusion_pause():
     app = _app()
     runtime = FakeRuntime()

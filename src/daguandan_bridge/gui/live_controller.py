@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from time import monotonic_ns, perf_counter
 from typing import Any
 
@@ -21,9 +23,21 @@ from ..advisor_strategy import (
 )
 from ..capture_service import FrameSnapshot
 from ..danzero.state import GuanDanState, RANKS
-from ..live.orchestrator import LiveOrchestrator, LiveUpdate
+from ..live.orchestrator import AdviceRequestKey, LiveAdvice, LiveOrchestrator, LiveUpdate
 from ..live.latest_worker import LatestOnlyWorker
+from ..infrastructure.win32_hand_preselector import Win32HandPreselector
+from .hand_preselection import HandPreselectionPlanner, PreselectionResult
 from .workers import OneShotThread, WorkerHandle
+
+
+@dataclass(frozen=True)
+class _PreselectionTask:
+    request_id: str
+    key: AdviceRequestKey
+    advice_cards: tuple[str, ...]
+    expected_hand: tuple[str, ...]
+    frame: FrameSnapshot
+    capture_generation: int
 
 
 class LiveAssistantController(QObject):
@@ -35,6 +49,7 @@ class LiveAssistantController(QObject):
     error = Signal(str)
     session_finished = Signal(object)
     danzero_warmup_status = Signal(str)
+    preselection_result = Signal(object)
     _waiting_recognized = Signal(object, object)
     _waiting_capture_stopped = Signal(object)
 
@@ -110,9 +125,21 @@ class LiveAssistantController(QObject):
         self._pending_auto_session: tuple[str, tuple[str, ...]] | None = None
         self._recognition_strategy = "two_valid_streak"
         self._auto_finish_requested = False
+        # Preselection is deliberately a GUI/infrastructure sidecar.  It has
+        # no reducer access and receives only a completed, visible advice plus
+        # the most recent immutable capture frame.
+        self._latest_live_frame: FrameSnapshot | None = None
+        self._latest_live_frame_generation = 0
+        self._preselection_thread: OneShotThread | None = None
+        self._active_preselection_task: _PreselectionTask | None = None
+        self._pending_preselection_task: _PreselectionTask | None = None
+        self._handled_preselection_request_ids: set[str] = set()
+        self._hand_preselector: object | None = None
+        self.latest_preselection_result: PreselectionResult | None = None
         self._waiting_recognized.connect(self._consume_waiting_recognition)
         self._waiting_capture_stopped.connect(self._waiting_capture_finished)
         self.update_ready.connect(self._auto_finish_on_game_end)
+        self.update_ready.connect(self._schedule_hand_preselection)
 
     @property
     def is_running(self) -> bool:
@@ -417,6 +444,11 @@ class LiveAssistantController(QObject):
         self.orchestrator = constructed.orchestrator
         self._live_source = constructed.source
         self._auto_finish_requested = False
+        self._latest_live_frame = None
+        self._latest_live_frame_generation = 0
+        self._pending_preselection_task = None
+        self._handled_preselection_request_ids.clear()
+        self.latest_preselection_result = None
         self.update_ready.emit(constructed.initial_update)
         self._start_analysis_worker()
         self._start_capture_worker()
@@ -489,7 +521,243 @@ class LiveAssistantController(QObject):
         worker.start()
 
     def _accept_live_frame(self, value: object) -> None:
+        if isinstance(value, FrameSnapshot):
+            self._latest_live_frame = value
+            self._latest_live_frame_generation = self._capture_generation
         self.frame_ready.emit(value)
+
+    def _schedule_hand_preselection(self, update: object) -> None:
+        """Sidecar entry point: queue one all-or-nothing hand selection.
+
+        This intentionally consumes only the public ``LiveUpdate``.  It never
+        writes a live event or state, and every failed guard returns before an
+        OS input adapter is reached.
+        """
+
+        if not isinstance(update, LiveUpdate):
+            return
+        raw = update.advice
+        snapshot = update.snapshot
+        if (
+            update.status != "running"
+            or getattr(snapshot, "current_player", None) != "self"
+            or not isinstance(raw, LiveAdvice)
+            or raw.status != "ready"
+            or not raw.visible
+            or raw.advice is None
+            or raw.advice.is_pass
+        ):
+            return
+        expected_key = AdviceRequestKey(
+            str(getattr(snapshot, "session_id", "")),
+            int(getattr(snapshot, "turn_id", 0) or 0),
+            int(getattr(snapshot, "revision", 0) or 0),
+        )
+        if raw.key != expected_key:
+            return
+        request_id = raw.key.request_id
+        if request_id in self._handled_preselection_request_ids:
+            return
+        self._handled_preselection_request_ids.add(request_id)
+        frame = self._latest_live_frame
+        if frame is None or self._latest_live_frame_generation != self._capture_generation:
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=request_id,
+                    status="rejected",
+                    detail="没有与当前对局匹配的新截图，已拒绝预选",
+                )
+            )
+            return
+        advice_request_id = str(getattr(raw.advice, "request_id", "") or "")
+        advice_revision = int(getattr(raw.advice, "state_revision", -1))
+        if (
+            advice_request_id != request_id
+            or advice_revision != raw.key.state_revision
+        ):
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=request_id,
+                    status="rejected",
+                    detail="推荐结果与当前请求不一致，已拒绝预选",
+                )
+            )
+            return
+        task = _PreselectionTask(
+            request_id=request_id,
+            key=raw.key,
+            advice_cards=tuple(str(card) for card in raw.advice.cards),
+            expected_hand=tuple(str(card) for card in snapshot.my_hand),
+            frame=frame,
+            capture_generation=self._capture_generation,
+        )
+        if self._preselection_thread is not None and self._preselection_thread.isRunning():
+            # A previous full-hand scan cannot be interrupted safely.  Keep
+            # only the newest eligible turn and still mark it handled so a
+            # repeated UI update cannot cause duplicate input.
+            self._pending_preselection_task = task
+            return
+        self._start_hand_preselection_recognition(task)
+
+    def _start_hand_preselection_recognition(self, task: _PreselectionTask) -> None:
+        if not self._preselection_task_is_current(task):
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=task.request_id,
+                    status="rejected",
+                    detail="推荐或牌局状态已过期，已拒绝预选",
+                )
+            )
+            return
+        self._active_preselection_task = task
+
+        def operation() -> object:
+            return self.recognition_service.recognize(task.frame.image)
+
+        thread = OneShotThread(operation, self)
+        thread.result.connect(
+            lambda recognition, value=task: self._complete_hand_preselection_recognition(
+                value, recognition
+            )
+        )
+        thread.error.connect(
+            lambda message, value=task: self._fail_hand_preselection_recognition(
+                value, message
+            )
+        )
+        thread.finished.connect(
+            lambda value=thread: self._hand_preselection_thread_finished(value)
+        )
+        self._preselection_thread = thread
+        thread.start()
+
+    def _complete_hand_preselection_recognition(
+        self,
+        task: _PreselectionTask,
+        recognition: object,
+    ) -> None:
+        if not self._preselection_task_is_current(task):
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=task.request_id,
+                    status="rejected",
+                    detail="推荐、牌局状态或截图已过期，已拒绝预选",
+                )
+            )
+            return
+        planner = HandPreselectionPlanner()
+        try:
+            planned = planner.plan(
+                request_id=task.request_id,
+                advice_cards=task.advice_cards,
+                expected_hand=task.expected_hand,
+                recognition=recognition,  # type: ignore[arg-type]
+                frame=task.frame,
+            )
+        except Exception as exc:
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=task.request_id,
+                    status="failed",
+                    detail=f"手牌定位失败：{exc}",
+                )
+            )
+            return
+        if planned.status != "planned" or planned.plan is None:
+            self._publish_preselection_result(planned)
+            return
+        if not self._preselection_task_is_current(task):
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=task.request_id,
+                    status="rejected",
+                    detail="推荐、牌局状态或截图已过期，已拒绝预选",
+                )
+            )
+            return
+        self._publish_preselection_result(planned)
+        adapter = self._get_hand_preselector()
+        if adapter is None:
+            self._publish_preselection_result(
+                PreselectionResult(
+                    request_id=task.request_id,
+                    status="rejected",
+                    detail="无法初始化游戏窗口预选适配器",
+                )
+            )
+            return
+        try:
+            result = adapter.preselect_hand_cards(planned.plan)
+        except Exception as exc:
+            result = PreselectionResult(
+                request_id=task.request_id,
+                status="failed",
+                detail=f"自动预选失败：{exc}",
+            )
+        self._publish_preselection_result(result)
+
+    def _fail_hand_preselection_recognition(
+        self,
+        task: _PreselectionTask,
+        message: str,
+    ) -> None:
+        self._publish_preselection_result(
+            PreselectionResult(
+                request_id=task.request_id,
+                status="failed",
+                detail=f"手牌定位失败：{message}",
+            )
+        )
+
+    def _hand_preselection_thread_finished(self, thread: OneShotThread) -> None:
+        if self._preselection_thread is not thread:
+            return
+        self._preselection_thread = None
+        self._active_preselection_task = None
+        pending, self._pending_preselection_task = self._pending_preselection_task, None
+        if pending is not None:
+            self._start_hand_preselection_recognition(pending)
+
+    def _preselection_task_is_current(self, task: _PreselectionTask) -> bool:
+        if task.capture_generation != self._capture_generation:
+            return False
+        frame_age = (datetime.now().astimezone() - task.frame.captured_at).total_seconds()
+        if frame_age < -1.0 or frame_age > 2.0:
+            return False
+        orchestrator = self.orchestrator
+        if orchestrator is None or orchestrator.status != "running":
+            return False
+        snapshot = orchestrator.snapshot
+        if (
+            snapshot.current_player != "self"
+            or AdviceRequestKey(snapshot.session_id, snapshot.turn_id, snapshot.revision)
+            != task.key
+        ):
+            return False
+        current = orchestrator.latest_advice
+        return bool(
+            isinstance(current, LiveAdvice)
+            and current.key == task.key
+            and current.status == "ready"
+            and current.visible
+            and current.advice is not None
+            and not current.advice.is_pass
+        )
+
+    def _get_hand_preselector(self):
+        if self._hand_preselector is not None:
+            return self._hand_preselector
+        try:
+            loaded = self.capture_service.load_profile(self.profile_name)
+            keywords = tuple(loaded.config.window_title_keywords)
+        except Exception:
+            return None
+        self._hand_preselector = Win32HandPreselector(keywords)
+        return self._hand_preselector
+
+    def _publish_preselection_result(self, result: PreselectionResult) -> None:
+        self.latest_preselection_result = result
+        self.preselection_result.emit(result)
 
     def _accept_live_error(self, message: str) -> None:
         self._stop_analysis_worker()

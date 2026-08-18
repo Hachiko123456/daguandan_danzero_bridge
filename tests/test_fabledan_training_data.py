@@ -6,6 +6,7 @@ import pytest
 
 from daguandan_bridge.application.fabledan_training_data import (
     FableDanTrainingDataService,
+    _infer_outcome,
 )
 
 
@@ -16,7 +17,7 @@ def _write_jsonl(path, records) -> None:
     )
 
 
-def _session(tmp_path, *, double_down: bool = True):
+def _session(tmp_path, *, double_down: bool = True, incomplete: bool = False):
     session = tmp_path / "game_training"
     session.mkdir()
     (session / "manifest.json").write_text(
@@ -84,6 +85,8 @@ def _session(tmp_path, *, double_down: bool = True):
                 {"event_id": "END-4", "event_type": "player_finished", "actor": "left", "payload": {"placement": "last"}},
             ]
         )
+    if incomplete:
+        events = events[:2]
     _write_jsonl(session / "timeline.jsonl", events)
     return session
 
@@ -133,3 +136,118 @@ def test_full_ranking_with_non_partner_second_place_is_exportable(tmp_path):
 
     assert review.can_confirm
     assert review.payload["outcome"]["terminal_kind"] == "full_ranking"
+
+
+def test_sealed_session_with_incomplete_outcome_writes_unconfirmable_draft(tmp_path):
+    session = _session(tmp_path, incomplete=True)
+    service = FableDanTrainingDataService()
+
+    review = service.initialize_review(session)
+
+    assert review.status == "draft"
+    assert review.payload["outcome"]["status"] == "incomplete"
+    assert not review.can_confirm
+    assert review.payload["eligibility"]["can_confirm"] is False
+    assert review.payload["candidates"]["eligible_decision_count"] == 0
+    assert (session / "fabledan_training_review.json").is_file()
+
+
+def _finished(actor, placement):
+    return {
+        "event_type": "player_finished",
+        "actor": actor,
+        "payload": {"placement": placement},
+    }
+
+
+def _terminal(counts):
+    return {
+        "event_type": "game_end_detected",
+        "payload": {"remaining_cards": dict(counts)},
+    }
+
+
+def test_head_second_without_terminal_counts_keeps_legacy_double_down_outcome():
+    outcome = _infer_outcome([_finished("right", "head"), _finished("left", "second")])
+
+    assert outcome["status"] == "complete"
+    assert outcome["terminal_kind"] == "double_down"
+    assert outcome["finish_order"] == ["right", "left"]
+    assert outcome["raw_team_reward"] == -3
+    assert "placement_inference" not in outcome
+
+
+def test_terminal_counts_infer_the_smaller_remaining_hand_as_third():
+    outcome = _infer_outcome(
+        [
+            _finished("right", "head"),
+            _finished("left", "second"),
+            _terminal({"self": 1, "right": 0, "opposite": 10, "left": 0}),
+        ]
+    )
+
+    assert outcome["finish_order"] == ["right", "left", "self", "opposite"]
+    assert outcome["placement_inference"] == {
+        "source": "game_end_detected.remaining_cards",
+        "counts": {"self": 1, "right": 0, "opposite": 10, "left": 0},
+        "inferred": {"third": "self", "last": "opposite"},
+        "tie_breaker": None,
+    }
+
+
+def test_equal_terminal_counts_use_stable_turn_order_for_third_and_last():
+    outcome = _infer_outcome(
+        [
+            _finished("right", "head"),
+            _finished("left", "second"),
+            _terminal({"self": 6, "right": 0, "opposite": 6, "left": 0}),
+        ]
+    )
+
+    assert outcome["finish_order"] == ["right", "left", "self", "opposite"]
+    assert outcome["placement_inference"]["tie_breaker"] == "TURN_ORDER:self,right,opposite,left"
+
+
+def test_terminal_counts_infer_the_larger_remaining_hand_as_last():
+    outcome = _infer_outcome(
+        [
+            _finished("right", "head"),
+            _finished("left", "second"),
+            _terminal({"self": 6, "right": 0, "opposite": 2, "left": 0}),
+        ]
+    )
+
+    assert outcome["finish_order"] == ["right", "left", "opposite", "self"]
+    assert outcome["placement_inference"]["inferred"] == {
+        "third": "opposite",
+        "last": "self",
+    }
+
+
+def test_explicit_ranking_is_not_replaced_by_conflicting_terminal_counts():
+    outcome = _infer_outcome(
+        [
+            _finished("right", "head"),
+            _finished("left", "second"),
+            _finished("opposite", "third"),
+            _finished("self", "last"),
+            _terminal({"self": 1, "right": 0, "opposite": 10, "left": 0}),
+        ]
+    )
+
+    assert outcome["terminal_kind"] == "full_ranking"
+    assert outcome["finish_order"] == ["right", "left", "opposite", "self"]
+    assert "placement_inference" not in outcome
+
+
+def test_invalid_terminal_counts_leave_a_double_down_outcome_incomplete():
+    outcome = _infer_outcome(
+        [
+            _finished("right", "head"),
+            _finished("left", "second"),
+            _terminal({"self": 1, "right": 0, "opposite": "10", "left": 0}),
+        ]
+    )
+
+    assert outcome["status"] == "incomplete"
+    assert "快照无效" in outcome["reason"]
