@@ -29,6 +29,14 @@ data/profiles/*/models/benchmarks/
 .codex/workflow/
 *.log
 
+# Local diagnostic run artifacts
+/$runRoot/
+/Q
+/diagnostics/
+/scripts/verify_terminal_placement_inference.py
+data/profiles/*/models/*.npz
+!data/profiles/*/models/best.npz
+
 # IDE and OS files
 .idea/
 .vscode/
