@@ -37,6 +37,7 @@ class FakeRuntime(QObject):
         self.session_data_recording_updates = []
         self.started = None
         self.listening_started = 0
+        self.start_listening_result = None
         self.confirmed_candidate_id = None
         self.manual_action = None
         self.correction = None
@@ -46,6 +47,7 @@ class FakeRuntime(QObject):
 
     def start_listening(self):
         self.listening_started += 1
+        return self.start_listening_result
 
     def start_session(
         self,
@@ -114,6 +116,33 @@ def test_live_page_requires_exactly_27_cards_before_start():
     page.close()
 
 
+def test_live_page_shows_recognized_initial_state_and_block_reason():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+
+    page.apply_initial_recognition(
+        SimpleNamespace(
+            round_level=None,
+            wild_rank=None,
+            lead_player="left",
+            current_player="right",
+            my_hand=("3S",) * 27,
+            diagnostics=("未识别到当前级牌",),
+        ),
+        None,
+    )
+    app.processEvents()
+
+    status = page.initialization_status.text()
+    assert "识别级牌：未识别" in status
+    assert "百搭级牌：未识别" in status
+    assert "起手牌：27/27 张" in status
+    assert "当前行动：右家" in status
+    assert "首发候选：左家" in status
+    assert "建局状态：等待级牌识别" in status
+    page.close()
+
+
 def test_live_page_starts_persistent_listener_without_manual_start_button():
     app = _app()
     runtime = FakeRuntime()
@@ -124,6 +153,22 @@ def test_live_page_starts_persistent_listener_without_manual_start_button():
 
     assert runtime.listening_started == 1
     assert not hasattr(page, "start_session_button")
+    page.close()
+
+
+def test_live_page_keeps_full_assistant_visible_when_window_lock_fails():
+    app = _app()
+    runtime = FakeRuntime()
+    runtime.start_listening_result = False
+    page = LiveAssistantPage(runtime)
+    requested = []
+    page.compact_mode_requested.connect(lambda: requested.append(True))
+
+    page.recognize_initial_button.click()
+    app.processEvents()
+
+    assert runtime.listening_started == 1
+    assert requested == []
     page.close()
 
 

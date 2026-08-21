@@ -443,6 +443,41 @@ class LiveAssistantPage(ScrollArea):
                 f"持续监听页面中；需要稳定识别 27 张初始手牌，当前为 {len(cards)} 张。"
             )
 
+    @staticmethod
+    def _recognized_seat_text(value: object) -> str:
+        seat = str(value or "")
+        return _SEAT_LABELS.get(seat, "未识别")
+
+    def _waiting_initialization_status(self, result: object) -> str:
+        buttons = set(getattr(result, "buttons", ()) or ())
+        if buttons & {"change_table", "continue_game"}:
+            return (
+                "持续监听页面中；当前为结算页（换桌 / 再来一局）；"
+                "不会创建新的对局录制，等待下一局牌桌出现。"
+            )
+        level = str(getattr(result, "round_level", "") or "")
+        wild_rank = str(getattr(result, "wild_rank", "") or "")
+        hand_count = len(tuple(getattr(result, "my_hand", ()) or ()))
+        current_player = self._recognized_seat_text(
+            getattr(result, "current_player", None)
+        )
+        lead_player = self._recognized_seat_text(
+            getattr(result, "lead_player", None)
+        )
+        recognized_level = level if level in RANKS else "未识别"
+        recognized_wild_rank = wild_rank if wild_rank in RANKS else "未识别"
+        if level not in RANKS:
+            progress = "建局状态：等待级牌识别。"
+        elif hand_count != 27:
+            progress = "建局状态：等待稳定的 27 张起手牌。"
+        else:
+            progress = "建局状态：等待下一帧确认同一副起手牌。"
+        return (
+            f"持续监听页面中；识别级牌：{recognized_level}；"
+            f"百搭级牌：{recognized_wild_rank}；起手牌：{hand_count}/27 张；"
+            f"当前行动：{current_player}；首发候选：{lead_player}；{progress}"
+        )
+
     def _start_listening(self) -> None:
         self._update_advisor_strategy()
         setter = getattr(self.runtime, "set_recognition_strategy", None)
@@ -450,10 +485,11 @@ class LiveAssistantPage(ScrollArea):
             setter(str(self.recognition_strategy_combo.currentData()))
         start = getattr(self.runtime, "start_listening", None)
         if callable(start):
+            if start() is False:
+                return
             self.compact_mode_requested.emit()
-            start()
             self.initialization_status.setText(
-                "正在持续监听页面；稳定识别两次相同的 27 张手牌后自动开始。"
+                "已锁定牌桌标准画面；识别级牌：等待首帧；起手牌：0/27 张。"
             )
             return
         # Compatibility only for an older embedded controller.  The shipped
@@ -512,7 +548,10 @@ class LiveAssistantPage(ScrollArea):
             self.show_frame(snapshot)
         diagnostics = tuple(getattr(result, "diagnostics", ()))
         self.error_status.setText("；".join(diagnostics[:4]))
-        self._refresh_initialization()
+        if not self._session_active:
+            self.initialization_status.setText(
+                self._waiting_initialization_status(result)
+            )
 
     @staticmethod
     def _set_combo_data(combo: ComboBox, value: object) -> None:

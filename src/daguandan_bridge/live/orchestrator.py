@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import shutil
 import logging
+import hashlib
+import sys
 from collections import Counter, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import wraps
 from inspect import signature
@@ -34,7 +36,7 @@ from ..danzero.rules import (
     logical_action_label,
     wildcard_substitutions,
 )
-from ..danzero.state import GuanDanState, Seat
+from ..danzero.state import GameStateError, GuanDanState, Seat
 from .action_uncertainty import state_variants_for_action_semantics
 from .consensus import (
     BurstConsensus,
@@ -61,8 +63,8 @@ from .models import LiveEvent, LiveSnapshot
 from .latest_worker import LatestOnlyWorker
 from .reducer import LiveReducer
 from .suit_correction import SuitCorrectionTracker
-from .turns import TURN_ORDER
-from .zone_lifecycle import ZoneFrameMetrics, ZoneLifecycle, ZonePhase
+from .turns import TURN_ORDER, next_active_seat
+from .zone_lifecycle import ZoneDecision, ZoneFrameMetrics, ZoneLifecycle, ZonePhase
 
 
 LiveStatus = Literal[
@@ -79,6 +81,14 @@ _MAX_ADVICE_STATE_VARIANTS = 32
 _MAX_SUIT_STATE_VARIANTS = 256
 _VISUAL_FINISH_WITHHOLD_REASON = "visual_finish_without_complete_history"
 _VISUAL_FINISH_WITHHOLD_TEXT = "牌局历史不完整，暂停推荐"
+_TURN_DESYNCHRONIZED_REASON = "turn_desynchronized"
+_TURN_DESYNCHRONIZED_TEXT = "牌局历史存在缺口，暂停推荐和预选"
+_TURN_RECOVERY_WITHHOLD_REASON = "turn_recovery_pending"
+_TURN_RECOVERY_WITHHOLD_TEXT = "牌局历史待恢复，暂停推荐"
+_PREVIOUS_ACTION_VERIFICATION_WITHHOLD_REASON = "previous_action_reread_pending"
+_PREVIOUS_ACTION_VERIFICATION_WITHHOLD_TEXT = "上一手牌面待复核，暂停推荐"
+_HANDOFF_GLOBAL_GRACE_MS = 3_000
+_HANDOFF_READABLE_CONFIRMATION_MS = 1_000
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -151,6 +161,107 @@ class LiveAdvice:
     suit_variant_count: int = 1
     suit_equivalence_class_count: int = 1
     semantic_variant_count: int = 1
+
+
+@dataclass
+class _TurnOwnershipWindow:
+    """Evidence ownership for one immutable expected-turn snapshot.
+
+    Fast active-player recognition is intentionally treated as a guard around
+    the slower play-region recognizer.  Candidate cards observed before the
+    owner is authenticated remain provisional.  Once a delayed-action window
+    is open, that same owner's ROI can be reread until its next action would
+    overwrite the visual evidence.
+    """
+
+    key: tuple[str, int, int, Seat]
+    expected_player: Seat
+    active_player: Seat | None = None
+    owner_active_streak: int = 0
+    handoff_active_player: Seat | None = None
+    handoff_active_streak: int = 0
+    handoff_detected_ms: int | None = None
+    handoff_global_deadline_ms: int | None = None
+    handoff_readable_since_ms: int | None = None
+    handoff_local_deadline_ms: int | None = None
+    handoff_unreadable_since_ms: int | None = None
+    handoff_sample_count: int = 0
+    handoff_block_reason: str = ""
+    handoff_last_block_reason: str = ""
+    handoff_deadline_kind: str | None = None
+    # A visible expected play can survive just long enough for the following
+    # player to PASS and the timer to reach the seat after that.  Keep this
+    # bounded recovery separate from a normal direct handoff: it requires a
+    # two-frame, seat-bound PASS marker before it can reconstruct history.
+    crossed_handoff_recovery_pending: bool = False
+    crossed_handoff_recovery_active_player: Seat | None = None
+    crossed_handoff_recovery_pass_player: Seat | None = None
+    crossed_handoff_recovery_detected_ms: int | None = None
+    crossed_handoff_recovery_pass_marker_streak: int = 0
+    # When an expected action has not reached consensus, retain its visual
+    # evidence until that same player becomes active again.  The next action
+    # from that player overwrites the only reliable recovery surface.
+    turn_recovery_pending: bool = False
+    turn_recovery_detected_ms: int | None = None
+    turn_recovery_active_player: Seat | None = None
+    turn_recovery_active_streak: int = 0
+    turn_recovery_owner_return_streak: int = 0
+    turn_recovery_pass_marker_streaks: dict[Seat, int] = field(
+        default_factory=dict
+    )
+    turn_recovery_advice_withheld: bool = False
+    turn_recovery_advice_event_id: str | None = None
+    sample_allowed: bool = False
+    crossing_active_player: Seat | None = None
+    crossing_active_streak: int = 0
+    crossing_non_owner_streak: int = 0
+    authenticated: bool = False
+    disposition: str = "unseen"
+    provisional_samples: list[RecognitionSample] = field(default_factory=list)
+    handoff_samples: list[RecognitionSample] = field(default_factory=list)
+    # This is deliberately a separate, pass-only recovery state.  Unlike an
+    # authenticated owner handoff it never makes a card ROI sample eligible
+    # for consensus.
+    unseen_direct_next_pass_pending: bool = False
+    unseen_direct_next_pass_detected_ms: int | None = None
+    unseen_direct_next_pass_deadline_ms: int | None = None
+    unseen_direct_next_pass_marker_visible: bool = False
+    unseen_direct_next_pass_edge_seen: bool = False
+    unseen_direct_next_pass_marker_streak: int = 0
+    unseen_direct_next_pass_marker_player: Seat | None = None
+    # Kept independently of the pending state so one owner-provisional frame
+    # can establish the false baseline for the immediately following timer
+    # handoff without making any card sample eligible.
+    last_expected_pass_marker_visible: bool = False
+    last_expected_pass_marker_player: Seat | None = None
+    accepted_sample_count: int = 0
+    isolated_sample_count: int = 0
+    desynchronized: bool = False
+
+
+@dataclass(frozen=True)
+class _OwnershipResolution:
+    event: LiveEvent
+    events: tuple[LiveEvent, ...]
+
+
+@dataclass
+class _PreviousActionVerification:
+    """One constrained reread opened by the immediately following action.
+
+    An action is armed as soon as it is recorded.  It is intentionally not
+    reread while the next player is still acting: the target play can still be
+    covered by its own animation then.  Only the next legal action opens its
+    short verification window, so the target is still the penultimate formal
+    action when a correction is considered.
+    """
+
+    target: LiveEvent
+    expected_followup_actor: Seat
+    followup_event_id: str | None = None
+    state: Literal["armed", "open", "confirmed", "expired"] = "armed"
+    last_probe_monotonic_ms: int | None = None
+    advice_withheld: bool = False
 
 
 @dataclass(frozen=True)
@@ -424,6 +535,8 @@ class LiveOrchestrator:
         self._last_sample_ms: int | None = None
         self._observation_sequence = 0
         self._last_monotonic_ms = 0
+        self._recognition_trace_context: dict[str, object] = {}
+        self._recognition_trace_pre_job_key: tuple[object, ...] = ()
         self._baseline_by_seat: dict[Seat, np.ndarray] = {}
         self._previous_by_seat: dict[Seat, np.ndarray] = {}
         self._content_prev_by_seat: dict[Seat, np.ndarray] = {}
@@ -443,6 +556,8 @@ class LiveOrchestrator:
         self._advice_withhold_reason: str | None = None
         self._advice_withhold_revision: int | None = None
         self._advice_withhold_finish_event_id: str | None = None
+        self._advice_suspended_reason: str | None = None
+        self._advice_suspended_turn_key: tuple[str, int, int, Seat] | None = None
         self._accept_advice_results = True
         self._status_before_pause: LiveStatus | None = None
         self._analysis_epoch = 0
@@ -464,6 +579,8 @@ class LiveOrchestrator:
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = False
         self._first_action_gate_reason = "not_started"
+        self._turn_ownership_window: _TurnOwnershipWindow | None = None
+        self._desynchronized_turn_key: tuple[str, int, int, Seat] | None = None
         self._game_end_detected = False
         self._finish_order: list[Seat] = []
         self._placement_streaks: dict[Seat, tuple[str, int]] = {}
@@ -472,6 +589,10 @@ class LiveOrchestrator:
         # result must be observed twice before it becomes a visual correction.
         self._suit_corrected_event_ids: set[str] = set()
         self._suit_correction_tracker = SuitCorrectionTracker()
+        # Every non-pass action is armed for one constrained reread.  Its
+        # window opens only once the next legal actor has completed an action;
+        # this is when the previous play's animation is expected to be gone.
+        self._previous_action_verifications: dict[str, _PreviousActionVerification] = {}
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -533,12 +654,19 @@ class LiveOrchestrator:
                 f"可用磁盘空间不足：需要 {self.minimum_free_bytes}，实际 {free_bytes}"
             )
         self._last_monotonic_ms = int(monotonic_ms)
+        self._recognition_trace_context = {}
+        self.store.update_runtime_identity(self._runtime_identity())
         self._game_end_detected = False
         self._finish_order = []
         self._placement_streaks.clear()
         self._advice_withhold_reason = None
         self._advice_withhold_revision = None
         self._advice_withhold_finish_event_id = None
+        self._advice_suspended_reason = None
+        self._advice_suspended_turn_key = None
+        self._turn_ownership_window = None
+        self._desynchronized_turn_key = None
+        self._previous_action_verifications.clear()
         self._first_action_gate_reason = "not_started"
         self._clear_first_action_candidates()
         event = self.reducer.confirm_initial_state(
@@ -614,6 +742,7 @@ class LiveOrchestrator:
         *,
         monotonic_ms: int,
         metrics: ZoneFrameMetrics | None = None,
+        trace_context: dict[str, object] | None = None,
     ) -> LiveUpdate:
         round_finished = False
         terminal_expected: Seat = "self"
@@ -621,6 +750,7 @@ class LiveOrchestrator:
             if self.status == "sealed":
                 raise RuntimeError("对局已经结束")
             self._last_monotonic_ms = int(monotonic_ms)
+            self._recognition_trace_context = dict(trace_context or {})
             if self.status == "waiting_lead":
                 job_key = self._analysis_job_key()
             elif self.status != "running":
@@ -639,6 +769,7 @@ class LiveOrchestrator:
                 else:
                     round_finished = False
                     job_key = self._analysis_job_key()
+            self._recognition_trace_pre_job_key = job_key
 
         if self.status == "waiting_lead":
             opening = self._recognize_opening_signal(frame)
@@ -704,6 +835,12 @@ class LiveOrchestrator:
             game_end = self._handle_game_end_control(fast)
             if game_end is not None:
                 return game_end
+            # A history gap makes further card/PASS reconstruction unsafe, but
+            # terminal controls and visual placement badges remain read-only
+            # evidence required to finish the recording cleanly.  Keep those
+            # paths above this guard and suspend every action path below it.
+            if self._advice_suspended_reason == _TURN_DESYNCHRONIZED_REASON:
+                return self._update(fast_signals=fast)
             if fast.super_double_visible:
                 self._clear_burst()
                 return self._update(fast_signals=fast)
@@ -751,8 +888,33 @@ class LiveOrchestrator:
                     content_changed=True,
                 )
             decision = self._zone.observe(current_metrics)
-            had_observations = bool(self._observations)
+            ownership_resolution = self._observe_turn_ownership(
+                expected,
+                fast,
+                monotonic_ms,
+                metrics=current_metrics,
+                decision=decision,
+            )
+            if ownership_resolution is not None:
+                return self._update(
+                    event=ownership_resolution.event,
+                    events=ownership_resolution.events,
+                    fast_signals=fast,
+                )
+            if self._desynchronized_turn_key == self._turn_ownership_key():
+                return self._update(fast_signals=fast)
+            owner_window = self._ensure_turn_ownership_window()
+            turn_recovery_pending = bool(
+                owner_window is not None and owner_window.turn_recovery_pending
+            )
+            had_observations = bool(
+                self._samples
+                or (owner_window is not None and owner_window.provisional_samples)
+            )
             if decision.timed_out:
+                if turn_recovery_pending:
+                    self._restart_turn_recovery_zone(monotonic_ms)
+                    return self._update(fast_signals=fast)
                 timeout_consensus = self._decide_timeout_candidate(
                     current_metrics,
                     fast,
@@ -776,83 +938,188 @@ class LiveOrchestrator:
                     return self._update(fast_signals=fast)
                 return self._require_review(decision.reason, monotonic_ms, fast)
             if decision.discard_burst:
+                if turn_recovery_pending:
+                    self._restart_turn_recovery_zone(monotonic_ms)
+                    return self._update(fast_signals=fast)
                 self._clear_burst()
-            if not decision.collect_sample or not self._sample_due(monotonic_ms):
-                return self._update(fast_signals=fast)
+                # A direct-next fallback may replay only the current readable
+                # expected-ROI burst.  An effect/motion reset invalidates any
+                # handoff samples collected before it.
+                if owner_window is not None:
+                    owner_window.handoff_samples.clear()
             snapshot = self.reducer.snapshot()
             wild_rank = snapshot.wild_rank
-            left_correction_target = self._left_suit_correction_target(snapshot)
+            previous_action_target = self._previous_action_verification_target(snapshot)
+            legacy_left_suit_target = (
+                None
+                if previous_action_target is not None
+                else self._left_suit_correction_target(snapshot)
+            )
+            collect_expected_sample = bool(
+                decision.collect_sample
+                and self._ownership_allows_sample()
+                and self._sample_due(monotonic_ms)
+            )
+            if (
+                not collect_expected_sample
+                and previous_action_target is None
+                and legacy_left_suit_target is None
+            ):
+                return self._update(fast_signals=fast)
 
-        # The expected player remains the sole action-commit path.  While
-        # self is deciding what to play, an already submitted left action can
-        # become visible again after its action controls disappear.  Read it
-        # as a best-effort sidecar only; a sidecar failure must never block
-        # the current player's recognition.
-        left_correction_result = self._probe_left_suit_correction(
+        # The expected player remains the sole action-commit path.  A previous
+        # action is reread only after its next legal actor has committed, when
+        # its own visual effect has had time to disappear.  The sidecar is
+        # deliberately best effort; only two distinct, identical legal reads
+        # can affect formal history.
+        previous_action_result = self._probe_previous_action(
+            frame,
+            target=previous_action_target,
+            wild_rank=wild_rank,
+        ) if previous_action_target is not None else None
+        legacy_left_suit_result = self._probe_left_suit_correction(
             frame,
             wild_rank=wild_rank,
-        ) if left_correction_target is not None else None
-        result = self._recognize_play_region(
-            frame,
-            expected,
-            wild_rank=wild_rank,
-            allow_pass=not first_action,
+        ) if legacy_left_suit_target is not None else None
+        result = (
+            self._recognize_play_region(
+                frame,
+                expected,
+                wild_rank=wild_rank,
+                allow_pass=not first_action,
+            )
+            if collect_expected_sample
+            else None
         )
         with self._state_lock:
             if not self._analysis_job_is_current(job_key):
                 return self._update()
             if self._zone is None or self._zone.expected_player != expected:
                 return self._update()
-            suit_correction = self._apply_left_suit_correction(
-                left_correction_target,
-                left_correction_result,
+            previous_action_event = self._apply_previous_action_correction(
+                previous_action_target,
+                previous_action_result,
+                monotonic_ms=monotonic_ms,
             )
-            self._append_sample(result, monotonic_ms, fast=fast)
+            if previous_action_event is not None:
+                return self._update(
+                    event=previous_action_event,
+                    events=(previous_action_event,),
+                    fast_signals=fast,
+                )
+            legacy_left_suit_event = self._apply_left_suit_correction(
+                legacy_left_suit_target,
+                legacy_left_suit_result,
+            )
+            if legacy_left_suit_event is not None:
+                return self._update(
+                    event=legacy_left_suit_event,
+                    events=(legacy_left_suit_event,),
+                    fast_signals=fast,
+                )
+            if not collect_expected_sample:
+                return self._update(fast_signals=fast)
+            assert result is not None
+            self._append_sample(
+                result,
+                monotonic_ms,
+                fast=fast,
+                metrics=current_metrics,
+                decision=decision,
+            )
             consensus = self._decide_if_ready(current_metrics, fast)
+            handoff_window = self._turn_ownership_window
+            if handoff_window is not None and handoff_window.handoff_samples:
+                self._append_recognition_trace(
+                    window=handoff_window,
+                    outcome="strategy_evaluated",
+                    strategy_result=consensus,
+                )
             if consensus is not None:
                 if consensus.status == "confirmed":
+                    if (
+                        handoff_window is not None
+                        and handoff_window.turn_recovery_pending
+                    ):
+                        if self._turn_recovery_is_ready(
+                            handoff_window,
+                            consensus,
+                            fast,
+                        ):
+                            event, events = self._commit_turn_recovery(
+                                consensus,
+                                monotonic_ms,
+                                fast=fast,
+                            )
+                            return self._update(
+                                event=event,
+                                events=events,
+                                fast_signals=fast,
+                            )
+                        return self._update(fast_signals=fast)
+                    if (
+                        handoff_window is not None
+                        and handoff_window.crossed_handoff_recovery_pending
+                    ):
+                        if self._crossed_handoff_recovery_is_ready(
+                            handoff_window,
+                            consensus,
+                        ):
+                            event, events = self._commit_crossed_handoff_recovery(
+                                consensus,
+                                monotonic_ms,
+                                fast=fast,
+                            )
+                            return self._update(
+                                event=event,
+                                events=events,
+                                fast_signals=fast,
+                            )
+                        # A verified play alone cannot fill the missing
+                        # action.  Keep sampling until the seat-bound PASS has
+                        # its own two-frame confirmation or the guard expires.
+                        return self._update(fast_signals=fast)
                     event, events = self._commit_consensus(
                         consensus,
                         monotonic_ms,
                         fast=fast,
                     )
-                    if suit_correction is not None:
-                        events = (suit_correction, *events)
+                    if handoff_window is not None and handoff_window.handoff_samples:
+                        self._append_recognition_trace(
+                            window=handoff_window,
+                            outcome="committed",
+                            strategy_result=consensus,
+                            commit_event_id=event.event_id,
+                        )
                     return self._update(
                         event=event,
                         events=events,
                         fast_signals=fast,
                     )
                 if consensus.status == "needs_confirmation":
+                    if (
+                        handoff_window is not None
+                        and handoff_window.turn_recovery_pending
+                    ):
+                        return self._update(fast_signals=fast)
                     update = self._require_review(
                         ",".join(consensus.rejected_reasons) or consensus.status,
                         monotonic_ms,
                         fast,
                         consensus,
                     )
-                    if suit_correction is not None:
-                        return replace(
-                            update,
-                            events=(suit_correction, *update.events),
-                        )
                     return update
-            if suit_correction is not None:
-                return self._update(
-                    event=suit_correction,
-                    events=(suit_correction,),
-                    fast_signals=fast,
-                )
             retry_reason = self._recognition_retry_reason(current_metrics, fast)
             if retry_reason is not None:
+                if (
+                    handoff_window is not None
+                    and handoff_window.turn_recovery_pending
+                ):
+                    return self._update(fast_signals=fast)
                 return self._require_review(
                     retry_reason,
                     monotonic_ms,
                     fast,
-                )
-            if suit_correction is not None:
-                return self._update(
-                    event=suit_correction,
-                    fast_signals=fast,
                 )
             return self._update(fast_signals=fast)
 
@@ -1045,36 +1312,33 @@ class LiveOrchestrator:
         wild_rank: str,
         allow_pass: bool,
     ) -> PlayRegionResult:
-        try:
-            return self.recognition_service.recognize_play_region(
-                frame,
-                expected,
-                wild_rank=wild_rank,
-                allow_pass=allow_pass,
-                allow_unknown_suit=True,
-            )
-        except TypeError as exc:
-            # Test doubles and external integrations built against the old
-            # recognizer may not know the new kwarg.  They remain compatible;
-            # the shipped service always preserves rank-only cards.
-            if "allow_unknown_suit" not in str(exc):
-                if "allow_pass" not in str(exc):
-                    raise
+        # Keep integrations and test doubles written against older recognizer
+        # signatures usable while preferring the full production call.
+        attempts = (
+            {"allow_pass": allow_pass, "allow_unknown_suit": True},
+            {"allow_pass": allow_pass},
+            {"allow_unknown_suit": True},
+            {},
+        )
+        for extra_kwargs in attempts:
             try:
                 return self.recognition_service.recognize_play_region(
                     frame,
                     expected,
                     wild_rank=wild_rank,
-                    allow_pass=allow_pass,
+                    **extra_kwargs,
                 )
-            except TypeError as fallback_exc:
-                if "allow_pass" not in str(fallback_exc):
-                    raise
-                return self.recognition_service.recognize_play_region(
-                    frame,
-                    expected,
-                    wild_rank=wild_rank,
-                )
+            except TypeError as exc:
+                message = str(exc)
+                unsupported = {
+                    name
+                    for name in extra_kwargs
+                    if f"unexpected keyword argument '{name}'" in message
+                }
+                if unsupported:
+                    continue
+                raise
+        raise TypeError("识别服务不接受任何兼容的出牌识别调用签名")
 
 
     @_state_synchronized
@@ -1528,6 +1792,7 @@ class LiveOrchestrator:
         player = self.snapshot.current_player
         if player is None:
             self._zone = None
+            self._turn_ownership_window = None
             return
         # Every action window starts from the expected player's current ROI.
         # Old cards and an earlier animation in this same seat must not count
@@ -1547,6 +1812,1608 @@ class LiveOrchestrator:
         )
         self._self_turn_corroborated = False
         self._clear_burst()
+        self._ensure_turn_ownership_window()
+
+    def _turn_ownership_key(
+        self,
+        snapshot: LiveSnapshot | None = None,
+    ) -> tuple[str, int, int, Seat] | None:
+        current = self.snapshot if snapshot is None else snapshot
+        if current.current_player is None:
+            return None
+        return (
+            current.session_id,
+            current.turn_id,
+            current.revision,
+            current.current_player,
+        )
+
+    def _ensure_turn_ownership_window(self) -> _TurnOwnershipWindow | None:
+        snapshot = self.snapshot
+        key = self._turn_ownership_key(snapshot)
+        if key is None:
+            self._turn_ownership_window = None
+            return None
+        window = self._turn_ownership_window
+        if window is None or window.key != key:
+            window = _TurnOwnershipWindow(key=key, expected_player=key[-1])
+            self._turn_ownership_window = window
+        return window
+
+    def _is_self_lead_handoff(
+        self,
+        expected: Seat,
+        active: Seat | None,
+    ) -> bool:
+        snapshot = self.snapshot
+        return bool(
+            self._first_action_pending
+            and expected == "self"
+            and snapshot.lead_player == "self"
+            and active in TURN_ORDER
+            and active != "self"
+        )
+
+    def _is_direct_next_active(
+        self,
+        expected: Seat,
+        active: Seat | None,
+    ) -> bool:
+        if active not in TURN_ORDER:
+            return False
+        snapshot = self.snapshot
+        return active == next_active_seat(expected, snapshot.finished_seats)
+
+    def _begin_owner_handoff(
+        self,
+        window: _TurnOwnershipWindow,
+        active: Seat,
+        monotonic_ms: int,
+    ) -> None:
+        self._clear_unseen_direct_next_pass(window)
+        self._clear_crossed_handoff_recovery(window)
+        window.handoff_active_player = active
+        window.handoff_active_streak = 1
+        window.handoff_detected_ms = int(monotonic_ms)
+        window.handoff_global_deadline_ms = self._handoff_global_deadline_ms(
+            monotonic_ms
+        )
+        window.handoff_readable_since_ms = None
+        window.handoff_local_deadline_ms = None
+        window.handoff_unreadable_since_ms = None
+        window.handoff_sample_count = 0
+        window.handoff_block_reason = "waiting_for_readable_expected_roi"
+        window.handoff_last_block_reason = ""
+        window.handoff_deadline_kind = None
+        # Do not let an earlier static owner ROI read combine with the first
+        # post-turn-timer handoff read.  The readable handoff window itself
+        # must provide all strategy evidence required for a commit.
+        self._samples.clear()
+        self._first_action_samples.clear()
+        window.provisional_samples.clear()
+        window.handoff_samples.clear()
+        self._last_sample_ms = None
+
+    @staticmethod
+    def _matching_expected_pass_marker(
+        fast: FastSignalResult,
+        expected: Seat,
+    ) -> bool:
+        """Return only a seat-bound pass marker for this expected action."""
+
+        return LiveOrchestrator._matching_pass_marker(fast, expected)
+
+    @staticmethod
+    def _matching_pass_marker(
+        fast: FastSignalResult,
+        player: Seat,
+    ) -> bool:
+        """Return a pass marker tied to one seat, including recovery scans."""
+
+        return bool(
+            player in getattr(fast, "pass_marker_players", ())
+            or (
+                fast.pass_visible
+                and fast.pass_marker_player == player
+            )
+        )
+
+    @staticmethod
+    def _unseen_direct_next_pass_telemetry(
+        window: _TurnOwnershipWindow,
+    ) -> dict[str, object]:
+        return {
+            "pending": window.unseen_direct_next_pass_pending,
+            "detected_ms": window.unseen_direct_next_pass_detected_ms,
+            "deadline_ms": window.unseen_direct_next_pass_deadline_ms,
+            "marker_visible": window.unseen_direct_next_pass_marker_visible,
+            "marker_player": window.unseen_direct_next_pass_marker_player,
+            "fresh_edge_seen": window.unseen_direct_next_pass_edge_seen,
+            "marker_streak": window.unseen_direct_next_pass_marker_streak,
+            "last_expected_marker_visible": window.last_expected_pass_marker_visible,
+            "last_expected_marker_player": window.last_expected_pass_marker_player,
+        }
+
+    def _clear_unseen_direct_next_pass(
+        self,
+        window: _TurnOwnershipWindow,
+    ) -> None:
+        window.unseen_direct_next_pass_pending = False
+        window.unseen_direct_next_pass_detected_ms = None
+        window.unseen_direct_next_pass_deadline_ms = None
+        window.unseen_direct_next_pass_marker_visible = False
+        window.unseen_direct_next_pass_edge_seen = False
+        window.unseen_direct_next_pass_marker_streak = 0
+        window.unseen_direct_next_pass_marker_player = None
+
+    @staticmethod
+    def _crossed_handoff_recovery_telemetry(
+        window: _TurnOwnershipWindow,
+    ) -> dict[str, object]:
+        return {
+            "pending": window.crossed_handoff_recovery_pending,
+            "detected_ms": window.crossed_handoff_recovery_detected_ms,
+            "active_player": window.crossed_handoff_recovery_active_player,
+            "pass_player": window.crossed_handoff_recovery_pass_player,
+            "pass_marker_streak": window.crossed_handoff_recovery_pass_marker_streak,
+        }
+
+    @staticmethod
+    def _clear_crossed_handoff_recovery(
+        window: _TurnOwnershipWindow,
+    ) -> None:
+        window.crossed_handoff_recovery_pending = False
+        window.crossed_handoff_recovery_active_player = None
+        window.crossed_handoff_recovery_pass_player = None
+        window.crossed_handoff_recovery_detected_ms = None
+        window.crossed_handoff_recovery_pass_marker_streak = 0
+
+    @staticmethod
+    def _turn_recovery_telemetry(
+        window: _TurnOwnershipWindow,
+    ) -> dict[str, object]:
+        return {
+            "pending": window.turn_recovery_pending,
+            "detected_ms": window.turn_recovery_detected_ms,
+            "active_player": window.turn_recovery_active_player,
+            "active_streak": window.turn_recovery_active_streak,
+            "owner_return_streak": window.turn_recovery_owner_return_streak,
+            "pass_marker_streaks": dict(window.turn_recovery_pass_marker_streaks),
+            "advice_withheld": window.turn_recovery_advice_withheld,
+            "advice_event_id": window.turn_recovery_advice_event_id,
+        }
+
+    def _begin_turn_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Keep rereading one missed action until its owner acts again."""
+
+        if window.turn_recovery_pending:
+            return
+        self._clear_crossed_handoff_recovery(window)
+        self._clear_unseen_direct_next_pass(window)
+        window.turn_recovery_pending = True
+        window.turn_recovery_detected_ms = int(monotonic_ms)
+        window.turn_recovery_active_player = fast.active_player
+        window.turn_recovery_active_streak = 0
+        window.turn_recovery_owner_return_streak = 0
+        window.turn_recovery_pass_marker_streaks.clear()
+        window.turn_recovery_advice_withheld = False
+        window.turn_recovery_advice_event_id = None
+        window.disposition = "turn_recovery_pending"
+        window.handoff_block_reason = reason
+        window.handoff_last_block_reason = reason
+        window.handoff_deadline_kind = None
+
+    def _turn_recovery_intervening_passes(
+        self,
+        window: _TurnOwnershipWindow,
+        active: Seat | None,
+    ) -> tuple[Seat, ...] | None:
+        """List the players that must have PASSed to reach ``active``."""
+
+        if active not in TURN_ORDER or active == window.expected_player:
+            return None
+        snapshot = self.snapshot
+        try:
+            start = next_active_seat(
+                window.expected_player,
+                snapshot.finished_seats,
+            )
+        except GameStateError:
+            return None
+        return self._intervening_passes_from(
+            start,
+            active,
+            snapshot.finished_seats,
+        )
+
+    @staticmethod
+    def _intervening_passes_from(
+        start: Seat | None,
+        active: Seat | None,
+        finished_seats: frozenset[Seat],
+    ) -> tuple[Seat, ...] | None:
+        if start not in TURN_ORDER or active not in TURN_ORDER:
+            return None
+        passes: list[Seat] = []
+        player = start
+        for _ in range(len(TURN_ORDER)):
+            if player == active:
+                return tuple(passes)
+            passes.append(player)
+            try:
+                player = next_active_seat(player, finished_seats)
+            except GameStateError:
+                return None
+        return None
+
+    def _preview_turn_recovery_snapshot(
+        self,
+        result: ConsensusResult,
+    ) -> LiveSnapshot | None:
+        """Preview the expected action without mutating the live reducer."""
+
+        window = self._ensure_turn_ownership_window()
+        if window is None:
+            return None
+        preview = self.reducer.clone_empty()
+        try:
+            for event in self.reducer.events:
+                preview.apply(event)
+            commit_cards = result.resolved_cards if not result.is_pass else result.cards
+            if result.is_pass:
+                preview.record_pass(
+                    window.expected_player,
+                    confidence=result.confidence,
+                    source="turn_recovery_preview",
+                )
+            else:
+                preview.record_play(
+                    window.expected_player,
+                    commit_cards,
+                    confidence=result.confidence,
+                    source="turn_recovery_preview",
+                    suit_options=(
+                        () if commit_cards != result.cards else result.suit_options
+                    ),
+                )
+        except GameStateError:
+            return None
+        return preview.snapshot()
+
+    def _turn_recovery_passes_after_action(
+        self,
+        result: ConsensusResult,
+        active: Seat | None,
+    ) -> tuple[Seat, ...] | None:
+        preview = self._preview_turn_recovery_snapshot(result)
+        if preview is None or preview.current_player is None:
+            return None
+        return self._intervening_passes_from(
+            preview.current_player,
+            active,
+            preview.finished_seats,
+        )
+
+    def _withhold_advice_for_turn_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+    ) -> None:
+        """Never call FableDan while the physical turn has outrun history."""
+
+        if window.turn_recovery_advice_withheld:
+            return
+        snapshot = self.snapshot
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        window.turn_recovery_advice_withheld = True
+        self.latest_advice = LiveAdvice(
+            key=key,
+            status="withheld",
+            error=_TURN_RECOVERY_WITHHOLD_TEXT,
+        )
+        self.store.append_advice(
+            {
+                "request_id": key.request_id,
+                "status": "withheld",
+                "reason": _TURN_RECOVERY_WITHHOLD_REASON,
+                "expected_player": window.expected_player,
+                "active_player": window.active_player,
+                "turn_id": key.turn_id,
+                "state_revision": key.state_revision,
+                **self._advisor_identity(),
+            }
+        )
+        event = self._append_advice_event(
+            "advice_withheld",
+            {
+                "request_id": key.request_id,
+                "reason": _TURN_RECOVERY_WITHHOLD_REASON,
+                "expected_player": window.expected_player,
+                "active_player": window.active_player,
+                "state_revision": key.state_revision,
+            },
+            confidence=0.0,
+        )
+        window.turn_recovery_advice_event_id = event.event_id
+
+    def _advance_turn_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
+    ) -> _OwnershipResolution | None:
+        """Collect delayed evidence until the missed owner's next action."""
+
+        active = fast.active_player
+        window.active_player = active
+        window.sample_allowed = False
+        if active == window.expected_player:
+            window.turn_recovery_owner_return_streak += 1
+            window.disposition = "turn_recovery_owner_returned"
+            window.handoff_block_reason = "expected_player_acted_again_before_recovery"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "owner_next_turn"
+            event = self._mark_turn_desynchronized(
+                window, fast, monotonic_ms, metrics=metrics, decision=decision
+            )
+            return _OwnershipResolution(event, (event,)) if event else None
+
+        window.turn_recovery_owner_return_streak = 0
+        if active == window.turn_recovery_active_player:
+            window.turn_recovery_active_streak += 1
+        else:
+            window.turn_recovery_active_player = active
+            window.turn_recovery_active_streak = 1
+
+        required_passes = self._turn_recovery_intervening_passes(window, active)
+        readable = bool(
+            decision.collect_sample
+            and decision.phase == ZonePhase.BURST_READ
+            and not fast.effect_visible
+            and not metrics.effect_visible
+        )
+        if required_passes is not None and readable:
+            for player in required_passes:
+                if self._matching_pass_marker(fast, player):
+                    window.turn_recovery_pass_marker_streaks[player] = (
+                        window.turn_recovery_pass_marker_streaks.get(player, 0) + 1
+                    )
+                else:
+                    window.turn_recovery_pass_marker_streaks[player] = 0
+
+        if active == "self" or fast.self_action_buttons_visible:
+            self._withhold_advice_for_turn_recovery(window)
+
+        window.sample_allowed = readable
+        window.disposition = (
+            "turn_recovery"
+            if readable
+            else "turn_recovery_waiting_readable"
+        )
+        window.handoff_block_reason = (
+            "" if readable else self._handoff_block_reason(metrics, decision, fast)
+        )
+        window.handoff_last_block_reason = window.handoff_block_reason
+        return None
+
+    def _turn_recovery_is_ready(
+        self,
+        window: _TurnOwnershipWindow | None,
+        result: ConsensusResult,
+        fast: FastSignalResult,
+    ) -> bool:
+        if (
+            window is None
+            or not window.turn_recovery_pending
+            or result.status != "confirmed"
+            or window.turn_recovery_active_streak < 2
+        ):
+            return False
+        required_passes = self._turn_recovery_passes_after_action(
+            result,
+            fast.active_player,
+        )
+        return bool(
+            required_passes is not None
+            and all(
+                window.turn_recovery_pass_marker_streaks.get(player, 0) >= 2
+                for player in required_passes
+            )
+        )
+
+    def _restart_turn_recovery_zone(self, monotonic_ms: int) -> None:
+        """Refresh UI timing without discarding delayed action evidence."""
+
+        window = self._ensure_turn_ownership_window()
+        if window is None or not window.turn_recovery_pending:
+            return
+        spec = strategy_spec(self.recognition_strategy)
+        self._zone = ZoneLifecycle(
+            expected_player=window.expected_player,
+            activated_at_ms=int(monotonic_ms),
+            settle_ms=max(self.settle_ms, spec.settle_ms),
+            stable_ms=spec.stable_ms,
+            action_timeout_ms=self.action_timeout_ms,
+            accept_initial_occupied=True,
+        )
+        self._last_sample_ms = None
+
+    def _begin_unseen_direct_next_pass(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        marker_baseline_visible: bool | None = None,
+    ) -> None:
+        """Open the one safe unauthenticated recovery: a new pass marker.
+
+        A just-created turn can miss the outgoing player's timer entirely.  It
+        is never safe to infer their cards from that condition, but a new
+        seat-bound PASS marker can be confirmed independently.  Capture the
+        first marker state as a baseline so an old, already-visible marker is
+        not mistaken for the current action.
+        """
+
+        self._clear_unseen_direct_next_pass(window)
+        window.unseen_direct_next_pass_pending = True
+        window.unseen_direct_next_pass_detected_ms = int(monotonic_ms)
+        window.unseen_direct_next_pass_deadline_ms = self._handoff_global_deadline_ms(
+            monotonic_ms
+        )
+        window.unseen_direct_next_pass_marker_visible = bool(
+            self._matching_expected_pass_marker(fast, window.expected_player)
+            if marker_baseline_visible is None
+            else marker_baseline_visible
+        )
+        window.unseen_direct_next_pass_marker_player = fast.pass_marker_player
+        window.disposition = "unseen_direct_next_pass_pending"
+        window.sample_allowed = False
+        # An unauthenticated handoff is never card evidence.  Keep any old ROI
+        # pixels diagnostic-only and prevent them from reaching consensus.
+        self._samples.clear()
+        self._first_action_samples.clear()
+        window.provisional_samples.clear()
+        window.handoff_samples.clear()
+        self._last_sample_ms = None
+
+    def _clear_owner_handoff(self, window: _TurnOwnershipWindow) -> None:
+        window.handoff_active_player = None
+        window.handoff_active_streak = 0
+        window.handoff_detected_ms = None
+        window.handoff_global_deadline_ms = None
+        window.handoff_readable_since_ms = None
+        window.handoff_local_deadline_ms = None
+        window.handoff_unreadable_since_ms = None
+        window.handoff_sample_count = 0
+        window.handoff_block_reason = ""
+        window.handoff_last_block_reason = ""
+        window.handoff_deadline_kind = None
+        # A later owner-active read invalidates the previous next-seat
+        # handoff.  Do not let its evidence be replayed or attributed to a
+        # normal owner commit.
+        window.handoff_samples.clear()
+        self._clear_unseen_direct_next_pass(window)
+        self._clear_crossed_handoff_recovery(window)
+
+    def _can_start_crossed_handoff_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+    ) -> bool:
+        """Allow only a visible play followed by its direct-next PASS.
+
+        The expected action must already have one readable, non-PASS sample.
+        A timer jump alone is never enough to manufacture the missing PASS.
+        """
+
+        snapshot = self.snapshot
+        expected = window.expected_player
+        if not window.handoff_samples or not any(
+            not sample.is_pass and sample.cards for sample in window.handoff_samples
+        ):
+            return False
+        try:
+            pass_player = next_active_seat(expected, snapshot.finished_seats)
+            recovery_active = next_active_seat(
+                pass_player,
+                snapshot.finished_seats,
+            )
+        except GameStateError:
+            return False
+        return bool(
+            fast.active_player == recovery_active
+            and self._matching_expected_pass_marker(fast, pass_player)
+        )
+
+    def _begin_crossed_handoff_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+    ) -> None:
+        """Retain the expected play while its direct follower PASSes quickly."""
+
+        snapshot = self.snapshot
+        pass_player = next_active_seat(
+            window.expected_player,
+            snapshot.finished_seats,
+        )
+        self._clear_crossed_handoff_recovery(window)
+        window.crossed_handoff_recovery_pending = True
+        window.crossed_handoff_recovery_active_player = fast.active_player
+        window.crossed_handoff_recovery_pass_player = pass_player
+        window.crossed_handoff_recovery_detected_ms = int(monotonic_ms)
+        window.crossing_active_player = fast.active_player
+        window.crossing_active_streak = 0
+        window.crossing_non_owner_streak = 0
+        window.disposition = "crossed_handoff_recovery"
+        window.handoff_block_reason = "waiting_for_crossed_handoff_confirmation"
+        window.handoff_last_block_reason = ""
+        window.handoff_deadline_kind = None
+
+    def _advance_crossed_handoff_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
+    ) -> _OwnershipResolution | None:
+        """Confirm a skipped direct-next PASS without relaxing normal votes."""
+
+        now = int(monotonic_ms)
+        global_deadline_ms = window.handoff_global_deadline_ms
+        if global_deadline_ms is not None and now >= global_deadline_ms:
+            window.disposition = "crossed_handoff_recovery_deadline_expired"
+            window.handoff_block_reason = "crossed_handoff_recovery_deadline"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "global"
+            self._begin_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                reason=window.handoff_block_reason,
+            )
+            return self._advance_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+
+        if fast.active_player != window.crossed_handoff_recovery_active_player:
+            window.disposition = "crossed_handoff_recovery_active_changed"
+            window.handoff_block_reason = "crossed_handoff_recovery_active_changed"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "seat_cross"
+            self._begin_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                reason=window.handoff_block_reason,
+            )
+            return self._advance_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+
+        window.crossing_active_streak += 1
+        window.crossing_non_owner_streak += 1
+        readable = bool(
+            decision.collect_sample
+            and decision.phase == ZonePhase.BURST_READ
+            and not fast.effect_visible
+            and not metrics.effect_visible
+        )
+        if not readable:
+            window.crossed_handoff_recovery_pass_marker_streak = 0
+            window.sample_allowed = False
+            window.disposition = "crossed_handoff_recovery_waiting_readable"
+            window.handoff_block_reason = self._handoff_block_reason(
+                metrics,
+                decision,
+                fast,
+            )
+            window.handoff_last_block_reason = window.handoff_block_reason
+            return None
+
+        pass_player = window.crossed_handoff_recovery_pass_player
+        pass_marker_visible = bool(
+            pass_player is not None
+            and self._matching_expected_pass_marker(fast, pass_player)
+        )
+        if pass_marker_visible:
+            window.crossed_handoff_recovery_pass_marker_streak += 1
+        else:
+            window.crossed_handoff_recovery_pass_marker_streak = 0
+        window.sample_allowed = True
+        window.disposition = "crossed_handoff_recovery"
+        window.handoff_block_reason = ""
+        return None
+
+    def _crossed_handoff_recovery_is_ready(
+        self,
+        window: _TurnOwnershipWindow | None,
+        result: ConsensusResult,
+    ) -> bool:
+        return bool(
+            window is not None
+            and window.crossed_handoff_recovery_pending
+            and result.status == "confirmed"
+            and not result.is_pass
+            and bool(result.cards)
+            and window.crossing_active_streak >= 2
+            and window.crossed_handoff_recovery_pass_marker_streak >= 2
+        )
+
+    def _handoff_global_deadline_ms(self, monotonic_ms: int) -> int:
+        """Bound recovery by both the handoff policy and this action window."""
+
+        now = int(monotonic_ms)
+        zone = self._zone
+        if zone is None:
+            return now
+        zone_deadline_ms = zone.activated_at_ms + zone.action_timeout_ms
+        return min(now + _HANDOFF_GLOBAL_GRACE_MS, zone_deadline_ms)
+
+    def _ownership_allows_sample(self) -> bool:
+        window = self._ensure_turn_ownership_window()
+        return bool(window is not None and window.sample_allowed)
+
+    @staticmethod
+    def _handoff_block_reason(
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
+        fast: FastSignalResult,
+    ) -> str:
+        if fast.effect_visible or metrics.effect_visible:
+            return "effect_settling"
+        if decision.phase != ZonePhase.BURST_READ:
+            return f"zone_{decision.phase.value}"
+        if not decision.collect_sample:
+            return decision.reason or "zone_not_collecting"
+        return "expected_roi_not_readable"
+
+    @staticmethod
+    def _handoff_telemetry(window: _TurnOwnershipWindow) -> dict[str, object]:
+        return {
+            "detected_ms": window.handoff_detected_ms,
+            "global_deadline_ms": window.handoff_global_deadline_ms,
+            "readable_since_ms": window.handoff_readable_since_ms,
+            "local_deadline_ms": window.handoff_local_deadline_ms,
+            "sample_count": window.handoff_sample_count,
+            "block_reason": window.handoff_block_reason,
+            "last_block_reason": window.handoff_last_block_reason,
+            "deadline_kind": window.handoff_deadline_kind,
+        }
+
+    @staticmethod
+    def _zone_telemetry(
+        metrics: ZoneFrameMetrics | None,
+        decision: ZoneDecision | None,
+        fast: FastSignalResult,
+    ) -> dict[str, object]:
+        return {
+            "phase": decision.phase.value if decision is not None else None,
+            "reason": decision.reason if decision is not None else "",
+            "collect_sample": decision.collect_sample if decision is not None else False,
+            "effect_visible": bool(
+                fast.effect_visible or (metrics.effect_visible if metrics else False)
+            ),
+            "motion_score": metrics.motion_score if metrics is not None else None,
+        }
+
+    @staticmethod
+    def _runtime_identity() -> dict[str, object]:
+        try:
+            fingerprint = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        except OSError:
+            fingerprint = "unavailable"
+        return {
+            "implementation_fingerprint": fingerprint,
+            "executable_path": sys.executable,
+        }
+
+    @staticmethod
+    def _strategy_trace(result: ConsensusResult | None) -> dict[str, object]:
+        if result is None:
+            return {"status": "none"}
+        return {
+            "status": result.status,
+            "cards": list(result.cards),
+            "is_pass": result.is_pass,
+            "vote_count": result.vote_count,
+            "rejected_reasons": list(result.rejected_reasons),
+        }
+
+    def _append_recognition_trace(
+        self,
+        *,
+        window: _TurnOwnershipWindow | None,
+        outcome: str,
+        strategy_result: ConsensusResult | None = None,
+        fallback: bool = False,
+        deadline_kind: str | None = None,
+        reason: str = "",
+        commit_attempted: bool = False,
+        commit_event_id: str = "",
+    ) -> None:
+        before_key = self._recognition_trace_pre_job_key or self._analysis_job_key()
+        refs = (
+            [sample.evidence_ref for sample in window.handoff_samples if sample.evidence_ref]
+            if window is not None
+            else []
+        )
+        self.store.append_recognition_trace(
+            {
+                **self._runtime_identity(),
+                **self._recognition_trace_context,
+                "monotonic_ms": self._last_monotonic_ms,
+                "outcome": outcome,
+                "reason": reason,
+                "fallback": bool(fallback),
+                "deadline_kind": deadline_kind,
+                "pre_job_key": list(before_key),
+                "post_job_key": list(self._analysis_job_key()),
+                "observation_refs": refs,
+                "strategy": self._strategy_trace(strategy_result),
+                "commit_attempted": bool(commit_attempted or commit_event_id),
+                "commit_event_id": commit_event_id,
+                "handoff": self._handoff_telemetry(window) if window else {},
+                "unseen_direct_next_pass": (
+                    self._unseen_direct_next_pass_telemetry(window)
+                    if window is not None
+                    else {}
+                ),
+                "turn_recovery": (
+                    self._turn_recovery_telemetry(window)
+                    if window is not None
+                    else {}
+                ),
+            }
+        )
+
+    def _can_start_unseen_direct_next_pass(
+        self,
+        window: _TurnOwnershipWindow,
+        expected: Seat,
+        active: Seat | None,
+    ) -> bool:
+        """Allow the pass-only exception solely on a brand-new non-lead turn."""
+
+        return bool(
+            expected == "left"
+            and active == "self"
+            and self._is_direct_next_active(expected, active)
+            and not self._is_first_action_turn(expected)
+            and bool(self.snapshot.trick_plays)
+            and not window.authenticated
+            and window.owner_active_streak == 0
+            and window.accepted_sample_count == 0
+            and not window.provisional_samples
+            and not window.handoff_samples
+            and window.handoff_detected_ms is None
+            and window.crossing_non_owner_streak == 0
+            and window.disposition in {"unseen", "owner_provisional"}
+        )
+
+    def _advance_unseen_direct_next_pass(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
+        active_is_direct_next: bool,
+    ) -> _OwnershipResolution | None:
+        """Confirm a fresh, expected-seat PASS marker without card recovery."""
+
+        now = int(monotonic_ms)
+        deadline_ms = window.unseen_direct_next_pass_deadline_ms
+        if deadline_ms is not None and now >= deadline_ms:
+            window.disposition = "unseen_direct_next_pass_deadline_expired"
+            window.handoff_block_reason = "unseen_direct_next_pass_deadline"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "unseen_direct_next_pass"
+            event = self._mark_turn_desynchronized(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+            return _OwnershipResolution(event, (event,)) if event else None
+
+        marker_visible = self._matching_expected_pass_marker(
+            fast,
+            window.expected_player,
+        )
+        window.unseen_direct_next_pass_marker_player = fast.pass_marker_player
+        readable = bool(
+            active_is_direct_next
+            and decision.phase == ZonePhase.BURST_READ
+            and decision.collect_sample
+            and not fast.effect_visible
+            and not metrics.effect_visible
+        )
+        if not readable:
+            # A marker observed while the ROI/effect is unsettled is baseline
+            # evidence only.  It cannot later satisfy the required fresh edge.
+            window.unseen_direct_next_pass_marker_visible = marker_visible
+            window.unseen_direct_next_pass_marker_streak = 0
+            window.disposition = (
+                "unseen_direct_next_pass_pending"
+                if active_is_direct_next
+                else "unseen_direct_next_pass_active_unknown"
+            )
+            self._append_recognition_trace(
+                window=window,
+                outcome="unseen_direct_next_pass_pending",
+                deadline_kind="unseen_direct_next_pass",
+                reason=(
+                    "unreadable_pass_marker"
+                    if active_is_direct_next
+                    else "active_player_unknown"
+                ),
+            )
+            return None
+
+        fresh_edge = (
+            marker_visible
+            and not window.unseen_direct_next_pass_marker_visible
+        )
+        window.unseen_direct_next_pass_marker_visible = marker_visible
+        if fresh_edge:
+            window.unseen_direct_next_pass_edge_seen = True
+            window.unseen_direct_next_pass_marker_streak = 1
+        elif marker_visible and window.unseen_direct_next_pass_edge_seen:
+            window.unseen_direct_next_pass_marker_streak += 1
+        elif not marker_visible:
+            window.unseen_direct_next_pass_marker_streak = 0
+
+        if (
+            window.unseen_direct_next_pass_edge_seen
+            and window.unseen_direct_next_pass_marker_streak >= 2
+        ):
+            marker_pass = ConsensusResult(
+                status="confirmed",
+                cards=(),
+                is_pass=True,
+                confidence=1.0,
+                source="unseen_direct_next_pass_marker",
+                vote_count=window.unseen_direct_next_pass_marker_streak,
+                candidates=(),
+            )
+            event, events = self._commit_consensus(
+                marker_pass,
+                monotonic_ms,
+                fast=fast,
+            )
+            self._append_recognition_trace(
+                window=window,
+                outcome="committed",
+                strategy_result=marker_pass,
+                fallback=True,
+                deadline_kind="unseen_direct_next_pass",
+                commit_attempted=True,
+                commit_event_id=event.event_id,
+            )
+            return _OwnershipResolution(event, events)
+
+        window.disposition = "unseen_direct_next_pass_pending"
+        self._append_recognition_trace(
+            window=window,
+            outcome="unseen_direct_next_pass_pending",
+            deadline_kind="unseen_direct_next_pass",
+            reason=(
+                "fresh_pass_marker_edge"
+                if fresh_edge
+                else "waiting_for_second_pass_marker"
+            ),
+        )
+        return None
+
+    def _advance_direct_handoff(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
+        readable: bool,
+        block_reason: str,
+    ) -> _OwnershipResolution | None:
+        """Advance a direct-next recovery without charging unreadable frames."""
+
+        now = int(monotonic_ms)
+        global_deadline_ms = window.handoff_global_deadline_ms
+        if global_deadline_ms is not None and now >= global_deadline_ms:
+            window.disposition = "handoff_global_deadline_expired"
+            window.handoff_block_reason = (
+                "global_deadline_before_readable"
+                if window.handoff_readable_since_ms is None
+                else "global_handoff_deadline"
+            )
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "global"
+            event = self._mark_turn_desynchronized(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+            return _OwnershipResolution(event, (event,)) if event else None
+        if not readable:
+            if (
+                window.handoff_readable_since_ms is not None
+                and window.handoff_unreadable_since_ms is None
+            ):
+                window.handoff_unreadable_since_ms = now
+            window.handoff_block_reason = block_reason
+            window.handoff_last_block_reason = block_reason
+            self._append_recognition_trace(
+                window=window,
+                outcome="invalidated",
+                reason=block_reason,
+            )
+            return None
+        if window.handoff_unreadable_since_ms is not None:
+            paused_ms = max(0, now - window.handoff_unreadable_since_ms)
+            if window.handoff_local_deadline_ms is not None:
+                window.handoff_local_deadline_ms += paused_ms
+            window.handoff_unreadable_since_ms = None
+        if window.handoff_readable_since_ms is None:
+            window.handoff_readable_since_ms = now
+            window.handoff_local_deadline_ms = now + _HANDOFF_READABLE_CONFIRMATION_MS
+        elif (
+            window.handoff_local_deadline_ms is not None
+            and now >= window.handoff_local_deadline_ms
+        ):
+            fallback = decide_recognition_strategy(
+                self.recognition_strategy,
+                window.handoff_samples,
+                context=self._consensus_context(metrics, fast),
+            )
+            self._append_recognition_trace(
+                window=window,
+                outcome="local_deadline_fallback",
+                strategy_result=fallback,
+                fallback=True,
+                deadline_kind="local",
+                commit_attempted=(
+                    fallback is not None and fallback.status == "confirmed"
+                ),
+            )
+            if fallback is not None and fallback.status == "confirmed":
+                event, events = self._commit_consensus(
+                    fallback,
+                    monotonic_ms,
+                    fast=fast,
+                )
+                self._append_recognition_trace(
+                    window=window,
+                    outcome="committed",
+                    strategy_result=fallback,
+                    fallback=True,
+                    deadline_kind="local",
+                    commit_event_id=event.event_id,
+                )
+                return _OwnershipResolution(event, events)
+            window.disposition = "handoff_local_deadline_expired"
+            window.handoff_block_reason = "readable_confirmation_deadline"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "local"
+            event = self._mark_turn_desynchronized(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+            return _OwnershipResolution(event, (event,)) if event else None
+        window.handoff_block_reason = ""
+        return None
+
+    def _append_consensus_sample(
+        self,
+        sample: RecognitionSample,
+        window: _TurnOwnershipWindow,
+    ) -> None:
+        self._samples.append(sample)
+        window.accepted_sample_count += 1
+        if window.turn_recovery_pending:
+            recovery_limit = max(12, self.burst_sample_limit * 3)
+            del self._samples[:-recovery_limit]
+        if self._is_first_action_turn(window.expected_player):
+            self._first_action_samples.append(sample)
+            # This buffer only bridges a short async handoff.  Bound it so a
+            # genuinely unresolved opening play cannot bias later retries.
+            first_action_limit = max(12, self.burst_sample_limit * 3)
+            del self._first_action_samples[:-first_action_limit]
+
+    def _promote_provisional_owner_samples(
+        self,
+        window: _TurnOwnershipWindow,
+    ) -> None:
+        for sample in window.provisional_samples:
+            self._append_consensus_sample(sample, window)
+        window.provisional_samples.clear()
+
+    def _suspend_advice_for_turn_desynchronization(
+        self,
+        snapshot: LiveSnapshot,
+        turn_key: tuple[str, int, int, Seat],
+        *,
+        event_id: str,
+    ) -> None:
+        self._advice_suspended_reason = _TURN_DESYNCHRONIZED_REASON
+        self._advice_suspended_turn_key = turn_key
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        self.latest_advice = LiveAdvice(
+            key=key,
+            status="withheld",
+            error=_TURN_DESYNCHRONIZED_TEXT,
+        )
+        self.store.append_advice(
+            {
+                "request_id": key.request_id,
+                "status": "withheld",
+                "reason": _TURN_DESYNCHRONIZED_REASON,
+                "turn_desynchronized_event_id": event_id,
+                "turn_id": key.turn_id,
+                "state_revision": key.state_revision,
+                **self._advisor_identity(),
+            }
+        )
+
+    def _mark_turn_desynchronized(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics | None = None,
+        decision: ZoneDecision | None = None,
+    ) -> LiveEvent | None:
+        snapshot = self.snapshot
+        turn_key = self._turn_ownership_key(snapshot)
+        if turn_key is None or self._desynchronized_turn_key == turn_key:
+            return None
+        self._desynchronized_turn_key = turn_key
+        window.desynchronized = True
+        incident_observations = list(self._observations)
+        self._analysis_epoch += 1
+        self._clear_burst()
+        self._zone = None
+        self.latest_review = None
+        event = self._append_lifecycle_event(
+            _TURN_DESYNCHRONIZED_REASON,
+            {
+                "reason": (
+                    window.handoff_block_reason
+                    or "active_player_advanced_without_committable_expected_action"
+                ),
+                "history_gap": True,
+                "expected_player": window.expected_player,
+                "active_player": fast.active_player,
+                "active_streak": window.crossing_non_owner_streak,
+                "zone": self._zone_telemetry(metrics, decision, fast),
+                "owner_window": {
+                    "key": list(window.key),
+                    "owner": window.expected_player,
+                    "active": window.active_player,
+                    "disposition": window.disposition,
+                    "authenticated": window.authenticated,
+                    "handoff_sample_count": window.handoff_sample_count,
+                    "accepted_sample_count": window.accepted_sample_count,
+                    "isolated_sample_count": window.isolated_sample_count,
+                    "provisional_sample_count": len(window.provisional_samples),
+                    "handoff": self._handoff_telemetry(window),
+                    "crossed_handoff_recovery": self._crossed_handoff_recovery_telemetry(
+                        window
+                    ),
+                    "turn_recovery": self._turn_recovery_telemetry(window),
+                    "unseen_direct_next_pass": self._unseen_direct_next_pass_telemetry(
+                        window
+                    ),
+                },
+            },
+            actor=window.expected_player,
+            confidence=0.0,
+            source="turn_ownership_guard",
+        )
+        self._append_recognition_trace(
+            window=window,
+            outcome="desynchronized",
+            deadline_kind=window.handoff_deadline_kind,
+            reason=window.handoff_block_reason,
+            commit_event_id="",
+        )
+        self._suspend_advice_for_turn_desynchronization(
+            snapshot,
+            turn_key,
+            event_id=event.event_id,
+        )
+        self._create_incident(
+            _TURN_DESYNCHRONIZED_REASON,
+            monotonic_ms,
+            observations=incident_observations,
+        )
+        self._notify_update_listener()
+        return event
+
+    def _observe_turn_ownership(
+        self,
+        expected: Seat,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
+    ) -> _OwnershipResolution | None:
+        """Classify evidence after the zone has decided whether the ROI is readable."""
+
+        window = self._ensure_turn_ownership_window()
+        if window is None or window.expected_player != expected:
+            return None
+        active = fast.active_player
+        previous_expected_pass_marker_visible = (
+            window.last_expected_pass_marker_visible
+        )
+        window.last_expected_pass_marker_visible = self._matching_expected_pass_marker(
+            fast,
+            expected,
+        )
+        window.last_expected_pass_marker_player = fast.pass_marker_player
+        window.active_player = active
+        window.sample_allowed = False
+        direct_next = self._is_direct_next_active(expected, active)
+        if window.turn_recovery_pending:
+            return self._advance_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+        if expected != "self" and (
+            (active == "self" and not direct_next)
+            or fast.self_action_buttons_visible
+        ):
+            self._begin_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                reason="self_turn_before_expected_action_confirmed",
+            )
+            return self._advance_turn_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+        if active == expected:
+            window.owner_active_streak += 1
+            self._clear_owner_handoff(window)
+            window.crossing_active_player = None
+            window.crossing_active_streak = 0
+            window.crossing_non_owner_streak = 0
+            if window.owner_active_streak >= 2:
+                window.authenticated = True
+                window.disposition = "owner_authenticated"
+                self._promote_provisional_owner_samples(window)
+            else:
+                window.disposition = "owner_provisional"
+            window.sample_allowed = True
+            return None
+        window.owner_active_streak = 0
+        self_lead_handoff = self._is_self_lead_handoff(expected, active)
+
+        # A pass can be recovered before the new owner is ever observed, but
+        # only on this initial direct-next frame.  This branch is intentionally
+        # ahead of generic handoff/card logic and leaves sample_allowed false.
+        if window.unseen_direct_next_pass_pending:
+            if direct_next:
+                return self._advance_unseen_direct_next_pass(
+                    window,
+                    fast,
+                    monotonic_ms,
+                    metrics=metrics,
+                    decision=decision,
+                    active_is_direct_next=True,
+                )
+            if active is None:
+                return self._advance_unseen_direct_next_pass(
+                    window,
+                    fast,
+                    monotonic_ms,
+                    metrics=metrics,
+                    decision=decision,
+                    active_is_direct_next=False,
+                )
+            window.disposition = "unseen_direct_next_pass_active_crossed"
+            window.handoff_block_reason = "unseen_direct_next_pass_active_crossed"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "seat_cross"
+            event = self._mark_turn_desynchronized(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+            return _OwnershipResolution(event, (event,)) if event else None
+
+        if self._can_start_unseen_direct_next_pass(window, expected, active):
+            # Only owner_provisional has an immediately preceding expected
+            # turn frame.  Reuse its explicit false marker as the edge
+            # baseline; an unseen first frame still treats a visible marker as
+            # stale by capturing the current value below.
+            marker_baseline_visible = (
+                previous_expected_pass_marker_visible
+                if window.disposition == "owner_provisional"
+                else None
+            )
+            self._begin_unseen_direct_next_pass(
+                window,
+                fast,
+                monotonic_ms,
+                marker_baseline_visible=marker_baseline_visible,
+            )
+            return self._advance_unseen_direct_next_pass(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+                active_is_direct_next=True,
+            )
+
+        can_handoff = direct_next and (window.authenticated or self_lead_handoff)
+        if can_handoff:
+            if active != window.handoff_active_player or window.handoff_detected_ms is None:
+                self._begin_owner_handoff(window, active, monotonic_ms)
+            else:
+                window.handoff_active_streak += 1
+            window.crossing_active_player = None
+            window.crossing_active_streak = 0
+            window.crossing_non_owner_streak = 0
+            readable = bool(
+                decision.collect_sample
+                and decision.phase == ZonePhase.BURST_READ
+                and not fast.effect_visible
+            )
+            ownership_event = self._advance_direct_handoff(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+                readable=readable,
+                block_reason=self._handoff_block_reason(metrics, decision, fast),
+            )
+            if ownership_event is not None:
+                return ownership_event
+            if self_lead_handoff and not window.authenticated:
+                if window.handoff_active_streak < 2:
+                    window.disposition = "self_lead_handoff_provisional"
+                else:
+                    window.authenticated = True
+                    window.disposition = "self_lead_handoff_authenticated"
+                    self._promote_provisional_owner_samples(window)
+            elif readable:
+                window.disposition = "direct_next_handoff"
+            else:
+                window.disposition = "direct_next_handoff_waiting_readable"
+            window.sample_allowed = readable
+            return None
+        if window.crossed_handoff_recovery_pending:
+            return self._advance_crossed_handoff_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+        if window.handoff_detected_ms is not None:
+            if active is None:
+                window.crossing_active_player = None
+                window.crossing_active_streak = 0
+                window.crossing_non_owner_streak = 0
+                ownership_event = self._advance_direct_handoff(
+                    window,
+                    fast,
+                    monotonic_ms,
+                    metrics=metrics,
+                    decision=decision,
+                    readable=False,
+                    block_reason="active_player_unknown",
+                )
+                if ownership_event is not None:
+                    return ownership_event
+                window.disposition = "direct_next_handoff_active_unknown"
+                return None
+            if self._can_start_crossed_handoff_recovery(window, fast):
+                self._begin_crossed_handoff_recovery(window, fast, monotonic_ms)
+                return self._advance_crossed_handoff_recovery(
+                    window,
+                    fast,
+                    monotonic_ms,
+                    metrics=metrics,
+                    decision=decision,
+                )
+            window.crossing_active_player = active
+            window.crossing_active_streak += 1
+            window.crossing_non_owner_streak += 1
+            window.disposition = "handoff_active_crossed"
+            window.handoff_block_reason = "active_player_crossed_handoff"
+            window.handoff_last_block_reason = window.handoff_block_reason
+            window.handoff_deadline_kind = "seat_cross"
+            event = self._mark_turn_desynchronized(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+            return _OwnershipResolution(event, (event,)) if event else None
+        if active is None:
+            window.crossing_active_player = None
+            window.crossing_active_streak = 0
+            window.crossing_non_owner_streak = 0
+            window.disposition = "isolated_active_unknown"
+            return None
+        self._clear_owner_handoff(window)
+        if active == window.crossing_active_player:
+            window.crossing_active_streak += 1
+        else:
+            window.crossing_active_player = active
+            window.crossing_active_streak = 1
+        window.crossing_non_owner_streak += 1
+        window.disposition = "isolated_active_mismatch"
+        window.handoff_block_reason = "foreign_active_mismatch"
+        window.handoff_last_block_reason = window.handoff_block_reason
+        # Keep one expected-ROI read as replayable diagnostic evidence, but
+        # _append_sample will quarantine it from all consensus paths.
+        window.sample_allowed = True
+        if window.crossing_non_owner_streak < 2:
+            return None
+        event = self._mark_turn_desynchronized(
+            window,
+            fast,
+            monotonic_ms,
+            metrics=metrics,
+            decision=decision,
+        )
+        return _OwnershipResolution(event, (event,)) if event else None
+
+    def _advance_previous_action_verifications(
+        self,
+        event: LiveEvent,
+        *,
+        after: LiveSnapshot,
+    ) -> None:
+        """Arm a real play and open only its predecessor's safe reread window.
+
+        A correction is never allowed to reach past the penultimate formal
+        action.  When another action is recorded before an open reread gains
+        two matching frames, that window simply expires and its original
+        history remains intact.
+        """
+
+        action_types = {"player_played", "player_passed", "manual_confirmed_event"}
+        if event.event_type not in action_types:
+            return
+
+        for verification in self._previous_action_verifications.values():
+            if verification.state == "open" and verification.followup_event_id != event.event_id:
+                verification.state = "expired"
+                self._suit_correction_tracker.clear(verification.target.event_id)
+
+        for verification in self._previous_action_verifications.values():
+            if (
+                verification.state == "armed"
+                and verification.expected_followup_actor == event.actor
+            ):
+                verification.followup_event_id = event.event_id
+                verification.state = "open"
+
+        if event.event_type == "player_passed" or bool(event.payload.get("is_pass", False)):
+            return
+        if after.current_player is None:
+            return
+        self._previous_action_verifications[event.event_id] = _PreviousActionVerification(
+            target=event,
+            expected_followup_actor=after.current_player,
+        )
+
+    def _previous_action_verification_target(
+        self,
+        snapshot: LiveSnapshot,
+    ) -> _PreviousActionVerification | None:
+        """Return the one reread target that is still penultimate and open."""
+
+        actions = [
+            event
+            for event in self.reducer.events
+            if event.event_type in {"player_played", "player_passed", "manual_confirmed_event"}
+        ]
+        if len(actions) < 2:
+            return None
+        penultimate, latest = actions[-2:]
+        verification = self._previous_action_verifications.get(penultimate.event_id)
+        if (
+            verification is None
+            or verification.state != "open"
+            or verification.target.event_id != penultimate.event_id
+            or verification.followup_event_id != latest.event_id
+            or latest.actor != verification.expected_followup_actor
+            or snapshot.current_player is None
+        ):
+            return None
+        return verification
+
+    def _probe_previous_action(
+        self,
+        frame: np.ndarray,
+        *,
+        target: _PreviousActionVerification,
+        wild_rank: str,
+    ) -> PlayRegionResult | None:
+        """Read the target's own region without treating it as a new action."""
+
+        try:
+            return self._recognize_play_region(
+                frame,
+                target.target.actor,
+                wild_rank=wild_rank,
+                allow_pass=False,
+            )
+        except (cv2.error, OSError, RuntimeError, ValueError):
+            return None
+
+    def _apply_previous_action_correction(
+        self,
+        target: _PreviousActionVerification | None,
+        result: PlayRegionResult | None,
+        *,
+        monotonic_ms: int,
+    ) -> LiveEvent | None:
+        """Confirm or correct an adjacent action from two distinct rereads."""
+
+        if (
+            target is None
+            or target.state != "open"
+            or result is None
+            or result.is_pass
+            or result.player != target.target.actor
+            or target.last_probe_monotonic_ms == int(monotonic_ms)
+        ):
+            return None
+        target.last_probe_monotonic_ms = int(monotonic_ms)
+        original_cards = tuple(str(card) for card in target.target.payload.get("cards", ()))
+        observation = self._suit_correction_tracker.observe_visual_action(
+            target.target.event_id,
+            original_cards,
+            tuple(str(card) for card in result.cards),
+        )
+        if not observation.confirmed:
+            return None
+
+        target.state = "confirmed"
+        self._suit_correction_tracker.clear(target.target.event_id)
+        if observation.cards == tuple(sorted(original_cards)):
+            event = self._append_lifecycle_event(
+                "previous_action_verified",
+                {
+                    "target_event_id": target.target.event_id,
+                    "followup_event_id": target.followup_event_id,
+                    "cards": list(observation.cards),
+                    "reason": "two_distinct_adjacent_action_rereads",
+                },
+                actor=target.target.actor,
+                confidence=result.confidence,
+                source="two_frame_adjacent_action_reread",
+            )
+            self._request_advice_if_needed()
+            return event
+
+        before = self.reducer.snapshot()
+        try:
+            correction = self.reducer.correct_previous_action_after_followup(
+                target.target.event_id,
+                expected_followup_actor=target.expected_followup_actor,
+                followup_event_id=target.followup_event_id or "",
+                cards=observation.cards,
+                reason="two_distinct_adjacent_action_rereads",
+                confidence=result.confidence,
+                source="two_frame_adjacent_action_reread",
+            )
+        except GameStateError as exc:  # reducer rolls back invalid semantic rewrites
+            target.state = "expired"
+            _LOGGER.warning("相邻动作复核纠正被拒绝：%s", exc)
+            return None
+        after = self.reducer.snapshot()
+        if after.current_player != before.current_player:
+            # The reducer method already rolls back violations, but keep the
+            # orchestration invariant explicit: rereading an older action must
+            # never change whose turn it is after the following action.
+            raise RuntimeError("相邻动作复核改变了当前行动者")
+        published = self._publish_event(correction)
+        self._analysis_epoch += 1
+        self._clear_burst()
+        self._activate_zone(monotonic_ms)
+        self._request_advice_if_needed()
+        return published
+
+    def _withhold_advice_for_previous_action_verification(
+        self,
+        snapshot: LiveSnapshot,
+        key: AdviceRequestKey,
+    ) -> bool:
+        """Do not send FableDan an action history waiting for its reread."""
+
+        target = self._previous_action_verification_target(snapshot)
+        if target is None:
+            return False
+        if not target.advice_withheld:
+            target.advice_withheld = True
+            self.store.append_advice(
+                {
+                    "request_id": key.request_id,
+                    "status": "withheld",
+                    "reason": _PREVIOUS_ACTION_VERIFICATION_WITHHOLD_REASON,
+                    "target_event_id": target.target.event_id,
+                    "followup_event_id": target.followup_event_id,
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                    **self._advisor_identity(),
+                }
+            )
+            self._append_advice_event(
+                "advice_withheld",
+                {
+                    "request_id": key.request_id,
+                    "reason": _PREVIOUS_ACTION_VERIFICATION_WITHHOLD_REASON,
+                    "target_event_id": target.target.event_id,
+                    "followup_event_id": target.followup_event_id,
+                    "state_revision": key.state_revision,
+                },
+                confidence=0.0,
+            )
+        self.latest_advice = LiveAdvice(
+            key=key,
+            status="withheld",
+            error=_PREVIOUS_ACTION_VERIFICATION_WITHHOLD_TEXT,
+        )
+        return True
 
     def _left_suit_correction_target(
         self,
@@ -1743,6 +3610,8 @@ class LiveOrchestrator:
         return True
 
     def _request_advice_if_needed(self) -> AdviceRequestKey | None:
+        if self._advice_suspended_reason is not None:
+            return None
         if self.advisor is None or self.status != "running":
             return None
         snapshot = self.snapshot
@@ -1758,6 +3627,8 @@ class LiveOrchestrator:
             snapshot.revision,
         )
         with self._advice_lock:
+            if self._withhold_advice_for_previous_action_verification(snapshot, key):
+                return None
             if not self._clear_advice_withhold_if_reconstructed(snapshot):
                 # The placement path emits the single audit record.  Repeated
                 # frames must be inert: no AdviceJob, FableDan trace, or
@@ -1818,6 +3689,9 @@ class LiveOrchestrator:
         )
         raw_suit_variants = suit_expansion.states
         has_unknown_suit = any(
+            is_unknown_suit_card(card)
+            for card in job.state.my_hand
+        ) or any(
             is_unknown_suit_card(card)
             for event in job.state.play_history
             for card in event.cards
@@ -2325,6 +4199,9 @@ class LiveOrchestrator:
                 snapshot.turn_id,
                 snapshot.revision,
             )
+            if self._advice_suspended_reason is not None:
+                self._signal_advice_completion(key)
+                return
             if not self._clear_advice_withhold_if_reconstructed(snapshot):
                 # A worker may have started just before the visual fallback.
                 # Its result is intentionally discarded without a trace so a
@@ -2941,6 +4818,8 @@ class LiveOrchestrator:
         monotonic_ms: int,
         *,
         fast: FastSignalResult,
+        metrics: ZoneFrameMetrics,
+        decision: ZoneDecision,
     ) -> None:
         self._observation_sequence += 1
         observation_id = f"OBS-{self._observation_sequence:06d}"
@@ -2953,6 +4832,35 @@ class LiveOrchestrator:
             suit_options=result.suit_options,
             post_hand=result.post_hand,
         )
+        owner_window = self._ensure_turn_ownership_window()
+        owner_disposition = (
+            owner_window.disposition if owner_window is not None else "isolated_no_window"
+        )
+        accepted_for_consensus = owner_disposition in {
+            "owner_authenticated",
+            "self_lead_handoff_authenticated",
+            "direct_next_handoff",
+            "crossed_handoff_recovery",
+            "turn_recovery",
+        } and bool(owner_window and owner_window.sample_allowed)
+        provisional_owner_sample = owner_disposition in {
+            "owner_provisional",
+            "self_lead_handoff_provisional",
+        }
+        is_readable_handoff_sample = bool(
+            owner_window is not None
+            and owner_disposition
+            in {
+                "self_lead_handoff_authenticated",
+                "self_lead_handoff_provisional",
+                "direct_next_handoff",
+                "crossed_handoff_recovery",
+                "turn_recovery",
+            }
+            and owner_window.handoff_readable_since_ms is not None
+        )
+        if is_readable_handoff_sample:
+            owner_window.handoff_sample_count += 1
         record: dict[str, object] = {
             "id": observation_id,
             "monotonic_ms": int(monotonic_ms),
@@ -2982,11 +4890,53 @@ class LiveOrchestrator:
                 "active_player": fast.active_player,
                 "self_action_buttons_visible": fast.self_action_buttons_visible,
                 "pass_visible": fast.pass_visible,
+                "pass_marker_player": fast.pass_marker_player,
+                "pass_marker_players": list(
+                    getattr(fast, "pass_marker_players", ())
+                ),
                 "effect_visible": fast.effect_visible,
             },
             "zone": {
                 "expected_player": self._zone.expected_player if self._zone else None,
-                "phase": self._zone.phase.value if self._zone else None,
+                **self._zone_telemetry(metrics, decision, fast),
+            },
+            "ownership": {
+                "owner": owner_window.expected_player if owner_window else None,
+                "active": fast.active_player,
+                "window_key": list(owner_window.key) if owner_window else None,
+                "owner_active_streak": (
+                    owner_window.owner_active_streak if owner_window else 0
+                ),
+                "crossing_active_streak": (
+                    owner_window.crossing_active_streak if owner_window else 0
+                ),
+                "crossing_non_owner_streak": (
+                    owner_window.crossing_non_owner_streak if owner_window else 0
+                ),
+                "authenticated": owner_window.authenticated if owner_window else False,
+                "disposition": owner_disposition,
+                "accepted_for_consensus": accepted_for_consensus,
+                "sample_allowed": owner_window.sample_allowed if owner_window else False,
+                "handoff": (
+                    self._handoff_telemetry(owner_window)
+                    if owner_window is not None
+                    else {}
+                ),
+                "unseen_direct_next_pass": (
+                    self._unseen_direct_next_pass_telemetry(owner_window)
+                    if owner_window is not None
+                    else {}
+                ),
+                "crossed_handoff_recovery": (
+                    self._crossed_handoff_recovery_telemetry(owner_window)
+                    if owner_window is not None
+                    else {}
+                ),
+                "turn_recovery": (
+                    self._turn_recovery_telemetry(owner_window)
+                    if owner_window is not None
+                    else {}
+                ),
             },
             "hand_card_count_before": len(self.snapshot.my_hand)
             if result.player == "self"
@@ -2995,14 +4945,22 @@ class LiveOrchestrator:
             if result.player == "self" and result.post_hand
             else None,
         }
-        self._samples.append(sample)
         self._observations.append(record)
-        if self._is_first_action_turn(result.player):
-            self._first_action_samples.append(sample)
-            # This buffer only bridges a short async handoff.  Bound it so a
-            # genuinely unresolved opening play cannot bias later retries.
-            first_action_limit = max(12, self.burst_sample_limit * 3)
-            del self._first_action_samples[:-first_action_limit]
+        if owner_window is None:
+            pass
+        elif accepted_for_consensus:
+            self._append_consensus_sample(sample, owner_window)
+            if is_readable_handoff_sample and owner_disposition in {
+                "direct_next_handoff",
+                "crossed_handoff_recovery",
+            }:
+                owner_window.handoff_samples.append(sample)
+            elif owner_disposition == "turn_recovery":
+                owner_window.handoff_samples.append(sample)
+        elif provisional_owner_sample:
+            owner_window.provisional_samples.append(sample)
+        else:
+            owner_window.isolated_sample_count += 1
         self.store.append_observation(record)
         self._last_sample_ms = int(monotonic_ms)
 
@@ -3146,6 +5104,7 @@ class LiveOrchestrator:
         monotonic_ms: int,
         *,
         fast: FastSignalResult | None = None,
+        suppress_turn_side_effects: bool = False,
     ) -> tuple[LiveEvent, tuple[LiveEvent, ...]]:
         player = self.snapshot.current_player
         assert player is not None
@@ -3260,10 +5219,187 @@ class LiveOrchestrator:
                 and after.trick_id == before.trick_id
             ),
         )
+        if suppress_turn_side_effects:
+            return event, (event, *outcomes)
         turn_started = self._append_current_turn_started()
         self._request_advice_if_needed()
         events = (event, *outcomes) + ((turn_started,) if turn_started else ())
         return event, events
+
+    def _commit_crossed_handoff_recovery(
+        self,
+        result: ConsensusResult,
+        monotonic_ms: int,
+        *,
+        fast: FastSignalResult,
+    ) -> tuple[LiveEvent, tuple[LiveEvent, ...]]:
+        """Commit a visible play and its verified direct-next PASS together."""
+
+        window = self._ensure_turn_ownership_window()
+        if not self._crossed_handoff_recovery_is_ready(window, result):
+            raise RuntimeError("跨座位交接恢复尚未满足提交条件")
+        assert window is not None
+        pass_player = window.crossed_handoff_recovery_pass_player
+        if pass_player is None:
+            raise RuntimeError("跨座位交接恢复缺少不出玩家")
+
+        # Do not emit a turn-start or request advice after the recovered play
+        # alone.  The state lock keeps the immediate PASS reconstruction in
+        # this same analysis step before the caller receives an update.
+        play_event, play_events = self._commit_consensus(
+            result,
+            monotonic_ms,
+            fast=fast,
+            suppress_turn_side_effects=True,
+        )
+        before_pass = self.reducer.snapshot()
+        if before_pass.current_player != pass_player:
+            raise RuntimeError("跨座位交接恢复后的不出玩家不匹配")
+        pass_event = self._record_action(
+            pass_player,
+            (),
+            True,
+            confidence=1.0,
+            source="crossed_handoff_recovery_pass_marker",
+            evidence_refs=result.evidence_refs,
+        )
+        pass_event, pass_outcomes = self._publish_action_with_outcomes(
+            pass_event,
+            before_pass,
+        )
+        after = self.reducer.snapshot()
+        self._activate_zone(
+            monotonic_ms,
+            accept_initial_occupied=bool(
+                after.current_player is not None
+                and fast.active_player == after.current_player
+                and after.trick_id == before_pass.trick_id
+            ),
+        )
+        recovery_event = self._append_lifecycle_event(
+            "crossed_handoff_recovered",
+            {
+                "play_event_id": play_event.event_id,
+                "pass_event_id": pass_event.event_id,
+                "play_player": play_event.actor,
+                "pass_player": pass_player,
+                "active_player": fast.active_player,
+                "pass_marker_streak": window.crossed_handoff_recovery_pass_marker_streak,
+                "play_vote_count": result.vote_count,
+            },
+            actor=play_event.actor,
+            confidence=result.confidence,
+            source="crossed_handoff_recovery",
+        )
+        self._append_recognition_trace(
+            window=window,
+            outcome="crossed_handoff_recovered",
+            strategy_result=result,
+            fallback=True,
+            reason="two_frame_pass_marker_and_play_reread",
+            commit_attempted=True,
+            commit_event_id=pass_event.event_id,
+        )
+        turn_started = self._append_current_turn_started()
+        self._request_advice_if_needed()
+        events = (
+            *play_events,
+            pass_event,
+            *pass_outcomes,
+            recovery_event,
+            *((turn_started,) if turn_started else ()),
+        )
+        return pass_event, events
+
+    def _commit_turn_recovery(
+        self,
+        result: ConsensusResult,
+        monotonic_ms: int,
+        *,
+        fast: FastSignalResult,
+    ) -> tuple[LiveEvent, tuple[LiveEvent, ...]]:
+        """Commit a delayed expected action and its proven intervening PASSes."""
+
+        window = self._ensure_turn_ownership_window()
+        if not self._turn_recovery_is_ready(window, result, fast):
+            raise RuntimeError("回合容错恢复尚未满足提交条件")
+        assert window is not None
+
+        action_event, action_events = self._commit_consensus(
+            result,
+            monotonic_ms,
+            fast=fast,
+            suppress_turn_side_effects=True,
+        )
+        events: list[LiveEvent] = [*action_events]
+        last_action_event = action_event
+        after_action = self.reducer.snapshot()
+        recovered_passes = self._intervening_passes_from(
+            after_action.current_player,
+            fast.active_player,
+            after_action.finished_seats,
+        )
+        if recovered_passes is None:
+            raise RuntimeError("回合容错恢复后的活动座位顺序不匹配")
+        for pass_player in recovered_passes:
+            before_pass = self.reducer.snapshot()
+            if before_pass.current_player != pass_player:
+                raise RuntimeError("回合容错恢复中的不出玩家不匹配")
+            pass_event = self._record_action(
+                pass_player,
+                (),
+                True,
+                confidence=1.0,
+                source="turn_recovery_pass_marker",
+                evidence_refs=result.evidence_refs,
+            )
+            pass_event, pass_outcomes = self._publish_action_with_outcomes(
+                pass_event,
+                before_pass,
+            )
+            events.extend((pass_event, *pass_outcomes))
+            last_action_event = pass_event
+
+        after = self.reducer.snapshot()
+        if after.current_player != fast.active_player:
+            raise RuntimeError("回合容错恢复后的活动座位不匹配")
+        self._activate_zone(
+            monotonic_ms,
+            accept_initial_occupied=bool(
+                after.current_player is not None
+                and fast.active_player == after.current_player
+            ),
+        )
+        recovery_event = self._append_lifecycle_event(
+            "turn_recovery_recovered",
+            {
+                "action_event_id": action_event.event_id,
+                "action_player": action_event.actor,
+                "recovered_pass_players": list(recovered_passes),
+                "active_player": fast.active_player,
+                "action_vote_count": result.vote_count,
+                "pass_marker_streaks": {
+                    player: window.turn_recovery_pass_marker_streaks.get(player, 0)
+                    for player in recovered_passes
+                },
+            },
+            actor=action_event.actor,
+            confidence=result.confidence,
+            source="turn_recovery",
+        )
+        self._append_recognition_trace(
+            window=window,
+            outcome="turn_recovery_recovered",
+            strategy_result=result,
+            fallback=True,
+            reason="recovered_before_expected_player_next_turn",
+            commit_attempted=True,
+            commit_event_id=last_action_event.event_id,
+        )
+        turn_started = self._append_current_turn_started()
+        self._request_advice_if_needed()
+        events.extend((recovery_event, *((turn_started,) if turn_started else ())))
+        return last_action_event, tuple(events)
 
     def _record_action(
         self,
@@ -3279,22 +5415,28 @@ class LiveOrchestrator:
         action_metadata: dict[str, object] | None = None,
     ) -> LiveEvent:
         if is_pass:
-            return self.reducer.record_pass(
+            event = self.reducer.record_pass(
                 player,
                 confidence=confidence,
                 source=source,
                 evidence_refs=evidence_refs,
             )
-        return self.reducer.record_play(
-            player,
-            cards,
-            confidence=confidence,
-            source=source,
-            evidence_refs=evidence_refs,
-            suit_options=suit_options,
-            integrity_warnings=integrity_warnings,
-            action_metadata=action_metadata,
+        else:
+            event = self.reducer.record_play(
+                player,
+                cards,
+                confidence=confidence,
+                source=source,
+                evidence_refs=evidence_refs,
+                suit_options=suit_options,
+                integrity_warnings=integrity_warnings,
+                action_metadata=action_metadata,
+            )
+        self._advance_previous_action_verifications(
+            event,
+            after=self.reducer.snapshot(),
         )
+        return event
 
     def _require_review(
         self,
@@ -3499,6 +5641,9 @@ class LiveOrchestrator:
         self._samples.clear()
         self._observations.clear()
         self._last_sample_ms = None
+        window = self._turn_ownership_window
+        if window is not None and not self._is_first_action_turn(window.expected_player):
+            window.provisional_samples.clear()
 
     def _is_first_action_turn(self, player: Seat | None = None) -> bool:
         snapshot = self.snapshot

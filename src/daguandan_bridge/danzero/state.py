@@ -103,13 +103,20 @@ class GuanDanState:
 
     @staticmethod
     def _validate_deck_limit(cards: Iterable[str]) -> None:
-        overflow = [
-            card
-            for card, count in Counter(cards).items()
-            if count > 2
-        ]
+        values = tuple(str(card) for card in cards)
+        exact_cards = Counter(card for card in values if not card.endswith("?"))
+        overflow = [card for card, count in exact_cards.items() if count > 2]
         if overflow:
             raise GameStateError("单张牌在双副牌中不能超过两张：" + "、".join(overflow))
+
+        rank_counts = Counter(
+            card[:-1]
+            for card in values
+            if card not in SPECIAL_CARDS
+        )
+        rank_overflow = [rank for rank, count in rank_counts.items() if count > 8]
+        if rank_overflow:
+            raise GameStateError("同点数在双副牌中不能超过八张：" + "、".join(rank_overflow))
 
     def set_context(
         self,

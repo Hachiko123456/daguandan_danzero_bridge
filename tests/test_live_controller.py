@@ -11,7 +11,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from daguandan_bridge.gui.live_controller import LiveAssistantController
+from daguandan_bridge.gui.live_controller import (
+    LiveAssistantController,
+    _AnalysisFrameTask,
+    _LiveRunToken,
+)
 from daguandan_bridge.capture_service import FrameSnapshot
 from daguandan_bridge.danzero.advisor import LocalAdvice
 from daguandan_bridge.image_io import StandardizationResult
@@ -28,6 +32,18 @@ def _app():
 class _CaptureServiceStub:
     def __init__(self, root):
         self.profiles_root = root
+
+
+class _LockingCaptureServiceStub(_CaptureServiceStub):
+    def __init__(self, root, *, error: Exception | None = None):
+        super().__init__(root)
+        self.error = error
+        self.locked_profiles = []
+
+    def lock_target_client_size(self, profile_name):
+        self.locked_profiles.append(profile_name)
+        if self.error is not None:
+            raise self.error
 
 
 class _WarmAdvisor:
@@ -177,6 +193,79 @@ def _initial_recognition(hand, *, round_level="2"):
     return SimpleNamespace(my_hand=hand, round_level=round_level)
 
 
+class _UnknownSuitAwareRecognitionStub:
+    def __init__(self) -> None:
+        self.allow_unknown_suit = None
+
+    def recognize(self, image, *, allow_unknown_suit=False):
+        del image
+        self.allow_unknown_suit = allow_unknown_suit
+        return _initial_recognition(())
+
+
+class _WaitingRecordingStub:
+    def __init__(self) -> None:
+        self.frames = []
+        self.recognitions = []
+        self.closed_reasons = []
+
+    def record_frame(self, frame, *, monotonic_ms, wall_time):
+        self.frames.append((frame, monotonic_ms, wall_time))
+
+    def record_recognition(self, result, *, captured_at, acceptance_reason):
+        self.recognitions.append((result, captured_at, acceptance_reason))
+
+    def close_unconfirmed(self, reason):
+        self.closed_reasons.append(reason)
+
+
+def test_waiting_scan_keeps_unknown_suits_in_the_initial_hand(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    recognition = _UnknownSuitAwareRecognitionStub()
+    controller.recognition_service = recognition
+    snapshot = SimpleNamespace(image=np.zeros((1, 1, 3), dtype=np.uint8))
+
+    result, returned_snapshot = controller._recognize_waiting_frame(snapshot)
+
+    assert recognition.allow_unknown_suit is True
+    assert result.my_hand == ()
+    assert returned_snapshot is snapshot
+
+
+def test_listener_locks_target_client_before_starting_waiting_capture(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    capture = _LockingCaptureServiceStub(tmp_path)
+    controller = LiveAssistantController(capture)
+    started = []
+    monkeypatch.setattr(controller, "_start_danzero_warmup", lambda: None)
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: started.append(True))
+
+    assert controller.start_listening() is True
+    assert capture.locked_profiles == ["tencent_daguandan"]
+    assert started == [True]
+
+
+def test_listener_does_not_start_when_target_client_lock_fails(tmp_path, monkeypatch):
+    _app()
+    capture = _LockingCaptureServiceStub(tmp_path, error=RuntimeError("window denied resize"))
+    controller = LiveAssistantController(capture)
+    errors = []
+    started = []
+    controller.error.connect(errors.append)
+    monkeypatch.setattr(controller, "_start_danzero_warmup", lambda: None)
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: started.append(True))
+
+    assert controller.start_listening() is False
+    assert capture.locked_profiles == ["tencent_daguandan"]
+    assert controller._listening_enabled is False
+    assert started == []
+    assert errors == ["无法锁定牌桌客户区尺寸：window denied resize"]
+
+
 def test_listener_starts_session_after_two_identical_complete_hands(tmp_path, monkeypatch):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
@@ -193,6 +282,60 @@ def test_listener_starts_session_after_two_identical_complete_hands(tmp_path, mo
     controller._consume_waiting_recognition(_initial_recognition(hand), None)
 
     assert started == [("2", hand)]
+
+
+def test_listener_persists_the_reason_an_initial_state_is_rejected(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    recording = _WaitingRecordingStub()
+    controller._waiting_recording = recording
+    controller._listening_enabled = True
+    hand = tuple(f"{rank}{suit}" for rank in ("3", "4", "5", "6", "7", "8", "9") for suit in "SHCD")[:27]
+
+    controller._consume_waiting_recognition(
+        _initial_recognition(hand, round_level=""),
+        SimpleNamespace(captured_at=None),
+    )
+
+    assert recording.recognitions[-1][2] == "round_level_unrecognized"
+
+
+def test_listener_does_not_create_a_recording_from_settlement_controls(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    recording_attempts = []
+    monkeypatch.setattr(
+        controller,
+        "_ensure_waiting_recording",
+        lambda: recording_attempts.append(True) or True,
+    )
+
+    controller._consume_waiting_recognition(
+        SimpleNamespace(
+            my_hand=(),
+            round_level=None,
+            buttons=("change_table", "continue_game"),
+        ),
+        SimpleNamespace(),
+    )
+
+    assert recording_attempts == []
+    assert controller._waiting_candidate is None
+
+
+def test_stop_listener_seals_an_unconfirmed_waiting_recording(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    recording = _WaitingRecordingStub()
+    controller._waiting_recording = recording
+
+    controller.stop_listening()
+
+    assert recording.closed_reasons == ["listening_stopped_before_initial_state"]
 
 
 def test_listener_does_not_start_session_when_complete_hand_changes(tmp_path, monkeypatch):
@@ -224,6 +367,28 @@ def test_listener_treats_different_recognition_order_as_the_same_hand(tmp_path, 
 
     controller._consume_waiting_recognition(_initial_recognition(first), None)
     controller._consume_waiting_recognition(_initial_recognition(tuple(reversed(first))), None)
+
+    assert len(started) == 1
+
+
+def test_listener_starts_with_multiple_unknown_suits_of_the_same_rank(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    hand = (
+        "5?", "5?", "5?",
+        "3S", "3H", "3C", "3D",
+        "4S", "4H", "4C", "4D",
+        "6S", "6H", "6C", "6D",
+        "7S", "7H", "7C", "7D",
+        "8S", "8H", "8C", "8D",
+        "9S", "9H", "9C", "9D",
+    )
+    started = []
+    controller._listening_enabled = True
+    monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
+
+    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+    controller._consume_waiting_recognition(_initial_recognition(hand), None)
 
     assert len(started) == 1
 
@@ -321,6 +486,70 @@ def _preselection_frame():
             window_title="game",
         )
     )
+
+
+class _TokenAnalysisOrchestrator:
+    def __init__(self, session_id):
+        self.snapshot = SimpleNamespace(session_id=session_id)
+        self.calls = 0
+        self.trace_contexts = []
+
+    def analyze_frame(self, _image, *, monotonic_ms, trace_context):
+        self.calls += 1
+        self.trace_contexts.append((monotonic_ms, trace_context))
+        return LiveUpdate(
+            status="running",
+            snapshot=self.snapshot,
+        )
+
+
+def test_stale_analysis_task_cannot_call_replacement_orchestrator(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    old = _TokenAnalysisOrchestrator("old")
+    old_token = _LiveRunToken(old, "old", 1, 1)
+    controller.orchestrator = old  # type: ignore[assignment]
+    controller._active_live_token = old_token
+    controller._capture_generation = 1
+    replacement = _TokenAnalysisOrchestrator("replacement")
+    replacement_token = _LiveRunToken(replacement, "replacement", 2, 2)
+    controller.orchestrator = replacement  # type: ignore[assignment]
+    controller._active_live_token = replacement_token
+    controller._capture_generation = 2
+
+    result = controller._analyze_live_frame(
+        old_token,
+        _AnalysisFrameTask(old_token, _preselection_frame(), 7, 123),
+    )
+
+    assert result is None
+    assert old.calls == 0
+    assert replacement.calls == 0
+
+
+def test_current_analysis_task_uses_its_immutable_token_and_capture_metadata(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    orchestrator = _TokenAnalysisOrchestrator("session")
+    token = _LiveRunToken(orchestrator, "session", 4, 9)
+    controller.orchestrator = orchestrator  # type: ignore[assignment]
+    controller._active_live_token = token
+    controller._capture_generation = 9
+
+    result = controller._analyze_live_frame(
+        token,
+        _AnalysisFrameTask(token, _preselection_frame(), 17, 456),
+    )
+
+    assert isinstance(result, LiveUpdate)
+    assert orchestrator.calls == 1
+    monotonic_ms, trace_context = orchestrator.trace_contexts[-1]
+    assert monotonic_ms == 456
+    assert trace_context == {
+        "worker_token": {"session_id": "session", "nonce": 4, "generation": 9},
+        "capture_seq": 17,
+        "captured_ms": 456,
+    }
 
 
 def test_controller_schedules_visible_non_pass_advice_once_per_request(tmp_path, monkeypatch):

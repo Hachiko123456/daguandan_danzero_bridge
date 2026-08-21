@@ -444,6 +444,28 @@ def test_advice_expands_occluded_suit_only_in_temporary_variants(tmp_path):
     orchestrator.finish()
 
 
+def test_advice_expands_an_occluded_initial_hand_before_model_inference(tmp_path):
+    advisor = FakeAdvisor()
+    hand = tuple(
+        card for card in HAND if card not in {"3S", "3H", "8S"}
+    ) + ("8?", "8H", "8C")
+    orchestrator = _build(tmp_path, advisor, hand=hand)
+
+    _commit_left_action(orchestrator)
+    advice = orchestrator.wait_for_advice(
+        orchestrator.latest_advice.key,
+        timeout=2.0,
+    )
+
+    assert advice is not None
+    assert advice.status == "ready"
+    assert advice.suit_uncertain is True
+    assert advice.suit_variant_count == 2
+    assert advisor.calls == 2
+    assert orchestrator.snapshot.my_hand.count("8?") == 1
+    orchestrator.finish()
+
+
 def test_fabledan_evaluates_occluded_full_house_with_exact_temporary_suits(
     tmp_path,
 ):
@@ -517,7 +539,7 @@ def test_fabledan_deduplicates_suit_states_with_identical_model_semantics(tmp_pa
     orchestrator.finish()
 
 
-def test_semantic_branches_continue_when_every_model_recommendation_agrees(tmp_path):
+def test_wildcard_history_uses_one_strongest_model_interpretation(tmp_path):
     advisor = SemanticBranchAdvisor(conflicting=False)
     orchestrator = _build(tmp_path, advisor, round_level="9")
 
@@ -532,13 +554,13 @@ def test_semantic_branches_continue_when_every_model_recommendation_agrees(tmp_p
 
     assert advice is not None
     assert advice.status == "ready"
-    assert advice.semantic_uncertain is True
-    assert advice.semantic_source_history_indices == (1,)
-    assert advice.semantic_variant_count == 2
-    assert advice.variant_count == 2
+    assert advice.semantic_uncertain is False
+    assert advice.semantic_source_history_indices == ()
+    assert advice.semantic_variant_count == 1
+    assert advice.variant_count == 1
     assert advice.advice_agrees_across_variants is True
-    assert advisor.calls == 2
-    assert {str(item["key"]) for item in advisor.observed_choices} == {"J", "2"}
+    assert advisor.calls == 1
+    assert [str(item["key"]) for item in advisor.observed_choices] == ["J"]
     assert (
         orchestrator.snapshot.play_history[-1].action_metadata[
             "selected_interpretation"
@@ -550,9 +572,9 @@ def test_semantic_branches_continue_when_every_model_recommendation_agrees(tmp_p
         for item in read_json_lines(orchestrator.store.advice_path)
         if item.get("status") == "ready"
     )
-    assert ready["semantic_uncertain"] is True
-    assert ready["semantic_source_history_indices"] == [1]
-    assert len(ready["uncertainty_diagnostics"]["branch_results"]) == 2
+    assert ready["semantic_uncertain"] is False
+    assert ready["semantic_source_history_indices"] == []
+    assert ready["uncertainty_diagnostics"]["input_variant_count_before_validation"] == 1
     orchestrator.finish()
 
 
@@ -579,10 +601,10 @@ def test_complete_history_eliminates_impossible_semantic_branch(tmp_path):
         if item.get("status") == "ready"
     )
     diagnostics = ready["uncertainty_diagnostics"]
-    assert diagnostics["input_variant_count_before_validation"] == 2
+    assert diagnostics["input_variant_count_before_validation"] == 1
     assert diagnostics["valid_encoded_input_count"] == 1
-    assert diagnostics["eliminated_variant_count"] == 1
-    assert diagnostics["eliminated_variants"][0]["diagnostic"]["source_turn_id"] == 38
+    assert diagnostics["eliminated_variant_count"] == 0
+    assert diagnostics["eliminated_variants"] == []
     orchestrator.finish()
 
 
@@ -602,14 +624,13 @@ def test_all_invalid_semantic_branches_report_deepest_source_error(tmp_path):
     assert advice is not None
     assert advice.status == "failed"
     assert advisor.calls == 0
-    assert "2 个候选状态全部被完整牌局历史排除" in advice.error
+    assert "1 个候选状态全部被完整牌局历史排除" in advice.error
     assert "最深可达根因：第 43 条历史不是合法牌型" in advice.error
-    assert "第 38 条历史动作 222JJ 不能压过右家的 55533" in advice.error
     assert "模型未被调用" in advice.error
     orchestrator.finish()
 
 
-def test_semantic_branches_block_with_chinese_details_when_advice_conflicts(
+def test_wildcard_history_does_not_compare_weaker_interpretations(
     tmp_path,
 ):
     advisor = SemanticBranchAdvisor(conflicting=True)
@@ -625,23 +646,21 @@ def test_semantic_branches_block_with_chinese_details_when_advice_conflicts(
     advice = orchestrator.wait_for_advice(update.advice.key, timeout=2.0)
 
     assert advice is not None
-    assert advice.status == "failed"
-    assert advice.semantic_uncertain is True
-    assert advice.semantic_source_history_indices == (1,)
-    assert advice.variant_count == 2
-    assert advice.advice_agrees_across_variants is False
-    assert "历史第 1 条动作存在多种合法语义" in advice.error
-    assert "分支 1" in advice.error
-    assert "分支 2" in advice.error
-    assert "主牌局历史未被改写" in advice.error
-    failed = next(
+    assert advice.status == "ready"
+    assert advice.semantic_uncertain is False
+    assert advice.semantic_source_history_indices == ()
+    assert advice.variant_count == 1
+    assert advice.advice_agrees_across_variants is True
+    assert advisor.calls == 1
+    assert [str(item["key"]) for item in advisor.observed_choices] == ["J"]
+    ready = next(
         item
         for item in read_json_lines(orchestrator.store.advice_path)
-        if item.get("status") == "failed"
+        if item.get("status") == "ready"
     )
-    diagnostics = failed["uncertainty_diagnostics"]
-    assert diagnostics["semantic_source_history_indices"] == [1]
-    assert {item["status"] for item in diagnostics["branch_results"]} == {"ready"}
+    diagnostics = ready["uncertainty_diagnostics"]
+    assert diagnostics["semantic_source_history_indices"] == []
+    assert diagnostics["input_variant_count_before_validation"] == 1
     assert (
         orchestrator.snapshot.play_history[-1].action_metadata[
             "selected_interpretation"

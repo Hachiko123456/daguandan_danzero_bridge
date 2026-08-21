@@ -292,15 +292,22 @@ def state_variants_for_unknown_suits_detailed(
     """Return temporary states plus an explicit cap/truncation audit."""
 
     max_variants = max(1, int(limit))
+    hand = tuple(state.my_hand)
     history = tuple(state.play_history)
-    unknown_positions = [
+    unknown_hand_positions = [
+        (card_index, card, options)
+        for card_index, card in enumerate(hand)
+        if is_unknown_suit_card(card)
+        for options in (normalized_suit_options(hand)[card_index],)
+    ]
+    unknown_history_positions = [
         (event_index, card_index, card, options)
         for event_index, event in enumerate(history)
         for card_index, card in enumerate(event.cards)
         if is_unknown_suit_card(card)
         for options in (normalized_suit_options(event.cards, event.suit_options)[card_index],)
     ]
-    if not unknown_positions:
+    if not unknown_hand_positions and not unknown_history_positions:
         return SuitStateVariants(states=(state,), limit=max_variants)
 
     counts: Counter[str] = Counter(
@@ -315,17 +322,19 @@ def state_variants_for_unknown_suits_detailed(
         *,
         relax_unknown_suits: bool,
     ) -> tuple[tuple[GuanDanState, ...], bool]:
+        resolved_hand = list(hand)
         resolved = [list(event.cards) for event in history]
         branch_counts = counts.copy()
         variants: list[GuanDanState] = []
-        seen: set[tuple[tuple[str, ...], ...]] = set()
+        seen: set[tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]] = set()
         collection_limit = max_variants + 1
 
         def visit(index: int) -> None:
             if len(variants) >= collection_limit:
                 return
-            if index == len(unknown_positions):
-                signature = tuple(tuple(cards) for cards in resolved)
+            if index == len(unknown_hand_positions) + len(unknown_history_positions):
+                normalized_hand = tuple(sorted(resolved_hand))
+                signature = (normalized_hand, tuple(tuple(cards) for cards in resolved))
                 if signature in seen:
                     return
                 seen.add(signature)
@@ -338,12 +347,27 @@ def state_variants_for_unknown_suits_detailed(
                 variants.append(
                     replace(
                         state,
+                        my_hand=normalized_hand,
                         play_history=concrete_history,
                         trick_plays=concrete_trick,
                     )
                 )
                 return
-            event_index, card_index, card, options = unknown_positions[index]
+            if index < len(unknown_hand_positions):
+                card_index, card, options = unknown_hand_positions[index]
+                choices = SUITS if relax_unknown_suits else options
+                for suit in choices:
+                    concrete = f"{card[:-1]}{suit}"
+                    if branch_counts[concrete] >= 2:
+                        continue
+                    branch_counts[concrete] += 1
+                    resolved_hand[card_index] = concrete
+                    visit(index + 1)
+                    branch_counts[concrete] -= 1
+                return
+            event_index, card_index, card, options = unknown_history_positions[
+                index - len(unknown_hand_positions)
+            ]
             choices = SUITS if relax_unknown_suits else options
             for suit in choices:
                 concrete = f"{card[:-1]}{suit}"

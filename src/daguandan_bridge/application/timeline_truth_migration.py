@@ -16,7 +16,10 @@ from ..domain.truth import LabelProvenance, TruthEvidence
 from ..live.models import LiveEvent
 from ..live.reducer import LiveReducer
 from ..live.session_store import read_json_lines
-from ..live.suit_correction import validate_suit_correction
+from ..live.suit_correction import (
+    validate_suit_correction,
+    validate_visual_action_correction,
+)
 from ..live.truth_log import (
     TruthInitialState,
     TruthLog,
@@ -868,7 +871,38 @@ class TimelineTruthMigrationService:
                     for event in events[:position]
                     if event.event_type in _ACTION_TYPES
                 ]
-                if not previous_actions or previous_actions[-1].event_id != target_id:
+                scope = str(correction.payload.get("correction_scope", "")).strip()
+                if scope == "previous_action_after_followup":
+                    followup_id = str(correction.payload.get("followup_event_id", "")).strip()
+                    expected_followup = correction.payload.get("expected_followup_actor")
+                    if (
+                        len(previous_actions) < 2
+                        or previous_actions[-2].event_id != target_id
+                        or previous_actions[-1].event_id != followup_id
+                        or previous_actions[-1].actor != expected_followup
+                    ):
+                        raise _BlockedMigration(
+                            "invalid_previous_action_followup_correction",
+                            f"correction {correction.event_id} is not tied to its "
+                            "immediate follower",
+                        )
+                    target_cards = tuple(str(card) for card in target.payload.get("cards", ()))
+                    corrected_cards = correction.payload.get("cards", ())
+                    if (
+                        target.event_type == "player_passed"
+                        or bool(target.payload.get("is_pass", False))
+                        or bool(correction.payload.get("is_pass", False))
+                        or not isinstance(corrected_cards, (list, tuple))
+                        or validate_visual_action_correction(
+                            target_cards,
+                            tuple(str(card) for card in corrected_cards),
+                        ) is None
+                    ):
+                        raise _BlockedMigration(
+                            "invalid_previous_action_followup_correction",
+                            f"correction {correction.event_id} is not a valid visual expansion",
+                        )
+                elif not previous_actions or previous_actions[-1].event_id != target_id:
                     raise _BlockedMigration(
                         "nonlatest_event_correction",
                         f"event correction {correction.event_id} does not target the latest action",

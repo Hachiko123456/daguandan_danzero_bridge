@@ -157,6 +157,7 @@ class LiveSessionStore:
         self.timeline_markdown_path = self.directory / "timeline.md"
         self.advice_path = self.directory / "advice.jsonl"
         self.decisions_path = self.directory / "decisions.jsonl"
+        self.recognition_trace_path = self.directory / "recognition_trace.jsonl"
         self.observations_part_path = self.directory / "observations.jsonl.part"
         self.observations_gzip_path = self.directory / "observations.jsonl.gz"
         self.incidents_directory = self.directory / "incidents"
@@ -178,6 +179,7 @@ class LiveSessionStore:
                 self.timeline_path,
                 self.advice_path,
                 self.decisions_path,
+                self.recognition_trace_path,
                 self.observations_part_path,
             ):
                 path.touch()
@@ -230,6 +232,29 @@ class LiveSessionStore:
             payload.setdefault("schema_version", SCHEMA_VERSION)
             payload.setdefault("session_id", self.session_id)
             _append_json_line(self.observations_part_path, payload, durable=False)
+
+    def append_recognition_trace(self, record: dict[str, object]) -> None:
+        """Persist live-pipeline evidence without touching training decisions."""
+
+        with self._lock:
+            self._ensure_writable()
+            payload = dict(record)
+            payload.setdefault("schema_version", SCHEMA_VERSION)
+            payload.setdefault("session_id", self.session_id)
+            payload.setdefault("wall_time", _now_text())
+            _append_json_line(self.recognition_trace_path, payload, durable=False)
+
+    def update_runtime_identity(self, identity: dict[str, object]) -> None:
+        with self._lock:
+            self._ensure_writable()
+            self._update_manifest({"runtime_identity": dict(identity)})
+
+    def update_session_metadata(self, metadata: dict[str, object]) -> None:
+        """Attach lifecycle metadata without mutating append-only evidence."""
+
+        with self._lock:
+            self._ensure_writable()
+            self._update_manifest(dict(metadata))
 
     def upsert_decision(self, record: dict[str, object]) -> None:
         """Atomically maintain one correlated training record per self decision."""
@@ -515,6 +540,15 @@ class InMemoryLiveSessionStore:
 
     def append_observation(self, record: dict[str, object]) -> None:
         del record
+
+    def append_recognition_trace(self, record: dict[str, object]) -> None:
+        del record
+
+    def update_runtime_identity(self, identity: dict[str, object]) -> None:
+        del identity
+
+    def update_session_metadata(self, metadata: dict[str, object]) -> None:
+        del metadata
 
     def upsert_decision(self, record: dict[str, object]) -> None:
         del record

@@ -11,7 +11,7 @@ from daguandan_bridge.live.action_uncertainty import (
 def _ambiguous_event() -> PlayEvent:
     return PlayEvent(
         player="left",
-        cards=("2D", "2H", "9H", "JC", "JD"),
+        cards=("2D", "2H", "3C", "JC", "JD"),
         is_pass=False,
         observed_at=datetime.now().astimezone(),
         action_metadata={
@@ -65,6 +65,63 @@ def test_action_semantic_variants_are_temporary_and_auditable():
         for branch in result.states
     } == {"J", "2"}
     assert state.play_history[0].action_metadata["selected_interpretation"] is None
+
+
+def test_wildcard_history_uses_the_strongest_full_house_interpretation():
+    event = PlayEvent(
+        player="left",
+        cards=("9C", "9D", "6H", "3C", "3D"),
+        is_pass=False,
+        observed_at=datetime.now().astimezone(),
+    )
+    state = GuanDanState(
+        round_level="6",
+        wild_rank="6",
+        current_player="self",
+        lead_player="left",
+        my_hand=("7S",),
+        trick_plays=[event],
+        play_history=[event],
+    )
+
+    result = state_variants_for_action_semantics(state)
+
+    assert len(result.states) == 1
+    metadata = result.states[0].play_history[0].action_metadata
+    assert metadata["selection_source"] == "rules_strongest_wildcard"
+    assert metadata["selected_interpretation"]["logical_label"] == "99933"
+    assert metadata["selected_interpretation"]["wildcard_assignments"] == [
+        {"physical_card": "6H", "as_rank": "9"}
+    ]
+    assert state.play_history[0].action_metadata is None
+
+
+def test_wildcard_history_uses_straight_flush_over_straight():
+    event = PlayEvent(
+        player="right",
+        cards=("10C", "6C", "6H", "7C", "9C"),
+        is_pass=False,
+        observed_at=datetime.now().astimezone(),
+    )
+    state = GuanDanState(
+        round_level="6",
+        wild_rank="6",
+        current_player="self",
+        lead_player="right",
+        my_hand=("3S",),
+        trick_plays=[event],
+        play_history=[event],
+    )
+
+    result = state_variants_for_action_semantics(state)
+
+    metadata = result.states[0].play_history[0].action_metadata
+    assert metadata["selected_interpretation"] == {
+        "move_type": "StraightFlush",
+        "key": "6",
+        "logical_label": "678910",
+        "wildcard_assignments": [{"physical_card": "6H", "as_rank": "8"}],
+    }
 
 
 def test_action_semantic_variant_limit_blocks_before_partial_evaluation():

@@ -210,6 +210,46 @@ def test_correction_rebuild_matches_clean_history():
     assert corrected.events[-1].payload["target_event_id"] == original.event_id
 
 
+def test_adjacent_reread_correction_only_rewrites_penultimate_action_and_keeps_turn():
+    reducer = _started_reducer()
+    original = reducer.record_play("right", ("7S",))
+    followup = reducer.record_pass("opposite")
+    before = reducer.snapshot()
+
+    correction = reducer.correct_previous_action_after_followup(
+        original.event_id,
+        expected_followup_actor="opposite",
+        followup_event_id=followup.event_id,
+        cards=("7S", "7H", "7C", "8S", "8H", "8C"),
+        reason="two_distinct_adjacent_action_rereads",
+    )
+
+    after = reducer.snapshot()
+    assert correction.payload["correction_scope"] == "previous_action_after_followup"
+    assert after.current_player == before.current_player == "left"
+    assert after.play_history[0].cards == ("7C", "7H", "7S", "8C", "8H", "8S")
+    assert after.play_history[1].is_pass
+
+
+def test_adjacent_reread_correction_rejects_a_nonmatching_follower_without_mutation():
+    reducer = _started_reducer()
+    original = reducer.record_play("right", ("7S",))
+    followup = reducer.record_pass("opposite")
+    before = reducer.snapshot().semantic_dict()
+
+    with pytest.raises(GameStateError, match="跟随动作不匹配"):
+        reducer.correct_previous_action_after_followup(
+            original.event_id,
+            expected_followup_actor="left",
+            followup_event_id=followup.event_id,
+            cards=("7S", "7H"),
+            reason="test",
+        )
+
+    assert reducer.snapshot().semantic_dict() == before
+    assert len(reducer.events) == 3
+
+
 def test_projection_is_ready_when_confirmed_history_reaches_self_turn():
     reducer = _started_reducer()
     reducer.record_play("right", ("10S",))

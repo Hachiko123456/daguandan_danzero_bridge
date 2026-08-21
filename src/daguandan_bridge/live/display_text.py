@@ -204,10 +204,11 @@ def compact_cards_text(
         elif card == "big_joker":
             values.append("大王")
         elif card.endswith("?"):
+            candidate_options = raw_options[index] if index < len(raw_options) else ()
             candidates = tuple(
                 dict.fromkeys(
                     _SUIT_GLYPHS[suit]
-                    for suit in raw_options[index] if index < len(raw_options)
+                    for suit in candidate_options
                     if suit in _SUIT_GLYPHS
                 )
             )

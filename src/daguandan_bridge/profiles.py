@@ -153,6 +153,7 @@ class ProfileConfig:
     detect_black_bars: bool = True
     viewport_mode: str = "full"
     viewport_aspect_ratio: float = 16 / 9
+    target_client_size: tuple[int, int] | None = None
     match_settings: MatchSettings = field(default_factory=MatchSettings)
     counter_settings: CounterSettings = field(default_factory=CounterSettings)
     advisor_strategy: str = "fabledan"
@@ -184,6 +185,14 @@ class ProfileConfig:
             raise ProfileConfigError(
                 "viewport_aspect_ratio must be a finite positive number"
             )
+        target_client_size = None
+        if self.target_client_size is not None:
+            target_client_size = (
+                int(self.target_client_size[0]),
+                int(self.target_client_size[1]),
+            )
+            if target_client_size[0] <= 0 or target_client_size[1] <= 0:
+                raise ProfileConfigError("target_client_size 必须包含两个正整数")
         keywords = tuple(
             keyword.strip() for keyword in self.window_title_keywords if keyword.strip()
         )
@@ -206,6 +215,7 @@ class ProfileConfig:
             detect_black_bars=bool(self.detect_black_bars),
             viewport_mode=viewport_mode,
             viewport_aspect_ratio=viewport_aspect_ratio,
+            target_client_size=target_client_size,
             match_settings=self.match_settings.normalized(),
             counter_settings=self.counter_settings.normalized(),
             advisor_strategy=advisor_strategy,
@@ -226,6 +236,11 @@ class ProfileConfig:
             "detect_black_bars": normalized.detect_black_bars,
             "viewport_mode": normalized.viewport_mode,
             "viewport_aspect_ratio": normalized.viewport_aspect_ratio,
+            "target_client_size": (
+                list(normalized.target_client_size)
+                if normalized.target_client_size is not None
+                else None
+            ),
             "match_settings": normalized.match_settings.to_json_dict(),
             "counter_settings": normalized.counter_settings.to_json_dict(),
             "advisor_strategy": normalized.advisor_strategy,
@@ -320,6 +335,7 @@ def load_profile_config(paths: ProfilePaths) -> ProfileConfig:
                 f"不支持的 profile schema_version：{schema_version}"
             )
         base_size_raw = data.get("base_size", list(DEFAULT_BASE_SIZE))
+        target_client_size_raw = data.get("target_client_size")
         match_raw = data.get("match_settings", {})
         counter_raw = data.get("counter_settings", {})
         if not isinstance(match_raw, dict) or not isinstance(counter_raw, dict):
@@ -341,6 +357,12 @@ def load_profile_config(paths: ProfilePaths) -> ProfileConfig:
             viewport_aspect_ratio=float(
                 data.get("viewport_aspect_ratio", 16 / 9)
             ),
+            target_client_size=(
+                int(target_client_size_raw[0]),
+                int(target_client_size_raw[1]),
+            )
+            if target_client_size_raw is not None
+            else None,
             match_settings=MatchSettings(
                 scales=tuple(float(item) for item in match_raw.get("scales", (0.9, 0.95, 1.0, 1.05, 1.1))),
                 min_confidence=float(match_raw.get("min_confidence", 0.78)),

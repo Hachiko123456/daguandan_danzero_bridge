@@ -52,6 +52,45 @@ def validate_suit_correction(
     return corrected
 
 
+def validate_visual_action_correction(
+    target_cards: tuple[str, ...],
+    observed_cards: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    """Validate a conservative reread of the immediately preceding action.
+
+    The live reader can capture only the first visible card while an action
+    animation is still expanding.  A later reread is allowed to *add* cards,
+    but never to remove cards.  Unknown suits retain the old, exact-rank suit
+    correction rule.  This helper intentionally does not decide whether the
+    result beats the table; the reducer/recognition path remains responsible
+    for that semantic validation.
+    """
+
+    target = tuple(str(card) for card in target_cards)
+    observed = tuple(sorted(str(card) for card in observed_cards))
+    if not target or not observed or any(is_unknown_suit_card(card) for card in observed):
+        return None
+
+    target_ranks = _rank_counts(target)
+    observed_ranks = _rank_counts(observed)
+    # A same-size reread is safe only when it resolves an unknown suit.  For
+    # known cards it is merely confirmation, not a correction event.
+    if len(observed) == len(target):
+        if not any(is_unknown_suit_card(card) for card in target):
+            return None
+        if observed_ranks != target_ranks:
+            return None
+        return observed
+
+    # Expansion is the only count change permitted: every previously seen
+    # rank must still be present, while newly visible cards may be appended.
+    if len(observed) < len(target):
+        return None
+    if any(observed_ranks[rank] < count for rank, count in target_ranks.items()):
+        return None
+    return observed
+
+
 @dataclass(frozen=True)
 class SuitCorrectionObservation:
     """One observation result, including whether two matching reads exist."""
@@ -77,6 +116,35 @@ class SuitCorrectionTracker:
         observed_cards: tuple[str, ...],
     ) -> SuitCorrectionObservation:
         corrected = validate_suit_correction(target_cards, observed_cards)
+        if corrected is None:
+            self._streaks.pop(str(target_id), None)
+            return SuitCorrectionObservation()
+        previous = self._streaks.get(str(target_id))
+        observation = SuitCorrectionObservation(
+            cards=corrected,
+            confirmations=(previous.confirmations + 1)
+            if previous is not None and previous.cards == corrected
+            else 1,
+        )
+        self._streaks[str(target_id)] = observation
+        return observation
+
+    def observe_visual_action(
+        self,
+        target_id: str,
+        target_cards: tuple[str, ...],
+        observed_cards: tuple[str, ...],
+    ) -> SuitCorrectionObservation:
+        """Track a generic previous-action reread using the same two-frame rule."""
+
+        target = tuple(sorted(str(card) for card in target_cards))
+        observed = tuple(sorted(str(card) for card in observed_cards))
+        # Identical physical cards are confirmation evidence but do not need
+        # a reducer correction event.
+        corrected = observed if target and observed == target else validate_visual_action_correction(
+            target,
+            observed,
+        )
         if corrected is None:
             self._streaks.pop(str(target_id), None)
             return SuitCorrectionObservation()

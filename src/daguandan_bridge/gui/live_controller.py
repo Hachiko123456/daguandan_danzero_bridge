@@ -40,6 +40,22 @@ class _PreselectionTask:
     capture_generation: int
 
 
+@dataclass(frozen=True)
+class _LiveRunToken:
+    orchestrator: LiveOrchestrator
+    session_id: str
+    nonce: int
+    generation: int
+
+
+@dataclass(frozen=True)
+class _AnalysisFrameTask:
+    token: _LiveRunToken
+    snapshot: FrameSnapshot
+    capture_seq: int
+    captured_ms: int
+
+
 class LiveAssistantController(QObject):
     """Qt signal adapter around the UI-independent live orchestrator."""
 
@@ -115,6 +131,8 @@ class LiveAssistantController(QObject):
         self._finish_thread: OneShotThread | None = None
         self._deferred_source_close = None
         self._capture_generation = 0
+        self._live_session_nonce = 0
+        self._active_live_token: _LiveRunToken | None = None
         self._resume_requested = False
         self._listening_enabled = False
         self._waiting_source = None
@@ -123,6 +141,8 @@ class LiveAssistantController(QObject):
         self._waiting_generation = 0
         self._waiting_candidate: tuple[str, tuple[str, ...]] | None = None
         self._pending_auto_session: tuple[str, tuple[str, ...]] | None = None
+        self._waiting_recording: object | None = None
+        self._pending_waiting_recording_seal_reason: str | None = None
         self._recognition_strategy = "two_valid_streak"
         self._auto_finish_requested = False
         # Preselection is deliberately a GUI/infrastructure sidecar.  It has
@@ -155,7 +175,7 @@ class LiveAssistantController(QObject):
 
         def operation():
             snapshot = self.capture_service.capture_frame(self.profile_name)
-            result = self.recognition_service.recognize(snapshot.image)
+            result = self._recognize_initial_image(snapshot.image)
             return result, snapshot
 
         thread = OneShotThread(operation, self)
@@ -217,19 +237,33 @@ class LiveAssistantController(QObject):
             )
         )
 
-    def start_listening(self) -> None:
+    def start_listening(self) -> bool:
         """Continuously inspect the current page and start only on a stable deal."""
 
+        if self._listening_enabled or self.orchestrator is not None:
+            return True
+        lock_client = getattr(self.capture_service, "lock_target_client_size", None)
+        if callable(lock_client):
+            try:
+                lock_client(self.profile_name)
+            except Exception as exc:
+                self.error.emit(f"无法锁定牌桌客户区尺寸：{exc}")
+                return False
         self._listening_enabled = True
         self._start_danzero_warmup()
         if self.orchestrator is None and self._finish_thread is None:
             self._start_waiting_workers()
+        return True
 
     def stop_listening(self) -> None:
         self._listening_enabled = False
         self._waiting_candidate = None
         self._pending_auto_session = None
-        self._stop_waiting_workers()
+        self._pending_waiting_recording_seal_reason = (
+            "listening_stopped_before_initial_state"
+        )
+        if self._stop_waiting_workers():
+            self._seal_waiting_recording()
 
     def _start_waiting_workers(self) -> None:
         if (
@@ -242,6 +276,9 @@ class LiveAssistantController(QObject):
             source = self.capture_service.open_live_source(self.profile_name)
         except Exception as exc:
             self.error.emit(str(exc))
+            self._listening_enabled = False
+            self._pending_waiting_recording_seal_reason = "waiting_capture_source_open_failed"
+            self._seal_waiting_recording()
             return
         self._waiting_source = source
         generation = self._waiting_generation
@@ -257,6 +294,7 @@ class LiveAssistantController(QObject):
             snapshot: FrameSnapshot = source.capture()
             if generation != self._waiting_generation:
                 return snapshot
+            self._record_waiting_frame(snapshot)
             active_analysis = self._waiting_analysis_worker
             if active_analysis is not None:
                 active_analysis.submit(snapshot)
@@ -273,13 +311,32 @@ class LiveAssistantController(QObject):
         self,
         snapshot: FrameSnapshot,
     ) -> tuple[object, FrameSnapshot]:
-        return self.recognition_service.recognize(snapshot.image), snapshot
+        return self._recognize_initial_image(snapshot.image), snapshot
+
+    def _recognize_initial_image(self, image: object) -> object:
+        """Keep an occluded hand card as ``5?`` instead of losing the deal."""
+
+        try:
+            return self.recognition_service.recognize(
+                image,
+                allow_unknown_suit=True,
+            )
+        except TypeError as exc:
+            # External recognizer plug-ins may still expose the older method
+            # signature. The bundled recognizer always supports this flag.
+            if "allow_unknown_suit" not in str(exc):
+                raise
+            return self.recognition_service.recognize(image)
 
     def _accept_waiting_frame(self, snapshot: object) -> None:
         self.frame_ready.emit(snapshot)
 
     def _accept_waiting_error(self, message: str) -> None:
         self.error.emit(message)
+        if self.orchestrator is None:
+            self._listening_enabled = False
+            self._waiting_candidate = None
+            self._pending_waiting_recording_seal_reason = "waiting_capture_failed"
 
     def _consume_waiting_recognition(self, result: object, snapshot: object) -> None:
         """Require two identical normalized 27-card results before starting."""
@@ -287,21 +344,53 @@ class LiveAssistantController(QObject):
         self.initial_recognized.emit(result, snapshot)
         if not self._listening_enabled or self.orchestrator is not None:
             return
+        buttons = set(getattr(result, "buttons", ()) or ())
+        if buttons & {"change_table", "continue_game"}:
+            # A settlement screen belongs to the just-finished table, never to
+            # the next game's listener recording.
+            self._waiting_candidate = None
+            return
+        if not self._ensure_waiting_recording():
+            self._listening_enabled = False
+            self._waiting_candidate = None
+            self._pending_waiting_recording_seal_reason = "waiting_recording_start_failed"
+            if self._stop_waiting_workers():
+                self._seal_waiting_recording()
+            return
+        if self._waiting_recording is not None:
+            self._record_waiting_frame(snapshot)
         hand = tuple(str(card) for card in getattr(result, "my_hand", ()))
         round_level = str(getattr(result, "round_level", ""))
         if round_level not in RANKS or len(hand) != 27:
+            reason = (
+                "round_level_unrecognized"
+                if round_level not in RANKS
+                else f"initial_hand_count_{len(hand)}"
+            )
+            self._record_waiting_recognition(result, snapshot, reason)
             self._waiting_candidate = None
             return
         try:
             normalizer = GuanDanState()
             normalizer.confirm_hand(hand)
-        except Exception:
+        except Exception as exc:
+            self._record_waiting_recognition(
+                result,
+                snapshot,
+                f"initial_hand_invalid:{type(exc).__name__}",
+            )
             self._waiting_candidate = None
             return
         candidate = (round_level, normalizer.my_hand)
         if candidate != self._waiting_candidate:
+            self._record_waiting_recognition(
+                result,
+                snapshot,
+                "awaiting_second_matching_initial_read",
+            )
             self._waiting_candidate = candidate
             return
+        self._record_waiting_recognition(result, snapshot, "initial_state_confirmed")
         self._waiting_candidate = None
         self._start_detected_session(result)
 
@@ -329,6 +418,86 @@ class LiveAssistantController(QObject):
             recognition_strategy=self._recognition_strategy,
         ):
             self._start_waiting_workers()
+
+    def _ensure_waiting_recording(self) -> bool:
+        if self._waiting_recording is not None or not self.session_data_recording_enabled:
+            return True
+        begin_recording = getattr(
+            self.session_factory,
+            "begin_listening_recording",
+            None,
+        )
+        if not callable(begin_recording):
+            # Third-party session factories predating listener recording retain
+            # their prior behaviour; the bundled factory always supports it.
+            return True
+        if not callable(getattr(self.capture_service, "load_profile", None)):
+            return True
+        try:
+            recording = begin_recording(
+                recognition_strategy=self._recognition_strategy,
+            )
+        except Exception as exc:
+            self.error.emit(f"无法启动对局数据保存：{exc}")
+            return False
+        if recording is None:
+            self.error.emit("对局数据保存已开启，但未能创建监听期录制")
+            return False
+        self._waiting_recording = recording
+        self._pending_waiting_recording_seal_reason = None
+        return True
+
+    def _record_waiting_frame(self, snapshot: FrameSnapshot) -> None:
+        recording = self._waiting_recording
+        record_frame = getattr(recording, "record_frame", None)
+        if not callable(record_frame):
+            return
+        try:
+            record_frame(
+                snapshot.image,
+                monotonic_ms=monotonic_ns() // 1_000_000,
+                wall_time=snapshot.captured_at.isoformat(timespec="milliseconds"),
+            )
+        except Exception as exc:
+            self.error.emit(f"监听期录像写入失败：{exc}")
+
+    def _record_waiting_recognition(
+        self,
+        result: object,
+        snapshot: object,
+        acceptance_reason: str,
+    ) -> None:
+        recording = self._waiting_recording
+        record_recognition = getattr(recording, "record_recognition", None)
+        if not callable(record_recognition):
+            return
+        captured_at = getattr(snapshot, "captured_at", None)
+        try:
+            record_recognition(
+                result,
+                captured_at=(
+                    captured_at.isoformat(timespec="milliseconds")
+                    if isinstance(captured_at, datetime)
+                    else ""
+                ),
+                acceptance_reason=acceptance_reason,
+            )
+        except Exception as exc:
+            self.error.emit(f"监听期识别记录写入失败：{exc}")
+
+    def _seal_waiting_recording(self) -> None:
+        reason = self._pending_waiting_recording_seal_reason
+        if reason is None:
+            return
+        recording, self._waiting_recording = self._waiting_recording, None
+        self._pending_waiting_recording_seal_reason = None
+        close_unconfirmed = getattr(recording, "close_unconfirmed", None)
+        if not callable(close_unconfirmed):
+            return
+        try:
+            close_unconfirmed(reason)
+        except Exception as exc:
+            self.error.emit(f"监听期对局数据封存失败：{exc}")
 
     def _stop_waiting_workers(self) -> bool:
         worker = self._waiting_capture_worker
@@ -360,6 +529,8 @@ class LiveAssistantController(QObject):
         self._close_waiting_source()
         if self._pending_auto_session is not None:
             self._start_pending_auto_session()
+            return
+        self._seal_waiting_recording()
 
     def _initial_result(self, value: object) -> None:
         result, snapshot = value  # type: ignore[misc]
@@ -431,18 +602,39 @@ class LiveAssistantController(QObject):
             self.error.emit("当前已有实时对局")
             return False
         try:
-            constructed = self.session_factory.start_session(
-                round_level=round_level,
-                hand=hand,
-                lead_player=lead_player,
-                recognition_strategy=recognition_strategy,
-                on_update=self.update_ready.emit,
+            recording, self._waiting_recording = self._waiting_recording, None
+            promote_recording = getattr(
+                self.session_factory,
+                "start_session_from_listening_recording",
+                None,
             )
+            if recording is not None and callable(promote_recording):
+                constructed = promote_recording(
+                    recording,
+                    round_level=round_level,
+                    hand=hand,
+                    lead_player=lead_player,
+                    recognition_strategy=recognition_strategy,
+                    on_update=self.update_ready.emit,
+                )
+            else:
+                if recording is not None:
+                    close_unconfirmed = getattr(recording, "close_unconfirmed", None)
+                    if callable(close_unconfirmed):
+                        close_unconfirmed("session_factory_does_not_support_recording_promotion")
+                constructed = self.session_factory.start_session(
+                    round_level=round_level,
+                    hand=hand,
+                    lead_player=lead_player,
+                    recognition_strategy=recognition_strategy,
+                    on_update=self.update_ready.emit,
+                )
         except Exception as exc:
             self.error.emit(str(exc))
             return False
         self.orchestrator = constructed.orchestrator
         self._live_source = constructed.source
+        self._activate_live_token(constructed.orchestrator)
         self._auto_finish_requested = False
         self._latest_live_frame = None
         self._latest_live_frame_generation = 0
@@ -454,30 +646,85 @@ class LiveAssistantController(QObject):
         self._start_capture_worker()
         return True
 
+    def _activate_live_token(self, orchestrator: LiveOrchestrator) -> _LiveRunToken:
+        self._capture_generation += 1
+        self._live_session_nonce += 1
+        token = _LiveRunToken(
+            orchestrator=orchestrator,
+            session_id=str(orchestrator.snapshot.session_id),
+            nonce=self._live_session_nonce,
+            generation=self._capture_generation,
+        )
+        self._active_live_token = token
+        return token
+
+    def _invalidate_live_token(self) -> None:
+        self._capture_generation += 1
+        self._live_session_nonce += 1
+        self._active_live_token = None
+
+    def _live_token_is_current(self, token: _LiveRunToken) -> bool:
+        return bool(
+            self._active_live_token == token
+            and self.orchestrator is token.orchestrator
+            and str(token.orchestrator.snapshot.session_id) == token.session_id
+            and token.generation == self._capture_generation
+        )
+
     def _start_analysis_worker(self) -> None:
-        if self.orchestrator is None or self._analysis_worker is not None:
+        token = self._active_live_token
+        if token is None or self._analysis_worker is not None:
             return
         worker = LatestOnlyWorker(
-            self._analyze_live_frame,
-            on_result=self.update_ready.emit,
-            on_error=self._accept_analysis_error,
+            lambda value, current=token: self._analyze_live_frame(current, value),
+            on_result=lambda update, current=token: self._accept_analysis_update(
+                current, update
+            ),
+            on_error=lambda exc, current=token: self._accept_analysis_error(
+                current, exc
+            ),
         )
         self._analysis_worker = worker
         worker.start()
 
-    def _analyze_live_frame(self, value: object) -> LiveUpdate:
-        snapshot, monotonic_ms = value  # type: ignore[misc]
-        assert self.orchestrator is not None
-        return self.orchestrator.analyze_frame(
-            snapshot.image,
-            monotonic_ms=monotonic_ms,
+    def _analyze_live_frame(
+        self,
+        token: _LiveRunToken,
+        value: object,
+    ) -> LiveUpdate | None:
+        task = value
+        if not isinstance(task, _AnalysisFrameTask) or task.token != token:
+            return None
+        if not self._live_token_is_current(token):
+            return None
+        update = token.orchestrator.analyze_frame(
+            task.snapshot.image,
+            monotonic_ms=task.captured_ms,
+            trace_context={
+                "worker_token": {
+                    "session_id": token.session_id,
+                    "nonce": token.nonce,
+                    "generation": token.generation,
+                },
+                "capture_seq": task.capture_seq,
+                "captured_ms": task.captured_ms,
+            },
         )
+        return update if self._live_token_is_current(token) else None
 
-    def _accept_analysis_error(self, exc: Exception) -> None:
+    def _accept_analysis_update(
+        self,
+        token: _LiveRunToken,
+        update: object,
+    ) -> None:
+        if self._live_token_is_current(token) and isinstance(update, LiveUpdate):
+            self.update_ready.emit(update)
+
+    def _accept_analysis_error(self, token: _LiveRunToken, exc: Exception) -> None:
         message = str(exc)
-        if self.orchestrator is not None:
+        if self._live_token_is_current(token):
             try:
-                update = self.orchestrator.analysis_failed(
+                update = token.orchestrator.analysis_failed(
                     message,
                     monotonic_ms=monotonic_ns() // 1_000_000,
                 )
@@ -488,43 +735,50 @@ class LiveAssistantController(QObject):
         self.error.emit(message)
 
     def _start_capture_worker(self) -> None:
-        if self.orchestrator is None or self._live_source is None or self.is_running:
+        token = self._active_live_token
+        if token is None or self._live_source is None or self.is_running:
             return
-        orchestrator = self.orchestrator
-        generation = self._capture_generation
+        source = self._live_source
+        analysis = self._analysis_worker
+        capture_seq = 0
 
         def operation():
-            snapshot: FrameSnapshot = self._live_source.capture()
-            if generation != self._capture_generation:
-                return snapshot
+            nonlocal capture_seq
+            snapshot: FrameSnapshot = source.capture()
+            capture_seq += 1
             captured_ms = monotonic_ns() // 1_000_000
-            orchestrator.record_frame(
+            if not self._live_token_is_current(token):
+                return snapshot
+            token.orchestrator.record_frame(
                 snapshot.image,
                 monotonic_ms=captured_ms,
                 wall_time=snapshot.captured_at.isoformat(),
             )
-            analysis = self._analysis_worker
-            if analysis is not None:
+            if self._live_token_is_current(token) and analysis is not None:
                 analysis.submit(
-                    (snapshot, captured_ms),
-                    preserve=orchestrator.needs_first_action_frames,
+                    _AnalysisFrameTask(token, snapshot, capture_seq, captured_ms),
+                    preserve=token.orchestrator.needs_first_action_frames,
                     max_preserved=8,
                 )
             return snapshot
 
         worker = WorkerHandle(operation, 0.1)
-        worker.frame_ready.connect(self._accept_live_frame)
-        worker.error.connect(self._accept_live_error)
-        worker.finished.connect(lambda: self._capture_finished(worker))
+        worker.frame_ready.connect(
+            lambda value, current=token: self._accept_live_frame(current, value)
+        )
+        worker.error.connect(
+            lambda message, current=token: self._accept_live_error(current, message)
+        )
+        worker.finished.connect(lambda: self._capture_finished(worker, token))
         self._capture_worker = worker
         self._resume_requested = False
         worker.start()
 
-    def _accept_live_frame(self, value: object) -> None:
-        if isinstance(value, FrameSnapshot):
+    def _accept_live_frame(self, token: _LiveRunToken, value: object) -> None:
+        if self._live_token_is_current(token) and isinstance(value, FrameSnapshot):
             self._latest_live_frame = value
             self._latest_live_frame_generation = self._capture_generation
-        self.frame_ready.emit(value)
+            self.frame_ready.emit(value)
 
     def _schedule_hand_preselection(self, update: object) -> None:
         """Sidecar entry point: queue one all-or-nothing hand selection.
@@ -759,20 +1013,26 @@ class LiveAssistantController(QObject):
         self.latest_preselection_result = result
         self.preselection_result.emit(result)
 
-    def _accept_live_error(self, message: str) -> None:
+    def _accept_live_error(self, token: _LiveRunToken, message: str) -> None:
+        if not self._live_token_is_current(token):
+            return
         self._stop_analysis_worker()
-        if self.orchestrator is not None and self.orchestrator.status not in {
+        if token.orchestrator.status not in {
             "finalizing",
             "sealed",
         }:
-            update = self.orchestrator.capture_interrupted(
+            update = token.orchestrator.capture_interrupted(
                 message,
                 monotonic_ms=monotonic_ns() // 1_000_000,
             )
             self.update_ready.emit(update)
         self.error.emit(message)
 
-    def _capture_finished(self, worker: WorkerHandle) -> None:
+    def _capture_finished(
+        self,
+        worker: WorkerHandle,
+        token: _LiveRunToken | None = None,
+    ) -> None:
         if self._capture_worker is worker:
             self._capture_worker = None
         deferred, self._deferred_source_close = self._deferred_source_close, None
@@ -780,6 +1040,13 @@ class LiveAssistantController(QObject):
             deferred.close()
         if (
             self._resume_requested
+            and (
+                token is None
+                or (
+                    self._live_token_is_current(token)
+                    and token.orchestrator.status == "running"
+                )
+            )
             and self.orchestrator is not None
             and self.orchestrator.status == "running"
         ):
@@ -833,6 +1100,8 @@ class LiveAssistantController(QObject):
             lambda value: value.resume(monotonic_ms=monotonic_ns() // 1_000_000)
         )
         self._resume_requested = True
+        if isinstance(self.orchestrator, LiveOrchestrator):
+            self._activate_live_token(self.orchestrator)
         self._start_analysis_worker()
         self._start_capture_worker()
 
@@ -894,9 +1163,9 @@ class LiveAssistantController(QObject):
 
     def _stop_capture_worker(self) -> bool:
         worker = self._capture_worker
+        self._invalidate_live_token()
         if worker is None:
             return True
-        self._capture_generation += 1
         worker.stop()
         stopped = worker.wait(0)
         if stopped:
@@ -916,14 +1185,13 @@ class LiveAssistantController(QObject):
         if self._capture_worker is not None and self._capture_worker.is_running:
             self._capture_worker.stop()
             self._capture_worker.wait(10_000)
-        if (
-            self._waiting_capture_worker is not None
-            and self._waiting_capture_worker.is_running
-        ):
-            self._waiting_capture_worker.stop()
-            self._waiting_capture_worker.wait(10_000)
+        if self._waiting_capture_worker is not None:
+            if self._waiting_capture_worker.is_running:
+                self._waiting_capture_worker.stop()
+                self._waiting_capture_worker.wait(10_000)
             self._waiting_capture_worker = None
             self._close_waiting_source()
+        self._seal_waiting_recording()
         if self._initial_thread is not None and self._initial_thread.isRunning():
             self._initial_thread.wait(10_000)
         if (

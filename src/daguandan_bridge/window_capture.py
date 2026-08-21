@@ -15,6 +15,12 @@ class TargetWindowError(RuntimeError):
     """无法定位或截取目标窗口时抛出的错误。"""
 
 
+_SW_RESTORE = 9
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+_SWP_NOOWNERZORDER = 0x0200
+
+
 @dataclass(frozen=True)
 class CapturedClientImage:
     image: Any
@@ -125,6 +131,71 @@ def get_client_rect_on_screen(target: TargetWindow) -> ClientRect:
         width=width,
         height=height,
     )
+
+
+def resize_target_client(
+    target: TargetWindow,
+    client_size: tuple[int, int],
+    *,
+    window_api: Any | None = None,
+    client_rect_getter: Any | None = None,
+) -> ClientRect:
+    """Resize a target's client area and verify the resulting pixel size.
+
+    The outer window frame varies with DPI and window style, so derive its
+    current insets instead of assuming fixed caption or border dimensions.
+    """
+
+    width, height = (int(client_size[0]), int(client_size[1]))
+    if width <= 0 or height <= 0:
+        raise ValueError("目标客户区尺寸必须为正整数")
+    if sys.platform != "win32":
+        raise TargetWindowError("窗口尺寸锁定只能在 Windows 上运行")
+
+    win32gui = window_api or import_required("win32gui", "pywin32")
+    if not win32gui.IsWindow(target.hwnd):
+        raise TargetWindowError("目标窗口句柄已经失效，无法锁定尺寸")
+
+    show_window = getattr(win32gui, "ShowWindow", None)
+    is_iconic = bool(win32gui.IsIconic(target.hwnd))
+    is_zoomed = bool(getattr(win32gui, "IsZoomed", lambda _hwnd: False)(target.hwnd))
+    if (is_iconic or is_zoomed) and callable(show_window):
+        show_window(target.hwnd, _SW_RESTORE)
+
+    get_client = client_rect_getter or get_client_rect_on_screen
+    current = get_client(target)
+    outer_left, outer_top, outer_right, outer_bottom = (
+        int(value) for value in win32gui.GetWindowRect(target.hwnd)
+    )
+    left_inset = current.left - outer_left
+    top_inset = current.top - outer_top
+    right_inset = outer_right - (current.left + current.width)
+    bottom_inset = outer_bottom - (current.top + current.height)
+    if min(left_inset, top_inset, right_inset, bottom_inset) < 0:
+        raise TargetWindowError("无法计算目标窗口边框，拒绝调整尺寸")
+
+    outer_width = width + left_inset + right_inset
+    outer_height = height + top_inset + bottom_inset
+    try:
+        win32gui.SetWindowPos(
+            target.hwnd,
+            0,
+            outer_left,
+            outer_top,
+            outer_width,
+            outer_height,
+            _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_NOOWNERZORDER,
+        )
+    except Exception as exc:
+        raise TargetWindowError(f"调整目标窗口尺寸失败：{exc}") from exc
+
+    resized = get_client(target)
+    if (resized.width, resized.height) != (width, height):
+        raise TargetWindowError(
+            "目标窗口未接受请求尺寸："
+            f"期望 {width}x{height}，实际 {resized.width}x{resized.height}"
+        )
+    return resized
 
 
 def get_window_dpi(target: TargetWindow) -> int:

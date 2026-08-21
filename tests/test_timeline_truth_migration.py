@@ -125,6 +125,34 @@ def test_timeline_migration_preserves_realtime_move_semantics(tmp_path: Path):
     assert semantics["selected_interpretation"]["key"] == "2"
 
 
+def test_timeline_migration_accepts_only_the_adjacent_visual_expansion_scope(
+    tmp_path: Path,
+):
+    session = tmp_path / "sessions" / "adjacent-reread"
+    reducer = LiveReducer("adjacent-reread")
+    initial = reducer.confirm_initial_state(
+        round_level="8", hand=HAND, lead_player="self"
+    )
+    played = reducer.record_play("self", ("2H",))
+    followed = reducer.record_pass("right")
+    correction = reducer.correct_previous_action_after_followup(
+        played.event_id,
+        expected_followup_actor="right",
+        followup_event_id=followed.event_id,
+        cards=("2H", "2D", "2C", "3H", "3C", "3S"),
+        reason="two_distinct_adjacent_action_rereads",
+    )
+    _write_timeline(session, [initial, played, followed, correction])
+
+    result = TimelineTruthMigrationService().migrate_session(session)
+    truth = load_truth_log(session / "truth_log.json", session_id="adjacent-reread")
+
+    assert result.status == "migrated"
+    assert truth.turns[0].cards == ("2C", "2D", "2H", "3C", "3H", "3S")
+    assert truth.turns[1].actor == "right"
+    assert truth.turns[1].is_pass
+
+
 def test_action_sequence_mismatch_blocks_without_truth_output(tmp_path: Path):
     session = tmp_path / "sessions" / "bad-sequence"
     events = _valid_events("bad-sequence")

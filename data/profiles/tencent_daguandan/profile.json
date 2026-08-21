@@ -11,7 +11,7 @@
   "auto_capture_interval_sec": 5.0,
   "schema_version": 2,
   "advisor_strategy": "fabledan",
-  "save_session_data": true,
+  "save_session_data": false,
   "fabledan_debug": true,
   "aspect_ratio_tolerance": 0.03,
   "capture_backend": "auto",
@@ -19,6 +19,10 @@
   "detect_black_bars": false,
   "viewport_mode": "bottom_aspect",
   "viewport_aspect_ratio": 1.7777777777777777,
+  "target_client_size": [
+    1280,
+    764
+  ],
   "match_settings": {
     "scales": [
       0.9,

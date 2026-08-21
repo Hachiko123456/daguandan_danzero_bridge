@@ -26,6 +26,7 @@ HAND = tuple(
 class ScriptedRecognition:
     def __init__(self, actions):
         self.actions = list(actions)
+        self.history: dict[str, dict[str, object]] = {}
         self.sample_counts: dict[str, int] = {}
 
     def recognize_fast_signals(self, _image, expected_player):
@@ -39,12 +40,13 @@ class ScriptedRecognition:
 
     def recognize_play_region(self, _image, seat, *, wild_rank):
         del wild_rank
-        while self.actions and self.actions[0]["player"] != seat:
-            # The state machine owns commitment timing.  This fixture keeps a
-            # visible action available through effects/retries and advances
-            # only when turn ownership has actually changed.
-            self.actions.pop(0)
-        action = self.actions[0]
+        if self.actions and self.actions[0]["player"] == seat:
+            action = self.actions.pop(0)
+            self.history[seat] = action
+        else:
+            action = self.history.get(seat)
+        if action is None:
+            raise AssertionError(f"no scripted action available for {seat}")
         assert action["player"] == seat
         self.sample_counts[seat] = self.sample_counts.get(seat, 0) + 1
         return PlayRegionResult(

@@ -16,6 +16,7 @@ from .window_capture import (
     find_screen_occluders,
     find_target_window,
     get_client_rect_on_screen,
+    resize_target_client,
 )
 
 
@@ -116,3 +117,11 @@ class CaptureService:
         loaded = self.load_profile(profile_name)
         target = find_target_window(loaded.config.window_title_keywords)
         return get_client_rect_on_screen(target)
+
+    def lock_target_client_size(self, profile_name: str):
+        """Make the target client match this profile's canonical base size."""
+
+        loaded = self.load_profile(profile_name)
+        target = find_target_window(loaded.config.window_title_keywords)
+        target_size = loaded.config.target_client_size or loaded.config.base_size
+        return resize_target_client(target, target_size)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
@@ -64,6 +64,17 @@ class _TemplateMatch:
     @property
     def center_y(self) -> float:
         return self.y + self.h / 2
+
+
+@dataclass(frozen=True)
+class _RecognizedCard:
+    center_x: float
+    code: str
+    confidence: float
+    source: str
+    box: tuple[int, int, int, int]
+    suit_options: tuple[str, ...]
+    candidate_suits: tuple[str, ...]
 
 
 class ScreenshotRecognitionService:
@@ -212,6 +223,7 @@ class ScreenshotRecognitionService:
             wild_rank=level,
             rank_threshold=self._HAND_RANK_THRESHOLD,
             suit_threshold=self._HAND_SUIT_THRESHOLD,
+            allow_unknown_suit=allow_unknown_suit,
         )
         diagnostics.extend(hand_diagnostics)
         annotations.extend(hand_annotations)
@@ -568,14 +580,18 @@ class ScreenshotRecognitionService:
             kind="timer",
             label="active",
         )
-        pass_visible = False
+        pass_marker_players: list[Seat] = []
         if allow_pass:
-            pass_visible, _, _, _ = self._recognize_status(
-                source_image,
-                regions.get(f"passed_{expected_player}"),
-                templates,
-                label="passed",
-            )
+            for player in SEATS_IN_ORDER:
+                marker_visible, _, _, _ = self._recognize_status(
+                    source_image,
+                    regions.get(f"passed_{player}"),
+                    templates,
+                    label="passed",
+                )
+                if marker_visible:
+                    pass_marker_players.append(player)
+        pass_visible = expected_player in pass_marker_players
         buttons, _, _, _ = self._recognize_buttons_in_regions(
             source_image,
             (regions.get("button_actions"), regions.get("game_end_controls")),
@@ -617,6 +633,8 @@ class ScreenshotRecognitionService:
             pass_visible=pass_visible,
             self_action_buttons_visible=expected_player == "self" and bool(buttons),
             effect_visible=bool(effects),
+            pass_marker_player=expected_player if pass_visible else None,
+            pass_marker_players=tuple(pass_marker_players),
             super_double_visible="super_double" in buttons,
             game_end_control=game_end_control,
             placements=placements,
@@ -868,25 +886,29 @@ class ScreenshotRecognitionService:
             threshold=suit_threshold,
             limit=self._MAX_MATCHES_PER_TEMPLATE,
         )
-        suit_matches = self._deduplicate(raw_suit_matches)
         diagnostics: list[str] = []
         used_suits: set[int] = set()
-        cards: list[
-            tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
-        ] = []
-        joker_cards: list[
-            tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
-        ] = []
+        cards: list[_RecognizedCard] = []
+        joker_cards: list[_RecognizedCard] = []
         category = "hand" if "hand" in source_roles else "play"
         for joker in joker_matches:
             card_box = self._box_for_matches((joker,))
             joker_cards.append(
-                (joker.center_x, joker.label, joker.score, joker.source, card_box, ())
+                _RecognizedCard(
+                    joker.center_x,
+                    joker.label,
+                    joker.score,
+                    joker.source,
+                    card_box,
+                    (),
+                    (),
+                )
             )
         for rank in sorted(rank_matches, key=lambda item: (item.center_x, item.center_y)):
+            color_candidates = self._unknown_suit_options(image, rank)
             possible = [
                 (index, suit)
-                for index, suit in enumerate(suit_matches)
+                for index, suit in enumerate(raw_suit_matches)
                 if index not in used_suits
                 and (
                     suit.source_role != "level"
@@ -896,14 +918,35 @@ class ScreenshotRecognitionService:
                 <= max(24.0, rank.w * 0.8, suit.w * 0.8)
                 and self._suit_is_below_rank(rank, suit)
             ]
+            color_matched = [
+                (index, suit)
+                for index, suit in possible
+                if self._suit_code(suit.label) in color_candidates
+            ]
+            # Older template sets include a few rank-only glyph samples whose
+            # colour no longer matches their accompanying suit sample. Prefer
+            # colour-compatible matches, but do not erase the only spatially
+            # valid candidate when that legacy data is encountered.
+            preferred = color_matched or possible
+            preferred_ids = {
+                id(candidate)
+                for candidate in self._deduplicate(
+                    candidate for _index, candidate in preferred
+                )
+            }
+            possible = [
+                (index, candidate)
+                for index, candidate in preferred
+                if id(candidate) in preferred_ids
+            ]
             if not possible and str(rank.label) == str(wild_rank):
                 special_suit = self._infer_special_level_suit(image, rank)
                 if special_suit is not None:
-                    possible = [(len(suit_matches), special_suit)]
+                    possible = [(len(raw_suit_matches), special_suit)]
                 else:
                     possible = [
                         (
-                            len(suit_matches),
+                            len(raw_suit_matches),
                             _TemplateMatch(
                                 label="heart",
                                 kind="suit",
@@ -921,13 +964,14 @@ class ScreenshotRecognitionService:
                 if allow_unknown_suit:
                     card_box = self._box_for_matches((rank,))
                     cards.append(
-                        (
+                        _RecognizedCard(
                             rank.center_x,
                             f"{rank.label}?",
                             rank.score,
                             rank.source,
                             card_box,
-                            self._unknown_suit_options(image, rank),
+                            color_candidates,
+                            color_candidates,
                         )
                     )
                     diagnostics.append(f"{rank.label} 花色被遮挡，按未知花色")
@@ -954,11 +998,19 @@ class ScreenshotRecognitionService:
             )
             shape_suit_code = (
                 self._black_suit_shape_code(image, suit)
-                if uncertain_options == ("S", "C")
+                if (
+                    color_candidates == ("S", "C")
+                    and self._suit_code(suit.label) in {"S", "C"}
+                )
                 else None
             )
             if shape_suit_code is not None:
                 uncertain_options = ()
+            elif (
+                color_candidates == ("S", "C")
+                and self._suit_code(suit.label) in {"S", "C"}
+            ):
+                uncertain_options = color_candidates
             if uncertain_options:
                 card_code = f"{rank.label}?"
                 diagnostics.append(
@@ -967,7 +1019,7 @@ class ScreenshotRecognitionService:
             else:
                 card_code = f"{rank.label}{shape_suit_code or self._suit_code(suit.label)}"
             cards.append(
-                (
+                _RecognizedCard(
                     rank.center_x,
                     card_code,
                     min(rank.score, suit.score),
@@ -978,21 +1030,29 @@ class ScreenshotRecognitionService:
                     self._box_for_matches((rank, suit)),
                     uncertain_options
                     or (shape_suit_code or self._suit_code(suit.label),),
+                    (
+                        uncertain_options
+                        or (shape_suit_code,)
+                        if shape_suit_code is not None
+                        else (
+                            color_candidates
+                            if self._suit_code(suit.label) in color_candidates
+                            else (self._suit_code(suit.label),)
+                        )
+                    ),
                 )
             )
-        cards.sort(key=lambda item: item[0])
+        cards.sort(key=lambda item: item.center_x)
         if joker_cards:
             # 大小王图案相似，同一张牌可能同时命中两个模板：按距离分组，
             # 每组只保留分数最高的候选。
-            competed: list[
-                tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
-            ] = []
-            for joker in sorted(joker_cards, key=lambda item: -item[2]):
-                jx, jy, jw, jh = joker[4]
+            competed: list[_RecognizedCard] = []
+            for joker in sorted(joker_cards, key=lambda item: -item.confidence):
+                jx, jy, jw, jh = joker.box
                 jcx, jcy = jx + jw / 2, jy + jh / 2
                 near_kept = False
                 for kept in competed:
-                    kx, ky, kw, kh = kept[4]
+                    kx, ky, kw, kh = kept.box
                     kcx, kcy = kx + kw / 2, ky + kh / 2
                     max_distance = max(10.0, min(jw, kw) * 0.6)
                     if (
@@ -1007,40 +1067,78 @@ class ScreenshotRecognitionService:
             # A relaxed joker threshold also catches ornate regular cards
             # (wild/level cards with gold art). A real joker never overlaps
             # another recognized card, so drop joker boxes that sit on one.
-            kept_jokers: list[
-                tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
-            ] = []
+            kept_jokers: list[_RecognizedCard] = []
             for joker in joker_cards:
-                if any(self._boxes_overlap(joker[4], card[4]) for card in cards):
-                    diagnostics.append(f"{joker[1]} 疑似误报，已忽略重叠候选")
+                if any(self._boxes_overlap(joker.box, card.box) for card in cards):
+                    diagnostics.append(f"{joker.code} 疑似误报，已忽略重叠候选")
                     continue
                 kept_jokers.append(joker)
             cards.extend(kept_jokers)
-            cards.sort(key=lambda item: item[0])
-        limited_cards: list[
-            tuple[float, str, float, str, tuple[int, int, int, int], tuple[str, ...]]
-        ] = []
-        counts: Counter[str] = Counter()
-        for item in cards:
-            if counts[item[1]] >= 2:
-                diagnostics.append(f"{item[1]} 超过双副牌限制，已忽略低优先级候选")
-                continue
-            counts[item[1]] += 1
-            limited_cards.append(item)
-        cards = limited_cards
+            cards.sort(key=lambda item: item.center_x)
+        cards = self._limit_deck_copies(
+            cards,
+            diagnostics,
+            allow_unknown_suit=allow_unknown_suit,
+        )
         if not cards:
             return (), 0.0, "", tuple(diagnostics), (), ()
         return (
-            tuple(item[1] for item in cards),
-            min(item[2] for item in cards),
+            tuple(item.code for item in cards),
+            min(item.confidence for item in cards),
             "template:cards",
             tuple(diagnostics),
             tuple(
-                RecognitionAnnotation(item[1], item[4], item[2], category)
+                RecognitionAnnotation(item.code, item.box, item.confidence, category)
                 for item in cards
             ),
-            tuple(item[5] for item in cards),
+            tuple(item.suit_options for item in cards),
         )
+
+    @staticmethod
+    def _limit_deck_copies(
+        cards: list[_RecognizedCard],
+        diagnostics: list[str],
+        *,
+        allow_unknown_suit: bool,
+    ) -> list[_RecognizedCard]:
+        """Retain an over-counted suit as bounded uncertainty before dropping it."""
+
+        limited = list(cards)
+        while True:
+            counts = Counter(
+                card.code for card in limited if not card.code.endswith("?")
+            )
+            overflow = next(
+                (code for code, count in counts.items() if count > 2),
+                None,
+            )
+            if overflow is None:
+                return limited
+            matching = [
+                (index, card)
+                for index, card in enumerate(limited)
+                if card.code == overflow
+            ]
+            repairable = [
+                (index, card)
+                for index, card in matching
+                if len(card.candidate_suits) > 1
+            ]
+            if allow_unknown_suit and repairable and len(overflow) >= 2:
+                index, card = min(repairable, key=lambda item: item[1].confidence)
+                limited[index] = replace(
+                    card,
+                    code=f"{overflow[:-1]}?",
+                    source=f"{card.source}+deck-limit:unknown",
+                    suit_options=card.candidate_suits,
+                )
+                diagnostics.append(
+                    f"{overflow} 超过双副牌限制，按候选花色保留低置信度牌"
+                )
+                continue
+            index, _card = min(matching, key=lambda item: item[1].confidence)
+            limited.pop(index)
+            diagnostics.append(f"{overflow} 超过双副牌限制，已忽略低优先级候选")
 
     @staticmethod
     def _unknown_suit_options(
@@ -1149,7 +1247,7 @@ class ScreenshotRecognitionService:
             for raw, template in self._templates():
                 if (
                     raw.get("kind") != "suit"
-                    or raw.get("source_role") != "play"
+                    or raw.get("source_role") not in {"hand", "hand_partial", "play"}
                     or raw.get("label") not in {"spade", "club"}
                 ):
                     continue

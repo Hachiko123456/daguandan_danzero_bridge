@@ -284,6 +284,75 @@ class LiveReducer:
         self.apply(event)
         return event
 
+    def correct_previous_action_after_followup(
+        self,
+        target_event_id: str,
+        *,
+        expected_followup_actor: Seat,
+        followup_event_id: str,
+        cards: Iterable[str],
+        reason: str,
+        confidence: float = 1.0,
+        source: str = "two_frame_adjacent_action_reread",
+        evidence_refs: Iterable[str] = (),
+    ) -> LiveEvent:
+        """Correct only the penultimate play after its legal follower acted.
+
+        This is intentionally narrower than :meth:`correct_event`: a visual
+        reread may add cards only while the originally observed action is still
+        immediately before its follower.  Rebuilding validates all remaining
+        card counts and must leave the current player unchanged; any failure
+        rolls the correction back atomically.
+        """
+
+        actions = [event for event in self._events if event.event_type in _ACTION_EVENT_TYPES]
+        if len(actions) < 2 or actions[-2].event_id != target_event_id:
+            raise GameStateError("相邻复核只能纠正倒数第二个正式动作")
+        target, followup = actions[-2:]
+        if target.event_type == "player_passed" or bool(target.payload.get("is_pass", False)):
+            raise GameStateError("相邻复核不能纠正不出动作")
+        if (
+            followup.event_id != str(followup_event_id)
+            or followup.actor != expected_followup_actor
+        ):
+            raise GameStateError("相邻复核后的跟随动作不匹配")
+        if any(
+            event.event_type == "event_correction"
+            and str(event.payload.get("target_event_id", "")) == target_event_id
+            for event in self._events
+        ):
+            raise GameStateError("该动作已经被纠正")
+        normalized = self._normalize_cards(cards)
+        if not normalized:
+            raise GameStateError("相邻复核必须保留出牌")
+        current_before = self.snapshot().current_player
+        event = self._new_event(
+            "event_correction",
+            actor=target.actor,
+            payload={
+                "target_event_id": target_event_id,
+                "cards": list(normalized),
+                "is_pass": False,
+                "reason": str(reason),
+                "correction_scope": "previous_action_after_followup",
+                "followup_event_id": followup.event_id,
+                "expected_followup_actor": expected_followup_actor,
+            },
+            confidence=confidence,
+            source=source,
+            evidence_refs=evidence_refs,
+        )
+        self._events.append(event)
+        try:
+            self._rebuild()
+            if self.snapshot().current_player != current_before:
+                raise GameStateError("相邻复核不能改变后续当前行动者")
+        except Exception:
+            self._events.pop()
+            self._rebuild()
+            raise
+        return event
+
     def _require_expected_player(self, player: Seat) -> None:
         if not self._initialized:
             raise GameStateError("牌局尚未初始化")

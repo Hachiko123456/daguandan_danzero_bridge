@@ -10,7 +10,11 @@ from daguandan_bridge.image_io import standardize_to_base
 from daguandan_bridge.models import ClientRect
 from daguandan_bridge.models import TargetWindow
 from daguandan_bridge.profiles import ProfileConfig, create_profile
-from daguandan_bridge.window_capture import CapturedStandardizedFrame
+from daguandan_bridge.window_capture import (
+    CapturedStandardizedFrame,
+    TargetWindowError,
+    resize_target_client,
+)
 
 
 def _frame_snapshot() -> FrameSnapshot:
@@ -69,6 +73,139 @@ def test_live_source_reuses_window_lookup_and_capture_backend(tmp_path, monkeypa
 
     assert source.window_lookup_count == 1
     assert calls == {"find": 1, "capture": 2, "close": 1}
+
+
+def test_resize_target_client_preserves_client_origin_and_accounts_for_frame():
+    target = TargetWindow(hwnd=123, title="Test Window")
+    calls = []
+
+    class WindowApi:
+        @staticmethod
+        def IsWindow(_hwnd):
+            return True
+
+        @staticmethod
+        def IsIconic(_hwnd):
+            return False
+
+        @staticmethod
+        def IsZoomed(_hwnd):
+            return False
+
+        @staticmethod
+        def GetWindowRect(_hwnd):
+            return (90, 160, 1010, 930)
+
+        @staticmethod
+        def SetWindowPos(*args):
+            calls.append(args)
+
+    rectangles = iter(
+        (
+            ClientRect(100, 200, 900, 700),
+            ClientRect(100, 200, 1280, 720),
+        )
+    )
+
+    resized = resize_target_client(
+        target,
+        (1280, 720),
+        window_api=WindowApi(),
+        client_rect_getter=lambda _target: next(rectangles),
+    )
+
+    assert resized == ClientRect(100, 200, 1280, 720)
+    assert calls == [(123, 0, 90, 160, 1300, 790, 532)]
+
+
+def test_resize_target_client_rejects_a_window_that_refuses_requested_size():
+    target = TargetWindow(hwnd=123, title="Test Window")
+
+    class WindowApi:
+        @staticmethod
+        def IsWindow(_hwnd):
+            return True
+
+        @staticmethod
+        def IsIconic(_hwnd):
+            return False
+
+        @staticmethod
+        def IsZoomed(_hwnd):
+            return False
+
+        @staticmethod
+        def GetWindowRect(_hwnd):
+            return (90, 160, 1010, 930)
+
+        @staticmethod
+        def SetWindowPos(*_args):
+            pass
+
+    with pytest.raises(TargetWindowError, match="未接受请求尺寸"):
+        resize_target_client(
+            target,
+            (1280, 720),
+            window_api=WindowApi(),
+            client_rect_getter=lambda _target: ClientRect(100, 200, 900, 700),
+        )
+
+
+def test_capture_service_locks_the_client_to_its_profile_base_size(tmp_path, monkeypatch):
+    service = CaptureService(tmp_path / "profiles")
+    create_profile(
+        service.profiles_root,
+        ProfileConfig("test_game", "Test", ("Test",), base_size=(1280, 720)),
+    )
+    target = TargetWindow(hwnd=123, title="Test Window")
+    locked = []
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_target_window",
+        lambda _keywords: target,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.resize_target_client",
+        lambda passed_target, size: locked.append((passed_target, size))
+        or ClientRect(10, 20, 1280, 720),
+    )
+
+    result = service.lock_target_client_size("test_game")
+
+    assert result == ClientRect(10, 20, 1280, 720)
+    assert locked == [(target, (1280, 720))]
+
+
+def test_capture_service_uses_a_profile_specific_client_size_when_configured(
+    tmp_path,
+    monkeypatch,
+):
+    service = CaptureService(tmp_path / "profiles")
+    create_profile(
+        service.profiles_root,
+        ProfileConfig(
+            "test_game",
+            "Test",
+            ("Test",),
+            base_size=(1280, 720),
+            target_client_size=(1280, 764),
+        ),
+    )
+    target = TargetWindow(hwnd=123, title="Test Window")
+    locked = []
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_target_window",
+        lambda _keywords: target,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.resize_target_client",
+        lambda passed_target, size: locked.append((passed_target, size))
+        or ClientRect(10, 20, 1280, 764),
+    )
+
+    result = service.lock_target_client_size("test_game")
+
+    assert result == ClientRect(10, 20, 1280, 764)
+    assert locked == [(target, (1280, 764))]
 
 
 def test_live_source_reports_geometry_change_as_interruption(tmp_path, monkeypatch):

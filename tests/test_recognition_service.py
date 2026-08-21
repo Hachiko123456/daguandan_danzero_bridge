@@ -65,6 +65,79 @@ def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
     assert any(annotation.label == "2S" for annotation in result.annotations)
 
 
+def test_initial_hand_keeps_a_rank_when_its_suit_is_occluded():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/rank/2_hand.png", 40, 510)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    result = service.recognize(image, allow_unknown_suit=True)
+
+    assert "2?" in result.my_hand
+
+
+def test_hand_color_gate_keeps_a_black_suit_when_diamond_scores_higher(monkeypatch):
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    rank = _TemplateMatch("9", "rank", "hand", "test:9", 0.92, 40, 510, 35, 50)
+    wrong_diamond = _TemplateMatch(
+        "diamond", "suit", "hand", "test:diamond", 0.99, 43, 550, 30, 32
+    )
+    spade = _TemplateMatch("spade", "suit", "hand", "test:spade", 0.84, 43, 550, 31, 31)
+    responses = iter(([rank], [], [wrong_diamond, spade]))
+    monkeypatch.setattr(service, "_matches_for_region", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(service, "_unknown_suit_options", lambda *_args: ("S", "C"))
+    monkeypatch.setattr(service, "_black_suit_shape_code", lambda *_args: "S")
+
+    cards, *_rest = service._recognize_cards(
+        np.zeros((720, 1280, 3), dtype=np.uint8),
+        object(),
+        (),
+        source_roles={"hand"},
+        rank_threshold=service._HAND_RANK_THRESHOLD,
+        suit_threshold=service._HAND_SUIT_THRESHOLD,
+        allow_unknown_suit=True,
+    )
+
+    assert cards == ("9S",)
+
+
+def test_hand_duplicate_suit_is_preserved_as_bounded_unknown_before_drop(monkeypatch):
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    ranks = [
+        _TemplateMatch("9", "rank", "hand", "test:9", score, x, 510, 35, 50)
+        for x, score in ((40, 0.92), (90, 0.88), (140, 0.73))
+    ]
+    diamonds = [
+        _TemplateMatch("diamond", "suit", "hand", "test:diamond", 0.90, x + 3, 550, 30, 32)
+        for x, _score in ((40, 0.92), (90, 0.88), (140, 0.73))
+    ]
+    responses = iter((ranks, [], diamonds))
+    monkeypatch.setattr(service, "_matches_for_region", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(service, "_unknown_suit_options", lambda *_args: ("H", "D"))
+
+    cards, _score, _source, diagnostics, _annotations, suit_options = service._recognize_cards(
+        np.zeros((720, 1280, 3), dtype=np.uint8),
+        object(),
+        (),
+        source_roles={"hand"},
+        rank_threshold=service._HAND_RANK_THRESHOLD,
+        suit_threshold=service._HAND_SUIT_THRESHOLD,
+        allow_unknown_suit=True,
+    )
+
+    assert cards == ("9D", "9D", "9?")
+    assert suit_options == (("D",), ("D",), ("H", "D"))
+    assert any("按候选花色保留" in item for item in diagnostics)
+
+
 def test_effect_overlay_just_outside_play_roi_still_gates_the_action():
     """Effects may overhang the cards, unlike ordinary play templates."""
 

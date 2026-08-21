@@ -6,6 +6,7 @@ import json
 from math import prod
 
 from ..danzero.rules import (
+    action_for_cards,
     actions_for_cards,
     logical_action_label,
     wildcard_substitutions,
@@ -49,6 +50,7 @@ def state_variants_for_action_semantics(
     """Expand unresolved semantic declarations without mutating canonical state."""
 
     max_variants = max(1, int(limit))
+    resolved_history = list(state.play_history)
     branch_points: list[tuple[int, PlayEvent, tuple[dict[str, object], ...]]] = []
     branch_audits: list[dict[str, object]] = []
 
@@ -69,6 +71,57 @@ def state_variants_for_action_semantics(
         )
         contains_wildcard = f"{state.wild_rank}H" in event.cards
         if not unresolved and not (contains_wildcard and not isinstance(selected, dict)):
+            continue
+
+        # A level-heart card is the wildcard. Its physical suit can be known
+        # while its declared rank/type is still missing from older histories.
+        # GuanDan's convention is deterministic here: choose the strongest
+        # legal declaration instead of asking the advisor to guess later.
+        if contains_wildcard and not isinstance(selected, dict):
+            try:
+                candidates = _derived_candidates(event.cards, state.wild_rank)
+                strongest = _strongest_candidate(event.cards, state.wild_rank)
+            except Exception as exc:
+                return _semantic_error(
+                    state,
+                    event_index,
+                    (),
+                    f"规则引擎恢复最大逢人配语义时出错：{type(exc).__name__}: {exc}",
+                    branch_audits,
+                )
+            if strongest is None:
+                return _semantic_error(
+                    state,
+                    event_index,
+                    candidates,
+                    "没有记录候选，规则引擎也无法从实体牌恢复任何合法解释",
+                    branch_audits,
+                )
+
+            metadata.update(
+                {
+                    "interpretation_ambiguous": len(candidates) > 1,
+                    "candidate_interpretations": [dict(item) for item in candidates],
+                    "selected_interpretation": strongest,
+                    "selection_source": "rules_strongest_wildcard",
+                }
+            )
+            resolved_history[event_index] = replace(
+                event,
+                action_metadata=metadata,
+            )
+            branch_audits.append(
+                {
+                    "source_history_index": event_index + 1,
+                    "physical_cards": list(event.cards),
+                    "level": state.round_level,
+                    "wild_rank": state.wild_rank,
+                    "candidate_source": "rules_strongest_wildcard",
+                    "candidate_count": len(candidates),
+                    "candidate_interpretations": [dict(item) for item in candidates],
+                    "selected_interpretation": dict(strongest),
+                }
+            )
             continue
 
         candidates = _metadata_candidates(metadata)
@@ -110,8 +163,20 @@ def state_variants_for_action_semantics(
         branch_audits.append(audit)
         branch_points.append((event_index, event, candidates))
 
+    trick_count = len(state.trick_plays)
+    resolved_state = replace(
+        state,
+        play_history=resolved_history,
+        trick_plays=(
+            resolved_history[-trick_count:] if trick_count else []
+        ),
+    )
+
     if not branch_points:
-        return ActionSemanticVariants(states=(state,))
+        return ActionSemanticVariants(
+            states=(resolved_state,),
+            branch_points=tuple(branch_audits),
+        )
 
     total_variants = prod(len(candidates) for _, _, candidates in branch_points)
     source_indices = tuple(index + 1 for index, _, _ in branch_points)
@@ -138,7 +203,7 @@ def state_variants_for_action_semantics(
     states: list[GuanDanState] = []
     candidate_groups = [candidates for _, _, candidates in branch_points]
     for branch_index, choices in enumerate(product(*candidate_groups), start=1):
-        history = list(state.play_history)
+        history = list(resolved_history)
         for (event_index, event, candidates), selected in zip(branch_points, choices):
             metadata = dict(event.action_metadata or {})
             metadata.update(
@@ -156,7 +221,6 @@ def state_variants_for_action_semantics(
                 }
             )
             history[event_index] = replace(event, action_metadata=metadata)
-        trick_count = len(state.trick_plays)
         trick = history[-trick_count:] if trick_count else []
         states.append(replace(state, play_history=history, trick_plays=trick))
 
@@ -197,6 +261,24 @@ def _derived_candidates(
             }
         )
     return _deduplicate_candidates(candidates)
+
+
+def _strongest_candidate(
+    cards: tuple[str, ...],
+    wild_rank: str,
+) -> dict[str, object] | None:
+    action = action_for_cards(cards, wild_rank)
+    if action is None:
+        return None
+    return {
+        "move_type": str(action[0]),
+        "key": str(action[1]),
+        "logical_label": logical_action_label(action, wild_rank),
+        "wildcard_assignments": [
+            {"physical_card": card, "as_rank": rank}
+            for card, rank in wildcard_substitutions(action, wild_rank)
+        ],
+    }
 
 
 def _deduplicate_candidates(

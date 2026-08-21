@@ -77,6 +77,14 @@ class FastSignalResult:
     pass_visible: bool
     self_action_buttons_visible: bool
     effect_visible: bool
+    # ``pass_visible`` is retained for the zone lifecycle.  The live
+    # ownership guard additionally needs the seat-bound marker identity so it
+    # never converts a stale marker from another action into a pass.
+    pass_marker_player: Seat | None = None
+    # The expected-seat fields above retain their original meaning.  Recovery
+    # also needs the complete visible status set so it can prove intervening
+    # passes after an expected action has been delayed.
+    pass_marker_players: tuple[Seat, ...] = ()
     super_double_visible: bool = False
     game_end_control: str | None = None
     placements: tuple[PlacementSignal, ...] = ()
