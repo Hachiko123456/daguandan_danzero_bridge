@@ -192,6 +192,58 @@ def test_finished_player_partner_catches_wind_after_active_opponent_passes():
     assert snapshot.current_player == "opposite"
 
 
+@pytest.mark.parametrize(
+    ("leader", "required_passes", "wind_receiver"),
+    (
+        ("self", ("right", "left"), "opposite"),
+        ("right", ("opposite", "self"), "left"),
+        ("opposite", ("left", "right"), "self"),
+        ("left", ("self", "opposite"), "right"),
+    ),
+)
+def test_finished_leader_skips_partner_until_two_opponents_pass(
+    leader: str,
+    required_passes: tuple[str, str],
+    wind_receiver: str,
+):
+    """Every seat can finish without making its wind-catch partner PASS."""
+
+    reducer = LiveReducer(f"wind-{leader}")
+    reducer.confirm_initial_state(
+        round_level="2",
+        hand=INITIAL_HAND,
+        lead_player=leader,
+    )
+    reducer.record_play(leader, INITIAL_HAND)
+
+    reducer.record_pass(required_passes[0])
+    assert reducer.snapshot().current_player == required_passes[1]
+
+    reducer.record_pass(required_passes[1])
+    snapshot = reducer.snapshot()
+    assert snapshot.trick_plays == ()
+    assert snapshot.lead_player == wind_receiver
+    assert snapshot.current_player == wind_receiver
+
+
+def test_wind_receiver_after_current_pass_requires_the_last_active_opponent():
+    reducer = LiveReducer("wind-projection")
+    reducer.confirm_initial_state(
+        round_level="2",
+        hand=INITIAL_HAND,
+        lead_player="right",
+    )
+    reducer.record_play("right", ("3S",))
+    reducer.record_pass("opposite")
+    reducer.record_play("left", INITIAL_HAND)
+    reducer.record_pass("self")
+
+    assert reducer.snapshot().current_player == "opposite"
+    assert reducer.pending_wind_receiver() == "right"
+    assert reducer.wind_receiver_after_current_pass("self") is None
+    assert reducer.wind_receiver_after_current_pass("opposite") == "right"
+
+
 def test_correction_rebuild_matches_clean_history():
     corrected = _started_reducer()
     original = corrected.record_play("right", ("7S", "7H"))

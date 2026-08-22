@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, Qt, Signal, QTimer
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
@@ -40,6 +40,9 @@ _TRICK_SEATS = (
     ("opposite", "对家"),
     ("left", "左家"),
 )
+
+_PREVIOUS_ACTION_REREAD_PENDING = "previous_action_reread_pending"
+_TRANSIENT_WITHHOLD_DELAY_MS = 500
 
 
 def _rank_token(card: str) -> str:
@@ -158,6 +161,12 @@ class RecommendationFloatWindow(QWidget):
         self._preselection_by_request_id: dict[str, object] = {}
         self._backend = ""
         self._card_badges: list[CardBadge] = []
+        self._transient_withhold_request_id = ""
+        self._transient_withhold_timer = QTimer(self)
+        self._transient_withhold_timer.setSingleShot(True)
+        self._transient_withhold_timer.timeout.connect(
+            self._show_delayed_transient_withhold
+        )
         self.setObjectName("recommendationFloatWindow")
         self.setWindowTitle(f"{self._advisor_display_name()} 极简推荐")
         self.setWindowFlags(
@@ -254,16 +263,39 @@ class RecommendationFloatWindow(QWidget):
         player = getattr(update.snapshot, "current_player", None)
         self.trick_strip.set_snapshot(update.snapshot, update.status)
         raw = update.advice
+        terminal_event = getattr(getattr(update, "event", None), "event_type", None)
+        terminal_events = tuple(getattr(update, "events", ()) or ())
+        is_terminal = (
+            update.status in {"finalizing", "sealed"}
+            or (update.status == "running" and player is None)
+            or terminal_event == "game_end_detected"
+            or any(
+                getattr(event, "event_type", None) == "game_end_detected"
+                for event in terminal_events
+            )
+        )
+        if is_terminal:
+            self._clear_transient_withhold()
+            self.suggestion_label.setText("本局已结束")
+            self.detail_label.setText("已确认终局，正在封存本局记录")
+            self._render_cards(())
+            return
         if update.status == "paused":
+            self._clear_transient_withhold()
             self.suggestion_label.setText("识别已暂停")
             self.detail_label.setText("请排除窗口遮挡后，在完整助手中点击继续")
             self._render_cards(())
             return
         if isinstance(raw, LiveAdvice) and raw.status == "withheld":
+            if raw.withhold_reason == _PREVIOUS_ACTION_REREAD_PENDING:
+                self._show_transient_withhold(raw)
+                return
+            self._clear_transient_withhold()
             self.suggestion_label.setText("牌局历史不完整，暂停推荐")
             self.detail_label.setText(raw.error or "请在完整助手中补正缺失动作后再继续")
             self._render_cards(())
             return
+        self._clear_transient_withhold()
         if update.status == "running" and player != "self":
             self.suggestion_label.setText("等待自己回合")
             self.detail_label.setText(f"当前轮到{seat_text(player, unknown='其他玩家')}")
@@ -330,6 +362,30 @@ class RecommendationFloatWindow(QWidget):
             if detail:
                 details.append(detail)
         self.detail_label.setText(" · ".join(details))
+
+    def _show_transient_withhold(self, advice: LiveAdvice) -> None:
+        """Keep a short adjacent-reread guard from looking like lost history."""
+
+        request_id = advice.key.request_id
+        if request_id == self._transient_withhold_request_id:
+            return
+        self._clear_transient_withhold()
+        self._transient_withhold_request_id = request_id
+        self.suggestion_label.setText("正在更新建议")
+        self.detail_label.setText(advice.error or "正在核验上一手牌面")
+        self._render_cards(())
+        self._transient_withhold_timer.start(_TRANSIENT_WITHHOLD_DELAY_MS)
+
+    def _show_delayed_transient_withhold(self) -> None:
+        if not self._transient_withhold_request_id:
+            return
+        self.suggestion_label.setText("正在复核上一手牌面")
+        self.detail_label.setText("复核完成后将自动更新推荐")
+        self._render_cards(())
+
+    def _clear_transient_withhold(self) -> None:
+        self._transient_withhold_timer.stop()
+        self._transient_withhold_request_id = ""
 
     def apply_preselection_result(self, result: object) -> None:
         request_id = str(getattr(result, "request_id", "") or "")

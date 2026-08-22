@@ -6,6 +6,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, QRect, Signal
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.danzero.advisor import LocalAdvice
@@ -125,6 +126,88 @@ def test_float_window_clears_recommendation_when_history_is_withheld():
 
     assert window.suggestion_label.text() == "牌局历史不完整，暂停推荐"
     assert window._card_badges == []
+    window.hide()
+
+
+def test_float_window_prioritizes_terminal_state_over_a_stale_withhold():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    withheld = LiveAdvice(
+        key=AdviceRequestKey("session", 8, 9),
+        status="withheld",
+        error="牌局历史不完整，暂停推荐",
+        withhold_reason="visual_finish_without_complete_history",
+    )
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player=None),
+            advice=withheld,
+        )
+    )
+    app.processEvents()
+
+    assert window.suggestion_label.text() == "本局已结束"
+    assert "历史不完整" not in window.suggestion_label.text()
+    window.hide()
+
+
+def test_float_window_treats_short_adjacent_reread_as_updating_not_missing_history():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    snapshot = SimpleNamespace(current_player="self")
+    withheld = LiveAdvice(
+        key=AdviceRequestKey("session", 8, 9),
+        status="withheld",
+        error="上一手牌面待复核，暂停推荐",
+        withhold_reason="previous_action_reread_pending",
+    )
+
+    runtime.update_ready.emit(
+        LiveUpdate(status="running", snapshot=snapshot, advice=withheld)
+    )
+    app.processEvents()
+    assert window.suggestion_label.text() == "正在更新建议"
+    assert window._card_badges == []
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            advice=_ready_advice(visible=True),
+        )
+    )
+    QTest.qWait(600)
+    app.processEvents()
+    assert window.suggestion_label.text() == "出牌 · 顺子"
+    window.hide()
+
+
+def test_float_window_labels_long_adjacent_reread_as_verification():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    withheld = LiveAdvice(
+        key=AdviceRequestKey("session", 8, 9),
+        status="withheld",
+        error="上一手牌面待复核，暂停推荐",
+        withhold_reason="previous_action_reread_pending",
+    )
+
+    runtime.update_ready.emit(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self"),
+            advice=withheld,
+        )
+    )
+    QTest.qWait(600)
+    app.processEvents()
+    assert window.suggestion_label.text() == "正在复核上一手牌面"
+    assert "历史不完整" not in window.suggestion_label.text()
     window.hide()
 
 

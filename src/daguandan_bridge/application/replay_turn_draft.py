@@ -3,41 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ..live.truth_log import TruthInitialState, TruthLog, TruthTurn
-
-
-_SEATS = {"self", "right", "opposite", "left"}
-_TURN_ORDER = ("self", "right", "opposite", "left")
-_PARTNER_SEAT = {
-    "self": "opposite",
-    "opposite": "self",
-    "right": "left",
-    "left": "right",
-}
-_TEAMS = (
-    frozenset({"self", "opposite"}),
-    frozenset({"right", "left"}),
+from ..live.turns import (
+    TURN_ORDER,
+    next_active_seat,
+    project_trick_turn,
+    round_is_decided,
 )
-
-
-@dataclass(frozen=True)
-class _ActorAction:
-    actor: str
-    is_pass: bool
-
-
-def _next_active_player(actor: str, finished: set[str]) -> str | None:
-    if actor not in _SEATS:
-        return None
-    index = _TURN_ORDER.index(actor)
-    for offset in range(1, len(_TURN_ORDER) + 1):
-        candidate = _TURN_ORDER[(index + offset) % len(_TURN_ORDER)]
-        if candidate not in finished:
-            return candidate
-    return None
-
-
-def _round_is_decided(finished: set[str]) -> bool:
-    return len(finished) >= 3 or any(team.issubset(finished) for team in _TEAMS)
 
 
 def next_actor_after_prefix(
@@ -53,18 +24,19 @@ def next_actor_after_prefix(
     """
 
     lead = getattr(initial_state, "lead_player", None)
-    if lead not in _SEATS:
+    if lead not in TURN_ORDER:
         raise ValueError("首出玩家无效")
     hand = tuple(getattr(initial_state, "my_hand", ()))
-    remaining = {seat: 27 for seat in _TURN_ORDER}
+    remaining = {seat: 27 for seat in TURN_ORDER}
     remaining["self"] = len(hand)
     finished: set[str] = set()
-    trick: list[_ActorAction] = []
+    trick_leader: str | None = None
+    passed: set[str] = set()
     expected: str | None = str(lead)
 
     for position, turn in enumerate(turns, start=1):
         actor = str(turn.actor)
-        if actor not in _SEATS:
+        if actor not in TURN_ORDER:
             raise ValueError(f"第 {position} 条动作的玩家无效")
         if expected is None:
             raise ValueError(f"第 {position} 条动作发生在对局已经结束之后")
@@ -80,36 +52,22 @@ def next_actor_after_prefix(
             remaining[actor] -= played
             if remaining[actor] == 0:
                 finished.add(actor)
-        trick.append(_ActorAction(actor, bool(turn.is_pass)))
-        if _round_is_decided(finished):
+            trick_leader = actor
+            passed.clear()
+        elif trick_leader is not None:
+            passed.add(actor)
+        if round_is_decided(finished):
             expected = None
             continue
 
-        expected = _next_active_player(actor, finished)
-        last_play_index = next(
-            (index for index in range(len(trick) - 1, -1, -1) if not trick[index].is_pass),
-            None,
-        )
-        if last_play_index is None:
+        if trick_leader is None:
+            expected = next_active_seat(actor, frozenset(finished))
             continue
-        leader = trick[last_play_index].actor
-        next_leader = leader
-        if leader in finished:
-            next_leader = _PARTNER_SEAT[leader]
-            if next_leader in finished:
-                next_leader = _next_active_player(next_leader, finished)
-        if next_leader is None:
-            expected = None
-            continue
-        required_passes = set(_TURN_ORDER) - finished - {next_leader}
-        passed = {
-            action.actor
-            for action in trick[last_play_index + 1 :]
-            if action.is_pass
-        }
-        if required_passes and required_passes.issubset(passed):
-            expected = next_leader
-            trick.clear()
+        projection = project_trick_turn(trick_leader, finished, passed)
+        expected = projection.expected_after(actor)
+        if projection.is_complete:
+            trick_leader = None
+            passed.clear()
     return expected
 
 
@@ -196,7 +154,7 @@ class ReplayTurnDraftAssembler:
             return self._rejected("缺少有效 turn_id")
         if source_turn_id in self._source_turn_ids:
             return self._rejected("该回合已确认")
-        if actor not in _SEATS:
+        if actor not in TURN_ORDER:
             return self._rejected(f"回合 {source_turn_id} 的 actor 无效")
         if self._next_actor is None:
             return self._rejected("对局已结束，不能追加新的动作")

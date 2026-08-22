@@ -22,9 +22,10 @@ from ..advisor_strategy import (
     save_profile_session_data_recording_enabled,
 )
 from ..capture_service import FrameSnapshot
-from ..danzero.state import GuanDanState, RANKS
+from ..danzero.state import GuanDanState, RANKS, Seat
 from ..live.orchestrator import AdviceRequestKey, LiveAdvice, LiveOrchestrator, LiveUpdate
 from ..live.latest_worker import LatestOnlyWorker
+from ..live.turns import TURN_ORDER, next_active_seat
 from ..infrastructure.win32_hand_preselector import Win32HandPreselector
 from .hand_preselection import HandPreselectionPlanner, PreselectionResult
 from .workers import OneShotThread, WorkerHandle
@@ -56,6 +57,27 @@ class _AnalysisFrameTask:
     captured_ms: int
 
 
+@dataclass(frozen=True)
+class _OpeningActionSeed:
+    """A fully visual, already-observed first action at listener startup."""
+
+    actor: Seat
+    cards: tuple[str, ...]
+    next_player: Seat
+    confidence: float
+    source: str
+
+
+@dataclass(frozen=True)
+class _AutoSessionSeed:
+    """The stable opening state passed from the listener to the live session."""
+
+    round_level: str
+    hand: tuple[str, ...]
+    lead_player: Seat | None
+    opening_action: _OpeningActionSeed | None = None
+
+
 class LiveAssistantController(QObject):
     """Qt signal adapter around the UI-independent live orchestrator."""
 
@@ -68,6 +90,7 @@ class LiveAssistantController(QObject):
     preselection_result = Signal(object)
     _waiting_recognized = Signal(object, object)
     _waiting_capture_stopped = Signal(object)
+    _TABLE_ANCHOR_READY_SCORE = 0.85
 
     def __init__(
         self,
@@ -139,10 +162,9 @@ class LiveAssistantController(QObject):
         self._waiting_capture_worker: WorkerHandle | None = None
         self._waiting_analysis_worker: LatestOnlyWorker | None = None
         self._waiting_generation = 0
-        self._waiting_candidate: tuple[str, tuple[str, ...]] | None = None
-        self._pending_auto_session: tuple[str, tuple[str, ...]] | None = None
-        self._waiting_recording: object | None = None
-        self._pending_waiting_recording_seal_reason: str | None = None
+        self._waiting_candidate: _AutoSessionSeed | None = None
+        self._pending_auto_session: _AutoSessionSeed | None = None
+        self._table_anchor_observed = False
         self._recognition_strategy = "two_valid_streak"
         self._auto_finish_requested = False
         # Preselection is deliberately a GUI/infrastructure sidecar.  It has
@@ -250,6 +272,7 @@ class LiveAssistantController(QObject):
                 self.error.emit(f"无法锁定牌桌客户区尺寸：{exc}")
                 return False
         self._listening_enabled = True
+        self._table_anchor_observed = False
         self._start_danzero_warmup()
         if self.orchestrator is None and self._finish_thread is None:
             self._start_waiting_workers()
@@ -259,11 +282,8 @@ class LiveAssistantController(QObject):
         self._listening_enabled = False
         self._waiting_candidate = None
         self._pending_auto_session = None
-        self._pending_waiting_recording_seal_reason = (
-            "listening_stopped_before_initial_state"
-        )
-        if self._stop_waiting_workers():
-            self._seal_waiting_recording()
+        self._table_anchor_observed = False
+        self._stop_waiting_workers()
 
     def _start_waiting_workers(self) -> None:
         if (
@@ -277,8 +297,6 @@ class LiveAssistantController(QObject):
         except Exception as exc:
             self.error.emit(str(exc))
             self._listening_enabled = False
-            self._pending_waiting_recording_seal_reason = "waiting_capture_source_open_failed"
-            self._seal_waiting_recording()
             return
         self._waiting_source = source
         generation = self._waiting_generation
@@ -294,7 +312,8 @@ class LiveAssistantController(QObject):
             snapshot: FrameSnapshot = source.capture()
             if generation != self._waiting_generation:
                 return snapshot
-            self._record_waiting_frame(snapshot)
+            # Opening probes stay in memory.  Storage starts only after a
+            # complete initial state has been confirmed.
             active_analysis = self._waiting_analysis_worker
             if active_analysis is not None:
                 active_analysis.submit(snapshot)
@@ -336,7 +355,6 @@ class LiveAssistantController(QObject):
         if self.orchestrator is None:
             self._listening_enabled = False
             self._waiting_candidate = None
-            self._pending_waiting_recording_seal_reason = "waiting_capture_failed"
 
     def _consume_waiting_recognition(self, result: object, snapshot: object) -> None:
         """Require two identical normalized 27-card results before starting."""
@@ -346,59 +364,58 @@ class LiveAssistantController(QObject):
             return
         buttons = set(getattr(result, "buttons", ()) or ())
         if buttons & {"change_table", "continue_game"}:
-            # A settlement screen belongs to the just-finished table, never to
-            # the next game's listener recording.
+            # A settlement screen never becomes a session.  Reset the table
+            # probe and keep listening for the next real opening.
             self._waiting_candidate = None
+            self._table_anchor_observed = False
             return
-        if not self._ensure_waiting_recording():
-            self._listening_enabled = False
-            self._waiting_candidate = None
-            self._pending_waiting_recording_seal_reason = "waiting_recording_start_failed"
-            if self._stop_waiting_workers():
-                self._seal_waiting_recording()
-            return
-        if self._waiting_recording is not None:
-            self._record_waiting_frame(snapshot)
+        if not self._table_anchor_observed:
+            if self._table_anchor_score(snapshot) < self._TABLE_ANCHOR_READY_SCORE:
+                # Do not start a session from a lobby, settlement screen, or
+                # a manually clicked late page.
+                self._waiting_candidate = None
+                return
+            self._table_anchor_observed = True
         hand = tuple(str(card) for card in getattr(result, "my_hand", ()))
         round_level = str(getattr(result, "round_level", ""))
         if round_level not in RANKS or len(hand) != 27:
-            reason = (
-                "round_level_unrecognized"
-                if round_level not in RANKS
-                else f"initial_hand_count_{len(hand)}"
-            )
-            self._record_waiting_recognition(result, snapshot, reason)
             self._waiting_candidate = None
             return
         try:
             normalizer = GuanDanState()
             normalizer.confirm_hand(hand)
-        except Exception as exc:
-            self._record_waiting_recognition(
-                result,
-                snapshot,
-                f"initial_hand_invalid:{type(exc).__name__}",
-            )
+        except Exception:
             self._waiting_candidate = None
             return
-        candidate = (round_level, normalizer.my_hand)
+        candidate = self._auto_session_seed(
+            result,
+            round_level=round_level,
+            hand=normalizer.my_hand,
+        )
+        if candidate is None:
+            self._waiting_candidate = None
+            return
         if candidate != self._waiting_candidate:
-            self._record_waiting_recognition(
-                result,
-                snapshot,
-                "awaiting_second_matching_initial_read",
-            )
             self._waiting_candidate = candidate
             return
-        self._record_waiting_recognition(result, snapshot, "initial_state_confirmed")
         self._waiting_candidate = None
         self._start_detected_session(result)
 
     def _start_detected_session(self, result: object) -> None:
-        self._pending_auto_session = (
-            str(getattr(result, "round_level")),
-            tuple(str(card) for card in getattr(result, "my_hand", ())),
+        hand = tuple(str(card) for card in getattr(result, "my_hand", ()))
+        try:
+            normalizer = GuanDanState()
+            normalizer.confirm_hand(hand)
+        except Exception:
+            return
+        seed = self._auto_session_seed(
+            result,
+            round_level=str(getattr(result, "round_level", "")),
+            hand=normalizer.my_hand,
         )
+        if seed is None:
+            return
+        self._pending_auto_session = seed
         if self._stop_waiting_workers():
             self._start_pending_auto_session()
 
@@ -410,94 +427,82 @@ class LiveAssistantController(QObject):
             or self.orchestrator is not None
         ):
             return
-        round_level, hand = pending
         if not self.start_session(
-            round_level=round_level,
-            hand=hand,
-            lead_player=None,
+            round_level=pending.round_level,
+            hand=pending.hand,
+            lead_player=pending.lead_player,
             recognition_strategy=self._recognition_strategy,
+            opening_action=pending.opening_action,
         ):
+            self._table_anchor_observed = False
             self._start_waiting_workers()
 
-    def _ensure_waiting_recording(self) -> bool:
-        if self._waiting_recording is not None or not self.session_data_recording_enabled:
-            return True
-        begin_recording = getattr(
-            self.session_factory,
-            "begin_listening_recording",
+    def _table_anchor_score(self, snapshot: object) -> float:
+        image = getattr(snapshot, "image", None)
+        recognize_anchor = getattr(
+            self.recognition_service,
+            "recognize_table_anchor",
             None,
         )
-        if not callable(begin_recording):
-            # Third-party session factories predating listener recording retain
-            # their prior behaviour; the bundled factory always supports it.
-            return True
-        if not callable(getattr(self.capture_service, "load_profile", None)):
-            return True
+        if image is None or not callable(recognize_anchor):
+            return 0.0
         try:
-            recording = begin_recording(
-                recognition_strategy=self._recognition_strategy,
-            )
+            return float(recognize_anchor(image))
         except Exception as exc:
-            self.error.emit(f"无法启动对局数据保存：{exc}")
-            return False
-        if recording is None:
-            self.error.emit("对局数据保存已开启，但未能创建监听期录制")
-            return False
-        self._waiting_recording = recording
-        self._pending_waiting_recording_seal_reason = None
-        return True
+            self.error.emit(f"牌桌锚点识别失败：{exc}")
+            return 0.0
 
-    def _record_waiting_frame(self, snapshot: FrameSnapshot) -> None:
-        recording = self._waiting_recording
-        record_frame = getattr(recording, "record_frame", None)
-        if not callable(record_frame):
-            return
-        try:
-            record_frame(
-                snapshot.image,
-                monotonic_ms=monotonic_ns() // 1_000_000,
-                wall_time=snapshot.captured_at.isoformat(timespec="milliseconds"),
-            )
-        except Exception as exc:
-            self.error.emit(f"监听期录像写入失败：{exc}")
-
-    def _record_waiting_recognition(
-        self,
+    @staticmethod
+    def _auto_session_seed(
         result: object,
-        snapshot: object,
-        acceptance_reason: str,
-    ) -> None:
-        recording = self._waiting_recording
-        record_recognition = getattr(recording, "record_recognition", None)
-        if not callable(record_recognition):
-            return
-        captured_at = getattr(snapshot, "captured_at", None)
-        try:
-            record_recognition(
-                result,
-                captured_at=(
-                    captured_at.isoformat(timespec="milliseconds")
-                    if isinstance(captured_at, datetime)
-                    else ""
-                ),
-                acceptance_reason=acceptance_reason,
-            )
-        except Exception as exc:
-            self.error.emit(f"监听期识别记录写入失败：{exc}")
-
-    def _seal_waiting_recording(self) -> None:
-        reason = self._pending_waiting_recording_seal_reason
-        if reason is None:
-            return
-        recording, self._waiting_recording = self._waiting_recording, None
-        self._pending_waiting_recording_seal_reason = None
-        close_unconfirmed = getattr(recording, "close_unconfirmed", None)
-        if not callable(close_unconfirmed):
-            return
-        try:
-            close_unconfirmed(reason)
-        except Exception as exc:
-            self.error.emit(f"监听期对局数据封存失败：{exc}")
+        *,
+        round_level: str,
+        hand: tuple[str, ...],
+    ) -> _AutoSessionSeed | None:
+        lead_player = getattr(result, "lead_player", None)
+        current_player = getattr(result, "current_player", None)
+        events = tuple(getattr(result, "events", ()) or ())
+        if not events:
+            # Before the first play, the lead marker may be present while the
+            # active indicator is either absent or still points at that lead.
+            if lead_player is None and current_player is None:
+                return _AutoSessionSeed(round_level, hand, None)
+            if (
+                lead_player in TURN_ORDER
+                and current_player in {None, lead_player}
+            ):
+                return _AutoSessionSeed(round_level, hand, lead_player)
+            return None
+        if len(events) != 1 or lead_player not in TURN_ORDER:
+            return None
+        event = events[0]
+        actor = getattr(event, "player", None)
+        cards = tuple(str(card) for card in getattr(event, "cards", ()) or ())
+        if (
+            actor != lead_player
+            or actor not in TURN_ORDER
+            or bool(getattr(event, "is_pass", False))
+            or not cards
+            or any("?" in card for card in cards)
+            or current_player != next_active_seat(actor, frozenset())
+        ):
+            # A complete hand on an already-running table is not a valid
+            # opening anchor.  Do not invent a history or request FableDan
+            # from that unknown state.
+            return None
+        opening_action = _OpeningActionSeed(
+            actor=actor,
+            cards=cards,
+            next_player=current_player,
+            confidence=float(getattr(event, "confidence", 0.0)),
+            source=str(getattr(event, "source", "visual_opening_anchor")),
+        )
+        return _AutoSessionSeed(
+            round_level,
+            hand,
+            lead_player,
+            opening_action,
+        )
 
     def _stop_waiting_workers(self) -> bool:
         worker = self._waiting_capture_worker
@@ -530,7 +535,6 @@ class LiveAssistantController(QObject):
         if self._pending_auto_session is not None:
             self._start_pending_auto_session()
             return
-        self._seal_waiting_recording()
 
     def _initial_result(self, value: object) -> None:
         result, snapshot = value  # type: ignore[misc]
@@ -596,44 +600,48 @@ class LiveAssistantController(QObject):
         hand: tuple[str, ...],
         lead_player: str | None,
         recognition_strategy: str = "two_valid_streak",
+        opening_action: _OpeningActionSeed | None = None,
     ) -> bool:
         self._start_danzero_warmup()
         if self.orchestrator is not None:
             self.error.emit("当前已有实时对局")
             return False
         try:
-            recording, self._waiting_recording = self._waiting_recording, None
-            promote_recording = getattr(
-                self.session_factory,
-                "start_session_from_listening_recording",
-                None,
+            constructed = self.session_factory.start_session(
+                round_level=round_level,
+                hand=hand,
+                lead_player=lead_player,
+                recognition_strategy=recognition_strategy,
+                on_update=self.update_ready.emit,
             )
-            if recording is not None and callable(promote_recording):
-                constructed = promote_recording(
-                    recording,
-                    round_level=round_level,
-                    hand=hand,
-                    lead_player=lead_player,
-                    recognition_strategy=recognition_strategy,
-                    on_update=self.update_ready.emit,
-                )
-            else:
-                if recording is not None:
-                    close_unconfirmed = getattr(recording, "close_unconfirmed", None)
-                    if callable(close_unconfirmed):
-                        close_unconfirmed("session_factory_does_not_support_recording_promotion")
-                constructed = self.session_factory.start_session(
-                    round_level=round_level,
-                    hand=hand,
-                    lead_player=lead_player,
-                    recognition_strategy=recognition_strategy,
-                    on_update=self.update_ready.emit,
-                )
         except Exception as exc:
             self.error.emit(str(exc))
             return False
         self.orchestrator = constructed.orchestrator
         self._live_source = constructed.source
+        initial_update = constructed.initial_update
+        if opening_action is not None:
+            try:
+                initial_update = self.orchestrator.bootstrap_opening_action(
+                    actor=opening_action.actor,
+                    cards=opening_action.cards,
+                    expected_next_player=opening_action.next_player,
+                    monotonic_ms=monotonic_ns() // 1_000_000,
+                    confidence=opening_action.confidence,
+                    source=opening_action.source,
+                )
+            except Exception as exc:
+                finish = getattr(self.orchestrator, "finish", None)
+                if callable(finish):
+                    try:
+                        finish()
+                    except Exception:
+                        pass
+                self._live_source.close()
+                self._live_source = None
+                self.orchestrator = None
+                self.error.emit(f"首出动作锚定失败：{exc}")
+                return False
         self._activate_live_token(constructed.orchestrator)
         self._auto_finish_requested = False
         self._latest_live_frame = None
@@ -641,7 +649,7 @@ class LiveAssistantController(QObject):
         self._pending_preselection_task = None
         self._handled_preselection_request_ids.clear()
         self.latest_preselection_result = None
-        self.update_ready.emit(constructed.initial_update)
+        self.update_ready.emit(initial_update)
         self._start_analysis_worker()
         self._start_capture_worker()
         return True
@@ -1191,7 +1199,6 @@ class LiveAssistantController(QObject):
                 self._waiting_capture_worker.wait(10_000)
             self._waiting_capture_worker = None
             self._close_waiting_source()
-        self._seal_waiting_recording()
         if self._initial_thread is not None and self._initial_thread.isRunning():
             self._initial_thread.wait(10_000)
         if (

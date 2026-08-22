@@ -20,6 +20,7 @@ from uuid import uuid4
 import numpy as np
 
 from ..live.session_store import read_json_lines
+from ..live.turns import PARTNER_SEAT
 from ..storage import atomic_write_json
 
 
@@ -27,7 +28,6 @@ TRAINING_REVIEW_SCHEMA = "fabledan.training-review/1"
 TRAINING_SAMPLE_SCHEMA = "fabledan.offline-dmc-sample/1"
 FEATURE_SCHEMA = "fabledan-token48-feat80/v1"
 _SEATS = ("self", "right", "opposite", "left")
-_PARTNER = {"self": "opposite", "opposite": "self", "right": "left", "left": "right"}
 
 
 @dataclass(frozen=True)
@@ -515,11 +515,11 @@ def _infer_outcome(timeline: list[dict[str, object]]) -> dict[str, object]:
 
     first = placements.get("first")
     second = placements.get("second")
-    if first and second and _PARTNER[first] == second:
+    if first and second and PARTNER_SEAT[first] == second:
         terminal_counts, terminal_evidence_error = _terminal_remaining_cards(timeline)
         if terminal_counts is not None:
             remaining = [seat for seat in _SEATS if seat not in {first, second}]
-            if len(remaining) != 2 or _PARTNER[remaining[0]] != remaining[1]:
+            if len(remaining) != 2 or PARTNER_SEAT[remaining[0]] != remaining[1]:
                 return {
                     "status": "incomplete",
                     "reason": "双下后的剩余玩家不是同一队，不能推断三四名。",
@@ -617,7 +617,7 @@ def _terminal_remaining_cards(
 
 
 def _outcome_payload(*, first: str, finish_order: list[str], terminal_kind: str) -> dict[str, object]:
-    partner_position = finish_order.index(_PARTNER[first])
+    partner_position = finish_order.index(PARTNER_SEAT[first])
     score = {1: 3, 2: 2, 3: 1}[partner_position]
     self_won = first in {"self", "opposite"}
     raw_reward = score if self_won else -score

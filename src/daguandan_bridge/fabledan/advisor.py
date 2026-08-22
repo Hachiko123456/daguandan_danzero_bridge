@@ -24,6 +24,7 @@ from ..danzero.state import (
     Seat,
 )
 from ..domain.advice import AdviceResult, StrategyExecutionTrace
+from ..live.turns import TURN_ORDER, project_trick_turn, round_is_decided
 from ._vendor.fabledan.agents import NumpyAgent, RuleAgent
 from ._vendor.fabledan.cards import RANK_NAMES, is_wildcard, order_of, rank_of
 from ._vendor.fabledan.combos import (
@@ -53,15 +54,8 @@ STANDARD_NO_TRIBUTE = True
 DECISION_TRACE_SCHEMA = "fabledan-trace/1"
 DEFAULT_WEIGHTS_FILENAME = "best.npz"
 DiagnosticsMode = Literal["off", "basic", "full"]
-_TURN_ORDER: tuple[Seat, ...] = ("self", "right", "opposite", "left")
 _SEAT_TO_PLAYER: dict[Seat, int] = {
-    seat: index for index, seat in enumerate(_TURN_ORDER)
-}
-_PARTNER: dict[Seat, Seat] = {
-    "self": "opposite",
-    "opposite": "self",
-    "right": "left",
-    "left": "right",
+    seat: index for index, seat in enumerate(TURN_ORDER)
 }
 _SUIT_TO_INDEX = {"H": 0, "D": 1, "S": 2, "C": 3}
 _INDEX_TO_SUIT = {value: key for key, value in _SUIT_TO_INDEX.items()}
@@ -618,7 +612,7 @@ class FableDanAdvisor:
     ) -> _MappedState:
         _validate_standard_snapshot(snapshot)
         allocation = _PhysicalCards()
-        counts = {seat: 27 for seat in _TURN_ORDER}
+        counts = {seat: 27 for seat in TURN_ORDER}
         done: set[Seat] = set()
         events: list[tuple[object, ...]] = []
         event_audit: list[dict[str, object]] = []
@@ -728,29 +722,20 @@ class FableDanAdvisor:
                     }
                 )
 
-            active = set(_TURN_ORDER) - done
-            if len(done) >= 3:
+            if round_is_decided(done):
                 expected = None
                 trick_lead = None
                 trick_leader = None
                 passed.clear()
                 continue
-            if (
-                trick_lead is not None
-                and trick_leader is not None
-                and (active - {trick_leader}).issubset(passed)
-            ):
-                next_leader = trick_leader
-                if next_leader in done:
-                    next_leader = _PARTNER[next_leader]
-                if next_leader in done:
-                    next_leader = _next_active(next_leader, done)
-                expected = next_leader
+            if trick_leader is None:
+                raise FableDanStateError(f"第 {index} 条历史后缺少当前墩首出玩家")
+            projection = project_trick_turn(trick_leader, done, passed)
+            expected = projection.expected_after(event.player)
+            if projection.is_complete:
                 trick_lead = None
                 trick_leader = None
                 passed.clear()
-            else:
-                expected = _next_active(event.player, done)
 
         hand_ids = tuple(allocation.allocate(card) for card in snapshot.my_hand)
         counts["self"] = len(hand_ids)
@@ -771,14 +756,14 @@ class FableDanAdvisor:
                 for event in snapshot.play_history
                 if event.player == seat and not event.is_pass
             )
-            for seat in _TURN_ORDER
+            for seat in TURN_ORDER
         }
         derived_counts["self"] = len(hand_ids)
         if snapshot.remaining_cards is not None:
-            if set(snapshot.remaining_cards) != set(_TURN_ORDER):
+            if set(snapshot.remaining_cards) != set(TURN_ORDER):
                 raise FableDanStateError("remaining_cards 必须包含四个标准座位")
             supplied = {
-                seat: int(snapshot.remaining_cards[seat]) for seat in _TURN_ORDER
+                seat: int(snapshot.remaining_cards[seat]) for seat in TURN_ORDER
             }
             if supplied != derived_counts:
                 raise FableDanStateError(
@@ -814,8 +799,8 @@ class FableDanAdvisor:
             if reconstructed_lead is not None and trick_leader is not None
             else None
         )
-        left = [counts[seat] for seat in _TURN_ORDER]
-        done_flags = [seat in done for seat in _TURN_ORDER]
+        left = [counts[seat] for seat in TURN_ORDER]
+        done_flags = [seat in done for seat in TURN_ORDER]
         observation: dict[str, object] = {
             "level": level,
             "player": 0,
@@ -865,7 +850,7 @@ class FableDanAdvisor:
                     "seat": seat,
                     "count": counts[seat],
                 }
-                for seat in _TURN_ORDER
+                for seat in TURN_ORDER
             },
             "done": done_flags,
             "lead": (
@@ -1885,15 +1870,6 @@ def _token_name(token: int) -> str:
     if value == 0:
         return "PAD"
     return f"UNKNOWN_{value}"
-
-
-def _next_active(current: Seat, done: set[Seat]) -> Seat:
-    start = _TURN_ORDER.index(current)
-    for offset in range(1, len(_TURN_ORDER) + 1):
-        candidate = _TURN_ORDER[(start + offset) % len(_TURN_ORDER)]
-        if candidate not in done:
-            return candidate
-    raise FableDanStateError("标准对局中没有仍在行动的玩家")
 
 
 def _base_card_id(code: str) -> int:

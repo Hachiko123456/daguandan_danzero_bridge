@@ -15,7 +15,12 @@ from ..danzero.state import (
 )
 from .models import LiveEvent, LiveSnapshot
 from .card_uncertainty import normalized_suit_options
-from .turns import TURN_ORDER, next_active_seat
+from .turns import (
+    TURN_ORDER,
+    next_active_seat,
+    project_trick_turn,
+    round_is_decided,
+)
 
 
 _ACTION_EVENT_TYPES = {
@@ -23,19 +28,6 @@ _ACTION_EVENT_TYPES = {
     "player_passed",
     "manual_confirmed_event",
 }
-
-# 接风：出完牌的赢家把下一墩的领出权交给队友（桌面正对座位）。
-_PARTNER_SEAT = {
-    "self": "opposite",
-    "opposite": "self",
-    "right": "left",
-    "left": "right",
-}
-_TEAMS = (
-    frozenset({"self", "opposite"}),
-    frozenset({"right", "left"}),
-)
-
 
 class LiveReducer:
     """Deterministically reduce immutable live events into confirmed game state."""
@@ -531,16 +523,24 @@ class LiveReducer:
             self._turn_id += 1
             return
 
-        self._current_player = next_active_seat(
+        self._current_player = self._next_player_after_action(
             player,
-            frozenset(self._finished_seats),
         )
         self._turn_id += 1
         self._finish_trick_if_all_others_passed()
 
-    def _finish_trick_if_all_others_passed(self) -> None:
-        if not self._trick_plays:
-            return
+    def _next_player_after_action(self, player: Seat) -> Seat:
+        """Advance by the common trick projection without synthetic PASSes."""
+
+        projection = self._current_trick_projection()
+        if projection is None:
+            return next_active_seat(player, frozenset(self._finished_seats))
+        expected = projection.expected_after(player)
+        if expected is None:
+            raise GameStateError("当前墩没有仍在对局中的下一位玩家")
+        return expected
+
+    def _current_trick_projection(self):
         last_non_pass_index = next(
             (
                 index
@@ -550,39 +550,66 @@ class LiveReducer:
             None,
         )
         if last_non_pass_index is None:
-            return
+            return None
         leader = self._trick_plays[last_non_pass_index].player
-        active = set(TURN_ORDER) - self._finished_seats
-        # A player who just emptied their hand cannot lead the next trick. In
-        # the wind-catch case their partner receives that lead automatically,
-        # so the partner is not expected to emit a synthetic pass. Only the
-        # still-active opponents must decline the completed play.
-        next_leader = leader
-        if leader in self._finished_seats:
-            next_leader = _PARTNER_SEAT.get(leader, leader)
-            if next_leader in self._finished_seats:
-                if self._round_is_decided():
-                    self._close_round()
-                    return
-                next_leader = next_active_seat(
-                    next_leader,
-                    frozenset(self._finished_seats),
-                )
-        required_passes = active - {next_leader}
-        later = self._trick_plays[last_non_pass_index + 1 :]
-        passed = {event.player for event in later if event.is_pass}
-        if required_passes and required_passes.issubset(passed):
-            if leader in self._finished_seats:
-                # 赢家已出完：接风给队友，而不是按轮转给下一家
-                leader = next_leader
-            self._trick_plays.clear()
-            self._lead_player = leader
-            self._current_player = leader
-            self._trick_id += 1
+        passed = {
+            event.player
+            for event in self._trick_plays[last_non_pass_index + 1 :]
+            if event.is_pass
+        }
+        return project_trick_turn(
+            leader,
+            frozenset(self._finished_seats),
+            passed,
+        )
+
+    def _pending_wind_receiver(self) -> Seat | None:
+        """Return the partner that will lead after a finished leader's trick."""
+
+        projection = self._current_trick_projection()
+        return projection.wind_receiver if projection is not None else None
+
+    def pending_wind_receiver(self) -> Seat | None:
+        """Return the partner that is waiting to catch wind, if any.
+
+        This is intentionally read-only so the visual ownership guard can
+        recognise the real UI handoff without manufacturing a player action.
+        """
+
+        return self._pending_wind_receiver()
+
+    def wind_receiver_after_current_pass(self, player: Seat) -> Seat | None:
+        """Return the wind receiver only when ``player`` can close this trick.
+
+        The result is deliberately narrower than :meth:`pending_wind_receiver`:
+        it proves that the current expected player's PASS is the one remaining
+        legal action before the new trick starts.  It is safe for a visual
+        recovery path to use only together with a seat-bound PASS marker.
+        """
+
+        if player != self._current_player:
+            return None
+        projection = self._current_trick_projection()
+        if projection is None or projection.wind_receiver is None:
+            return None
+        if player not in projection.required_passers:
+            return None
+        return projection.next_leader if projection.closes_if(player) else None
+
+    def _finish_trick_if_all_others_passed(self) -> None:
+        projection = self._current_trick_projection()
+        if projection is None or not projection.is_complete:
+            return
+        next_leader = projection.next_leader
+        if next_leader is None:
+            return
+        self._trick_plays.clear()
+        self._lead_player = next_leader
+        self._current_player = next_leader
+        self._trick_id += 1
 
     def _round_is_decided(self) -> bool:
-        finished = frozenset(self._finished_seats)
-        return len(finished) >= 3 or any(team.issubset(finished) for team in _TEAMS)
+        return round_is_decided(self._finished_seats)
 
     def _close_round(self) -> None:
         self._trick_plays.clear()

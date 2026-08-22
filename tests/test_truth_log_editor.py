@@ -429,11 +429,10 @@ def test_selected_recognition_handles_finished_leader_wind_before_flagging_stale
         (
             TruthTurn(1, "right", False, ("3S",) * 27),
             TruthTurn(2, "opposite", True, ()),
-            TruthTurn(3, "left", True, ()),
-            TruthTurn(4, "self", False, ("4H",)),
+            TruthTurn(3, "self", False, ("4H",)),
             # This was valid before the selected row became a PASS.  After
             # the correction, right's partner left catches the wind instead.
-            TruthTurn(5, "opposite", True, ()),
+            TruthTurn(4, "opposite", True, ()),
         ),
     )
     fake = _FakeRecognition(
@@ -454,11 +453,11 @@ def test_selected_recognition_handles_finished_leader_wind_before_flagging_stale
         frame_provider=lambda: (44, np.zeros((32, 64, 3), np.uint8)),
         recognition_service=fake,
     )
-    editor.table.selectRow(3)
+    editor.table.selectRow(2)
 
     editor._recognize_frame()
 
-    assert editor._is_pass_from_row(3)
+    assert editor._is_pass_from_row(2)
     assert [call for call in fake.calls if call[0] == "region"] == [
         ("region", "self", "2")
     ]
@@ -475,8 +474,7 @@ def test_cleared_selection_recognizes_wind_recipient_after_finished_leader_passe
         (
             TruthTurn(1, "right", False, ("3S",) * 27),
             TruthTurn(2, "opposite", True, ()),
-            TruthTurn(3, "left", True, ()),
-            TruthTurn(4, "self", True, ()),
+            TruthTurn(3, "self", True, ()),
         ),
     )
     fake = _FakeRecognition(
@@ -505,12 +503,11 @@ def test_cleared_selection_recognizes_wind_recipient_after_finished_leader_passe
     assert [call for call in fake.calls if call[0] == "region"] == [
         ("region", "left", "2")
     ]
-    assert editor.table.cellWidget(4, 1).currentData() == "left"
-    assert editor._cards_from_row(4) == ("6C", "6S")
+    assert editor.table.cellWidget(3, 1).currentData() == "left"
+    assert editor._cards_from_row(3) == ("6C", "6S")
     assert [turn.actor for turn in editor._build_log().turns] == [
         "right",
         "opposite",
-        "left",
         "self",
         "left",
     ]
@@ -856,8 +853,8 @@ def test_save_actor_chain_skips_a_finished_player(tmp_path):
     editor._append_row(TruthTurn(1, "self", False, ("2S",)))
     editor._append_row(TruthTurn(2, "right", False, ("3S",) * 27))
     editor._append_row(TruthTurn(3, "opposite", True, ()))
-    editor._append_row(TruthTurn(4, "left", True, ()))
-    editor._append_row(TruthTurn(5, "self", False, ("2H",)))
+    editor._append_row(TruthTurn(4, "self", True, ()))
+    editor._append_row(TruthTurn(5, "left", False, ("2H",)))
 
     built = editor._build_log()
 
@@ -865,8 +862,8 @@ def test_save_actor_chain_skips_a_finished_player(tmp_path):
         "self",
         "right",
         "opposite",
-        "left",
         "self",
+        "left",
     ]
 
 
@@ -879,11 +876,11 @@ def test_add_row_infers_player_from_tail_and_skips_finished_player(tmp_path):
     editor._replace_row(0, TruthTurn(1, "self", True, ()), status="测试不出")
     editor._append_row(TruthTurn(2, "right", False, ("3S",) * 27))
     editor._append_row(TruthTurn(3, "opposite", True, ()))
-    editor._append_row(TruthTurn(4, "left", True, ()))
+    editor._append_row(TruthTurn(4, "self", True, ()))
 
     editor.add_row()
 
-    assert editor.table.cellWidget(4, 1).currentData() == "self"
+    assert editor.table.cellWidget(4, 1).currentData() == "left"
 
 
 def test_add_and_insert_use_prefix_wind_derivation_without_reverse_conflict(tmp_path):
@@ -892,26 +889,25 @@ def test_add_and_insert_use_prefix_wind_derivation_without_reverse_conflict(tmp_
     prefix = (
         TruthTurn(1, "right", False, ("3S",) * 27),
         TruthTurn(2, "opposite", True, ()),
-        TruthTurn(3, "left", True, ()),
-        TruthTurn(4, "self", True, ()),
+        TruthTurn(3, "self", True, ()),
     )
 
     append_editor = TruthLogEditor(tmp_path, TruthLog("game", initial, prefix))
     append_editor.add_row()
-    assert append_editor.table.cellWidget(4, 1).currentData() == "left"
+    assert append_editor.table.cellWidget(3, 1).currentData() == "left"
 
     insert_editor = TruthLogEditor(
         tmp_path,
         TruthLog(
             "game",
             initial,
-            (*prefix, TruthTurn(5, "opposite", True, ())),
+            (*prefix, TruthTurn(4, "opposite", True, ())),
         ),
     )
-    insert_editor.table.selectRow(4)
+    insert_editor.table.selectRow(3)
     insert_editor.insert_row()
 
-    inserted = insert_editor.table.cellWidget(4, 1)
+    inserted = insert_editor.table.cellWidget(3, 1)
     assert inserted.currentData() == "left"
     assert not bool(inserted.property("sequenceConflict"))
 

@@ -371,6 +371,60 @@ def test_fabledan_maps_complete_following_history_and_returns_a_legal_self_actio
     assert advice.engine_input["selected_action"] in advice.engine_input["legal_actions"]
 
 
+def test_fabledan_accepts_a_finished_leader_wind_without_partner_pass(tmp_path):
+    """The adapter must use the live turn rule while reconstructing history."""
+
+    state = GuanDanState()
+    state.set_context(
+        round_level="2",
+        wild_rank="2",
+        current_player="self",
+        lead_player="left",
+    )
+    state.confirm_hand(HAND)
+    left_cards = tuple(
+        f"{rank}{suit}"
+        for rank in ("9", "10", "J", "Q", "K", "A")
+        for suit in "SHCD"
+    ) + ("8D", "small_joker", "big_joker")
+    assert len(left_cards) == 27
+    for card in left_cards[:-1]:
+        state.record_play("left", (card,))
+        state.record_pass("self")
+        state.record_pass("right")
+        state.record_pass("opposite")
+    state.record_play("left", (left_cards[-1],))
+    state.record_pass("self")
+    state.record_pass("opposite")
+    # left has finished, so right catches wind and leads immediately.
+    state.record_play("right", ("9S",))
+    state.record_play("opposite", ("10S",))
+    state.trick_plays = state.play_history[-2:]
+    state.current_player = "self"
+    state.lead_player = "right"
+    state.remaining_cards = {
+        "self": 27,
+        "right": 26,
+        "opposite": 26,
+        "left": 0,
+    }
+
+    advice = FableDanAdvisor(tmp_path, "profile").recommend(
+        state,
+        request_id="wind-without-synthetic-pass",
+    )
+
+    assert advice.engine_input is not None
+    history = advice.engine_input["project_snapshot"]["play_history"]
+    assert [event["player"] for event in history[-5:]] == [
+        "left",
+        "self",
+        "opposite",
+        "right",
+        "opposite",
+    ]
+
+
 def test_fabledan_accepts_exact_suit_options_from_live_reducer(tmp_path):
     """Concrete suit metadata from replay is not an ambiguous candidate."""
 

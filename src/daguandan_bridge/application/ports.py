@@ -15,6 +15,8 @@ from ..domain.live import LiveEvent
 class RecognitionPort(Protocol):
     def recognize(self, image: Any) -> Any: ...
 
+    def recognize_table_anchor(self, image: Any) -> float: ...
+
     def recognize_play_region(
         self,
         image: Any,

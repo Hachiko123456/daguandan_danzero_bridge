@@ -95,7 +95,7 @@ def test_disabled_recording_uses_memory_only_without_creating_sessions(tmp_path)
     assert not tuple(profile.rglob("*.jsonl"))
 
 
-def test_listener_persists_unconfirmed_initial_state_before_a_live_session_exists(tmp_path):
+def test_live_session_is_created_only_after_initial_state_is_confirmed(tmp_path):
     profile = _profile(tmp_path, save_session_data=True)
     factory = DefaultLiveSessionFactory(
         _Capture(tmp_path),
@@ -103,75 +103,8 @@ def test_listener_persists_unconfirmed_initial_state_before_a_live_session_exist
         advisor=None,
         profile_name=profile.name,
     )
-
-    recording = factory.begin_listening_recording(
-        recognition_strategy="two_valid_streak",
-    )
-
-    assert recording is not None
-    recording.record_frame(
-        np.zeros((32, 64, 3), dtype=np.uint8),
-        monotonic_ms=10,
-        wall_time="t0",
-    )
-    recording.record_recognition(
-        SimpleNamespace(
-            round_level=None,
-            wild_rank=None,
-            current_player="self",
-            lead_player=None,
-            my_hand=HAND,
-            field_confidences={},
-            diagnostics=("未识别到当前级牌",),
-            unresolved_fields=("round_level",),
-        ),
-        captured_at="t0",
-        acceptance_reason="round_level_unrecognized",
-    )
-    recording.close_unconfirmed("listening_stopped_before_initial_state")
-
-    manifest = json.loads((recording.store.directory / "manifest.json").read_text("utf-8"))
-    trace = read_json_lines(recording.store.directory / "recognition_trace.jsonl")
-    assert manifest["status"] == "sealed"
-    assert manifest["initial_state_status"] == "unconfirmed"
-    assert manifest["termination_reason"] == "listening_stopped_before_initial_state"
-    assert manifest["frame_count"] == 1
-    assert any(
-        item.get("initial_state_acceptance") == "round_level_unrecognized"
-        for item in trace
-    )
-    initial_read = next(item for item in trace if item.get("kind") == "initial_recognition")
-    assert initial_read["initial_state_summary"] == {
-        "recognized_round_level": "unrecognized",
-        "recognized_wild_rank": "unrecognized",
-        "hand_count": 27,
-        "current_player": "self",
-        "lead_player": "unrecognized",
-        "acceptance_reason": "round_level_unrecognized",
-    }
-    assert (recording.store.directory / "video" / "game.avi").is_file()
-
-
-def test_listener_recording_is_promoted_into_the_same_live_session(tmp_path):
-    profile = _profile(tmp_path, save_session_data=True)
-    factory = DefaultLiveSessionFactory(
-        _Capture(tmp_path),
-        recognizer=object(),
-        advisor=None,
-        profile_name=profile.name,
-    )
-    recording = factory.begin_listening_recording(
-        recognition_strategy="two_valid_streak",
-    )
-
-    assert recording is not None
-    recording.record_frame(
-        np.zeros((32, 64, 3), dtype=np.uint8),
-        monotonic_ms=10,
-        wall_time="t0",
-    )
-    constructed = factory.start_session_from_listening_recording(
-        recording,
+    assert not (profile / "sessions").exists()
+    constructed = factory.start_session(
         round_level="2",
         hand=HAND,
         lead_player=None,
@@ -179,16 +112,18 @@ def test_listener_recording_is_promoted_into_the_same_live_session(tmp_path):
     )
     constructed.orchestrator.record_frame(
         np.ones((32, 64, 3), dtype=np.uint8),
-        monotonic_ms=20,
+        monotonic_ms=10,
         wall_time="t1",
     )
     constructed.orchestrator.finish()
 
-    assert constructed.orchestrator.store.directory == recording.store.directory
-    assert constructed.orchestrator.recorder is recording.recorder
-    manifest = json.loads((recording.store.directory / "manifest.json").read_text("utf-8"))
+    manifest = json.loads(
+        (constructed.orchestrator.store.directory / "manifest.json").read_text("utf-8")
+    )
     assert manifest["status"] == "sealed"
     assert manifest["recording_phase"] == "live"
     assert manifest["initial_state_status"] == "confirmed"
-    assert manifest["frame_count"] == 2
-    assert len(read_json_lines(recording.store.directory / "video" / "frame_index.jsonl")) == 2
+    assert manifest["frame_count"] == 1
+    assert len(
+        read_json_lines(constructed.orchestrator.store.directory / "video" / "frame_index.jsonl")
+    ) == 1

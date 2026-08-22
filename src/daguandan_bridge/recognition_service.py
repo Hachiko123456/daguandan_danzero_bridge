@@ -125,6 +125,11 @@ class ScreenshotRecognitionService:
     # stronger, clearly better match than ordinary transient status markers.
     _FIRST_PLAY_THRESHOLD = 0.80
     _FIRST_PLAY_MIN_MARGIN = 0.08
+    # The table anchor is solely a listener/recording gate.  It deliberately
+    # has a stricter score than ordinary UI glyphs, but it is a one-frame
+    # readiness signal rather than a three-frame card-recognition consensus.
+    _TABLE_ANCHOR_THRESHOLD = 0.85
+    _TABLE_ANCHOR_SEARCH_PADDING_RATIO = 0.08
     _TIMER_THRESHOLD = 0.45
     # A hand can contain more than four cards of the same suit.  Keep enough
     # candidates for a complete suit while using the centered suppression
@@ -147,6 +152,79 @@ class ScreenshotRecognitionService:
             tuple[dict[str, object], np.ndarray], ...
         ] | None = None
         self._black_suit_hog_cache: tuple[tuple[str, np.ndarray], ...] | None = None
+
+    def recognize_table_anchor(self, image: np.ndarray | Path) -> float:
+        """Return the best ``table_anchor_1`` score on the current table page.
+
+        Anchor samples live in the template manifest rather than in the
+        annotation-region document, so they must not be routed through the
+        ordinary region recognizer.  This is intentionally a narrow direct
+        match: the controller uses one score at or above 0.85 to begin
+        recording, while all game-state fields retain their own stability
+        requirements.
+        """
+
+        source_image = self._source_image(image)
+        image_height, image_width = source_image.shape[:2]
+        best_score = 0.0
+        for raw, template in self._templates():
+            if (
+                raw.get("kind") != "anchor"
+                or raw.get("label") != "table_anchor_1"
+            ):
+                continue
+            try:
+                ratio_box = tuple(float(value) for value in raw["ratio_box"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(ratio_box) != 4:
+                continue
+            ratio_x, ratio_y, ratio_w, ratio_h = ratio_box
+            box = Box(
+                round(ratio_x * image_width),
+                round(ratio_y * image_height),
+                max(1, round(ratio_w * image_width)),
+                max(1, round(ratio_h * image_height)),
+            )
+            padding_x = max(1, round(box.w * self._TABLE_ANCHOR_SEARCH_PADDING_RATIO))
+            padding_y = max(1, round(box.h * self._TABLE_ANCHOR_SEARCH_PADDING_RATIO))
+            left = max(0, box.x - padding_x)
+            top = max(0, box.y - padding_y)
+            right = min(image_width, box.x + box.w + padding_x)
+            bottom = min(image_height, box.y + box.h + padding_y)
+            search = source_image[top:bottom, left:right]
+            if search.size == 0:
+                continue
+            template_height, template_width = template.shape[:2]
+            if template_height != box.h or template_width != box.w:
+                template = cv2.resize(
+                    template,
+                    (box.w, box.h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                template_height, template_width = template.shape[:2]
+            if (
+                template_height > search.shape[0]
+                or template_width > search.shape[1]
+            ):
+                continue
+            if search.ndim == 3:
+                search_gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+            else:
+                search_gray = search
+            if template.ndim == 3:
+                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            else:
+                template_gray = template
+            _min_score, max_score, _min_location, _max_location = cv2.minMaxLoc(
+                cv2.matchTemplate(
+                    search_gray,
+                    template_gray,
+                    cv2.TM_CCOEFF_NORMED,
+                )
+            )
+            best_score = max(best_score, float(max_score))
+        return best_score
 
     def play_roi(self, image: np.ndarray, seat: Seat) -> np.ndarray:
         """Return the configured play-region crop without exposing annotation infrastructure."""

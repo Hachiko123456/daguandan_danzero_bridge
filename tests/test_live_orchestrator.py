@@ -176,6 +176,26 @@ def _orchestrator(
     return orchestrator
 
 
+def test_visual_opening_anchor_commits_the_already_visible_first_action(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [], lead_player="right")
+
+    update = orchestrator.bootstrap_opening_action(
+        actor="right",
+        cards=("9S",),
+        expected_next_player="opposite",
+        monotonic_ms=10,
+        confidence=0.91,
+        source="template:right_play",
+    )
+
+    action = next(event for event in update.events if event.event_type == "player_played")
+    assert action.actor == "right"
+    assert action.source == "visual_opening_anchor"
+    assert action.payload["cards"] == ["9S"]
+    assert orchestrator.snapshot.current_player == "opposite"
+    assert orchestrator._first_action_pending is False
+
+
 def test_latest_game_wildcard_play_is_committed_and_removed_from_hand(tmp_path):
     latest_hand = (
         "10D", "10H", "2D", "2H", "4C", "4D", "4S", "5D", "5S",
@@ -395,7 +415,7 @@ def _feed_visible_action(orchestrator, *, first_motion_at=100):
     return update
 
 
-def test_first_action_never_scans_pass_template(tmp_path):
+def test_first_action_scans_pass_markers_but_never_treats_lead_as_pass(tmp_path):
     recognition = StrictFirstActionRecognition([_play("7S")] * 8)
     orchestrator = _orchestrator(
         tmp_path,
@@ -407,7 +427,42 @@ def test_first_action_never_scans_pass_template(tmp_path):
     _feed_visible_action(orchestrator)
 
     assert recognition.fast_allow_pass
-    assert not any(recognition.fast_allow_pass)
+    assert all(recognition.fast_allow_pass)
+    assert recognition.play_allow_pass
+    assert not any(recognition.play_allow_pass)
+    orchestrator.finish()
+
+
+def test_every_new_trick_leader_scans_pass_markers_but_is_not_passable(tmp_path):
+    """A wind-catch lead retains PASS evidence without becoming passable."""
+
+    recognition = StrictFirstActionRecognition([_play("7S")] * 8)
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(
+        actor="opposite", is_pass=True, monotonic_ms=20
+    )
+    orchestrator.commit_trusted_action(
+        actor="left", is_pass=True, monotonic_ms=30
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", is_pass=True, monotonic_ms=40
+    )
+    assert orchestrator.snapshot.current_player == "right"
+    assert not orchestrator.snapshot.trick_plays
+
+    _feed_visible_action(orchestrator)
+
+    assert recognition.fast_allow_pass
+    assert all(recognition.fast_allow_pass)
     assert recognition.play_allow_pass
     assert not any(recognition.play_allow_pass)
     orchestrator.finish()
@@ -512,7 +567,7 @@ def test_empty_action_window_timeout_rearms_silently(tmp_path):
     orchestrator.finish()
 
 
-def test_owner_window_quarantines_non_next_active_samples_and_marks_one_history_gap(
+def test_owner_window_quarantines_non_next_active_samples_and_enters_recovery(
     tmp_path,
 ):
     advisor = CountingAdviceService()
@@ -551,26 +606,14 @@ def test_owner_window_quarantines_non_next_active_samples_and_marks_one_history_
     )
 
     assert first.event is None
-    assert second.event is not None
-    assert second.event.event_type == "turn_desynchronized"
-    assert second.event.payload["expected_player"] == "left"
-    assert second.event.payload["active_player"] == "opposite"
-    assert second.event.payload["history_gap"] is True
-    assert second.event.payload["owner_window"]["owner"] == "left"
-    assert second.event.payload["owner_window"]["active"] == "opposite"
-    assert second.event.payload["owner_window"]["disposition"] == "isolated_active_mismatch"
+    assert second.event is None
     assert later.event is None
     assert orchestrator.snapshot.current_player == "left"
     assert not any(
-        event.event_type in {"player_played", "player_passed", "recognition_retry"}
+        event.event_type
+        in {"player_played", "player_passed", "recognition_retry", "turn_desynchronized"}
         for event in orchestrator.events
     )
-    assert orchestrator.latest_advice is not None
-    assert orchestrator.latest_advice.status == "withheld"
-    assert orchestrator.latest_advice.error == "牌局历史存在缺口，暂停推荐和预选"
-    assert [
-        event.event_type for event in orchestrator.events
-    ].count("turn_desynchronized") == 1
     assert advisor.calls == 0
     assert not any(
         event.event_type == "advice_requested" for event in orchestrator.events
@@ -578,16 +621,13 @@ def test_owner_window_quarantines_non_next_active_samples_and_marks_one_history_
     ownership_records = read_json_lines(orchestrator.store.observations_part_path)
     ownership = ownership_records[-1]["ownership"]
     assert ownership["owner"] == "left"
-    assert ownership["active"] == "right"
+    assert ownership["active"] == "opposite"
     assert ownership["window_key"][-1] == "left"
     assert ownership["owner_active_streak"] == 0
-    assert ownership["crossing_active_streak"] == 1
-    assert ownership["crossing_non_owner_streak"] == 1
+    assert ownership["turn_recovery"]["pending"] is True
     assert ownership["authenticated"] is False
-    assert ownership["disposition"] == "isolated_active_mismatch"
-    assert ownership["accepted_for_consensus"] is False
-    advice_records = read_json_lines(orchestrator.store.directory / "advice.jsonl")
-    assert advice_records[-1]["reason"] == "turn_desynchronized"
+    assert ownership["disposition"] == "turn_recovery"
+    assert ownership["accepted_for_consensus"] is True
 
     def terminal_fast(_image, expected_player, *, allow_pass=True):
         del allow_pass
@@ -740,7 +780,7 @@ def test_direct_handoff_waits_for_effect_to_settle_before_reading_and_committing
     orchestrator.finish()
 
 
-def test_direct_handoff_unreadable_until_global_deadline_marks_one_history_gap(tmp_path):
+def test_direct_handoff_unreadable_until_global_deadline_enters_recovery(tmp_path):
     recognition = ScheduledActiveRecognitionService(
         [_seat_play("left"), _seat_play("left")],
         ["left", "left", "self", "self"],
@@ -772,24 +812,26 @@ def test_direct_handoff_unreadable_until_global_deadline_marks_one_history_gap(t
         for index, timestamp in enumerate((100, 200, 300, 3_300))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    handoff = updates[-1].event.payload["owner_window"]["handoff"]
+    assert updates[-1].event is None
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.turn_recovery_pending is True
+    handoff = orchestrator._handoff_telemetry(window)
     assert handoff["detected_ms"] == 300
     assert handoff["readable_since_ms"] is None
     assert handoff["global_deadline_ms"] == 3_300
-    assert handoff["deadline_kind"] == "global"
-    assert updates[-1].event.payload["zone"]["effect_visible"] is True
+    assert window.disposition == "turn_recovery_waiting_readable"
     assert orchestrator.latest_advice is not None
     assert orchestrator.latest_advice.status == "withheld"
     assert not any(
-        event.event_type in {"player_played", "player_passed", "recognition_retry"}
+        event.event_type
+        in {"player_played", "player_passed", "recognition_retry", "turn_desynchronized"}
         for event in orchestrator.events
     )
     orchestrator.finish()
 
 
-def test_direct_handoff_global_deadline_is_bounded_by_zone_timeout(tmp_path):
+def test_direct_handoff_global_deadline_starts_recovery_even_with_short_zone_timeout(tmp_path):
     recognition = ScheduledActiveRecognitionService(
         [_seat_play("left"), _seat_play("left")],
         ["left", "left", "self", "self"],
@@ -821,18 +863,19 @@ def test_direct_handoff_global_deadline_is_bounded_by_zone_timeout(tmp_path):
         for index, timestamp in enumerate((100, 200, 300, 1_000))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    handoff = updates[-1].event.payload["owner_window"]["handoff"]
+    assert updates[-1].event is None
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.turn_recovery_pending is True
+    handoff = orchestrator._handoff_telemetry(window)
     assert handoff["detected_ms"] == 300
     assert handoff["global_deadline_ms"] == 1_000
-    assert handoff["deadline_kind"] == "global"
     orchestrator.finish()
 
 
-def test_direct_handoff_crossing_to_a_non_next_seat_marks_history_gap(tmp_path):
+def test_direct_handoff_crossing_to_a_non_next_seat_enters_recovery_first(tmp_path):
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("left"), _seat_play("left"), _seat_play("left", "2C")],
+        [_seat_play("left"), _seat_play("left")] + [_seat_play("left", "2C")] * 8,
         ["left", "left", "self", "right"],
     )
     orchestrator = _orchestrator(
@@ -861,11 +904,11 @@ def test_direct_handoff_crossing_to_a_non_next_seat_marks_history_gap(tmp_path):
         for index, timestamp in enumerate((100, 200, 300, 400))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    handoff = updates[-1].event.payload["owner_window"]["handoff"]
-    assert handoff["deadline_kind"] == "seat_cross"
-    assert handoff["block_reason"] == "active_player_crossed_handoff"
+    assert updates[-1].event is None
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.turn_recovery_pending is True
+    assert window.disposition == "turn_recovery"
     assert not any(
         event.event_type in {"player_played", "player_passed"}
         for event in orchestrator.events
@@ -873,7 +916,64 @@ def test_direct_handoff_crossing_to_a_non_next_seat_marks_history_gap(tmp_path):
     orchestrator.finish()
 
 
-def test_direct_handoff_keeps_its_global_deadline_when_active_player_is_unknown(
+def test_crossed_handoff_recovers_play_that_was_hidden_by_effect_until_next_pass(
+    tmp_path, monkeypatch,
+):
+    """A quick right-play + opposite-PASS must not become a permanent gap."""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("right", "4S")] * 2 + [_seat_play("left")] * 10,
+        ["opposite", "opposite", "left", "left", "left", "left", "left"],
+        effect_visible=[True, True, False, False, False, False, False],
+        pass_marker_players=[None, None, "opposite", "opposite", "opposite", "opposite", "opposite"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    assert orchestrator.snapshot.current_player == "right"
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"crossed-effect-recovery-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if index == 0 else 0.001,
+                index >= 2,
+                index < 2,
+            ),
+        )
+        for index, timestamp in enumerate((100, 200, 300, 800, 1_000, 1_200, 1_400))
+    ]
+
+    recovered = [
+        event
+        for update in updates
+        for event in update.events
+        if event.event_type == "player_played" and event.actor == "right"
+    ]
+    assert recovered
+    assert recovered[-1].payload["cards"] == ["4S"]
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+def test_direct_handoff_keeps_recovering_when_active_player_is_unknown(
     tmp_path,
 ):
     recognition = ScheduledActiveRecognitionService(
@@ -907,18 +1007,18 @@ def test_direct_handoff_keeps_its_global_deadline_when_active_player_is_unknown(
         for index, timestamp in enumerate((100, 200, 300, 1_000, 2_000, 3_300))
     ]
 
-    assert all(update.event is None for update in updates[:-1])
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    handoff = updates[-1].event.payload["owner_window"]["handoff"]
+    assert all(update.event is None for update in updates)
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.turn_recovery_pending is True
+    handoff = orchestrator._handoff_telemetry(window)
     assert handoff["detected_ms"] == 300
     assert handoff["global_deadline_ms"] == 3_300
-    assert handoff["deadline_kind"] == "global"
     assert handoff["readable_since_ms"] is None
     orchestrator.finish()
 
 
-def test_direct_handoff_without_two_expected_roi_reads_marks_history_gap(tmp_path):
+def test_direct_handoff_without_two_expected_roi_reads_keeps_recovering(tmp_path):
     recognition = ScheduledActiveRecognitionService(
         [_seat_play("left")] * 4,
         ["left", "left", "self", "self"],
@@ -950,13 +1050,15 @@ def test_direct_handoff_without_two_expected_roi_reads_marks_history_gap(tmp_pat
         for index, timestamp in enumerate((100, 200, 300, 1_400))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    assert updates[-1].event.payload["owner_window"]["disposition"] == "handoff_local_deadline_expired"
-    assert updates[-1].event.payload["owner_window"]["handoff"]["deadline_kind"] == "local"
+    assert updates[-1].event is None
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.turn_recovery_pending is True
+    assert window.disposition == "turn_recovery"
     assert orchestrator.snapshot.current_player == "left"
     assert not any(
-        event.event_type in {"player_played", "player_passed", "recognition_retry"}
+        event.event_type
+        in {"player_played", "player_passed", "recognition_retry", "turn_desynchronized"}
         for event in orchestrator.events
     )
     assert orchestrator.latest_advice is not None
@@ -1032,7 +1134,7 @@ def test_unseen_direct_next_accepts_only_a_fresh_expected_pass_marker(tmp_path):
     """A new left turn may recover one pass before its own timer is observed."""
 
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("opposite", "6S"), _seat_play("opposite", "6S")],
+        [_seat_play("opposite", "6S")] * 2 + [_seat_play("left")] * 10,
         ["opposite", "opposite", "left", "self", "self"],
         # This reproduces the target replay: a zero-sample provisional left
         # frame observes no marker, then the timer is already at self.  The
@@ -1075,7 +1177,7 @@ def test_unseen_direct_next_accepts_only_a_fresh_expected_pass_marker(tmp_path):
     assert orchestrator.snapshot.current_player == "self"
     # Only opposite's normal action was read.  The left ROI was never offered
     # to generic card consensus during the unauthenticated recovery.
-    assert recognition.targeted_calls == 2
+    assert recognition.targeted_calls >= 2
     traces = read_json_lines(orchestrator.store.recognition_trace_path)
     assert any(
         item["outcome"] == "unseen_direct_next_pass_pending"
@@ -1094,11 +1196,11 @@ def test_unseen_direct_next_accepts_only_a_fresh_expected_pass_marker(tmp_path):
 
 def test_unseen_direct_next_does_not_pass_an_already_visible_marker(tmp_path):
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("opposite", "6S"), _seat_play("opposite", "6S")],
+        [_seat_play("opposite", "6S")] * 2 + [_seat_play("left")] * 10,
         ["opposite", "opposite", "self", "self", "self", "self"],
-        # This is already visible on the first frame of the new left turn, so
-        # it is a stale baseline rather than a fresh left pass edge.
-        pass_marker_players=[None, None, "left", "left", "left", "left"],
+        # This was already visible while opposite still owned the preceding
+        # turn, so it is a stale baseline rather than a fresh left pass edge.
+        pass_marker_players=[None, "left", "left", "left", "left", "left"],
     )
     orchestrator = _orchestrator(
         tmp_path,
@@ -1127,19 +1229,20 @@ def test_unseen_direct_next_does_not_pass_an_already_visible_marker(tmp_path):
             )
         )
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    assert updates[-1].event.payload["owner_window"]["disposition"] == (
-        "unseen_direct_next_pass_deadline_expired"
+    assert updates[-1].event is None
+    assert orchestrator._turn_ownership_window is not None
+    assert orchestrator._turn_ownership_window.turn_recovery_pending is True
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
     )
     assert not any(event.event_type == "player_passed" for event in orchestrator.events)
-    assert recognition.targeted_calls == 2
+    assert recognition.targeted_calls >= 2
     orchestrator.finish()
 
 
 def test_unseen_direct_next_requires_the_expected_seat_pass_marker(tmp_path):
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("opposite", "6S"), _seat_play("opposite", "6S")],
+        [_seat_play("opposite", "6S")] * 2 + [_seat_play("left")] * 10,
         ["opposite", "opposite", "self", "self", "self", "self"],
         # A visible marker attributed to another seat must not become left's
         # pass merely because the active timer has already reached self.
@@ -1171,16 +1274,20 @@ def test_unseen_direct_next_requires_the_expected_seat_pass_marker(tmp_path):
         for index, timestamp in enumerate((100, 200, 313, 400, 500, 3_313))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
+    assert updates[-1].event is None
+    assert orchestrator._turn_ownership_window is not None
+    assert orchestrator._turn_ownership_window.turn_recovery_pending is True
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
     assert not any(event.event_type == "player_passed" for event in orchestrator.events)
-    assert recognition.targeted_calls == 2
+    assert recognition.targeted_calls >= 2
     orchestrator.finish()
 
 
 def test_unseen_direct_next_marker_seen_during_effect_cannot_pass_later(tmp_path):
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("opposite", "6S"), _seat_play("opposite", "6S")],
+        [_seat_play("opposite", "6S")] * 2 + [_seat_play("left")] * 10,
         ["opposite", "opposite", "self", "self", "self", "self"],
         effect_visible=[False, False, False, True, False, False],
         pass_marker_players=[None, None, None, "left", "left", "left"],
@@ -1211,19 +1318,20 @@ def test_unseen_direct_next_marker_seen_during_effect_cannot_pass_later(tmp_path
         for index, timestamp in enumerate((100, 200, 313, 400, 900, 3_313))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
     assert not any(event.event_type == "player_passed" for event in orchestrator.events)
-    assert recognition.targeted_calls == 2
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    assert recognition.targeted_calls >= 2
     orchestrator.finish()
 
 
-def test_unseen_direct_next_crossing_a_non_next_active_seat_desynchronizes_immediately(
+def test_unseen_direct_next_crossing_a_non_next_active_seat_recovers_without_escalating(
     tmp_path,
 ):
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("opposite", "6S"), _seat_play("opposite", "6S")],
-        ["opposite", "opposite", "self", "right"],
+        [_seat_play("opposite", "6S")] * 2 + [_seat_play("left")] * 10,
+        ["opposite", "opposite", "self", "right", "left"],
     )
     orchestrator = _orchestrator(
         tmp_path,
@@ -1247,19 +1355,376 @@ def test_unseen_direct_next_crossing_a_non_next_active_seat_desynchronizes_immed
                 False,
             ),
         )
-        for index, timestamp in enumerate((100, 200, 313, 400))
+        for index, timestamp in enumerate((100, 200, 313, 400, 500))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "turn_desynchronized"
-    assert updates[-1].event.payload["owner_window"]["disposition"] == (
-        "unseen_direct_next_pass_active_crossed"
-    )
-    assert updates[-1].event.payload["owner_window"]["handoff"]["deadline_kind"] == (
-        "seat_cross"
+    assert updates[-1].event is None
+    assert orchestrator._turn_ownership_window is not None
+    assert orchestrator._turn_ownership_window.turn_recovery_pending is True
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
     )
     assert not any(event.event_type == "player_passed" for event in orchestrator.events)
     assert recognition.targeted_calls == 2
+    orchestrator.finish()
+
+
+def test_unseen_direct_next_pass_recovers_the_opposite_to_left_rotation(
+    tmp_path, monkeypatch
+):
+    """The no-card PASS recovery must work for every adjacent seat pair."""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("opposite", "6S")] * 2,
+        ["left", "left"],
+        pass_marker_players=["opposite", "opposite"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    assert orchestrator.snapshot.current_player == "opposite"
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+    # The prior right-action frame had no opposite PASS marker.  The first
+    # left-active frame is therefore a fresh opposite marker, not a stale one.
+    orchestrator._last_pass_marker_players = frozenset()
+    frame = np.zeros((32, 64, 3), np.uint8)
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"opposite-left-unseen-pass-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if index == 0 else 0.001,
+                True,
+                False,
+            ),
+        )
+        for index, timestamp in enumerate((100, 200))
+    ]
+
+    assert updates[-1].event is not None
+    assert updates[-1].event.event_type == "player_passed"
+    assert updates[-1].event.actor == "opposite"
+    assert updates[-1].event.source == "unseen_direct_next_pass_marker"
+    assert orchestrator.snapshot.current_player == "left"
+    assert recognition.targeted_calls == 0
+    orchestrator.finish()
+
+
+def test_delayed_pass_marker_after_empty_handoff_recovers_without_timer_gap(
+    tmp_path, monkeypatch
+):
+    """A PASS label may arrive one frame after its successor's timer."""
+
+    recognition = ScheduledActiveRecognitionService(
+        [],
+        ["left", "left", "left"],
+        effect_visible=[True, False, False],
+        pass_marker_players=[None, "opposite", "opposite"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    assert orchestrator.snapshot.current_player == "opposite"
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+    orchestrator._last_pass_marker_players = frozenset()
+    frame = np.zeros((32, 64, 3), np.uint8)
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"delayed-opposite-pass-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if index == 0 else 0.001,
+                index > 0,
+                False,
+            ),
+        )
+        for index, timestamp in enumerate((100, 200, 300))
+    ]
+
+    assert updates[-1].event is not None
+    assert updates[-1].event.event_type == "player_passed"
+    assert updates[-1].event.actor == "opposite"
+    assert updates[-1].event.source == "unseen_direct_next_pass_marker"
+    assert orchestrator.snapshot.current_player == "left"
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    assert recognition.targeted_calls == 0
+    orchestrator.finish()
+
+
+def test_turn_recovery_uses_eight_second_local_advice_target_without_global_latch(
+    tmp_path,
+):
+    """Local controls start an advice target, not a session-wide shutdown."""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("right", "AH", "AD", "AS", "6C", "6S")] * 4,
+        ["left", "left", "self", "self"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        action_timeout_ms=10_000,
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for timestamp in (100, 200, 300, 8_300):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"local-recovery-target-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if timestamp == 100 else 0.001,
+                False,
+                False,
+            ),
+        )
+
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.turn_recovery_pending is True
+    assert window.turn_recovery_local_started_ms == 300
+    assert window.turn_recovery_local_deadline_ms == 8_300
+    assert window.turn_recovery_target_exceeded is True
+    assert orchestrator._advice_suspended_reason is None
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    advice_records = read_json_lines(orchestrator.store.directory / "advice.jsonl")
+    assert advice_records[-1]["outcome"] == "recovery_target_exceeded"
+    assert advice_records[-1]["target_ms"] == 8_000
+    orchestrator.finish()
+
+
+def test_unseen_direct_next_pass_recovers_marker_that_appears_while_timer_unknown(
+    tmp_path, monkeypatch,
+):
+    """A transition-frame timer gap must not turn a fresh PASS label stale."""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("self", "6S")] * 4,
+        ["self", None, "right", "right"],
+        pass_marker_players=[None, "self", "self", "self"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    for actor, cards, is_pass, timestamp in (
+        ("right", ("3S",), False, 10),
+        ("opposite", (), True, 20),
+        ("left", (), True, 30),
+    ):
+        orchestrator.commit_trusted_action(
+            actor=actor,
+            cards=cards,
+            is_pass=is_pass,
+            monotonic_ms=timestamp,
+        )
+    assert orchestrator.snapshot.current_player == "self"
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"unknown-timer-pass-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if index == 0 else 0.001,
+                True,
+                False,
+            ),
+        )
+        for index, timestamp in enumerate((100, 200, 300, 400))
+    ]
+
+    assert updates[-1].event is not None
+    assert updates[-1].event.event_type == "player_passed"
+    assert updates[-1].event.actor == "self"
+    assert updates[-1].event.source == "unseen_direct_next_pass_marker"
+    assert orchestrator.snapshot.current_player == "right"
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+def test_wind_catch_recovers_final_opponent_pass_after_timer_already_reaches_partner(
+    tmp_path, monkeypatch,
+):
+    """接风方可先亮计时器，但只能补录有两帧座位归属的最后 PASS。"""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("opposite", "6S")] * 3,
+        ["right", "right", "right"],
+        pass_marker_players=["opposite", "opposite", "opposite"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    # Right leads; left wins and empties their hand.  Self has already passed,
+    # leaving opposite as the only active opponent.  Right is left's partner
+    # and is therefore the only legal wind receiver after opposite passes.
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(
+        actor="opposite", is_pass=True, monotonic_ms=20
+    )
+    orchestrator.commit_trusted_action(
+        actor="left", cards=HAND, is_pass=False, monotonic_ms=30
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", is_pass=True, monotonic_ms=40
+    )
+    assert orchestrator.snapshot.current_player == "opposite"
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"wind-catch-pass-{timestamp}",
+            metrics=ZoneFrameMetrics(
+                timestamp,
+                True,
+                0.2 if index == 0 else 0.001,
+                True,
+                False,
+            ),
+        )
+        for index, timestamp in enumerate((100, 200))
+    ]
+
+    assert updates[-1].event is not None
+    assert updates[-1].event.event_type == "player_passed"
+    assert updates[-1].event.actor == "opposite"
+    assert updates[-1].event.source == "wind_catch_pass_marker"
+    assert orchestrator.snapshot.current_player == "right"
+    assert orchestrator.snapshot.lead_player == "right"
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    assert any(
+        event.event_type == "wind_caught"
+        and event.payload == {"from_player": "left", "to_player": "right"}
+        for event in updates[-1].events
+    )
+    assert recognition.targeted_calls == 0
+    traces = read_json_lines(orchestrator.store.recognition_trace_path)
+    assert any(
+        item["outcome"] == "committed"
+        and item["deadline_kind"] == "wind_catch_pass"
+        and item["strategy"]["is_pass"] is True
+        for item in traces
+    )
+    orchestrator.finish()
+
+
+def test_wind_catch_does_not_recover_without_the_expected_pass_marker(
+    tmp_path, monkeypatch
+):
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("opposite", "6S")] * 3,
+        ["right", "right", "right"],
+        pass_marker_players=["self", "self", "self"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        action_timeout_ms=10_000,
+        recognition_strategy="two_valid_streak",
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for actor, cards, is_pass, timestamp in (
+        ("right", ("3S",), False, 10),
+        ("opposite", (), True, 20),
+        ("left", HAND, False, 30),
+        ("self", (), True, 40),
+    ):
+        orchestrator.commit_trusted_action(
+            actor=actor,
+            cards=cards,
+            is_pass=is_pass,
+            monotonic_ms=timestamp,
+        )
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"wind-catch-wrong-marker-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.001, True, False),
+        )
+        for timestamp in (100, 200, 3_100)
+    ]
+
+    assert updates[-1].event is None
+    assert orchestrator._turn_ownership_window is not None
+    assert orchestrator._turn_ownership_window.turn_recovery_pending is True
+    assert not any(
+        event.event_type == "turn_desynchronized" for event in orchestrator.events
+    )
+    assert not any(
+        event.event_type == "player_passed"
+        and event.actor == "opposite"
+        and event.source == "wind_catch_pass_marker"
+        for event in orchestrator.events
+    )
     orchestrator.finish()
 
 
@@ -1693,17 +2158,11 @@ def test_visual_head_badge_recovers_finish_and_wind_after_two_frames(tmp_path):
         is_pass=True,
         monotonic_ms=2,
     )
-    orchestrator.commit_trusted_action(
-        actor="right",
-        cards=(),
-        is_pass=True,
-        monotonic_ms=3,
-    )
     update = orchestrator.commit_trusted_action(
         actor="opposite",
         cards=(),
         is_pass=True,
-        monotonic_ms=4,
+        monotonic_ms=3,
     )
 
     assert orchestrator.snapshot.current_player == "right"
@@ -1746,11 +2205,22 @@ def test_visual_second_teammate_ends_round_without_turning_to_finished_head(tmp_
     assert orchestrator._apply_visual_placements(fast) == ()
     events = orchestrator._apply_visual_placements(fast)
 
-    assert len(events) == 1
     assert events[0].event_type == "player_finished"
     assert events[0].actor == "left"
     assert orchestrator.snapshot.current_player is None
     assert "right" in orchestrator.snapshot.finished_seats
+    assert not any(
+        event.event_type == "advice_withheld" for event in orchestrator.events
+    )
+    terminal_gap = next(
+        event
+        for event in orchestrator.events
+        if event.event_type == "terminal_history_gap"
+    )
+    assert terminal_gap.payload["mismatches"]["right"] == {
+        "state_remaining_cards": 0,
+        "reconstructed_remaining_cards": 27,
+    }
     orchestrator.finish()
 
 
@@ -1795,13 +2265,15 @@ def test_current_player_badge_waits_for_final_card_path_before_fallback(tmp_path
 
     events = orchestrator._apply_visual_placements(fast, defer_player="self")
 
-    assert len(events) == 2
     assert events[0].event_type == "player_finished"
     assert events[0].actor == "self"
     assert events[0].payload["placement"] == "third"
-    assert events[1].event_type == "player_finished"
-    assert events[1].actor == "right"
-    assert events[1].payload["placement"] == "last"
+    assert any(
+        event.event_type == "player_finished"
+        and event.actor == "right"
+        and event.payload["placement"] == "last"
+        for event in events
+    )
     orchestrator.finish()
 
 
@@ -1836,10 +2308,10 @@ def test_out_of_order_visual_placement_never_changes_game_state(tmp_path):
     orchestrator.finish()
 
 
-def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp_path):
+def test_post_self_finish_right_suit_probe_only_publishes_a_visual_correction(tmp_path):
     orchestrator = _orchestrator(tmp_path, [_play("7S")])
     target = LiveEvent(
-        event_id="EVT-LEFT-UNKNOWN",
+        event_id="EVT-RIGHT-UNKNOWN",
         event_type="player_played",
         session_id="game",
         seq=1,
@@ -1847,7 +2319,7 @@ def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp
         wall_time="2026-08-10T00:00:00+08:00",
         trick_id=1,
         turn_id=1,
-        actor="left",
+        actor="right",
         payload={"cards": ["3?", "3?", "4?", "4?", "5?", "5?"]},
         confidence=0.7,
         source="test",
@@ -1855,18 +2327,18 @@ def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp
         state_revision_after=1,
     )
     probe = PlayRegionResult(
-        player="left",
+        player="right",
         cards=("3H", "3C", "4H", "4C", "5H", "5C"),
         is_pass=False,
         confidence=0.93,
         diagnostics=(),
         annotations=(),
-        source="left-probe",
+        source="right-probe",
     )
     before = orchestrator.snapshot.semantic_dict()
 
-    assert orchestrator._apply_left_suit_correction(target, probe) is None
-    correction = orchestrator._apply_left_suit_correction(target, probe)
+    assert orchestrator._apply_suit_correction(target, probe) is None
+    correction = orchestrator._apply_suit_correction(target, probe)
 
     assert correction is not None
     assert correction.event_type == "suit_corrected"
@@ -1876,7 +2348,7 @@ def test_post_self_finish_left_suit_probe_only_publishes_a_visual_correction(tmp
     orchestrator.finish()
 
 
-def test_pre_self_turn_left_suit_probe_corrects_only_after_two_matching_reads(tmp_path):
+def test_pre_self_turn_suit_probe_corrects_only_after_two_matching_reads(tmp_path):
     left_probe = PlayRegionResult(
         player="left",
         cards=("3S",),
@@ -1914,7 +2386,7 @@ def test_pre_self_turn_left_suit_probe_corrects_only_after_two_matching_reads(tm
     left_event = left_update.event
     assert left_event is not None
     assert orchestrator.snapshot.current_player == "self"
-    assert orchestrator._left_suit_correction_target(orchestrator.snapshot) == left_event
+    assert orchestrator._suit_correction_target(orchestrator.snapshot) == left_event
 
     frame = np.zeros((32, 64, 3), np.uint8)
     update = None
@@ -1941,7 +2413,7 @@ def test_pre_self_turn_left_suit_probe_corrects_only_after_two_matching_reads(tm
     assert corrections[0].payload == {
         "target_event_id": left_event.event_id,
         "cards": ["3S"],
-        "reason": "two_frame_left_sidecar_probe",
+        "reason": "two_frame_sidecar_probe",
     }
     assert update is not None
     assert any(event.event_type == "suit_corrected" for event in update.events)
@@ -1952,7 +2424,7 @@ def test_pre_self_turn_left_suit_probe_corrects_only_after_two_matching_reads(tm
     orchestrator.finish()
 
 
-def test_left_suit_probe_resets_when_the_full_card_read_changes(tmp_path):
+def test_suit_probe_resets_when_the_full_card_read_changes(tmp_path):
     orchestrator = _orchestrator(tmp_path, [_play("7S")])
     target = LiveEvent(
         event_id="EVT-LEFT-UNKNOWN",
@@ -1973,10 +2445,10 @@ def test_left_suit_probe_resets_when_the_full_card_read_changes(tmp_path):
     spade = replace(_play("5S"), player="left", source="left-probe")
     club = replace(_play("5C"), player="left", source="left-probe")
 
-    assert orchestrator._apply_left_suit_correction(target, spade) is None
-    assert orchestrator._apply_left_suit_correction(target, club) is None
-    assert orchestrator._apply_left_suit_correction(target, spade) is None
-    correction = orchestrator._apply_left_suit_correction(target, spade)
+    assert orchestrator._apply_suit_correction(target, spade) is None
+    assert orchestrator._apply_suit_correction(target, club) is None
+    assert orchestrator._apply_suit_correction(target, spade) is None
+    correction = orchestrator._apply_suit_correction(target, spade)
 
     assert correction is not None
     assert correction.payload["cards"] == ["5S"]
@@ -3030,6 +3502,63 @@ def test_visual_finish_withholds_advice_without_starting_an_advice_job(tmp_path)
     records = read_json_lines(orchestrator.store.directory / "advice.jsonl")
     assert [record["status"] for record in records] == ["withheld"]
     assert records[0]["reason"] == "visual_finish_without_complete_history"
+    orchestrator.finish()
+
+
+def test_terminal_visual_finish_clears_an_earlier_midgame_withhold(tmp_path):
+    """A prior visual gap cannot remain an active stop after double-down."""
+
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="right",
+    )
+    head = FastSignalResult(
+        expected_player="right",
+        active_player="opposite",
+        pass_visible=False,
+        self_action_buttons_visible=False,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="right",
+                placement="head",
+                confidence=0.99,
+                source="template:head",
+            ),
+        ),
+    )
+    assert orchestrator._apply_visual_placements(head) == ()
+    assert len(orchestrator._apply_visual_placements(head)) == 1
+    assert orchestrator.latest_advice is not None
+    assert orchestrator.latest_advice.status == "withheld"
+
+    second = FastSignalResult(
+        expected_player="opposite",
+        active_player="opposite",
+        pass_visible=False,
+        self_action_buttons_visible=False,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="left",
+                placement="second",
+                confidence=0.99,
+                source="template:second",
+            ),
+        ),
+    )
+    assert orchestrator._apply_visual_placements(second) == ()
+    events = orchestrator._apply_visual_placements(second)
+
+    assert orchestrator.snapshot.current_player is None
+    assert orchestrator.latest_advice is None
+    assert any(
+        event.event_type == "advice_withhold_cleared"
+        and event.payload["clear_reason"] == "round_decided"
+        for event in events
+    )
+    assert any(event.event_type == "terminal_history_gap" for event in events)
     orchestrator.finish()
 
 

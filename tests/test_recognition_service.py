@@ -65,6 +65,20 @@ def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
     assert any(annotation.label == "2S" for annotation in result.annotations)
 
 
+def test_table_anchor_uses_one_frame_at_the_configured_085_threshold():
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    _paste_template(image, "templates/anchor/table_anchor_1.png", 1150, 2)
+
+    assert service.recognize_table_anchor(image) >= 0.85
+    assert service.recognize_table_anchor(
+        np.zeros((720, 1280, 3), dtype=np.uint8)
+    ) < 0.85
+
+
 def test_initial_hand_keeps_a_rank_when_its_suit_is_occluded():
     image = np.full((720, 1280, 3), 255, dtype=np.uint8)
     _paste_template(image, "templates/rank/2_hand.png", 40, 510)

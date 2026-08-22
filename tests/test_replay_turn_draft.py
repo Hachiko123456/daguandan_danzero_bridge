@@ -144,8 +144,7 @@ def test_prefix_derivation_assigns_a_finished_leaders_wind_to_the_partner():
     prefix = (
         TruthTurn(1, "right", False, ("3S",) * 27, trick_id=99),
         TruthTurn(2, "opposite", True, (), trick_id=3),
-        TruthTurn(3, "left", True, (), trick_id=3),
-        TruthTurn(4, "self", True, (), trick_id=3),
+        TruthTurn(3, "self", True, (), trick_id=3),
     )
 
     assert next_actor_after_prefix(initial, prefix) == "left"

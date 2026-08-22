@@ -203,22 +203,6 @@ class _UnknownSuitAwareRecognitionStub:
         return _initial_recognition(())
 
 
-class _WaitingRecordingStub:
-    def __init__(self) -> None:
-        self.frames = []
-        self.recognitions = []
-        self.closed_reasons = []
-
-    def record_frame(self, frame, *, monotonic_ms, wall_time):
-        self.frames.append((frame, monotonic_ms, wall_time))
-
-    def record_recognition(self, result, *, captured_at, acceptance_reason):
-        self.recognitions.append((result, captured_at, acceptance_reason))
-
-    def close_unconfirmed(self, reason):
-        self.closed_reasons.append(reason)
-
-
 def test_waiting_scan_keeps_unknown_suits_in_the_initial_hand(tmp_path):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
@@ -272,6 +256,7 @@ def test_listener_starts_session_after_two_identical_complete_hands(tmp_path, mo
     hand = tuple(f"{rank}{suit}" for rank in ("3", "4", "5", "6", "7", "8", "9") for suit in "SHCD")[:27]
     started = []
     controller._listening_enabled = True
+    controller._table_anchor_observed = True
     monkeypatch.setattr(
         controller,
         "_start_detected_session",
@@ -284,12 +269,11 @@ def test_listener_starts_session_after_two_identical_complete_hands(tmp_path, mo
     assert started == [("2", hand)]
 
 
-def test_listener_persists_the_reason_an_initial_state_is_rejected(tmp_path):
+def test_listener_keeps_rejected_initial_state_in_memory(tmp_path):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
-    recording = _WaitingRecordingStub()
-    controller._waiting_recording = recording
     controller._listening_enabled = True
+    controller._table_anchor_observed = True
     hand = tuple(f"{rank}{suit}" for rank in ("3", "4", "5", "6", "7", "8", "9") for suit in "SHCD")[:27]
 
     controller._consume_waiting_recognition(
@@ -297,22 +281,15 @@ def test_listener_persists_the_reason_an_initial_state_is_rejected(tmp_path):
         SimpleNamespace(captured_at=None),
     )
 
-    assert recording.recognitions[-1][2] == "round_level_unrecognized"
+    assert controller._waiting_candidate is None
 
 
 def test_listener_does_not_create_a_recording_from_settlement_controls(
     tmp_path,
-    monkeypatch,
 ):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
     controller._listening_enabled = True
-    recording_attempts = []
-    monkeypatch.setattr(
-        controller,
-        "_ensure_waiting_recording",
-        lambda: recording_attempts.append(True) or True,
-    )
 
     controller._consume_waiting_recognition(
         SimpleNamespace(
@@ -323,19 +300,18 @@ def test_listener_does_not_create_a_recording_from_settlement_controls(
         SimpleNamespace(),
     )
 
-    assert recording_attempts == []
     assert controller._waiting_candidate is None
+    assert controller._table_anchor_observed is False
 
 
-def test_stop_listener_seals_an_unconfirmed_waiting_recording(tmp_path):
+def test_stop_listener_discards_an_unconfirmed_initial_candidate(tmp_path):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
-    recording = _WaitingRecordingStub()
-    controller._waiting_recording = recording
+    controller._waiting_candidate = object()  # type: ignore[assignment]
 
     controller.stop_listening()
 
-    assert recording.closed_reasons == ["listening_stopped_before_initial_state"]
+    assert controller._waiting_candidate is None
 
 
 def test_listener_does_not_start_session_when_complete_hand_changes(tmp_path, monkeypatch):
@@ -345,6 +321,7 @@ def test_listener_does_not_start_session_when_complete_hand_changes(tmp_path, mo
     second = first[:-1] + ("10S",)
     started = []
     controller._listening_enabled = True
+    controller._table_anchor_observed = True
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
     controller._consume_waiting_recognition(_initial_recognition(first), None)
@@ -363,6 +340,7 @@ def test_listener_treats_different_recognition_order_as_the_same_hand(tmp_path, 
     )[:27]
     started = []
     controller._listening_enabled = True
+    controller._table_anchor_observed = True
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
     controller._consume_waiting_recognition(_initial_recognition(first), None)
@@ -385,12 +363,77 @@ def test_listener_starts_with_multiple_unknown_suits_of_the_same_rank(tmp_path, 
     )
     started = []
     controller._listening_enabled = True
+    controller._table_anchor_observed = True
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
     controller._consume_waiting_recognition(_initial_recognition(hand), None)
     controller._consume_waiting_recognition(_initial_recognition(hand), None)
 
     assert len(started) == 1
+
+
+def test_listener_does_not_start_before_the_table_anchor(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    started = []
+    controller._listening_enabled = True
+    monkeypatch.setattr(controller, "_table_anchor_score", lambda _snapshot: 0.8499)
+    monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
+
+    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
+    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
+
+    assert started == []
+    assert controller._waiting_candidate is None
+
+
+def test_listener_starts_after_a_single_085_table_anchor_frame(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    started = []
+    controller._listening_enabled = True
+    monkeypatch.setattr(controller, "_table_anchor_score", lambda _snapshot: 0.85)
+    monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
+
+    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
+    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
+
+    assert len(started) == 1
+
+
+def test_listener_keeps_a_late_unanchored_game_out_of_the_state_machine(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    controller._listening_enabled = True
+    controller._table_anchor_observed = True
+
+    controller._consume_waiting_recognition(
+        SimpleNamespace(
+            my_hand=hand,
+            round_level="2",
+            lead_player="right",
+            current_player="self",
+            events=(),
+        ),
+        SimpleNamespace(captured_at=None),
+    )
+
+    assert controller._waiting_candidate is None
 
 
 def test_controller_auto_finishes_once_when_game_end_is_detected(tmp_path, monkeypatch):

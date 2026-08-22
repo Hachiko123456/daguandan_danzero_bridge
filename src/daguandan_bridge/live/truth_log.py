@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import LiveEvent
+from .turns import project_trick_turn
 
 from ..danzero.state import RANKS, SEATS, SUITS, Seat
 from ..domain.truth import (
@@ -24,14 +25,6 @@ _SCHEMA_VERSIONS = {"guandan.truth/3": 3, _SCHEMA: _SCHEMA_VERSION}
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _SUIT_LABELS = {"S": "黑桃", "H": "红桃", "C": "梅花", "D": "方块"}
 _LABEL_TO_SUIT = {value: key for key, value in _SUIT_LABELS.items()}
-_PARTNER_SEAT = {
-    "self": "opposite",
-    "opposite": "self",
-    "right": "left",
-    "left": "right",
-}
-
-
 def card_code_to_text(card: str) -> str:
     if card == "small_joker":
         return "小王"
@@ -443,18 +436,9 @@ def _with_inferred_trick_ids(
         finished = {
             seat for seat in SEATS if played[seat] >= max(1, starting[seat])
         }
-        active = set(SEATS) - finished
         if leader is not None:
-            # Keep inferred trick ids consistent with LiveReducer: once the
-            # table winner has finished, their partner catches the wind and is
-            # therefore not required to record a pass.
-            next_leader = (
-                _PARTNER_SEAT.get(leader, leader)
-                if leader in finished
-                else leader
-            )
-            required = active - {next_leader}
-            if required and required.issubset(passed):
+            projection = project_trick_turn(leader, finished, passed)
+            if projection.is_complete:
                 current_trick = assigned + 1
                 leader = None
                 passed.clear()
