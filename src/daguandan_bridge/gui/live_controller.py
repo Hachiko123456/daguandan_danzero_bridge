@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic_ns, perf_counter
@@ -100,6 +101,8 @@ class LiveAssistantController(QObject):
         recognition_service: RecognitionPort | None = None,
         advisor: AdvicePort | None = None,
         session_factory: SessionFactoryPort | None = None,
+        capture_interval_sec: float = 0.1,
+        deduplicate_analysis_frames: bool = False,
     ) -> None:
         super().__init__()
         if (
@@ -137,6 +140,10 @@ class LiveAssistantController(QObject):
             )
         )
         self.session_factory = session_factory
+        if capture_interval_sec <= 0:
+            raise ValueError("capture_interval_sec must be positive")
+        self.capture_interval_sec = float(capture_interval_sec)
+        self.deduplicate_analysis_frames = bool(deduplicate_analysis_frames)
         self.session_data_recording_enabled = (
             load_profile_session_data_recording_enabled(
                 self.capture_service.profiles_root,
@@ -749,9 +756,10 @@ class LiveAssistantController(QObject):
         source = self._live_source
         analysis = self._analysis_worker
         capture_seq = 0
+        last_analysis_fingerprint: bytes | None = None
 
         def operation():
-            nonlocal capture_seq
+            nonlocal capture_seq, last_analysis_fingerprint
             snapshot: FrameSnapshot = source.capture()
             capture_seq += 1
             captured_ms = monotonic_ns() // 1_000_000
@@ -762,7 +770,19 @@ class LiveAssistantController(QObject):
                 monotonic_ms=captured_ms,
                 wall_time=snapshot.captured_at.isoformat(),
             )
-            if self._live_token_is_current(token) and analysis is not None:
+            submit_for_analysis = True
+            if self.deduplicate_analysis_frames:
+                fingerprint = hashlib.blake2b(
+                    memoryview(snapshot.image),
+                    digest_size=16,
+                ).digest()
+                submit_for_analysis = fingerprint != last_analysis_fingerprint
+                last_analysis_fingerprint = fingerprint
+            if (
+                submit_for_analysis
+                and self._live_token_is_current(token)
+                and analysis is not None
+            ):
                 analysis.submit(
                     _AnalysisFrameTask(token, snapshot, capture_seq, captured_ms),
                     preserve=token.orchestrator.needs_first_action_frames,
@@ -770,7 +790,7 @@ class LiveAssistantController(QObject):
                 )
             return snapshot
 
-        worker = WorkerHandle(operation, 0.1)
+        worker = WorkerHandle(operation, self.capture_interval_sec)
         worker.frame_ready.connect(
             lambda value, current=token: self._accept_live_frame(current, value)
         )
@@ -1046,19 +1066,8 @@ class LiveAssistantController(QObject):
         deferred, self._deferred_source_close = self._deferred_source_close, None
         if deferred is not None:
             deferred.close()
-        if (
-            self._resume_requested
-            and (
-                token is None
-                or (
-                    self._live_token_is_current(token)
-                    and token.orchestrator.status == "running"
-                )
-            )
-            and self.orchestrator is not None
-            and self.orchestrator.status == "running"
-        ):
-            self._start_capture_worker()
+        if self._resume_requested:
+            self._resume_after_capture_stopped()
 
     def confirm_candidate(self, candidate_id: str) -> None:
         self._invoke(lambda value: value.confirm_candidate(candidate_id))
@@ -1104,12 +1113,58 @@ class LiveAssistantController(QObject):
     def resume(self) -> None:
         if self.orchestrator is None:
             return
-        self._invoke(
-            lambda value: value.resume(monotonic_ms=monotonic_ns() // 1_000_000)
-        )
+        # A persistent source pins one HWND and one client geometry.  After a
+        # move, resize, minimization, or target recreation it must never be
+        # reused under the old state token.
         self._resume_requested = True
-        if isinstance(self.orchestrator, LiveOrchestrator):
-            self._activate_live_token(self.orchestrator)
+        capture_stopped = self._stop_capture_worker()
+        self._stop_analysis_worker()
+        old_source, self._live_source = self._live_source, None
+        if old_source is not None:
+            if capture_stopped:
+                try:
+                    old_source.close()
+                except Exception as exc:
+                    self._resume_requested = False
+                    self.error.emit(f"关闭旧采集源失败：{exc}")
+                    return
+            else:
+                self._deferred_source_close = old_source
+        if capture_stopped:
+            self._resume_after_capture_stopped()
+
+    def _resume_after_capture_stopped(self) -> None:
+        """Open a fresh validated source before state or workers resume."""
+
+        if not self._resume_requested:
+            return
+        orchestrator = self.orchestrator
+        if orchestrator is None:
+            self._resume_requested = False
+            return
+        try:
+            source = self.capture_service.open_live_source(self.profile_name)
+        except Exception as exc:
+            self._resume_requested = False
+            self.error.emit(f"重新打开采集源失败：{exc}")
+            return
+        try:
+            update = orchestrator.resume(
+                monotonic_ms=monotonic_ns() // 1_000_000,
+            )
+        except Exception as exc:
+            try:
+                source.close()
+            except Exception:
+                pass
+            self._resume_requested = False
+            self.error.emit(f"恢复实时对局失败：{exc}")
+            return
+        self._live_source = source
+        self._resume_requested = False
+        self.update_ready.emit(update)
+        if isinstance(orchestrator, LiveOrchestrator):
+            self._activate_live_token(orchestrator)
         self._start_analysis_worker()
         self._start_capture_worker()
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Iterable, Mapping
 
+from .placement_projection import project_recorded_placements
 from ..live.truth_log import TruthInitialState, TruthLog, TruthTurn
 from ..live.turns import (
     TURN_ORDER,
@@ -9,6 +13,7 @@ from ..live.turns import (
     project_trick_turn,
     round_is_decided,
 )
+from ..storage import atomic_write_json
 
 
 def next_actor_after_prefix(
@@ -87,6 +92,196 @@ def validate_turn_actor_chain(log: TruthLog) -> None:
 
 
 @dataclass(frozen=True)
+class TruthScanDraftPaths:
+    """The only files a visual scan is allowed to publish."""
+
+    directory: Path
+    truth_log_path: Path
+    comparison_path: Path
+    metadata_path: Path
+
+
+def truth_scan_draft_paths(session: Path, scan_id: str) -> TruthScanDraftPaths:
+    """Return a stable isolated output directory for one visual scan."""
+
+    normalized = str(scan_id).strip()
+    if not normalized or Path(normalized).name != normalized:
+        raise ValueError("扫描草稿标识无效")
+    directory = Path(session) / "derived" / "truth_scan_drafts" / normalized
+    return TruthScanDraftPaths(
+        directory=directory,
+        truth_log_path=directory / "truth_log.json",
+        comparison_path=directory / "comparison.json",
+        metadata_path=directory / "manifest.json",
+    )
+
+
+def compare_truth_scan_draft(
+    canonical: TruthLog | None,
+    draft: TruthLog,
+    *,
+    recorded_events: Iterable[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    """Compare scan actions and read-only placement projections to canonical."""
+
+    events = tuple(recorded_events)
+    canonical_by_id = (
+        {turn.index: turn for turn in canonical.turns} if canonical is not None else {}
+    )
+    draft_by_id = {turn.index: turn for turn in draft.turns}
+    rows: list[dict[str, object]] = []
+    counts = {"identical": 0, "changed": 0, "canonical_only": 0, "draft_only": 0}
+    for turn_id in sorted(set(canonical_by_id) | set(draft_by_id)):
+        canonical_action = _turn_action_semantics(canonical_by_id.get(turn_id))
+        draft_action = _turn_action_semantics(draft_by_id.get(turn_id))
+        if canonical_action is None:
+            status = "draft_only"
+        elif draft_action is None:
+            status = "canonical_only"
+        elif canonical_action == draft_action:
+            status = "identical"
+        else:
+            status = "changed"
+        counts[status] += 1
+        rows.append(
+            {
+                "turn_id": turn_id,
+                "status": status,
+                "canonical": canonical_action,
+                "scan_draft": draft_action,
+            }
+        )
+
+    canonical_placements = (
+        _placement_semantics(project_recorded_placements(events, canonical.turns))
+        if canonical is not None
+        else []
+    )
+    draft_placements = _placement_semantics(
+        project_recorded_placements(events, draft.turns)
+    )
+    return {
+        "schema": "guandan.truth-scan-comparison/1",
+        "action_semantics": {"rows": rows, "counts": counts},
+        "ranking_projection": {
+            "read_only_source": "timeline.jsonl",
+            "canonical": canonical_placements,
+            "scan_draft": draft_placements,
+            "identical": canonical_placements == draft_placements,
+        },
+    }
+
+
+def write_truth_scan_draft_sidecars(
+    paths: TruthScanDraftPaths,
+    *,
+    session: Path,
+    scan_id: str,
+    canonical: TruthLog | None,
+    canonical_sha256: str | None,
+    draft: TruthLog,
+    recorded_events: Iterable[Mapping[str, object]] = (),
+    comparison_reference: TruthLog | None = None,
+    comparison_reference_sha256: str | None = None,
+    comparison_reference_path: str | None = None,
+) -> None:
+    """Write comparison metadata next to an already-saved isolated draft.
+
+    ``canonical`` remains the formal session ``truth_log.json``.  A caller
+    may additionally supply a previously staged draft as a read-only
+    comparison reference; this is deliberately metadata only and never
+    changes the session's canonical truth log.
+    """
+
+    paths.directory.mkdir(parents=True, exist_ok=True)
+    reference = canonical if canonical is not None else comparison_reference
+    comparison = compare_truth_scan_draft(
+        reference,
+        draft,
+        recorded_events=recorded_events,
+    )
+    atomic_write_json(paths.comparison_path, comparison)
+    draft_sha256 = hashlib.sha256(paths.truth_log_path.read_bytes()).hexdigest()
+    atomic_write_json(
+        paths.metadata_path,
+        {
+            "schema": "guandan.truth-scan-draft/1",
+            "scan_id": scan_id,
+            "mode": "isolated_scan_draft",
+            "session": Path(session).name,
+            "canonical": {
+                "path": "truth_log.json",
+                "sha256": canonical_sha256,
+                "available": canonical is not None,
+            },
+            "comparison_reference": {
+                "kind": (
+                    "canonical"
+                    if canonical is not None
+                    else "staged_draft"
+                    if comparison_reference is not None
+                    else None
+                ),
+                "path": (
+                    "truth_log.json"
+                    if canonical is not None
+                    else comparison_reference_path
+                ),
+                "sha256": (
+                    canonical_sha256
+                    if canonical is not None
+                    else comparison_reference_sha256
+                ),
+                "available": reference is not None,
+            },
+            "draft": {
+                "path": "truth_log.json",
+                "sha256": draft_sha256,
+                "turn_count": len(draft.turns),
+            },
+            "comparison": {"path": "comparison.json"},
+            "ranking_projection": {"read_only": True, "source": "timeline.jsonl"},
+            "write_scope": {
+                "allowed": [
+                    "truth_log.json",
+                    "comparison.json",
+                    "manifest.json",
+                    "visual_scan_receipt.json",
+                    "replay/",
+                ],
+                "forbidden_session_artifacts": [
+                    "timeline.jsonl",
+                    "advice.jsonl",
+                    "decisions.jsonl",
+                    "derived/fabledan",
+                ],
+            },
+        },
+    )
+
+
+def _turn_action_semantics(turn: TruthTurn | None) -> dict[str, object] | None:
+    if turn is None:
+        return None
+    return {
+        "actor": turn.actor,
+        "is_pass": turn.is_pass,
+        "cards": sorted(turn.cards),
+    }
+
+
+def _placement_semantics(projections: Iterable[object]) -> list[dict[str, object]]:
+    return [
+        {
+            "placement": projection.placement,
+            "actor": projection.actor,
+            "anchor_turn_id": projection.anchor_turn_id,
+        }
+        for projection in projections
+    ]
+
+
+@dataclass(frozen=True)
 class ReplayTurnDraftAppend:
     accepted: bool
     reason: str
@@ -105,6 +300,9 @@ class ReplayTurnDraftAssembler:
         self._row_by_source_turn_id = {
             turn.index: row for row, turn in enumerate(baseline.turns)
         }
+        self._next_source_turn_id = (
+            max(self._source_turn_ids) + 1 if self._source_turn_ids else None
+        )
         # A pre-existing baseline is rare for scans, but validate it once so
         # an unsafe scan cannot silently extend a broken actor sequence.
         self._next_actor = next_actor_after_prefix(
@@ -126,8 +324,11 @@ class ReplayTurnDraftAssembler:
         )
 
     def append(self, raw: dict[str, object]) -> ReplayTurnDraftAppend:
-        if str(raw.get("kind", "action")) == "suit_corrected":
+        kind = str(raw.get("kind", "action"))
+        if kind == "suit_corrected":
             return self.apply_suit_correction(raw)
+        if kind == "event_correction":
+            return self.apply_event_correction(raw)
         try:
             source_turn_id = int(raw.get("turn_id", 0) or 0)
             frame_index = (
@@ -154,6 +355,14 @@ class ReplayTurnDraftAssembler:
             return self._rejected("缺少有效 turn_id")
         if source_turn_id in self._source_turn_ids:
             return self._rejected("该回合已确认")
+        if (
+            self._next_source_turn_id is not None
+            and source_turn_id != self._next_source_turn_id
+        ):
+            return self._rejected(
+                f"来源 turn_id 不连续：应为 {self._next_source_turn_id}，"
+                f"实际为 {source_turn_id}"
+            )
         if actor not in TURN_ORDER:
             return self._rejected(f"回合 {source_turn_id} 的 actor 无效")
         if self._next_actor is None:
@@ -174,9 +383,12 @@ class ReplayTurnDraftAssembler:
             () if is_pass else cards,
             frame_index=frame_index,
             trick_id=trick_id,
+            label_status=self._baseline.label_status,
+            provenance=self._baseline.provenance,
         )
         self._turns.append(turn)
         self._source_turn_ids.add(source_turn_id)
+        self._next_source_turn_id = source_turn_id + 1
         self._row_by_source_turn_id[source_turn_id] = len(self._turns) - 1
         try:
             self._next_actor = next_actor_after_prefix(
@@ -188,6 +400,7 @@ class ReplayTurnDraftAssembler:
             # leave a half-appended row that shifts every later recognition.
             self._turns.pop()
             self._source_turn_ids.remove(source_turn_id)
+            self._next_source_turn_id = source_turn_id
             self._row_by_source_turn_id.pop(source_turn_id, None)
             self._next_actor = next_actor_after_prefix(
                 self._baseline.initial_state,
@@ -235,6 +448,43 @@ class ReplayTurnDraftAssembler:
             corrected,
             self.truth_log,
             "花色修正已回填",
+        )
+
+    def apply_event_correction(self, raw: dict[str, object]) -> ReplayTurnDraftAppend:
+        """Replace a streamed action with the reducer's effective correction."""
+
+        try:
+            source_turn_id = int(raw.get("target_turn_id", 0) or 0)
+        except (TypeError, ValueError):
+            return self._rejected("动作修正缺少有效目标回合")
+        row = self._row_by_source_turn_id.get(source_turn_id)
+        if row is None:
+            return self._rejected(f"动作修正找不到第 {source_turn_id} 手原动作")
+        original = self._turns[row]
+        actor = str(raw.get("actor", original.actor))
+        is_pass = bool(raw.get("recognized_pass", raw.get("is_pass", False)))
+        cards = tuple(
+            str(card)
+            for card in (raw.get("recognized_cards", raw.get("cards", ())) or ())
+        )
+        if actor != original.actor:
+            return self._rejected("动作修正玩家与原动作不一致")
+        if is_pass and cards:
+            return self._rejected("动作修正的不出动作不能带牌")
+        if not is_pass and not cards:
+            return self._rejected("动作修正的出牌动作缺少牌面")
+        corrected = replace(
+            original,
+            is_pass=is_pass,
+            cards=() if is_pass else cards,
+        )
+        self._turns[row] = corrected
+        return ReplayTurnDraftAppend(
+            True,
+            "",
+            corrected,
+            self.truth_log,
+            "动作修正已回填",
         )
 
     def _rejected(self, reason: str) -> ReplayTurnDraftAppend:

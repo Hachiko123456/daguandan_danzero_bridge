@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -287,10 +288,7 @@ def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
     page = ReplayPage(session.parent)
     page.select_session(session)
     baseline = page._truth_log_for_video_scan()
-    page._truth_scan_base = baseline
-    page._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
-    page.truth_log = baseline
-    page._show_truth_log_editor()
+    page._begin_truth_scan(baseline)
 
     page._collect_truth_scan_turn(
         {
@@ -304,6 +302,7 @@ def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
     )
     editor = page._truth_editor
     assert editor is not None
+    assert editor.isEnabled() is False
     assert editor.table.rowCount() == 1
     assert editor.table.columnCount() == 5
     assert editor._frame_scan_provider == page._frames_after_current
@@ -319,7 +318,9 @@ def test_streamed_truth_rows_update_unsaved_editor_draft(tmp_path):
         }
     )
     assert editor.table.rowCount() == 2
-    assert [turn.actor for turn in page.truth_log.turns] == ["self", "right"]
+    assert page.truth_log is not None
+    assert page.truth_log.turns == ()
+    assert [turn.actor for turn in page._truth_scan_log.turns] == ["self", "right"]
     assert not (session / "truth_log.json").exists()
     page.shutdown()
     page.close()
@@ -340,10 +341,7 @@ def test_streamed_suit_correction_replaces_draft_row_without_overwriting_saved_l
     page = ReplayPage(session.parent)
     page.select_session(session)
     baseline = page._truth_log_for_video_scan()
-    page._truth_scan_base = baseline
-    page._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
-    page.truth_log = baseline
-    page._show_truth_log_editor()
+    page._begin_truth_scan(baseline)
 
     page._collect_truth_scan_turn(
         {
@@ -365,8 +363,126 @@ def test_streamed_suit_correction_replaces_draft_row_without_overwriting_saved_l
 
     assert page._truth_editor is not None
     assert page._truth_editor.table.rowCount() == 1
-    assert page.truth_log.turns[0].cards == ("JD",)
+    assert page.truth_log is not None
+    assert page.truth_log.turns == ()
+    assert page._truth_scan_log.turns[0].cards == ("JD",)
     assert truth_path.read_bytes() == source_bytes
+    page.shutdown()
+    page.close()
+
+
+def test_streamed_event_correction_replaces_draft_row_without_overwriting_saved_log(tmp_path):
+    _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    truth_path = session / "truth_log.json"
+    save_truth_log(
+        truth_path,
+        TruthLog(
+            "game-test",
+            TruthInitialState(
+                "2",
+                "self",
+                tuple(
+                    f"{rank}{suit}"
+                    for rank in ("2", "3", "4", "5", "6", "7")
+                    for suit in "SHCD"
+                )
+                + ("8S", "8H", "8C"),
+            ),
+            (),
+        ),
+    )
+    source_bytes = truth_path.read_bytes()
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._begin_truth_scan(page._truth_log_for_video_scan())
+
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 1,
+            "actor": "self",
+            "recognized_pass": False,
+            "recognized_cards": ["A?", "K?"],
+        }
+    )
+    page._collect_truth_scan_turn(
+        {
+            "kind": "event_correction",
+            "target_turn_id": 1,
+            "actor": "self",
+            "recognized_pass": False,
+            "recognized_cards": ["AC", "AS", "KC", "KS", "QD", "QS"],
+        }
+    )
+
+    assert page.truth_log is not None
+    assert page.truth_log.turns == ()
+    assert page._truth_scan_log is not None
+    assert page._truth_scan_log.turns[0].cards == (
+        "AC", "AS", "KC", "KS", "QD", "QS"
+    )
+    assert truth_path.read_bytes() == source_bytes
+    page.shutdown()
+    page.close()
+
+
+def test_scan_stays_in_memory_until_explicit_save_writes_canonical_truth(
+    tmp_path,
+):
+    _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("2", "3", "4", "5", "6", "7")
+        for suit in "SHCD"
+    ) + ("8S", "8H", "8C")
+    canonical = TruthLog(
+        "game-test",
+        TruthInitialState("2", "self", hand),
+        (),
+    )
+    canonical_path = session / "truth_log.json"
+    save_truth_log(canonical_path, canonical)
+    canonical_before = canonical_path.read_bytes()
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._begin_truth_scan(page._truth_log_for_video_scan())
+
+    editor = page._truth_editor
+    assert editor is not None
+    assert editor.save_button.text() == "保存日志"
+    assert editor.isEnabled() is False
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 1,
+            "actor": "self",
+            "recognized_pass": False,
+            "recognized_cards": ["2S"],
+        }
+    )
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 2,
+            "actor": "right",
+            "recognized_pass": True,
+            "recognized_cards": [],
+        }
+    )
+
+    assert canonical_path.read_bytes() == canonical_before
+    page._truth_scan_completed(None)
+
+    assert canonical_path.read_bytes() == canonical_before
+    assert page._truth_scan_log is not None
+    assert [turn.actor for turn in page._truth_scan_log.turns] == ["self", "right"]
+    assert editor.isEnabled() is True
+    assert "可编辑并点击『保存日志』" in page.truth_scan_status.text()
+
+    editor._save()
+
+    assert canonical_path.read_bytes() != canonical_before
+    saved = replay_page_module.load_truth_log(canonical_path, session_id="game-test")
+    assert [turn.actor for turn in saved.turns] == ["self", "right"]
     page.shutdown()
     page.close()
 
@@ -381,7 +497,7 @@ def test_replay_page_reuses_existing_button_for_trusted_advisor_mode(tmp_path):
     page.replay_mode_combo.setCurrentIndex(trusted_index)
     app.processEvents()
 
-    assert page.truth_replay_button.text() == "开始实时助手测试"
+    assert page.truth_replay_button.text() == "助手复测"
     page.shutdown()
     page.close()
 
@@ -455,6 +571,199 @@ def test_replay_page_prefills_truth_log_for_editor(tmp_path):
     page.close()
 
 
+def test_session_lead_confirmation_builds_opposite_scan_baseline_and_keeps_turn_one(
+    tmp_path,
+):
+    _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    timeline_path = session / "timeline.jsonl"
+    initial = json.loads(timeline_path.read_text("utf-8"))
+    initial["actor"] = None
+    initial["payload"]["lead_player"] = None
+    confirmed = {
+        **initial,
+        "event_id": "EVT-000002",
+        "event_type": "lead_player_confirmed",
+        "seq": 2,
+        "actor": "opposite",
+        "payload": {"lead_player": "opposite"},
+        "state_revision_before": 1,
+        "state_revision_after": 2,
+    }
+    timeline_path.write_text(
+        "\n".join(
+            json.dumps(item, ensure_ascii=False)
+            for item in (initial, confirmed)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+
+    assert page.truth_log is not None
+    assert page.truth_log.initial_state.lead_player == "opposite"
+    baseline = page._truth_log_for_video_scan()
+    assert baseline.initial_state.lead_player == "opposite"
+    page._begin_truth_scan(baseline)
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 1,
+            "actor": "opposite",
+            "recognized_pass": False,
+            "recognized_cards": ["2S"],
+        }
+    )
+
+    assert page._truth_scan_failure is None
+    assert page._truth_scan_log is not None
+    assert [(turn.index, turn.actor, turn.cards) for turn in page._truth_scan_log.turns] == [
+        (1, "opposite", ("2S",)),
+    ]
+    page.shutdown()
+    page.close()
+
+
+def test_rejected_or_out_of_sequence_streamed_action_marks_scan_failed_without_saving(
+    tmp_path,
+):
+    _app()
+    session = _recorded_session(tmp_path, with_initial=True)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._begin_truth_scan(page._truth_log_for_video_scan())
+    editor = page._truth_editor
+    assert editor is not None and editor.isEnabled() is False
+
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 2,
+            "actor": "right",
+            "recognized_pass": False,
+            "recognized_cards": ["2S"],
+        }
+    )
+
+    assert page._truth_scan_failure is not None
+    assert "turn_id 不连续" in page._truth_scan_failure
+    assert "扫描失败" in page.truth_scan_status.text()
+    assert editor.isEnabled() is True
+    assert not (session / "truth_log.json").exists()
+    page.shutdown()
+    page.close()
+
+
+def test_scan_completion_and_failure_emit_page_level_infobars(tmp_path, monkeypatch):
+    _app()
+    calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        replay_page_module.InfoBar,
+        "success",
+        lambda **kwargs: calls.append(("success", kwargs)),
+    )
+    monkeypatch.setattr(
+        replay_page_module.InfoBar,
+        "error",
+        lambda **kwargs: calls.append(("error", kwargs)),
+    )
+    session = _recorded_session(tmp_path, with_initial=True)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._begin_truth_scan(page._truth_log_for_video_scan())
+    page._collect_truth_scan_turn(
+        {
+            "turn_id": 1,
+            "actor": "self",
+            "recognized_pass": False,
+            "recognized_cards": ["2S"],
+        }
+    )
+    page._truth_scan_completed(None)
+
+    assert calls[0][0] == "success"
+    assert calls[0][1]["title"] == "扫描完成"
+    assert "可编辑并点击『保存日志』" in str(calls[0][1]["content"])
+    assert calls[0][1]["parent"] is page
+
+    page._fail_truth_scan("第 2 手被拒绝")
+
+    assert calls[1][0] == "error"
+    assert calls[1][1]["title"] == "扫描失败"
+    assert "未保存" in str(calls[1][1]["content"])
+    assert calls[1][1]["parent"] is page
+    page.shutdown()
+    page.close()
+
+
+def test_truth_scan_progress_bar_tracks_worker_progress_and_completion(
+    tmp_path, monkeypatch
+):
+    _app()
+    monkeypatch.setattr(replay_page_module.InfoBar, "success", lambda **_kwargs: None)
+    session = _recorded_session(tmp_path, with_initial=True)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._begin_truth_scan(page._truth_log_for_video_scan())
+
+    assert page.truth_scan_progress.isHidden() is False
+    assert page.truth_scan_progress.isEnabled()
+    assert page.truth_scan_progress.value() == 0
+
+    page._truth_scan_progress_changed(720, 1568, 719)
+
+    assert page.truth_scan_progress.maximum() == 1568
+    assert page.truth_scan_progress.value() == 720
+    assert page.truth_scan_status.text() == "扫描中：720/1568 帧（46%）"
+
+    page._truth_scan_completed(type("ReplayResult", (), {"frame_count": 1568})())
+
+    assert page.truth_scan_progress.isHidden() is False
+    assert page.truth_scan_progress.isEnabled() is False
+    assert page.truth_scan_progress.value() == 1568
+    assert "扫描完成" in page.truth_scan_status.text()
+    page.shutdown()
+    page.close()
+
+
+def test_truth_scan_progress_resets_after_partial_completion_and_ignores_stale_session(
+    tmp_path, monkeypatch
+):
+    _app()
+    monkeypatch.setattr(replay_page_module.InfoBar, "error", lambda **_kwargs: None)
+    session = _recorded_session(tmp_path, with_initial=True)
+    page = ReplayPage(session.parent)
+    page.select_session(session)
+    page._begin_truth_scan(page._truth_log_for_video_scan())
+    page._truth_scan_progress_changed(720, 1568, 719)
+
+    page._truth_scan_completed(type("ReplayResult", (), {"frame_count": 720})())
+
+    assert page.truth_scan_progress.isHidden()
+    assert page.truth_scan_progress.isEnabled() is False
+    assert page.truth_scan_progress.value() == 0
+    assert "扫描失败" in page.truth_scan_status.text()
+
+    page.select_session(session)
+    page._truth_scan_progress_changed(1568, 1568, 1567)
+
+    assert page.truth_scan_progress.isHidden()
+    assert page.truth_scan_status.text() == "扫描：未开始"
+    page.shutdown()
+    page.close()
+
+
+def test_replay_page_uses_short_scan_and_replay_action_labels(tmp_path):
+    _app()
+    page = ReplayPage(tmp_path / "sessions")
+
+    assert page.visual_replay_button.text() == "扫描出牌"
+    assert page.truth_edit_button.text() == "编辑日志"
+    assert page.state_replay_button.text() == "状态重放"
+    assert page.truth_replay_button.text() == "复测"
+    page.shutdown()
+    page.close()
+
+
 def test_replay_page_turns_confirmed_frame_scan_into_editable_truth_log(tmp_path):
     app = _app()
     session = _recorded_session(tmp_path, with_initial=True)
@@ -483,7 +792,7 @@ def test_replay_page_turns_confirmed_frame_scan_into_editable_truth_log(tmp_path
     )
     app.processEvents()
 
-    assert "逐帧分析" in page.visual_replay_button.text()
+    assert page.visual_replay_button.text() == "扫描出牌"
     assert page.visual_replay_button.parentWidget() is page.diagnostics_stack.widget(0)
     assert [(turn.actor, turn.is_pass, turn.cards, turn.frame_index) for turn in generated.turns] == [
         ("self", False, ("7S", "7H"), 12),
@@ -494,13 +803,14 @@ def test_replay_page_turns_confirmed_frame_scan_into_editable_truth_log(tmp_path
     page.close()
 
 
-def test_replay_page_opens_editor_with_unsaved_frame_scan_draft(tmp_path):
+def test_replay_page_opens_editor_with_unsaved_frame_scan(tmp_path):
     app = _app()
     session = _recorded_session(tmp_path, with_initial=True)
     page = ReplayPage(session.parent)
     page.select_session(session)
     assert page.truth_log is not None
-    page._truth_scan_base = page.truth_log
+    baseline = page._truth_log_for_video_scan()
+    page._begin_truth_scan(baseline)
 
     page._collect_truth_scan_turn(
         {
@@ -517,9 +827,12 @@ def test_replay_page_opens_editor_with_unsaved_frame_scan_draft(tmp_path):
     editor = page.truth_editor_host.itemAt(0).widget()
     assert page.truth_log is not None
     assert page.truth_log.turns[0].frame_index == 12
+    assert page._truth_scan_log is not None
+    assert page._truth_scan_log.turns[0].frame_index == 12
     assert page.diagnostics_stack.currentIndex() == 1
     assert editor.table.rowCount() == 1
-    assert "待校验" in page.truth_status.text()
+    assert editor.isEnabled() is True
+    assert "未保存" in page.truth_status.text()
     page.shutdown()
     page.close()
 

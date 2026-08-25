@@ -390,14 +390,21 @@ def test_video_visual_replay_runs_live_pipeline_and_compares_turns(tmp_path):
                 source="scripted-replay",
             )
 
+    progress: list[tuple[int, int, int]] = []
     result = replay_video_through_live_pipeline(
         session_store.directory,
         ScriptedRecognition(),
         use_live_pipeline=True,
         sample_every_frame=True,
+        on_progress=lambda processed, total, frame_index: progress.append(
+            (processed, total, frame_index)
+        ),
     )
 
     assert result.frame_count == 15
+    assert progress[0] == (0, 15, 0)
+    assert progress[-1] == (15, 15, 14)
+    assert [item[0] for item in progress] == list(range(16))
     assert result.comparison.identical_turn_ids == (1,)
     assert result.comparison.missing == ()
     assert result.comparison.changed == ()
@@ -411,6 +418,64 @@ def test_video_visual_replay_runs_live_pipeline_and_compares_turns(tmp_path):
         for row in rows
         for event in row.get("events", ())
     )
+
+
+def test_visual_replay_can_run_production_advisor_and_preserve_runtime_logs(tmp_path):
+    store = LiveSessionStore(tmp_path, "profile", session_id="visual-advisor")
+    store.start({"target_fps": 10})
+    reducer = LiveReducer("visual-advisor")
+    initial = reducer.confirm_initial_state(
+        round_level="2",
+        hand=HAND,
+        lead_player="self",
+    )
+    store.append_event(initial)
+    recorder = SessionRecorder(store.directory, size=(64, 32), fps=10)
+    for index in range(5):
+        recorder.write_frame(np.zeros((32, 64, 3), np.uint8), index * 100, f"t{index}")
+    recording = recorder.close()
+    store.seal(frame_count=recording.frame_count, dropped_frames=recording.dropped_frames)
+
+    class Recognition:
+        def recognize(self, _frame):
+            return type("Opening", (), {"round_level": "2", "my_hand": HAND})()
+
+        def recognize_opening_signal(self, _frame):
+            return OpeningSignal(
+                super_double_visible=False,
+                marker_player="self",
+                active_player="self",
+                self_action_buttons_visible=True,
+            )
+
+        def recognize_fast_signals(self, _frame, expected_player):
+            return FastSignalResult(
+                expected_player=expected_player,
+                active_player="self",
+                pass_visible=False,
+                self_action_buttons_visible=True,
+                effect_visible=False,
+            )
+
+    output = tmp_path / "audit-output"
+    result = replay_video_through_live_pipeline(
+        store.directory,
+        Recognition(),
+        use_live_pipeline=True,
+        output_root=output,
+        advisor=TrustedReplayAdvisor(),
+        advice_timeout_sec=2.0,
+    )
+
+    assert result.completed is True
+    assert result.advice_requested == 1
+    assert result.advice_ready == 1
+    assert result.advice_failed == 0
+    assert result.run_directory == output / "runtime"
+    assert result.artifact_paths["timeline.jsonl"].is_file()
+    assert result.artifact_paths["advice.jsonl"].is_file()
+    assert result.artifact_paths["decisions.jsonl"].is_file()
+    assert result.artifact_paths["recognition_trace.jsonl"].is_file()
 
 
 def test_truth_log_video_replay_uses_manual_baseline(tmp_path):

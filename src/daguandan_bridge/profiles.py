@@ -170,7 +170,9 @@ class ProfileConfig:
             raise ProfileConfigError("aspect_ratio_tolerance 必须在 0 到 0.25 之间")
         backend = str(self.capture_backend).strip().lower()
         if backend not in {"auto", "printwindow", "screen", "gdi_screen"}:
-            raise ProfileConfigError("capture_backend 只能是 auto、printwindow 或 screen")
+            raise ProfileConfigError(
+                "capture_backend 只能是 auto、printwindow、screen 或 gdi_screen"
+            )
         viewport_mode = str(self.viewport_mode).strip().lower()
         if viewport_mode not in {"full", "bottom_aspect"}:
             raise ProfileConfigError(

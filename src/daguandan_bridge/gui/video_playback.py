@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QGridLayout, QWidget
+from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QWidget
 from qfluentwidgets import BodyLabel, ComboBox, PrimaryPushButton, PushButton, SpinBox
 
 from ..live.replay import VideoReplaySource
@@ -37,8 +37,11 @@ class SessionPlaybackToolbar(QWidget):
         self._layout.setVerticalSpacing(6)
         self._compact_layout: bool | None = None
 
+        self.previous_button = PushButton("上一帧")
         self.play_button = PrimaryPushButton("播放")
         self.step_button = PushButton("下一帧")
+        self.more_button = PushButton("更多")
+        self.more_button.setCheckable(True)
         self.rewind_button = PushButton("后退 5 秒")
         self.forward_button = PushButton("前进 5 秒")
         self.frame_spin = SpinBox(self)
@@ -63,9 +66,23 @@ class SessionPlaybackToolbar(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
 
+        self.advanced_panel = QWidget(self)
+        advanced = QHBoxLayout(self.advanced_panel)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        advanced.setSpacing(8)
+        if not self._overlay_seek:
+            advanced.addWidget(self.rewind_button)
+            advanced.addWidget(self.forward_button)
+            advanced.addWidget(self.frame_spin, 1)
+            advanced.addWidget(self.frame_jump_button)
+            advanced.addWidget(self.speed_combo)
+        self.advanced_panel.hide()
+
         for control in (
+            self.previous_button,
             self.play_button,
             self.step_button,
+            self.more_button,
             self.rewind_button,
             self.forward_button,
             self.frame_spin,
@@ -74,7 +91,9 @@ class SessionPlaybackToolbar(QWidget):
         ):
             control.setMinimumHeight(34)
         self.play_button.setMinimumWidth(88)
+        self.previous_button.setMinimumWidth(76)
         self.step_button.setMinimumWidth(76)
+        self.more_button.setMinimumWidth(72)
         self.rewind_button.setMinimumWidth(96)
         self.forward_button.setMinimumWidth(96)
         self.frame_jump_button.setMinimumWidth(72)
@@ -82,8 +101,12 @@ class SessionPlaybackToolbar(QWidget):
 
         self._arrange_controls(compact=True)
 
+        self.previous_button.clicked.connect(
+            lambda: self.seek_requested.emit(max(0, self.frame_spin.value() - 1))
+        )
         self.play_button.clicked.connect(self.play_pause_requested)
         self.step_button.clicked.connect(self.step_requested)
+        self.more_button.toggled.connect(self._set_advanced_visible)
         self.rewind_button.clicked.connect(
             lambda: self.seek_seconds_requested.emit(-5.0)
         )
@@ -101,6 +124,12 @@ class SessionPlaybackToolbar(QWidget):
                 float(self.speed_combo.currentData() or 1.0)
             )
         )
+
+    def _set_advanced_visible(self, visible: bool) -> None:
+        if self._overlay_seek:
+            return
+        self.advanced_panel.setVisible(bool(visible))
+        self.more_button.setText("收起" if visible else "更多")
 
     def set_playing(self, playing: bool) -> None:
         self.play_button.setText("暂停" if playing else "播放")
@@ -126,40 +155,28 @@ class SessionPlaybackToolbar(QWidget):
             return
         self._compact_layout = compact
         for widget in (
+            self.previous_button,
             self.play_button,
             self.step_button,
-            self.rewind_button,
-            self.forward_button,
-            self.frame_spin,
-            self.frame_jump_button,
-            self.speed_combo,
+            self.more_button,
+            self.advanced_panel,
             self.frame_status,
         ):
             self._layout.removeWidget(widget)
         for column in range(5):
             self._layout.setColumnStretch(column, 0)
         if not self._overlay_seek:
-            if compact:
-                self._layout.addWidget(self.play_button, 0, 0)
-                self._layout.addWidget(self.step_button, 0, 1)
-                self._layout.addWidget(self.speed_combo, 0, 2)
-                self._layout.addWidget(self.rewind_button, 1, 0)
-                self._layout.addWidget(self.forward_button, 1, 1)
-                self._layout.addWidget(self.frame_spin, 2, 0, 1, 2)
-                self._layout.addWidget(self.frame_jump_button, 2, 2)
-                self._layout.addWidget(self.frame_status, 2, 3)
-                self._layout.setColumnStretch(3, 1)
-                return
-            self._layout.addWidget(self.play_button, 0, 0)
-            self._layout.addWidget(self.step_button, 0, 1)
-            self._layout.addWidget(self.rewind_button, 0, 2)
-            self._layout.addWidget(self.forward_button, 0, 3)
-            self._layout.addWidget(self.speed_combo, 0, 4)
-            self._layout.addWidget(self.frame_spin, 1, 0, 1, 2)
-            self._layout.addWidget(self.frame_jump_button, 1, 2)
-            self._layout.addWidget(self.frame_status, 1, 3, 1, 2)
-            self._layout.setColumnStretch(3, 1)
+            self._layout.addWidget(self.previous_button, 0, 0)
+            self._layout.addWidget(self.play_button, 0, 1)
+            self._layout.addWidget(self.step_button, 0, 2)
+            self._layout.addWidget(self.more_button, 0, 3)
+            self._layout.addWidget(self.frame_status, 0, 4)
+            self._layout.addWidget(self.advanced_panel, 1, 0, 1, 5)
+            self._layout.setColumnStretch(4, 1)
             return
+        self.previous_button.hide()
+        self.more_button.hide()
+        self.advanced_panel.hide()
         if compact:
             self._layout.addWidget(self.play_button, 0, 0)
             self._layout.addWidget(self.step_button, 0, 1)

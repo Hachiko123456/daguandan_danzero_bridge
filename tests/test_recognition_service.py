@@ -13,6 +13,7 @@ from daguandan_bridge.config import PROFILES_ROOT
 from daguandan_bridge.image_io import read_image_unicode
 from daguandan_bridge.live.card_uncertainty import normalized_suit_options
 from daguandan_bridge.live.consensus import BurstConsensus, ConsensusContext
+from daguandan_bridge.live.suit_correction import SuitCorrectionTracker
 from daguandan_bridge.models import Box
 from daguandan_bridge.recognition_service import (
     OpeningSignal,
@@ -487,6 +488,73 @@ def test_latest_first_play_recovers_clear_black_suits_and_keeps_occluded_rank():
     single_frame = service.recognize(frame, allow_unknown_suit=True)
     left_event = next(event for event in single_frame.events if event.player == "left")
     assert left_event.cards == ("3H", "3S", "4D", "4S", "5?", "7H")
+
+
+def test_latest_7777_button_occlusion_remains_candidate_compatible():
+    session = (
+        PROFILE_ROOT
+        / "sessions"
+        / "game_20260825_155452_7d2eb3"
+    )
+    video_path = session / "video" / "game.avi"
+    if not session.is_dir() or not video_path.is_file():
+        pytest.skip(f"缺少 7777 回归 session/录像：{video_path}")
+
+    capture = cv2.VideoCapture(str(video_path))
+    frames: dict[int, np.ndarray] = {}
+    try:
+        for frame_index in (1158, 1168):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            assert ok, f"无法解码 7777 回归帧：{frame_index}"
+            frames[frame_index] = frame
+    finally:
+        capture.release()
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    exact = service.recognize_play_region(
+        frames[1158],
+        "right",
+        wild_rank="9",
+        allow_unknown_suit=True,
+        allow_pass=False,
+    )
+    occluded = service.recognize_play_region(
+        frames[1168],
+        "right",
+        wild_rank="9",
+        allow_unknown_suit=True,
+        allow_pass=False,
+    )
+
+    assert exact.cards == ("7H", "7D", "7D", "7C")
+    assert exact.suit_options == (("H",), ("D",), ("D",), ("C",))
+    assert occluded.cards == ("7?", "7D", "7D", "7C")
+    assert occluded.suit_options == (("H", "D"), ("D",), ("D",), ("C",))
+
+    tracker = SuitCorrectionTracker()
+    first = tracker.observe_visual_action(
+        "latest-7777",
+        exact.cards,
+        occluded.cards,
+        occluded.suit_options,
+    )
+    second = tracker.observe_visual_action(
+        "latest-7777",
+        exact.cards,
+        occluded.cards,
+        occluded.suit_options,
+    )
+
+    assert first.cards == tuple(sorted(exact.cards))
+    assert first.evidence_kind == "compatible"
+    assert not first.confirmed
+    assert second.confirmed
+    assert second.cards == tuple(sorted(exact.cards))
+    assert second.evidence_kind == "compatible"
 
 
 def test_latest_final_screen_recognizes_bottom_end_control():

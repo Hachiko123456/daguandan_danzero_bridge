@@ -23,7 +23,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="运行固定的 FableDan 无进贡基准评测，然后写入模型目录。",
     )
+    parser.add_argument(
+        "--simulated-game-window-config",
+        type=Path,
+        help="使用 JSON 配置启动第三阶段可见模拟游戏窗口。",
+    )
+    parser.add_argument(
+        "--window-e2e-validation-config",
+        type=Path,
+        help="使用 JSON 配置运行第三阶段窗口端到端验证。",
+    )
     args = parser.parse_args(argv)
+    selected_modes = sum(
+        (
+            bool(args.fabledan_fixed_benchmark),
+            args.simulated_game_window_config is not None,
+            args.window_e2e_validation_config is not None,
+        )
+    )
+    if selected_modes > 1:
+        parser.error("基准、模拟窗口和窗口 E2E 验证模式不能同时启用")
     if args.fabledan_fixed_benchmark:
         from daguandan_bridge.application.fabledan_benchmark import (
             FableDanBenchmarkService,
@@ -39,6 +58,18 @@ def main(argv: list[str] | None = None) -> int:
             "无法启用 Windows Per-Monitor DPI 感知："
             f"当前状态 {dpi_status.awareness}，方法 {dpi_status.method}"
         )
+    if args.simulated_game_window_config is not None:
+        from daguandan_bridge.application.simulated_game_window import (
+            run_simulated_game_window,
+        )
+
+        return int(run_simulated_game_window(args.simulated_game_window_config))
+    if args.window_e2e_validation_config is not None:
+        from daguandan_bridge.application.window_e2e_validation import (
+            run_window_e2e_validation,
+        )
+
+        return int(run_window_e2e_validation(args.window_e2e_validation_config))
     from daguandan_bridge.gui.app import main as gui_main
 
     return int(gui_main(argv))

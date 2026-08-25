@@ -377,6 +377,113 @@ def test_selected_row_recognition_atomically_replaces_only_that_row(tmp_path):
     assert replaced.uncertainty == ("unknown_suit",)
 
 
+def test_selected_inserted_row_targets_its_chosen_player_without_global_scan(tmp_path):
+    _app()
+    full_screen = _fake_result(
+        events=(
+            RecognizedEvent("self", (), True, 0.9, "full"),
+            RecognizedEvent("right", (), True, 0.9, "full"),
+            RecognizedEvent("opposite", (), True, 0.9, "full"),
+        )
+    )
+    recognition = _FakeRecognition(
+        full_screen,
+        region_result=PlayRegionResult(
+            player="left",
+            cards=(),
+            is_pass=True,
+            confidence=0.93,
+            diagnostics=(),
+            annotations=(),
+            source="left-pass",
+        ),
+    )
+    editor = TruthLogEditor(
+        tmp_path,
+        _log(),
+        frame_provider=lambda: (71, np.zeros((32, 64, 3), np.uint8)),
+        recognition_service=recognition,
+    )
+    editor._append_row(TruthTurn(1, "self", True, ()))
+    editor._append_row(TruthTurn(2, "right", True, ()))
+    editor.table.selectRow(1)
+    editor.insert_row()
+
+    inserted = editor.table.cellWidget(1, 1)
+    assert inserted.isEnabled()
+    inserted.setCurrentIndex(inserted.findData("left"))
+
+    editor._recognize_frame()
+
+    assert recognition.calls == [("region", "left", "2")]
+    assert editor.table.rowCount() == 3
+    assert editor.table.cellWidget(1, 1).currentData() == "left"
+    assert editor._is_pass_from_row(1)
+    assert "玩家链冲突" in editor.recognition_hint.text()
+    assert "保存前请修正" in editor.recognition_hint.text()
+    with pytest.raises(ValueError, match="玩家顺序错误"):
+        editor._build_log()
+
+
+def test_selected_row_with_empty_roi_does_not_fall_back_to_global_scan(tmp_path):
+    _app()
+    recognition = _FakeRecognition(
+        _fake_result(
+            events=(RecognizedEvent("left", ("6S",), False, 0.95, "full"),)
+        )
+    )
+    editor = TruthLogEditor(
+        tmp_path,
+        _log(),
+        frame_provider=lambda: (72, np.zeros((32, 64, 3), np.uint8)),
+        recognition_service=recognition,
+    )
+    editor.add_row()
+    player = editor.table.cellWidget(0, 1)
+    player.setCurrentIndex(player.findData("left"))
+    editor.table.selectRow(0)
+
+    editor._recognize_frame()
+
+    assert recognition.calls == [("region", "left", "2")]
+    assert editor.table.cellWidget(0, 1).currentData() == "left"
+    assert not editor._is_pass_from_row(0)
+    assert editor._cards_from_row(0) == ()
+    assert "左家区域未识别到动作" in editor.recognition_hint.text()
+
+
+def test_selected_row_rejects_a_region_result_for_another_player(tmp_path):
+    _app()
+    recognition = _FakeRecognition(
+        _fake_result(),
+        region_result=PlayRegionResult(
+            player="right",
+            cards=(),
+            is_pass=True,
+            confidence=0.93,
+            diagnostics=(),
+            annotations=(),
+            source="wrong-seat",
+        ),
+    )
+    editor = TruthLogEditor(
+        tmp_path,
+        _log(),
+        frame_provider=lambda: (73, np.zeros((32, 64, 3), np.uint8)),
+        recognition_service=recognition,
+    )
+    editor.add_row()
+    player = editor.table.cellWidget(0, 1)
+    player.setCurrentIndex(player.findData("left"))
+    editor.table.selectRow(0)
+
+    editor._recognize_frame()
+
+    assert recognition.calls == [("region", "left", "2")]
+    assert not editor._is_pass_from_row(0)
+    assert "选中行玩家不一致" in editor.recognition_hint.text()
+
+
 def test_selected_recognition_writes_current_row_and_flags_unfixed_next_row(tmp_path):
     _app()
     log = TruthLog(
@@ -429,22 +536,22 @@ def test_selected_recognition_handles_finished_leader_wind_before_flagging_stale
         (
             TruthTurn(1, "right", False, ("3S",) * 27),
             TruthTurn(2, "opposite", True, ()),
-            TruthTurn(3, "self", False, ("4H",)),
+            TruthTurn(3, "left", False, ("4H",)),
             # This was valid before the selected row became a PASS.  After
-            # the correction, right's partner left catches the wind instead.
+            # the correction, self must still respond before a new trick.
             TruthTurn(4, "opposite", True, ()),
         ),
     )
     fake = _FakeRecognition(
         _fake_result(),
         region_result=PlayRegionResult(
-            player="self",
+            player="left",
             cards=(),
             is_pass=True,
             confidence=0.91,
             diagnostics=(),
             annotations=(),
-            source="self-pass",
+            source="left-pass",
         ),
     )
     editor = TruthLogEditor(
@@ -459,10 +566,10 @@ def test_selected_recognition_handles_finished_leader_wind_before_flagging_stale
 
     assert editor._is_pass_from_row(2)
     assert [call for call in fake.calls if call[0] == "region"] == [
-        ("region", "self", "2")
+        ("region", "left", "2")
     ]
     assert "下一行待修正" in editor.recognition_hint.text()
-    with pytest.raises(ValueError, match="应为 left，实际为 opposite"):
+    with pytest.raises(ValueError, match="应为 self，实际为 opposite"):
         editor._build_log()
 
 
@@ -474,15 +581,14 @@ def test_cleared_selection_recognizes_wind_recipient_after_finished_leader_passe
         (
             TruthTurn(1, "right", False, ("3S",) * 27),
             TruthTurn(2, "opposite", True, ()),
-            TruthTurn(3, "self", True, ()),
         ),
     )
     fake = _FakeRecognition(
         _fake_result(),
         region_result=PlayRegionResult(
             player="left",
-            cards=("6C", "6S"),
-            is_pass=False,
+            cards=(),
+            is_pass=True,
             confidence=0.93,
             diagnostics=(),
             annotations=(),
@@ -503,12 +609,11 @@ def test_cleared_selection_recognizes_wind_recipient_after_finished_leader_passe
     assert [call for call in fake.calls if call[0] == "region"] == [
         ("region", "left", "2")
     ]
-    assert editor.table.cellWidget(3, 1).currentData() == "left"
-    assert editor._cards_from_row(3) == ("6C", "6S")
+    assert editor.table.cellWidget(2, 1).currentData() == "left"
+    assert editor._is_pass_from_row(2)
     assert [turn.actor for turn in editor._build_log().turns] == [
         "right",
         "opposite",
-        "self",
         "left",
     ]
 
@@ -847,14 +952,14 @@ def test_save_validates_every_actor_transition_and_ignores_stale_trick_ids(tmp_p
     assert [turn.actor for turn in built.turns] == ["self", "right", "opposite"]
 
 
-def test_save_actor_chain_skips_a_finished_player(tmp_path):
+def test_save_actor_chain_requires_the_wind_receiver_to_pass(tmp_path):
     _app()
     editor = TruthLogEditor(tmp_path, _log())
     editor._append_row(TruthTurn(1, "self", False, ("2S",)))
     editor._append_row(TruthTurn(2, "right", False, ("3S",) * 27))
     editor._append_row(TruthTurn(3, "opposite", True, ()))
-    editor._append_row(TruthTurn(4, "self", True, ()))
-    editor._append_row(TruthTurn(5, "left", False, ("2H",)))
+    editor._append_row(TruthTurn(4, "left", True, ()))
+    editor._append_row(TruthTurn(5, "self", True, ()))
 
     built = editor._build_log()
 
@@ -862,12 +967,12 @@ def test_save_actor_chain_skips_a_finished_player(tmp_path):
         "self",
         "right",
         "opposite",
-        "self",
         "left",
+        "self",
     ]
 
 
-def test_add_row_infers_player_from_tail_and_skips_finished_player(tmp_path):
+def test_add_row_infers_wind_receiver_after_all_active_pass(tmp_path):
     _app()
     editor = TruthLogEditor(tmp_path, _log())
 
@@ -876,11 +981,12 @@ def test_add_row_infers_player_from_tail_and_skips_finished_player(tmp_path):
     editor._replace_row(0, TruthTurn(1, "self", True, ()), status="测试不出")
     editor._append_row(TruthTurn(2, "right", False, ("3S",) * 27))
     editor._append_row(TruthTurn(3, "opposite", True, ()))
-    editor._append_row(TruthTurn(4, "self", True, ()))
+    editor._append_row(TruthTurn(4, "left", True, ()))
+    editor._append_row(TruthTurn(5, "self", True, ()))
 
     editor.add_row()
 
-    assert editor.table.cellWidget(4, 1).currentData() == "left"
+    assert editor.table.cellWidget(5, 1).currentData() == "left"
 
 
 def test_add_and_insert_use_prefix_wind_derivation_without_reverse_conflict(tmp_path):
@@ -889,25 +995,26 @@ def test_add_and_insert_use_prefix_wind_derivation_without_reverse_conflict(tmp_
     prefix = (
         TruthTurn(1, "right", False, ("3S",) * 27),
         TruthTurn(2, "opposite", True, ()),
-        TruthTurn(3, "self", True, ()),
+        TruthTurn(3, "left", True, ()),
+        TruthTurn(4, "self", True, ()),
     )
 
     append_editor = TruthLogEditor(tmp_path, TruthLog("game", initial, prefix))
     append_editor.add_row()
-    assert append_editor.table.cellWidget(3, 1).currentData() == "left"
+    assert append_editor.table.cellWidget(4, 1).currentData() == "left"
 
     insert_editor = TruthLogEditor(
         tmp_path,
         TruthLog(
             "game",
             initial,
-            (*prefix, TruthTurn(4, "opposite", True, ())),
+            (*prefix, TruthTurn(5, "opposite", True, ())),
         ),
     )
-    insert_editor.table.selectRow(3)
+    insert_editor.table.selectRow(4)
     insert_editor.insert_row()
 
-    inserted = insert_editor.table.cellWidget(3, 1)
+    inserted = insert_editor.table.cellWidget(4, 1)
     assert inserted.currentData() == "left"
     assert not bool(inserted.property("sequenceConflict"))
 
@@ -1026,6 +1133,11 @@ def test_unknown_suit_card_round_trips(tmp_path):
             _fake_result(), region_result=region_result
         ),
     )
+    assert editor.save_button.text() == "保存日志"
+    assert editor.add_button.text() == "新增"
+    assert editor.insert_button.text() == "插入"
+    assert editor.remove_button.text() == "删除"
+    assert editor.recognize_frame_button.text() == "识别本帧"
     editor._append_row(TruthTurn(1, "self", False, ("2S",)))
 
     editor._recognize_frame()

@@ -168,8 +168,8 @@ def test_teammates_finishing_first_and_second_ends_round_without_finished_turn()
     assert snapshot.current_player not in snapshot.finished_seats
 
 
-def test_finished_player_partner_catches_wind_after_active_opponent_passes():
-    """A finished leader's partner does not need to emit a fake pass."""
+def test_finished_player_partner_catches_wind_after_every_active_player_passes():
+    """The future leader remains an ordinary responder in the current trick."""
 
     reducer = LiveReducer("wind-catch")
     reducer.confirm_initial_state(
@@ -180,9 +180,11 @@ def test_finished_player_partner_catches_wind_after_active_opponent_passes():
     reducer.confirm_player_finished("left", placement="head")
     reducer.record_play("self", INITIAL_HAND)
 
-    # Self has just finished. Right is the only active opponent who must
-    # decline; opposite catches the wind and immediately leads the next trick.
+    # Self has just finished. Right and opposite must each decline before
+    # opposite catches the wind.
     reducer.record_pass("right")
+    assert reducer.snapshot().current_player == "opposite"
+    reducer.record_pass("opposite")
 
     snapshot = reducer.snapshot()
     assert snapshot.finished_seats == frozenset({"left", "self"})
@@ -195,18 +197,18 @@ def test_finished_player_partner_catches_wind_after_active_opponent_passes():
 @pytest.mark.parametrize(
     ("leader", "required_passes", "wind_receiver"),
     (
-        ("self", ("right", "left"), "opposite"),
-        ("right", ("opposite", "self"), "left"),
-        ("opposite", ("left", "right"), "self"),
-        ("left", ("self", "opposite"), "right"),
+        ("self", ("right", "opposite", "left"), "opposite"),
+        ("right", ("opposite", "left", "self"), "left"),
+        ("opposite", ("left", "self", "right"), "self"),
+        ("left", ("self", "right", "opposite"), "right"),
     ),
 )
-def test_finished_leader_skips_partner_until_two_opponents_pass(
+def test_finished_leader_requires_every_active_player_to_pass(
     leader: str,
-    required_passes: tuple[str, str],
+    required_passes: tuple[str, str, str],
     wind_receiver: str,
 ):
-    """Every seat can finish without making its wind-catch partner PASS."""
+    """The wind receiver remains in the current trick until it passes."""
 
     reducer = LiveReducer(f"wind-{leader}")
     reducer.confirm_initial_state(
@@ -220,13 +222,16 @@ def test_finished_leader_skips_partner_until_two_opponents_pass(
     assert reducer.snapshot().current_player == required_passes[1]
 
     reducer.record_pass(required_passes[1])
+    assert reducer.snapshot().current_player == required_passes[2]
+
+    reducer.record_pass(required_passes[2])
     snapshot = reducer.snapshot()
     assert snapshot.trick_plays == ()
     assert snapshot.lead_player == wind_receiver
     assert snapshot.current_player == wind_receiver
 
 
-def test_wind_receiver_after_current_pass_requires_the_last_active_opponent():
+def test_wind_receiver_after_current_pass_requires_all_active_players():
     reducer = LiveReducer("wind-projection")
     reducer.confirm_initial_state(
         round_level="2",
@@ -238,10 +243,37 @@ def test_wind_receiver_after_current_pass_requires_the_last_active_opponent():
     reducer.record_play("left", INITIAL_HAND)
     reducer.record_pass("self")
 
-    assert reducer.snapshot().current_player == "opposite"
+    assert reducer.snapshot().current_player == "right"
     assert reducer.pending_wind_receiver() == "right"
     assert reducer.wind_receiver_after_current_pass("self") is None
+    assert reducer.wind_receiver_after_current_pass("right") is None
+    reducer.record_pass("right")
+    assert reducer.snapshot().current_player == "opposite"
     assert reducer.wind_receiver_after_current_pass("opposite") == "right"
+
+
+def test_finished_right_turn_50_to_53_keeps_left_pass_before_self_big_joker():
+    reducer = _started_reducer()
+
+    reducer.record_play("right", INITIAL_HAND)
+    reducer.record_pass("opposite")
+    reducer.record_pass("left")
+
+    assert reducer.snapshot().current_player == "self"
+    assert reducer.pending_wind_receiver() == "left"
+
+    reducer.record_play("self", ("big_joker",))
+
+    snapshot = reducer.snapshot()
+    assert snapshot.trick_id == 1
+    assert snapshot.lead_player == "right"
+    assert snapshot.current_player == "opposite"
+    assert [play.player for play in snapshot.trick_plays] == [
+        "right",
+        "opposite",
+        "left",
+        "self",
+    ]
 
 
 def test_correction_rebuild_matches_clean_history():

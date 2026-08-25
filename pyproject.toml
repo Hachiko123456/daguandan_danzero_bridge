@@ -28,3 +28,6 @@ include = ["daguandan_bridge*"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 tmp_path_retention_policy = "failed"
+markers = [
+  "windows_integration: requires a visible real Win32 desktop and HWND",
+]

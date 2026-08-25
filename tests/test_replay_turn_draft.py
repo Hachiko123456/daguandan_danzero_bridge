@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from daguandan_bridge.application.replay_turn_draft import (
     ReplayTurnDraftAssembler,
+    compare_truth_scan_draft,
     next_actor_after_prefix,
 )
 from daguandan_bridge.live.truth_log import TruthInitialState, TruthLog, TruthTurn
@@ -82,6 +83,32 @@ def test_streaming_assembler_rejects_a_direct_actor_jump_without_shifting_draft(
     ]
 
 
+def test_streaming_assembler_rejects_source_turn_gap_without_reindexing_rows():
+    assembler = ReplayTurnDraftAssembler(_log())
+    assert assembler.append(
+        {
+            "turn_id": 8,
+            "actor": "left",
+            "recognized_pass": False,
+            "recognized_cards": ["3D"],
+        }
+    ).accepted
+
+    skipped = assembler.append(
+        {
+            "turn_id": 10,
+            "actor": "self",
+            "recognized_pass": True,
+        }
+    )
+
+    assert not skipped.accepted
+    assert "来源 turn_id 不连续：应为 9，实际为 10" in skipped.reason
+    assert [(turn.index, turn.actor) for turn in skipped.truth_log.turns] == [
+        (1, "left"),
+    ]
+
+
 def test_suit_correction_replaces_its_existing_draft_row_without_adding_turn():
     assembler = ReplayTurnDraftAssembler(_log())
     appended = assembler.append(
@@ -105,6 +132,34 @@ def test_suit_correction_replaces_its_existing_draft_row_without_adding_turn():
     assert corrected.status == "花色修正已回填"
     assert [(turn.index, turn.actor, turn.cards) for turn in corrected.truth_log.turns] == [
         (1, "left", ("JD",)),
+    ]
+
+
+def test_event_correction_replaces_effective_action_without_adding_a_turn():
+    assembler = ReplayTurnDraftAssembler(_log())
+    assert assembler.append(
+        {
+            "turn_id": 1,
+            "actor": "left",
+            "recognized_pass": False,
+            "recognized_cards": ["A?", "K?"],
+        }
+    ).accepted
+
+    corrected = assembler.append(
+        {
+            "kind": "event_correction",
+            "target_turn_id": 1,
+            "actor": "left",
+            "recognized_pass": False,
+            "recognized_cards": ["AC", "AS", "KC", "KS", "QD", "QS"],
+        }
+    )
+
+    assert corrected.accepted
+    assert corrected.status == "动作修正已回填"
+    assert [(turn.index, turn.actor, turn.cards) for turn in corrected.truth_log.turns] == [
+        (1, "left", ("AC", "AS", "KC", "KS", "QD", "QS")),
     ]
 
 
@@ -139,12 +194,61 @@ def test_actor_chain_returns_to_left_then_self_after_a_completed_pass_cycle():
     assert results[-1].truth_log.turns[-1].cards == ("2D",)
 
 
-def test_prefix_derivation_assigns_a_finished_leaders_wind_to_the_partner():
+def test_prefix_derivation_returns_wind_receiver_after_every_active_pass():
     initial = TruthInitialState("2", "right", HAND)
     prefix = (
         TruthTurn(1, "right", False, ("3S",) * 27, trick_id=99),
         TruthTurn(2, "opposite", True, (), trick_id=3),
-        TruthTurn(3, "self", True, (), trick_id=3),
+        TruthTurn(3, "left", True, (), trick_id=3),
+        TruthTurn(4, "self", True, (), trick_id=3),
     )
 
     assert next_actor_after_prefix(initial, prefix) == "left"
+
+
+def test_scan_comparison_keeps_card_multisets_and_turns_50_to_53_explicit():
+    initial = TruthInitialState("2", "right", HAND)
+    canonical = TruthLog(
+        "game",
+        initial,
+        (
+            TruthTurn(50, "right", False, ("small_joker",)),
+            TruthTurn(51, "opposite", True, ()),
+            TruthTurn(52, "left", True, ()),
+            TruthTurn(53, "self", False, ("3S", "3H")),
+        ),
+    )
+    draft = TruthLog(
+        "game",
+        initial,
+        (
+            TruthTurn(50, "right", False, ("small_joker",)),
+            TruthTurn(51, "opposite", True, ()),
+            TruthTurn(52, "left", True, ()),
+            TruthTurn(53, "self", False, ("3H", "3S")),
+        ),
+    )
+    events = (
+        {
+            "event_type": "player_finished",
+            "actor": "right",
+            "turn_id": 51,
+            "payload": {"placement": "head"},
+        },
+    )
+
+    comparison = compare_truth_scan_draft(
+        canonical,
+        draft,
+        recorded_events=events,
+    )
+
+    rows = comparison["action_semantics"]["rows"]
+    assert [row["turn_id"] for row in rows] == [50, 51, 52, 53]
+    assert all(row["status"] == "identical" for row in rows)
+    assert comparison["ranking_projection"] == {
+        "read_only_source": "timeline.jsonl",
+        "canonical": [{"placement": "head", "actor": "right", "anchor_turn_id": 50}],
+        "scan_draft": [{"placement": "head", "actor": "right", "anchor_turn_id": 50}],
+        "identical": True,
+    }

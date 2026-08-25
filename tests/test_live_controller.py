@@ -46,6 +46,30 @@ class _LockingCaptureServiceStub(_CaptureServiceStub):
             raise self.error
 
 
+class _SourceStub:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _ReopeningCaptureServiceStub(_CaptureServiceStub):
+    def __init__(self, root, *, open_error=None):
+        super().__init__(root)
+        self.open_error = open_error
+        self.opened_profiles = []
+        self.sources = []
+
+    def open_live_source(self, profile_name):
+        self.opened_profiles.append(profile_name)
+        if self.open_error is not None:
+            raise self.open_error
+        source = _SourceStub()
+        self.sources.append(source)
+        return source
+
+
 class _WarmAdvisor:
     def __init__(self):
         self.initialize_calls = 0
@@ -107,11 +131,14 @@ def test_resume_restarts_capture_after_prior_blocked_capture_exits(
     monkeypatch,
 ):
     _app()
-    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    capture = _ReopeningCaptureServiceStub(tmp_path)
+    controller = LiveAssistantController(capture)
     orchestrator = _PauseOrchestrator()
     old_worker = _SlowCaptureWorker()
+    old_source = _SourceStub()
     controller.orchestrator = orchestrator  # type: ignore[assignment]
     controller._capture_worker = old_worker  # type: ignore[assignment]
+    controller._live_source = old_source
     monkeypatch.setattr(controller, "_start_analysis_worker", lambda: None)
     restarted = []
     monkeypatch.setattr(
@@ -129,6 +156,40 @@ def test_resume_restarts_capture_after_prior_blocked_capture_exits(
     controller._capture_finished(old_worker)  # type: ignore[arg-type]
 
     assert restarted == [True]
+    assert old_source.closed is True
+    assert capture.opened_profiles == ["tencent_daguandan"]
+    assert controller._live_source is capture.sources[0]
+    assert orchestrator.status == "running"
+
+
+def test_resume_open_failure_does_not_resume_state_or_start_workers(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    capture = _ReopeningCaptureServiceStub(
+        tmp_path,
+        open_error=RuntimeError("window is still minimized"),
+    )
+    controller = LiveAssistantController(capture)
+    orchestrator = _PauseOrchestrator()
+    orchestrator.status = "paused"
+    old_source = _SourceStub()
+    controller.orchestrator = orchestrator  # type: ignore[assignment]
+    controller._live_source = old_source
+    errors = []
+    started = []
+    controller.error.connect(errors.append)
+    monkeypatch.setattr(controller, "_start_analysis_worker", lambda: started.append("analysis"))
+    monkeypatch.setattr(controller, "_start_capture_worker", lambda: started.append("capture"))
+
+    controller.resume()
+
+    assert old_source.closed is True
+    assert orchestrator.status == "paused"
+    assert controller._live_source is None
+    assert started == []
+    assert errors == ["重新打开采集源失败：window is still minimized"]
 
 
 class _FinishOrchestrator:

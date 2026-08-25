@@ -1,0 +1,1303 @@
+"""Read-only production-pipeline audit for recorded sessions."""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import platform
+import re
+import subprocess
+import sys
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterable, Literal
+from uuid import uuid4
+
+import cv2
+
+from ..advisor_strategy import build_advisor
+from ..annotation_service import AnnotationService
+from ..live.replay import (
+    ReplayComparison,
+    TrustedAdviceReplayResult,
+    VideoReplaySource,
+    VisualPipelineReplayResult,
+    replay_truth_through_live_advisor,
+    replay_video_through_live_pipeline,
+)
+from ..live.session_store import read_json_lines
+from ..live.truth_log import TruthLog, load_truth_log
+from ..recognition_service import ScreenshotRecognitionService
+from ..storage import atomic_write_json
+from ..template_service import TemplateService
+
+_ACTION_TYPES = frozenset({"player_played", "player_passed", "manual_confirmed_event"})
+_GAP_TYPES = frozenset({"terminal_history_gap", "history_gap_detected"})
+_FRAME_WARNINGS = frozenset({"missing_video_frames", "extra_video_frames"})
+_SEATS = ("self", "right", "opposite", "left")
+
+
+@dataclass(frozen=True)
+class TruthAuditReference:
+    kind: Literal["canonical", "staged"]
+    path: Path
+
+
+@dataclass(frozen=True)
+class _Session:
+    source: Path
+    root: Path
+    store_id: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class SessionReplayAuditRun:
+    run_directory: Path
+    summary_path: Path
+    sessions: tuple[dict[str, object], ...]
+    inventory_path: Path | None = None
+    verification_path: Path | None = None
+    execution_ok: bool = False
+
+
+def resolve_truth_audit_reference(
+    session: Path | str, *, scan_run_id: str | Iterable[str] | None = None
+) -> TruthAuditReference | None:
+    """Canonical always wins; staged truth is never selected implicitly."""
+
+    root = Path(session)
+    canonical = root / "truth_log.json"
+    if canonical.is_file():
+        return TruthAuditReference("canonical", canonical)
+    for selected_run_id in _scan_run_ids(scan_run_id):
+        staged = root / "derived" / "truth_scan_drafts" / selected_run_id / "truth_log.json"
+        if staged.is_file():
+            return TruthAuditReference("staged", staged)
+    return None
+
+
+def summarize_visual_events(events: Iterable[dict[str, object]]) -> dict[str, object]:
+    rows = tuple(events)
+    actions = _effective_actions(rows)
+    event_counts = Counter(str(row.get("event_type", "unknown")) for row in rows)
+    expected_turn_id = 1
+    issues: list[dict[str, int]] = []
+    for action in actions:
+        turn_id = _int_or_none(action.get("turn_id"))
+        if turn_id is not None:
+            if turn_id != expected_turn_id:
+                issues.append({"expected_turn_id": expected_turn_id, "actual_turn_id": turn_id})
+            expected_turn_id = turn_id + 1
+    leads: list[dict[str, object]] = []
+    winds: list[dict[str, object]] = []
+    rankings: list[dict[str, object]] = []
+    gaps: list[dict[str, object]] = []
+    for row in rows:
+        event_type = str(row.get("event_type", ""))
+        payload = row.get("payload", {})
+        payload = payload if isinstance(payload, dict) else {}
+        if event_type == "lead_player_confirmed":
+            leads.append(
+                {
+                    "actor": row.get("actor"),
+                    "lead_player": payload.get("lead_player", row.get("actor")),
+                    "event_id": row.get("event_id"),
+                    "frame_index": row.get("_replay_frame_index"),
+                }
+            )
+        if event_type == "wind_caught":
+            winds.append(_event_digest(row))
+        if event_type == "player_finished":
+            rankings.append(_event_digest(row))
+        if event_type in _GAP_TYPES or "history_gap" in event_type:
+            gaps.append(_event_digest(row))
+    return {
+        "actions": {
+            "count": len(actions),
+            "plays": sum(not bool(row["is_pass"]) for row in actions),
+            "passes": sum(bool(row["is_pass"]) for row in actions),
+            "rows": actions,
+        },
+        "lead": {"confirmations": leads},
+        "turn_order": {"contiguous_turn_ids": not issues, "issues": issues},
+        "wind_catch_chain": winds,
+        "rankings": rankings,
+        "visual_gaps": gaps,
+        "recognized_result_categories": {"event_types": dict(sorted(event_counts.items()))},
+    }
+
+
+def compare_truth_visual_fields(
+    truth: TruthLog,
+    opening: dict[str, object],
+    visual: dict[str, object],
+) -> dict[str, object]:
+    """Return ordered field metrics without collapsing duplicate turn IDs."""
+
+    return _field_metrics(truth, opening, visual)
+
+
+class SessionReplayAuditService:
+    """Run every session independently and emit one verifiable report directory."""
+
+    def __init__(
+        self,
+        *,
+        recognition_factory: Callable[[Path], ScreenshotRecognitionService] | None = None,
+        opening_probe: Callable[[Path, ScreenshotRecognitionService, dict[str, object]], dict[str, object]] | None = None,
+        visual_replay: Callable[..., VisualPipelineReplayResult] = replay_video_through_live_pipeline,
+        advisor_factory: Callable[[Path, str], Any] | None = None,
+        advisor_replay: Callable[..., TrustedAdviceReplayResult] = replay_truth_through_live_advisor,
+    ) -> None:
+        self._recognition_factory = recognition_factory or _recognition_for_session
+        self._opening_probe = opening_probe or _opening_agreement
+        self._visual_replay = visual_replay
+        self._advisor_factory = advisor_factory or _fabledan_for_profile
+        self._advisor_replay = advisor_replay
+
+    def audit(
+        self,
+        session_roots: Iterable[Path | str],
+        *,
+        output: Path | str,
+        scan_run_id: str | Iterable[str] | None = None,
+        run_id: str | None = None,
+        command: Iterable[str] | None = None,
+    ) -> SessionReplayAuditRun:
+        roots = _normalize_roots(session_roots)
+        output_root = Path(output).resolve()
+        _reject_internal_output(output_root, roots)
+        run_dir = output_root / _safe_name(run_id or _new_run_id())
+        _reject_internal_output(run_dir, roots)
+        run_dir.mkdir(parents=True, exist_ok=False)
+
+        sessions = _discover(roots)
+        before = _source_snapshot(roots)
+        before_path = run_dir / "source_snapshot_before.json"
+        atomic_write_json(before_path, before)
+        inventory = _inventory(sessions, roots, scan_run_id)
+        inventory_path = run_dir / "inventory.json"
+        atomic_write_json(inventory_path, inventory)
+        rows: list[dict[str, object]] = []
+        for session in sessions:
+            session_dir = run_dir / "sessions" / session.store_id / _safe_name(session.session_id)
+            rows.append(
+                self._audit_session(
+                    session,
+                    session_dir,
+                    scan_run_id,
+                    _inventory_row(inventory, session),
+                )
+            )
+        after = _source_snapshot(roots)
+        after_path = run_dir / "source_snapshot_after.json"
+        atomic_write_json(after_path, after)
+        summary = _make_summary(
+            run_id=run_dir.name,
+            rows=rows,
+            inventory=inventory,
+            scan_run_id=scan_run_id,
+            command=command,
+            source_changes=_source_changes(before, after),
+            source_snapshot_paths=(before_path, after_path),
+        )
+        summary_path = run_dir / "all_session_audit.json"
+        atomic_write_json(summary_path, summary)
+        _write_sessions_csv(run_dir / "sessions.csv", rows)
+        _write_failures_csv(run_dir / "failures.csv", rows)
+        _write_markdown(run_dir / "summary.md", summary)
+        verification = _verify(run_dir, summary, before, after)
+        verification_path = run_dir / "verification.json"
+        atomic_write_json(verification_path, verification)
+        return SessionReplayAuditRun(
+            run_dir,
+            summary_path,
+            tuple(rows),
+            inventory_path,
+            verification_path,
+            bool(verification["passed"]),
+        )
+
+    def _audit_session(
+        self,
+        item: _Session,
+        output: Path,
+        scan_run_id: str | Iterable[str] | None,
+        inventory: dict[str, object],
+    ) -> dict[str, object]:
+        output.mkdir(parents=True, exist_ok=True)
+        reference = resolve_truth_audit_reference(item.source, scan_run_id=scan_run_id)
+        initial_frame_inventory = inventory.get("frame_index", {})
+        initial_frame_inventory = (
+            initial_frame_inventory if isinstance(initial_frame_inventory, dict) else {}
+        )
+        row: dict[str, object] = {
+            "source": str(item.source),
+            "sessions_root": str(item.root),
+            "store_id": item.store_id,
+            "session_id": item.session_id,
+            "status": "error",
+            "execution_status": "error",
+            "truth_quality": "not_available",
+            "visual_quality": "not_evaluated",
+            "fabledan_quality": "not_evaluated",
+            "frames_processed": 0,
+            "indexed_frames": int(initial_frame_inventory.get("row_count", 0) or 0),
+            "truth_log": {"kind": reference.kind if reference else "none", "path": str(reference.path) if reference else None},
+            "inventory": inventory,
+            "evidence_paths": {"session_audit": str(output)},
+        }
+        try:
+            truth = _load_truth(item.source, reference)
+            row["truth_log"] = _truth_metadata(reference, truth)
+            expected_initial = _expected_initial(item.source, truth)
+            recognition = self._recognition_factory(item.source)
+            opening = self._opening_probe(item.source, recognition, expected_initial)
+            visual_advisor = self._advisor(item.source)
+            result = self._visual_replay(
+                item.source,
+                recognition,
+                truth_log=reference.path if reference else None,
+                use_live_pipeline=True,
+                recognition_strategy="two_valid_streak",
+                output_root=output / "visual_driven",
+                advisor=visual_advisor,
+            )
+            events = _read_replay_events(result.output_path)
+            visual = summarize_visual_events(events)
+            recorded = summarize_visual_events(read_json_lines(item.source / "timeline.jsonl"))
+            frame_inventory = inventory.get("frame_index", {})
+            frame_inventory = frame_inventory if isinstance(frame_inventory, dict) else {}
+            indexed = int(frame_inventory.get("row_count", 0))
+            complete = (
+                indexed > 0
+                and result.frame_count == indexed
+                and bool(frame_inventory.get("continuous"))
+                and not frame_inventory.get("parse_error")
+                and not any(w.reason in _FRAME_WARNINGS for w in result.warnings)
+            )
+            metrics = _field_metrics(truth, opening, visual) if truth else _na_metrics()
+            divergence = _first_divergence(truth, opening, visual)
+            evidence = (
+                _write_evidence(
+                    item.source,
+                    output / "first_divergence",
+                    divergence,
+                    truth,
+                    visual_frame_log=result.output_path,
+                    runtime_directory=result.run_directory,
+                )
+                if divergence
+                else None
+            )
+            visual_fabledan = _visual_advice_summary(result, visual_advisor)
+            truth_fabledan = self._truth_advice(item.source, output, reference)
+            truth_tool_complete = (
+                not truth_fabledan.get("available")
+                or bool(truth_fabledan.get("completed"))
+            )
+            execution_complete = complete and truth_tool_complete
+            strict = _strict_quality(metrics) if reference and reference.kind == "canonical" else "diagnostic"
+            row.update(
+                {
+                    "status": "completed" if execution_complete else "error",
+                    "execution_status": "completed" if execution_complete else "incomplete",
+                    "truth_quality": strict,
+                    "visual_quality": _visual_quality(metrics, complete),
+                    "fabledan_quality": _advice_quality(truth_fabledan, visual_fabledan),
+                    "frames_processed": result.frame_count,
+                    "indexed_frames": indexed,
+                    "initial_visual_agreement": opening,
+                    "visual": visual,
+                    "recorded_timeline_diagnostics": recorded,
+                    "field_metrics": metrics,
+                    "warnings": [{"reason": w.reason, "details": w.details} for w in result.warnings],
+                    "timeline_comparison": _comparison_summary(result.comparison),
+                    "first_divergence": evidence,
+                    "fabledan": {"truth_driven": truth_fabledan, "visual_driven": visual_fabledan},
+                    "evidence_paths": {
+                        "session_audit": str(output),
+                        "visual_frame_log": str(result.output_path),
+                        "visual_comparison": str(result.comparison_path),
+                        "first_divergence": evidence.get("directory") if evidence else None,
+                    },
+                }
+            )
+            if not execution_complete:
+                row["error"] = (
+                    f"frame replay incomplete: processed={result.frame_count}, indexed={indexed}"
+                    if not complete
+                    else str(truth_fabledan.get("error", "truth-driven advisor replay incomplete"))
+                )
+        except Exception as exc:
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        atomic_write_json(output / "summary.json", row)
+        return row
+
+    def _advisor(self, session: Path) -> Any:
+        advisor = self._advisor_factory(session.parent.parent.parent, session.parent.parent.name)
+        if hasattr(advisor, "write_decision_log"):
+            advisor.write_decision_log = False
+        return advisor
+
+    def _truth_advice(
+        self, session: Path, output: Path, reference: TruthAuditReference | None
+    ) -> dict[str, object]:
+        if reference is None:
+            return {"available": False, "quality": "not_available", "reason": "no explicitly selected truth log"}
+        try:
+            advisor = self._advisor(session)
+            result = self._advisor_replay(
+                session,
+                advisor,
+                truth_log=reference.path,
+                output_root=output / "truth_driven",
+            )
+            summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
+            statuses = summary.get("advice_statuses", {})
+            return {
+                "available": True,
+                "truth_log_kind": reference.kind,
+                "run_directory": str(result.run_directory),
+                "completed": result.completed,
+                "turn_count": result.turn_count,
+                "processed_turn_count": result.processed_turn_count,
+                "advice": {
+                    "requested": result.advice_requested,
+                    "ready": result.advice_ready,
+                    "failed": result.advice_failed,
+                    "stale": result.advice_stale,
+                    "timeout": result.advice_timeouts,
+                    "timeouts": result.advice_timeouts,
+                    "withheld": int(statuses.get("withheld", 0)),
+                    "statuses": statuses,
+                },
+                "advisor": _advisor_info(advisor),
+                "artifacts": _artifact_map(result.run_directory),
+            }
+        except Exception as exc:
+            return {"available": True, "completed": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _stored_initial(session: Path) -> dict[str, object]:
+    for event in read_json_lines(session / "timeline.jsonl"):
+        if event.get("event_type") == "initial_state_confirmed":
+            payload = event.get("payload", {})
+            if isinstance(payload, dict):
+                return {
+                    "round_level": str(payload.get("round_level", "")),
+                    "lead_player": payload.get("lead_player", event.get("actor")),
+                    "hand": sorted(str(card) for card in payload.get("hand", ())),
+                }
+    raise ValueError("timeline.jsonl lacks initial_state_confirmed")
+
+
+def _expected_initial(session: Path, truth: TruthLog | None) -> dict[str, object]:
+    if truth is None:
+        return _stored_initial(session)
+    return {
+        "round_level": truth.initial_state.round_level,
+        "lead_player": truth.initial_state.lead_player,
+        "hand": sorted(truth.initial_state.my_hand),
+    }
+
+
+def _opening_agreement(session: Path, recognition: Any, stored: dict[str, object]) -> dict[str, object]:
+    source = VideoReplaySource(session / "video" / "game.avi", session / "video" / "frame_index.jsonl")
+    frames = iter(source.frames())
+    reads: list[dict[str, object]] = []
+    try:
+        for _ in range(2):
+            item = next(frames, None)
+            if item is None:
+                break
+            record, frame = item
+            result = recognition.recognize(frame, allow_unknown_suit=True)
+            level = str(getattr(result, "round_level", "") or "")
+            hand = sorted(str(card) for card in getattr(result, "my_hand", ()) or ())
+            reads.append(
+                {
+                    "frame_index": record.frame_index,
+                    "monotonic_ms": record.monotonic_ms,
+                    "round_level": level,
+                    "hand": hand,
+                    "matches_stored_level": level == stored["round_level"],
+                    "matches_stored_hand": hand == stored["hand"],
+                }
+            )
+    finally:
+        close = getattr(frames, "close", None)
+        if callable(close):
+            close()
+    stable = len(reads) == 2 and (reads[0]["round_level"], reads[0]["hand"]) == (reads[1]["round_level"], reads[1]["hand"])
+    return {
+        "stored_initial_state": stored,
+        "reads": reads,
+        "two_frame_agreement": stable,
+        "two_frame_matches_stored": bool(stable and all(r["matches_stored_level"] and r["matches_stored_hand"] for r in reads)),
+    }
+
+
+def _read_replay_events(path: Path) -> tuple[dict[str, object], ...]:
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for frame in read_json_lines(path):
+        events = frame.get("events", ())
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_id = str(event.get("event_id", ""))
+            if not event_id or event_id in seen:
+                continue
+            seen.add(event_id)
+            row = dict(event)
+            row["_replay_frame_index"] = frame.get("frame_index")
+            row["_replay_monotonic_ms"] = frame.get("monotonic_ms")
+            row["_replay_state_revision"] = frame.get("state_revision")
+            result.append(row)
+    return tuple(result)
+
+
+def _effective_actions(rows: tuple[dict[str, object], ...]) -> list[dict[str, object]]:
+    actions: list[dict[str, object]] = []
+    by_id: dict[str, dict[str, object]] = {}
+    for event in rows:
+        event_type = str(event.get("event_type", ""))
+        payload = event.get("payload", {})
+        payload = payload if isinstance(payload, dict) else {}
+        if event_type in _ACTION_TYPES:
+            action = {
+                "turn_id": _int_or_none(payload.get("turn_id", event.get("turn_id"))),
+                "trick_id": _int_or_none(event.get("trick_id")),
+                "actor": event.get("actor"),
+                "is_pass": bool(payload.get("is_pass", event_type == "player_passed")),
+                "cards": sorted(str(card) for card in payload.get("cards", ()) or ()),
+                "event_id": event.get("event_id"),
+                "evidence": payload.get("evidence"),
+                "frame_index": event.get("_replay_frame_index", payload.get("frame_index")),
+                "monotonic_ms": event.get("_replay_monotonic_ms", event.get("monotonic_ms")),
+                "state_revision_before": event.get("state_revision_before"),
+                "state_revision_after": event.get("state_revision_after", event.get("_replay_state_revision")),
+            }
+            actions.append(action)
+            if event.get("event_id"):
+                by_id[str(event["event_id"])] = action
+        elif event_type in {"event_correction", "suit_corrected"}:
+            target = by_id.get(str(payload.get("target_event_id", "")))
+            if target:
+                if "cards" in payload:
+                    target["cards"] = sorted(str(card) for card in payload.get("cards", ()) or ())
+                if "is_pass" in payload:
+                    target["is_pass"] = bool(payload.get("is_pass"))
+    return actions
+
+
+def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str, object]) -> dict[str, object]:
+    reads = opening.get("reads", ())
+    actual_open = reads[0] if isinstance(reads, list) and reads else {}
+    actual_open = actual_open if isinstance(actual_open, dict) else {}
+    expected_hand = Counter(truth.initial_state.my_hand)
+    actual_hand = Counter(str(card) for card in actual_open.get("hand", ()) or ())
+    hand_matches = sum((expected_hand & actual_hand).values())
+    expected = [
+        {"turn_id": t.index, "trick_id": t.trick_id, "actor": t.actor, "is_pass": t.is_pass, "cards": sorted(t.cards), "frame_index": t.frame_index, "monotonic_ms": t.monotonic_ms}
+        for t in truth.turns
+    ]
+    actual = list(visual.get("actions", {}).get("rows", ()))
+    compared = min(len(expected), len(actual))
+    actor_ok = pass_ok = cards_ok = identical = 0
+    changed: list[dict[str, object]] = []
+    for index in range(compared):
+        exp, act = expected[index], actual[index]
+        fields: list[str] = []
+        if exp["actor"] == act.get("actor"):
+            actor_ok += 1
+        else:
+            fields.append("actor")
+        if exp["is_pass"] == act.get("is_pass"):
+            pass_ok += 1
+        else:
+            fields.append("pass")
+        if Counter(exp["cards"]) == Counter(act.get("cards", ())):
+            cards_ok += 1
+        else:
+            fields.append("cards")
+        if not fields:
+            identical += 1
+        else:
+            changed.append({"position": index + 1, "fields": fields, "expected": exp, "actual": act})
+    denominator = len(expected)
+    confirmations = visual.get("lead", {}).get("confirmations", ())
+    actual_lead = confirmations[0].get("lead_player") if confirmations else None
+    finish_expected = list(truth.outcome.finish_order)
+    finish_actual = [row.get("actor") for row in visual.get("rankings", ())]
+    return {
+        "strict": True,
+        "level": _metric(1, int(actual_open.get("round_level") == truth.initial_state.round_level), truth.initial_state.round_level, actual_open.get("round_level")),
+        "hand_multiset": {
+            "expected_count": sum(expected_hand.values()), "actual_count": sum(actual_hand.values()), "matched_count": hand_matches,
+            "precision": _ratio(hand_matches, sum(actual_hand.values())), "recall": _ratio(hand_matches, sum(expected_hand.values())),
+            "exact": expected_hand == actual_hand, "missing": list((expected_hand - actual_hand).elements()), "added": list((actual_hand - expected_hand).elements()),
+        },
+        "lead_player": _metric(1, int(actual_lead == truth.initial_state.lead_player), truth.initial_state.lead_player, actual_lead),
+        "actions": {
+            "expected": len(expected), "actual": len(actual), "identical": identical,
+            "missing": max(0, len(expected) - len(actual)), "added": max(0, len(actual) - len(expected)), "changed": len(changed),
+            "accuracy": _ratio(identical, denominator), "actor": _metric(denominator, actor_ok), "pass": _metric(denominator, pass_ok), "cards": _metric(denominator, cards_ok),
+            "order": {**_metric(denominator, identical), "duplicate_expected_turn_ids": _duplicates(expected), "duplicate_actual_turn_ids": _duplicates(actual)},
+            "mismatches": changed, "missing_rows": expected[compared:], "added_rows": actual[compared:],
+        },
+        "wind_catch_chain": {"denominator": 0, "correct": 0, "errors": 0, "accuracy": None, "status": "diagnostic_only_truth_schema_has_no_wind_chain", "actual": visual.get("wind_catch_chain", ())},
+        "ranking": {**_metric(len(finish_expected), sum(a == b for a, b in zip(finish_expected, finish_actual))), "expected": finish_expected, "actual": finish_actual, "status": "strict" if finish_expected else "not_available"},
+    }
+
+
+def _na_metrics() -> dict[str, object]:
+    return {"strict": False, "status": "not_available_without_explicit_truth", "level": None, "hand_multiset": None, "lead_player": None, "actions": None, "wind_catch_chain": None, "ranking": None}
+
+
+def _first_divergence(truth: TruthLog | None, opening: dict[str, object], visual: dict[str, object]) -> dict[str, object] | None:
+    if truth is None:
+        return None
+    reads = opening.get("reads", ())
+    actual_open = reads[0] if isinstance(reads, list) and reads else {}
+    actual_open = actual_open if isinstance(actual_open, dict) else {}
+    expected_open = {"round_level": truth.initial_state.round_level, "hand": sorted(truth.initial_state.my_hand), "lead_player": truth.initial_state.lead_player}
+    if expected_open["round_level"] != actual_open.get("round_level") or Counter(expected_open["hand"]) != Counter(actual_open.get("hand", ())):
+        return {"kind": "initial_state", "field": "round_level_or_hand", "frame_index": _int_or_none(actual_open.get("frame_index")) or 0, "monotonic_ms": _int_or_none(actual_open.get("monotonic_ms")), "expected": expected_open, "actual": actual_open}
+    actions = list(visual.get("actions", {}).get("rows", ()))
+    for index in range(max(len(truth.turns), len(actions))):
+        exp = truth.turns[index] if index < len(truth.turns) else None
+        act = actions[index] if index < len(actions) else None
+        if exp and act and exp.actor == act.get("actor") and exp.is_pass == act.get("is_pass") and Counter(exp.cards) == Counter(act.get("cards", ())):
+            continue
+        exp_raw = {"turn_id": exp.index, "trick_id": exp.trick_id, "actor": exp.actor, "is_pass": exp.is_pass, "cards": list(exp.cards), "frame_index": exp.frame_index, "monotonic_ms": exp.monotonic_ms} if exp else None
+        frame = _int_or_none(act.get("frame_index")) if act else exp.frame_index if exp else 0
+        return {"kind": "action", "field": "missing" if act is None else "added" if exp is None else "changed", "position": index + 1, "frame_index": frame or 0, "monotonic_ms": _int_or_none(act.get("monotonic_ms")) if act else exp.monotonic_ms if exp else None, "expected": exp_raw, "actual": act}
+    leads = visual.get("lead", {}).get("confirmations", ())
+    actual_lead = leads[0].get("lead_player") if leads else None
+    if actual_lead != truth.initial_state.lead_player:
+        return {"kind": "lead_player", "field": "lead_player", "frame_index": _int_or_none(leads[0].get("frame_index")) if leads else 0, "monotonic_ms": None, "expected": {"lead_player": truth.initial_state.lead_player}, "actual": {"lead_player": actual_lead}}
+    expected_ranking = list(truth.outcome.finish_order)
+    actual_ranking_rows = list(visual.get("rankings", ()))
+    actual_ranking = [row.get("actor") for row in actual_ranking_rows]
+    if expected_ranking and expected_ranking != actual_ranking:
+        first_rank = actual_ranking_rows[0] if actual_ranking_rows else {}
+        fallback_frame = truth.turns[-1].frame_index if truth.turns else 0
+        return {
+            "kind": "ranking",
+            "field": "finish_order",
+            "frame_index": _int_or_none(first_rank.get("frame_index")) or fallback_frame or 0,
+            "monotonic_ms": _int_or_none(first_rank.get("monotonic_ms")),
+            "expected": {"finish_order": expected_ranking},
+            "actual": {"finish_order": actual_ranking},
+        }
+    return None
+
+
+def _write_evidence(
+    session: Path,
+    output: Path,
+    divergence: dict[str, object],
+    truth: TruthLog | None,
+    *,
+    visual_frame_log: Path | None = None,
+    runtime_directory: Path | None = None,
+) -> dict[str, object]:
+    output.mkdir(parents=True, exist_ok=True)
+    expected_path, actual_path, context_path = output / "expected.json", output / "actual.json", output / "context.json"
+    atomic_write_json(expected_path, divergence.get("expected"))
+    atomic_write_json(actual_path, divergence.get("actual"))
+    expected = divergence.get("expected") if isinstance(divergence.get("expected"), dict) else {}
+    actual = divergence.get("actual") if isinstance(divergence.get("actual"), dict) else {}
+    fallback = _resolve_evidence_context(
+        divergence,
+        actual,
+        visual_frame_log=visual_frame_log,
+        runtime_directory=runtime_directory,
+    )
+    revision_before = actual.get("state_revision_before")
+    revision_after = actual.get("state_revision_after")
+    if revision_before is None:
+        revision_before = fallback.get("state_revision_before")
+    if revision_after is None:
+        revision_after = fallback.get("state_revision_after")
+    monotonic_ms = divergence.get("monotonic_ms")
+    if monotonic_ms is None:
+        monotonic_ms = fallback.get("monotonic_ms")
+    event_id = actual.get("event_id") or fallback.get("event_id")
+    reducer_before = fallback.get("reducer_state_before")
+    reducer_after = fallback.get("reducer_state_after")
+    if not isinstance(reducer_before, dict):
+        reducer_before = {"revision": revision_before, "available": revision_before is not None}
+    if not isinstance(reducer_after, dict):
+        reducer_after = {"revision": revision_after, "available": revision_after is not None}
+    reducer_before["revision"] = revision_before
+    reducer_after["revision"] = revision_after
+    decisions_path = (
+        runtime_directory / "decisions.jsonl"
+        if runtime_directory is not None
+        else output.parent / "visual_driven" / "runtime" / "decisions.jsonl"
+    )
+    context = {
+        "kind": divergence.get("kind"), "field": divergence.get("field"), "position": divergence.get("position"),
+        "frame_index": divergence.get("frame_index"), "monotonic_ms": monotonic_ms,
+        "event_id": event_id, "turn_id": actual.get("turn_id", expected.get("turn_id")), "trick_id": actual.get("trick_id", expected.get("trick_id")),
+        "state_revision_before": revision_before, "state_revision_after": revision_after,
+        "reducer_state_before": reducer_before,
+        "reducer_state_after": reducer_after,
+        "reducer_state_diff": _reducer_state_diff(reducer_before, reducer_after),
+        "engine_input": actual.get("engine_input", fallback.get("engine_input")),
+        "engine_input_evidence": {
+            "path": str(decisions_path),
+            "available": decisions_path.is_file(),
+        },
+        "fallback": fallback.get("fallback"),
+        "evidence_unavailable": fallback.get("evidence_unavailable", []),
+        "truth_source_session_id": truth.source_session_id if truth else None,
+    }
+    atomic_write_json(context_path, context)
+    description = output / "description.md"
+    description.write_text(f"# 首个质量分歧\n\n- 类型：{divergence.get('kind')}\n- 字段：{divergence.get('field')}\n- 帧：{divergence.get('frame_index')}\n- 单调时间：{monotonic_ms}\n- 事件：{event_id}\n- 状态版本：{revision_before} → {revision_after}\n", encoding="utf-8")
+    images = _save_frame_rois(session / "video" / "game.avi", int(divergence.get("frame_index", 0) or 0), output, str(actual.get("actor", expected.get("actor", "")) or ""))
+    return {"directory": str(output), "kind": divergence.get("kind"), "field": divergence.get("field"), "frame_index": divergence.get("frame_index"), "monotonic_ms": monotonic_ms, "event_id": event_id, "state_revision_before": revision_before, "state_revision_after": revision_after, "expected": str(expected_path), "actual": str(actual_path), "context": str(context_path), "description": str(description), "images": images}
+
+
+def _resolve_evidence_context(
+    divergence: dict[str, object],
+    actual: dict[str, object],
+    *,
+    visual_frame_log: Path | None,
+    runtime_directory: Path | None,
+) -> dict[str, object]:
+    """Resolve honest nearby evidence when a missing action has no event object."""
+
+    target_frame = _int_or_none(divergence.get("frame_index"))
+    target_ms = _int_or_none(divergence.get("monotonic_ms"))
+    frame_rows = _read_existing_json_lines(visual_frame_log)
+    indexed_rows = [
+        row for row in frame_rows if _int_or_none(row.get("frame_index")) is not None
+    ]
+    indexed_rows.sort(key=lambda row: int(row["frame_index"]))
+    nearest_row = _nearest_frame_row(indexed_rows, target_frame)
+    before_row, after_row = _surrounding_frame_rows(indexed_rows, target_frame)
+    if target_ms is None and nearest_row is not None:
+        target_ms = _int_or_none(nearest_row.get("monotonic_ms"))
+
+    nearby_events: list[dict[str, object]] = []
+    for row in indexed_rows:
+        raw_events = row.get("events", ())
+        if not isinstance(raw_events, list):
+            continue
+        for event in raw_events:
+            if not isinstance(event, dict) or not event.get("event_id"):
+                continue
+            nearby_events.append(
+                {
+                    **event,
+                    "_frame_index": row.get("frame_index"),
+                    "_frame_monotonic_ms": row.get("monotonic_ms"),
+                    "_frame_state_revision": row.get("state_revision"),
+                }
+            )
+    nearest_event = _nearest_event(nearby_events, target_frame, target_ms)
+
+    runtime_timeline = (
+        runtime_directory / "timeline.jsonl"
+        if runtime_directory is not None
+        else None
+    )
+    timeline_rows = _read_existing_json_lines(runtime_timeline)
+    nearest_timeline_event = _nearest_event(timeline_rows, None, target_ms)
+    selected_event = nearest_event or nearest_timeline_event
+
+    before_revision = _row_revision(before_row)
+    after_revision = _row_revision(after_row)
+    if before_revision is None and selected_event is not None:
+        before_revision = _int_or_none(selected_event.get("state_revision_before"))
+    if after_revision is None and selected_event is not None:
+        after_revision = _int_or_none(selected_event.get("state_revision_after"))
+    if before_revision is None:
+        before_revision = _int_or_none(actual.get("state_revision_before"))
+    if after_revision is None:
+        after_revision = _int_or_none(actual.get("state_revision_after"))
+
+    before_state = _frame_state_summary(before_row, "nearest_frame_before_or_at")
+    after_state = _frame_state_summary(after_row, "nearest_frame_after_or_at")
+    if before_state is not None:
+        before_state["revision"] = before_revision
+    if after_state is not None:
+        after_state["revision"] = after_revision
+
+    decisions_path = runtime_directory / "decisions.jsonl" if runtime_directory else None
+    decisions = _read_existing_json_lines(decisions_path)
+    decision = _nearest_decision(decisions, divergence)
+    engine_input = None
+    if decision is not None:
+        engine_input = decision.get("engine_input")
+        if engine_input is None:
+            engine_input = {
+                "available_in_decision": False,
+                "decision_id": decision.get("decision_id"),
+                "request_id": decision.get("request_id"),
+                "state_revision": decision.get("state_revision"),
+            }
+
+    unavailable: list[str] = []
+    values = {
+        "monotonic_ms": target_ms,
+        "event_id": selected_event.get("event_id") if selected_event else None,
+        "state_revision_before": before_revision,
+        "state_revision_after": after_revision,
+    }
+    unavailable.extend(name for name, value in values.items() if value is None)
+    return {
+        **values,
+        "reducer_state_before": before_state,
+        "reducer_state_after": after_state,
+        "engine_input": engine_input,
+        "fallback": {
+            "monotonic_ms_source": (
+                "divergence" if divergence.get("monotonic_ms") is not None
+                else "nearest_visual_frame" if target_ms is not None
+                else "unavailable"
+            ),
+            "event_id_source": (
+                "nearest_actual_event_in_visual_frame_log" if nearest_event is not None
+                else "nearest_actual_event_in_runtime_timeline" if nearest_timeline_event is not None
+                else "unavailable"
+            ),
+            "state_source": "surrounding_visual_frame_rows",
+            "target_frame_index": target_frame,
+            "before_frame_index": before_row.get("frame_index") if before_row else None,
+            "after_frame_index": after_row.get("frame_index") if after_row else None,
+        },
+        "evidence_unavailable": unavailable,
+    }
+
+
+def _read_existing_json_lines(path: Path | None) -> list[dict[str, object]]:
+    if path is None or not path.is_file():
+        return []
+    try:
+        return list(read_json_lines(path))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def _nearest_frame_row(
+    rows: list[dict[str, object]], target_frame: int | None
+) -> dict[str, object] | None:
+    if not rows:
+        return None
+    if target_frame is None:
+        return rows[0]
+    return min(
+        rows,
+        key=lambda row: abs(int(row["frame_index"]) - target_frame),
+    )
+
+
+def _surrounding_frame_rows(
+    rows: list[dict[str, object]], target_frame: int | None
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    if not rows:
+        return None, None
+    if target_frame is None:
+        return rows[0], rows[0]
+    before = [row for row in rows if int(row["frame_index"]) < target_frame]
+    after = [row for row in rows if int(row["frame_index"]) >= target_frame]
+    return (
+        before[-1] if before else rows[0],
+        after[0] if after else rows[-1],
+    )
+
+
+def _nearest_event(
+    events: list[dict[str, object]],
+    target_frame: int | None,
+    target_ms: int | None,
+) -> dict[str, object] | None:
+    if not events:
+        return None
+
+    def score(event: dict[str, object]) -> tuple[int, int]:
+        frame = _int_or_none(event.get("_frame_index"))
+        monotonic = _int_or_none(
+            event.get("_frame_monotonic_ms", event.get("monotonic_ms"))
+        )
+        frame_delta = abs(frame - target_frame) if frame is not None and target_frame is not None else 10**12
+        ms_delta = abs(monotonic - target_ms) if monotonic is not None and target_ms is not None else 10**12
+        return frame_delta, ms_delta
+
+    return min(events, key=score)
+
+
+def _row_revision(row: dict[str, object] | None) -> int | None:
+    return _int_or_none(row.get("state_revision")) if row is not None else None
+
+
+def _frame_state_summary(
+    row: dict[str, object] | None, source: str
+) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {
+        "available": True,
+        "source": source,
+        "frame_index": row.get("frame_index"),
+        "monotonic_ms": row.get("monotonic_ms"),
+        "status": row.get("status"),
+        "current_player": row.get("current_player"),
+        "revision": row.get("state_revision"),
+    }
+
+
+def _reducer_state_diff(
+    before: dict[str, object], after: dict[str, object]
+) -> dict[str, object]:
+    before_revision = _int_or_none(before.get("revision"))
+    after_revision = _int_or_none(after.get("revision"))
+    return {
+        "before_revision": before_revision,
+        "after_revision": after_revision,
+        "revision_delta": (
+            after_revision - before_revision
+            if before_revision is not None and after_revision is not None
+            else None
+        ),
+        "current_player_before": before.get("current_player"),
+        "current_player_after": after.get("current_player"),
+        "current_player_changed": before.get("current_player") != after.get("current_player"),
+        "source": "surrounding_visual_frame_rows",
+        "scope": "summary_only_not_full_reducer_state",
+    }
+
+
+def _nearest_decision(
+    decisions: list[dict[str, object]], divergence: dict[str, object]
+) -> dict[str, object] | None:
+    if not decisions:
+        return None
+    expected = divergence.get("expected")
+    expected = expected if isinstance(expected, dict) else {}
+    turn_id = _int_or_none(expected.get("turn_id"))
+    if turn_id is not None:
+        same_turn = [row for row in decisions if _int_or_none(row.get("turn_id")) == turn_id]
+        if same_turn:
+            return same_turn[-1]
+    return decisions[-1]
+
+
+def _save_frame_rois(video: Path, index: int, output: Path, actor: str) -> dict[str, str]:
+    capture = cv2.VideoCapture(str(video))
+    try:
+        if not capture.isOpened():
+            return {}
+        capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, index))
+        ok, frame = capture.read()
+        if not ok:
+            return {}
+    finally:
+        capture.release()
+    height, width = frame.shape[:2]
+    crops = {
+        "trigger": frame,
+        "level_roi": frame[: max(1, height // 4), width // 3 : max(width // 3 + 1, 2 * width // 3)],
+        "hand_roi": frame[2 * height // 3 :, :],
+    }
+    actor_boxes = {"self": (0, height // 2, width, height), "right": (width // 2, height // 4, width, 3 * height // 4), "opposite": (0, 0, width, height // 2), "left": (0, height // 4, width // 2, 3 * height // 4)}
+    if actor in actor_boxes:
+        x1, y1, x2, y2 = actor_boxes[actor]
+        crops[f"play_{actor}_roi"] = frame[y1:y2, x1:x2]
+    saved: dict[str, str] = {}
+    for name, image in crops.items():
+        path = output / f"{name}.png"
+        if image.size and cv2.imwrite(str(path), image):
+            saved[name] = str(path)
+    return saved
+
+
+def _visual_advice_summary(result: VisualPipelineReplayResult, advisor: Any) -> dict[str, object]:
+    return {
+        "available": True, "completed": result.completed, "processed_turn_count": result.processed_turn_count,
+        "run_directory": str(result.run_directory) if result.run_directory else None,
+        "advice": {"requested": result.advice_requested, "ready": result.advice_ready, "failed": result.advice_failed, "stale": result.advice_stale, "timeout": result.advice_timeouts, "timeouts": result.advice_timeouts, "withheld": result.advice_withheld, "statuses": dict(result.advice_statuses)},
+        "advisor": _advisor_info(advisor), "artifacts": {name: str(path) for name, path in result.artifact_paths.items()},
+    }
+
+
+def _comparison_summary(value: ReplayComparison) -> dict[str, object]:
+    return {"identical_turn_ids": list(value.identical_turn_ids), "identical": len(value.identical_turn_ids), "missing": len(value.missing), "added": len(value.added), "changed": len(value.changed), "metric_deltas": len(value.metric_deltas)}
+
+
+def _normalize_roots(values: Iterable[Path | str]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    for value in values:
+        raw = Path(value).resolve()
+        root = raw / "sessions" if (raw / "sessions").is_dir() else raw
+        if root not in result:
+            result.append(root)
+    return tuple(result)
+
+
+def _scan_run_ids(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    values = (value,) if isinstance(value, str) else tuple(value)
+    result: list[str] = []
+    for item in values:
+        normalized = str(item).strip()
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return tuple(result)
+
+
+def _reject_internal_output(output: Path, roots: tuple[Path, ...]) -> None:
+    if any(_relative_to(output, root) for root in roots):
+        raise ValueError("audit output must be outside every sessions root")
+
+
+def _discover(roots: tuple[Path, ...]) -> tuple[_Session, ...]:
+    result: list[_Session] = []
+    used: set[str] = set()
+    for index, root in enumerate(roots, start=1):
+        label = root.parent.name if root.name.lower() == "sessions" else root.name
+        store_id = f"{_safe_name(label or f'store_{index}')}_{hashlib.sha256(str(root).casefold().encode()).hexdigest()[:8]}"
+        while store_id in used:
+            store_id += f"_{index}"
+        used.add(store_id)
+        if not root.is_dir():
+            continue
+        for session in sorted(root.iterdir(), key=lambda path: path.name):
+            if session.is_dir() and (session / "manifest.json").is_file():
+                result.append(_Session(session.resolve(), root, store_id, _session_id(session)))
+    return tuple(result)
+
+
+def _inventory(sessions: tuple[_Session, ...], roots: tuple[Path, ...], scan_run_id: str | Iterable[str] | None) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    profile_cache: dict[Path, dict[str, object]] = {}
+    for item in sessions:
+        reference = resolve_truth_audit_reference(item.source, scan_run_id=scan_run_id)
+        frame_path = item.source / "video" / "frame_index.jsonl"
+        frame_rows, frame_error = _read_lines_safe(frame_path)
+        indices = [_int_or_none(row.get("frame_index")) for row in frame_rows]
+        values = [value for value in indices if value is not None]
+        profile = item.source.parent.parent
+        profile_data = profile_cache.setdefault(profile, _profile_inventory(profile))
+        rows.append(
+            {
+                "source": str(item.source), "sessions_root": str(item.root), "store_id": item.store_id, "session_id": item.session_id,
+                "truth_kind": reference.kind if reference else "none",
+                "files": {
+                    "manifest": _file_info(item.source / "manifest.json"), "video": _file_info(item.source / "video" / "game.avi"),
+                    "frame_index": _file_info(frame_path), "truth": _file_info(reference.path if reference else None),
+                    "canonical_truth": _file_info(item.source / "truth_log.json"), "recognition_trace": _file_info(item.source / "recognition_trace.jsonl"), "timeline": _file_info(item.source / "timeline.jsonl"),
+                },
+                "frame_index": {"row_count": len(frame_rows), "continuous": bool(values) and all(b == a + 1 for a, b in zip(values, values[1:])), "first": values[0] if values else None, "last": values[-1] if values else None, "duplicates": sorted(v for v, count in Counter(values).items() if count > 1), "parse_error": frame_error},
+                "profile_artifacts": profile_data,
+            }
+        )
+    return {"schema": "guandan.session-replay-inventory/1", "created_at": datetime.now().astimezone().isoformat(), "roots": [str(root) for root in roots], "session_count": len(rows), "indexed_frame_count": sum(int(row["frame_index"]["row_count"]) for row in rows), "sessions": rows, "environment": _environment()}
+
+
+def _profile_inventory(profile: Path) -> dict[str, object]:
+    configs = [path for path in (profile / "profile.json", profile / "regions_config.json", profile / "templates_config.json") if path.is_file()]
+    template_root, model_root = profile / "templates", profile / "models"
+    templates = sorted(path for path in template_root.rglob("*") if path.is_file()) if template_root.is_dir() else []
+    models = sorted(path for path in model_root.rglob("*") if path.is_file()) if model_root.is_dir() else []
+    preferred = next((path for path in models if path.name == "best.npz"), None)
+    return {
+        "profile": str(profile), "configuration_files": [_file_info(path) for path in configs], "configuration_hash": _tree_hash(configs, profile),
+        "template_manifest_hash": _tree_hash(templates, template_root), "models": [_file_info(path) for path in models],
+        "model_digest": _sha_file(preferred) if preferred else None, "model_path": str(preferred) if preferred else None, "backend": "numpy" if preferred and preferred.suffix == ".npz" else None,
+    }
+
+
+def _source_snapshot(roots: tuple[Path, ...]) -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            stat = path.stat()
+            key = f"{root}::{path.relative_to(root).as_posix()}"
+            data: dict[str, object] = {"relative_path": path.relative_to(root).as_posix(), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+            if path.name in {"manifest.json", "timeline.jsonl", "truth_log.json", "recognition_trace.jsonl", "game.avi", "frame_index.jsonl"}:
+                data["sha256"] = _sha_file(path)
+            result[key] = data
+    return result
+
+
+def _make_summary(*, run_id: str, rows: list[dict[str, object]], inventory: dict[str, object], scan_run_id: str | Iterable[str] | None, command: Iterable[str] | None, source_changes: list[dict[str, object]], source_snapshot_paths: tuple[Path, Path]) -> dict[str, object]:
+    completed = sum(row.get("execution_status") == "completed" for row in rows)
+    return {
+        "schema": "guandan.session-replay-audit/2", "run_id": run_id, "created_at": datetime.now().astimezone().isoformat(),
+        "parameters": {"sessions_roots": inventory.get("roots", ()), "scan_run_ids": list(_scan_run_ids(scan_run_id)), "command": list(command) if command else None},
+        "environment": inventory.get("environment", {}), "session_count": len(rows), "completed": completed, "errors": len(rows) - completed,
+        "frames_processed": sum(int(row.get("frames_processed", 0) or 0) for row in rows), "indexed_frames": sum(int(row.get("indexed_frames", 0) or 0) for row in rows),
+        "source_integrity": {"unchanged": not source_changes, "changes": source_changes, "before_snapshot": str(source_snapshot_paths[0]), "after_snapshot": str(source_snapshot_paths[1])},
+        "truth_levels": dict(Counter(str(row.get("truth_log", {}).get("kind", "none")) for row in rows)), "fabledan": _aggregate_advice(rows), "sessions": rows,
+    }
+
+
+def _aggregate_advice(rows: Iterable[dict[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for channel in ("truth_driven", "visual_driven"):
+        totals = Counter()
+        available = completed = 0
+        for row in rows:
+            fabledan = row.get("fabledan", {})
+            data = fabledan.get(channel, {}) if isinstance(fabledan, dict) else {}
+            if not isinstance(data, dict) or not data.get("available"):
+                continue
+            available += 1
+            completed += bool(data.get("completed"))
+            advice = data.get("advice", {})
+            if isinstance(advice, dict):
+                for name in ("requested", "ready", "failed", "stale", "timeout", "withheld"):
+                    totals[name] += int(advice.get(name, 0) or 0)
+        result[channel] = {"available_sessions": available, "completed_sessions": completed, **dict(totals)}
+    return result
+
+
+def _write_sessions_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
+    fields = ("store_id", "session_id", "source", "truth_kind", "execution_status", "truth_quality", "visual_quality", "fabledan_quality", "frames_processed", "indexed_frames", "visual_requested", "visual_ready", "truth_requested", "truth_ready")
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            fabledan = row.get("fabledan", {})
+            visual = fabledan.get("visual_driven", {}) if isinstance(fabledan, dict) else {}
+            truth = fabledan.get("truth_driven", {}) if isinstance(fabledan, dict) else {}
+            va = visual.get("advice", {}) if isinstance(visual, dict) else {}
+            ta = truth.get("advice", {}) if isinstance(truth, dict) else {}
+            writer.writerow({"store_id": row.get("store_id"), "session_id": row.get("session_id"), "source": row.get("source"), "truth_kind": row.get("truth_log", {}).get("kind"), "execution_status": row.get("execution_status"), "truth_quality": row.get("truth_quality"), "visual_quality": row.get("visual_quality"), "fabledan_quality": row.get("fabledan_quality"), "frames_processed": row.get("frames_processed", 0), "indexed_frames": row.get("indexed_frames", 0), "visual_requested": va.get("requested", 0), "visual_ready": va.get("ready", 0), "truth_requested": ta.get("requested", 0), "truth_ready": ta.get("ready", 0)})
+
+
+def _write_failures_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
+    fields = ("store_id", "session_id", "category", "status", "detail", "evidence")
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            failures: list[tuple[str, str, str]] = []
+            if row.get("execution_status") != "completed":
+                failures.append(("execution", str(row.get("execution_status")), str(row.get("error", ""))))
+            for category in ("truth_quality", "visual_quality", "fabledan_quality"):
+                if row.get(category) in {"failed", "error", "incomplete"}:
+                    failures.append((category, str(row.get(category)), "quality mismatch"))
+            divergence = row.get("first_divergence")
+            evidence = divergence.get("directory") if isinstance(divergence, dict) else ""
+            for category, status, detail in failures:
+                writer.writerow({"store_id": row.get("store_id"), "session_id": row.get("session_id"), "category": category, "status": status, "detail": detail, "evidence": evidence})
+
+
+def _write_markdown(path: Path, summary: dict[str, object]) -> None:
+    integrity = summary.get("source_integrity", {})
+    lines = ["# 第一阶段：离线全量审计报告", "", f"- 对局：{summary.get('completed', 0)}/{summary.get('session_count', 0)} 完整执行", f"- 帧：{summary.get('frames_processed', 0)}/{summary.get('indexed_frames', 0)}", f"- 工具错误：{summary.get('errors', 0)}", f"- 源数据未变化：{'是' if integrity.get('unchanged') else '否'}", f"- 真值等级：{json.dumps(summary.get('truth_levels', {}), ensure_ascii=False)}", "", "## FableDan", ""]
+    for channel, data in summary.get("fabledan", {}).items():
+        lines.append(f"- {channel}：{json.dumps(data, ensure_ascii=False)}")
+    lines.extend(["", "## 会话", ""])
+    for row in summary.get("sessions", ()):
+        lines.append(f"- `{row.get('store_id')}/{row.get('session_id')}`：执行={row.get('execution_status')}，视觉={row.get('visual_quality')}，FableDan={row.get('fabledan_quality')}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _verify(run_dir: Path, summary: dict[str, object], before: dict[str, dict[str, object]], after: dict[str, dict[str, object]]) -> dict[str, object]:
+    rows = tuple(summary.get("sessions", ()))
+    csv_count = _csv_count(run_dir / "sessions.csv")
+    count = int(summary.get("session_count", 0))
+    checks = {
+        "nonempty_session_set": count > 0,
+        "session_counts_match": count == len(rows) == csv_count,
+        "frames_complete": int(summary.get("frames_processed", 0)) == int(summary.get("indexed_frames", 0)),
+        "no_tool_errors": int(summary.get("errors", 0)) == 0,
+        "source_unchanged": before == after,
+        "required_artifacts_exist": all((run_dir / name).is_file() for name in ("all_session_audit.json", "inventory.json", "sessions.csv", "failures.csv", "summary.md", "source_snapshot_before.json", "source_snapshot_after.json")),
+        "per_session_summaries_exist": all((run_dir / "sessions" / str(row.get("store_id")) / _safe_name(str(row.get("session_id"))) / "summary.json").is_file() for row in rows),
+    }
+    return {"schema": "guandan.session-replay-verification/1", "created_at": datetime.now().astimezone().isoformat(), "passed": all(checks.values()), "checks": checks, "counts": {"json_sessions": count, "csv_sessions": csv_count, "frames_processed": summary.get("frames_processed", 0), "indexed_frames": summary.get("indexed_frames", 0), "tool_errors": summary.get("errors", 0), "source_changes": len(_source_changes(before, after))}}
+
+
+def _recognition_for_session(session: Path) -> ScreenshotRecognitionService:
+    profile = session.parent.parent
+    return ScreenshotRecognitionService(AnnotationService(profile.parent, profile.name), TemplateService(profile.parent, profile.name))
+
+
+def _fabledan_for_profile(profiles_root: Path, profile_name: str) -> Any:
+    return build_advisor("fabledan", profiles_root=profiles_root, profile_name=profile_name, fabledan_diagnostics="full")
+
+
+def _load_truth(session: Path, reference: TruthAuditReference | None) -> TruthLog | None:
+    return load_truth_log(reference.path, session_id=_session_id(session)) if reference else None
+
+
+def _truth_metadata(reference: TruthAuditReference | None, truth: TruthLog | None) -> dict[str, object]:
+    if not reference or not truth:
+        return {"kind": "none", "path": None, "sha256": None, "schema": None, "provenance": None}
+    raw = json.loads(reference.path.read_text(encoding="utf-8"))
+    return {"kind": reference.kind, "path": str(reference.path), "sha256": _sha_file(reference.path), "schema": raw.get("schema", raw.get("schema_version")), "provenance": truth.provenance.to_dict(), "label_status": truth.label_status}
+
+
+def _session_id(session: Path) -> str:
+    try:
+        raw = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    return str(raw.get("session_id", session.name))
+
+
+def _file_info(path: Path | None) -> dict[str, object]:
+    if path is None or not path.is_file():
+        return {"path": str(path) if path else None, "exists": False, "size": None, "sha256": None}
+    stat = path.stat()
+    return {"path": str(path), "exists": True, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": _sha_file(path)}
+
+
+def _tree_hash(paths: Iterable[Path], base: Path) -> str | None:
+    digest, found = hashlib.sha256(), False
+    for path in sorted(paths, key=str):
+        if path.is_file():
+            found = True
+            try:
+                name = path.relative_to(base).as_posix()
+            except ValueError:
+                name = str(path)
+            digest.update(name.encode())
+            digest.update(bytes.fromhex(_sha_file(path)))
+    return digest.hexdigest() if found else None
+
+
+def _sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _environment() -> dict[str, object]:
+    status = _git("status", "--short")
+    return {"python": sys.version, "executable": sys.executable, "platform": platform.platform(), "git_commit": _git("rev-parse", "HEAD"), "git_dirty": bool(status), "git_status": status.splitlines()}
+
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], check=False, capture_output=True, text=True, encoding="utf-8").stdout.strip()
+    except OSError:
+        return ""
+
+
+def _artifact_map(directory: Path) -> dict[str, str]:
+    names = ("manifest.json", "timeline.jsonl", "timeline.md", "advice.jsonl", "decisions.jsonl", "recognition_trace.jsonl", "observations.jsonl.part", "observations.jsonl.gz", "summary.json")
+    return {name: str(directory / name) for name in names if (directory / name).is_file()}
+
+
+def _advisor_info(advisor: Any) -> dict[str, object]:
+    func = getattr(advisor, "audit_info", None)
+    return dict(func()) if callable(func) else {}
+
+
+def _inventory_row(inventory: dict[str, object], session: _Session) -> dict[str, object]:
+    for row in inventory.get("sessions", ()):
+        if row.get("source") == str(session.source) and row.get("store_id") == session.store_id:
+            return dict(row)
+    return {}
+
+
+def _event_digest(row: dict[str, object]) -> dict[str, object]:
+    return {"event_id": row.get("event_id"), "actor": row.get("actor"), "payload": row.get("payload", {}), "frame_index": row.get("_replay_frame_index"), "monotonic_ms": row.get("_replay_monotonic_ms", row.get("monotonic_ms")), "state_revision": row.get("_replay_state_revision", row.get("state_revision_after"))}
+
+
+def _metric(denominator: int, correct: int, expected: object = None, actual: object = None) -> dict[str, object]:
+    result: dict[str, object] = {"denominator": denominator, "correct": correct, "errors": max(0, denominator - correct), "accuracy": _ratio(correct, denominator)}
+    if expected is not None or actual is not None:
+        result.update({"expected": expected, "actual": actual})
+    return result
+
+
+def _strict_quality(metrics: dict[str, object]) -> str:
+    if not metrics.get("strict"):
+        return "not_available"
+    actions = metrics.get("actions", {})
+    ranking = metrics.get("ranking", {})
+    ranking_ok = not ranking.get("denominator") or ranking.get("errors") == 0
+    passed = metrics.get("level", {}).get("errors") == 0 and metrics.get("hand_multiset", {}).get("exact") is True and metrics.get("lead_player", {}).get("errors") == 0 and actions.get("missing") == actions.get("added") == actions.get("changed") == 0 and not actions.get("order", {}).get("duplicate_actual_turn_ids") and ranking_ok
+    return "passed" if passed else "failed"
+
+
+def _visual_quality(metrics: dict[str, object], complete: bool) -> str:
+    if not complete:
+        return "incomplete"
+    return _strict_quality(metrics) if metrics.get("strict") else "diagnostic"
+
+
+def _advice_quality(truth: dict[str, object], visual: dict[str, object]) -> str:
+    channels = [visual, truth] if truth.get("available") else [visual]
+    for channel in channels:
+        advice = channel.get("advice", {})
+        if not channel.get("completed") or int(advice.get("failed", 0) or 0) or int(advice.get("timeout", 0) or 0):
+            return "failed"
+    return "passed"
+
+
+def _duplicates(rows: Iterable[dict[str, object]]) -> list[int]:
+    values = [_int_or_none(row.get("turn_id")) for row in rows]
+    return sorted(value for value, count in Counter(value for value in values if value is not None).items() if count > 1)
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def _read_lines_safe(path: Path) -> tuple[list[dict[str, object]], str | None]:
+    try:
+        return list(read_json_lines(path)), None
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def _source_changes(before: dict[str, object], after: dict[str, object]) -> list[dict[str, object]]:
+    return [{"path": key, "before": before.get(key), "after": after.get(key)} for key in sorted(set(before) | set(after)) if before.get(key) != after.get(key)]
+
+
+def _csv_count(path: Path) -> int:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return max(0, sum(1 for _ in csv.reader(handle)) - 1)
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_name(value: str) -> str:
+    result = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value)).strip("._")
+    if not result or result in {".", ".."}:
+        raise ValueError(f"invalid path component: {value!r}")
+    return result
+
+
+def _new_run_id() -> str:
+    return datetime.now().astimezone().strftime("all_sessions_%Y%m%dT%H%M%S_") + uuid4().hex[:12]
+
+
+__all__ = ["SessionReplayAuditRun", "SessionReplayAuditService", "TruthAuditReference", "compare_truth_visual_fields", "resolve_truth_audit_reference", "summarize_visual_events"]

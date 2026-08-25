@@ -31,6 +31,12 @@ from ..storage import atomic_write_json
 
 
 MIGRATION_SOURCE = "timeline_migration_v1"
+CURRENT_TURN_PROJECTION_POLICY = "all_active/v1"
+LEGACY_TURN_PROJECTION_POLICY = "legacy_skip_wind_receiver/v1"
+_TURN_PROJECTION_POLICIES: dict[str, bool] = {
+    CURRENT_TURN_PROJECTION_POLICY: True,
+    LEGACY_TURN_PROJECTION_POLICY: False,
+}
 _ACTION_TYPES = frozenset(
     {"player_played", "player_passed", "manual_confirmed_event"}
 )
@@ -54,6 +60,7 @@ class TimelineTruthSessionInspection:
     event_type_counts: tuple[tuple[str, int], ...] = ()
     draft: TruthLog | None = None
     context_repairs: tuple[str, ...] = ()
+    turn_projection_policy: str = CURRENT_TURN_PROJECTION_POLICY
 
 
 @dataclass(frozen=True)
@@ -142,12 +149,27 @@ class _BlockedMigration(ValueError):
 class TimelineTruthMigrationService:
     """Safely reconstruct draft TruthLogs from append-only live timelines."""
 
+    @staticmethod
+    def _wind_receiver_must_pass(turn_projection_policy: str) -> bool:
+        try:
+            return _TURN_PROJECTION_POLICIES[turn_projection_policy]
+        except KeyError as exc:
+            choices = ", ".join(sorted(_TURN_PROJECTION_POLICIES))
+            raise ValueError(
+                f"unsupported turn projection policy {turn_projection_policy!r}; "
+                f"expected one of {choices}"
+            ) from exc
+
     def inspect_session(
         self,
         session: Path | str,
         *,
         force: bool = False,
+        turn_projection_policy: str = CURRENT_TURN_PROJECTION_POLICY,
     ) -> TimelineTruthSessionInspection:
+        wind_receiver_must_pass = self._wind_receiver_must_pass(
+            turn_projection_policy
+        )
         session_path = Path(session)
         truth_path = session_path / "truth_log.json"
         receipt_path = session_path / "truth_log.migration.json"
@@ -194,7 +216,11 @@ class TimelineTruthMigrationService:
         }
         try:
             events = tuple(LiveEvent.from_dict(raw) for raw in raw_events)
-            draft, context_repairs = self._build_and_validate(session_path.name, events)
+            draft, context_repairs = self._build_and_validate(
+                session_path.name,
+                events,
+                wind_receiver_must_pass=wind_receiver_must_pass,
+            )
         except _BlockedMigration as exc:
             return self._blocked(session_path, exc.code, str(exc), **base)
         except Exception as exc:
@@ -211,6 +237,7 @@ class TimelineTruthMigrationService:
             message="timeline deterministically replays as a draft TruthLog",
             draft=draft,
             context_repairs=context_repairs,
+            turn_projection_policy=turn_projection_policy,
             **base,
         )
 
@@ -219,10 +246,15 @@ class TimelineTruthMigrationService:
         sessions_root: Path | str,
         *,
         force: bool = False,
+        turn_projection_policy: str = CURRENT_TURN_PROJECTION_POLICY,
     ) -> TimelineTruthRootInspection:
         root = Path(sessions_root)
         sessions = () if not root.is_dir() else tuple(
-            self.inspect_session(path, force=force)
+            self.inspect_session(
+                path,
+                force=force,
+                turn_projection_policy=turn_projection_policy,
+            )
             for path in sorted(root.iterdir(), key=lambda item: item.name)
             if path.is_dir()
         )
@@ -513,8 +545,13 @@ class TimelineTruthMigrationService:
         session: Path | str,
         *,
         force: bool = False,
+        turn_projection_policy: str = CURRENT_TURN_PROJECTION_POLICY,
     ) -> TimelineTruthSessionMigration:
-        inspection = self.inspect_session(session, force=force)
+        inspection = self.inspect_session(
+            session,
+            force=force,
+            turn_projection_policy=turn_projection_policy,
+        )
         if inspection.status != "candidate" or inspection.draft is None:
             status: _MigrationStatus = (
                 "skipped" if inspection.status == "skipped" else "blocked"
@@ -557,6 +594,7 @@ class TimelineTruthMigrationService:
         receipt = {
             "schema": "guandan.timeline-truth-migration/1",
             "migration_source": MIGRATION_SOURCE,
+            "turn_projection_policy": inspection.turn_projection_policy,
             "migrated_at": datetime.now().astimezone().isoformat(),
             "session_id": inspection.session.name,
             "source_timeline": {
@@ -577,6 +615,7 @@ class TimelineTruthMigrationService:
                 "sha256": truth_digest,
                 "label_status": "draft",
                 "turn_count": inspection.action_count,
+                "turn_projection_policy": inspection.turn_projection_policy,
             },
             "validation": {
                 "truth_log_roundtrip": True,
@@ -619,6 +658,7 @@ class TimelineTruthMigrationService:
         *,
         force: bool = False,
         should_stop: Callable[[], bool] | None = None,
+        turn_projection_policy: str = CURRENT_TURN_PROJECTION_POLICY,
     ) -> TimelineTruthRootMigration:
         root = Path(sessions_root)
         results: list[TimelineTruthSessionMigration] = []
@@ -630,7 +670,13 @@ class TimelineTruthMigrationService:
                 if should_stop is not None and should_stop():
                     cancelled = True
                     break
-                results.append(self.migrate_session(path, force=force))
+                results.append(
+                    self.migrate_session(
+                        path,
+                        force=force,
+                        turn_projection_policy=turn_projection_policy,
+                    )
+                )
         return TimelineTruthRootMigration(root, tuple(results), cancelled)
 
     @staticmethod
@@ -703,6 +749,8 @@ class TimelineTruthMigrationService:
         self,
         session_id: str,
         events: tuple[LiveEvent, ...],
+        *,
+        wind_receiver_must_pass: bool = True,
     ) -> tuple[TruthLog, tuple[str, ...]]:
         if not session_id:
             raise _BlockedMigration("invalid_session_id", "session directory name is empty")
@@ -771,6 +819,7 @@ class TimelineTruthMigrationService:
             session_id,
             events,
             effective_actions,
+            wind_receiver_must_pass=wind_receiver_must_pass,
         )
         turns = tuple(
             self._turn_from_event(index, event)
@@ -795,7 +844,12 @@ class TimelineTruthMigrationService:
                 "truth_log_validation_failed",
                 f"draft TruthLog failed schema validation: {exc}",
             ) from exc
-        self._validate_truth_replay(session_id, normalized_actions, draft)
+        self._validate_truth_replay(
+            session_id,
+            normalized_actions,
+            draft,
+            wind_receiver_must_pass=wind_receiver_must_pass,
+        )
         return draft, context_repairs
 
     @staticmethod
@@ -1052,6 +1106,8 @@ class TimelineTruthMigrationService:
         session_id: str,
         events: tuple[LiveEvent, ...],
         actions: tuple[LiveEvent, ...],
+        *,
+        wind_receiver_must_pass: bool = True,
     ) -> tuple[tuple[LiveEvent, ...], tuple[str, ...]]:
         """Replay source actions and canonically repair one proven wind offset.
 
@@ -1064,7 +1120,10 @@ class TimelineTruthMigrationService:
         """
 
         effective_by_id = {event.event_id: event for event in actions}
-        source = LiveReducer(session_id)
+        source = LiveReducer(
+            session_id,
+            wind_receiver_must_pass=wind_receiver_must_pass,
+        )
         normalized: list[LiveEvent] = []
         context_repairs: list[str] = []
         accepted_offset: int | None = None
@@ -1142,8 +1201,13 @@ class TimelineTruthMigrationService:
         session_id: str,
         actions: tuple[LiveEvent, ...],
         draft: TruthLog,
+        *,
+        wind_receiver_must_pass: bool = True,
     ) -> None:
-        truth = LiveReducer(session_id)
+        truth = LiveReducer(
+            session_id,
+            wind_receiver_must_pass=wind_receiver_must_pass,
+        )
         truth_events = draft.to_events(session_id=session_id)
         try:
             truth.apply(truth_events[0])
@@ -1230,6 +1294,8 @@ class TimelineTruthMigrationService:
 
 
 __all__ = [
+    "CURRENT_TURN_PROJECTION_POLICY",
+    "LEGACY_TURN_PROJECTION_POLICY",
     "MIGRATION_SOURCE",
     "ExistingTruthRepairInspection",
     "ExistingTruthRepairResult",

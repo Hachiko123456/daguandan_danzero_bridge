@@ -32,10 +32,16 @@ _ACTION_EVENT_TYPES = {
 class LiveReducer:
     """Deterministically reduce immutable live events into confirmed game state."""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        wind_receiver_must_pass: bool = True,
+    ) -> None:
         if not str(session_id).strip():
             raise ValueError("session_id 不能为空")
         self.session_id = str(session_id)
+        self._wind_receiver_must_pass = wind_receiver_must_pass
         self._events: list[LiveEvent] = []
         self._reset_semantic_state()
 
@@ -561,6 +567,7 @@ class LiveReducer:
             leader,
             frozenset(self._finished_seats),
             passed,
+            wind_receiver_must_pass=self._wind_receiver_must_pass,
         )
 
     def _pending_wind_receiver(self) -> Seat | None:
@@ -651,7 +658,10 @@ class LiveReducer:
         return state
 
     def clone_empty(self) -> "LiveReducer":
-        return LiveReducer(self.session_id)
+        return LiveReducer(
+            self.session_id,
+            wind_receiver_must_pass=self._wind_receiver_must_pass,
+        )
 
 
 def _action_metadata_from_payload(

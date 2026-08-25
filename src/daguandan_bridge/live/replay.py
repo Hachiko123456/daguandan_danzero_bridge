@@ -5,7 +5,7 @@ import json
 import shutil
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import chain, product
 from inspect import signature
@@ -86,6 +86,18 @@ class VisualPipelineReplayResult:
     frame_count: int
     warnings: tuple[ReplayWarning, ...]
     comparison: ReplayComparison
+    # Defaults keep the historical five-argument construction API intact.
+    run_directory: Path | None = None
+    processed_turn_count: int = 0
+    completed: bool = False
+    advice_requested: int = 0
+    advice_ready: int = 0
+    advice_failed: int = 0
+    advice_stale: int = 0
+    advice_timeouts: int = 0
+    advice_withheld: int = 0
+    advice_statuses: dict[str, int] = field(default_factory=dict)
+    artifact_paths: dict[str, Path] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -299,7 +311,10 @@ def replay_truth_through_live_advisor(
             "timeline.jsonl",
             "timeline.md",
             "advice.jsonl",
+            "decisions.jsonl",
+            "recognition_trace.jsonl",
             "observations.jsonl.part",
+            "observations.jsonl.gz",
         ):
             source = store.directory / name
             if source.is_file():
@@ -577,6 +592,12 @@ class VideoReplaySource:
     def warnings(self) -> tuple[ReplayWarning, ...]:
         return self._warnings
 
+    @property
+    def indexed_frame_count(self) -> int:
+        """Return the stable number of frames advertised by the index."""
+
+        return sum(1 for _ in read_json_lines(self.index_path))
+
     def frames(
         self,
         *,
@@ -663,17 +684,23 @@ def replay_video_through_live_pipeline(
     truth_log: TruthLog | Path | None = None,
     stop_requested: Callable[[], bool] | None = None,
     on_turn: Callable[[dict[str, object]], None] | None = None,
+    on_progress: Callable[[int, int, int], None] | None = None,
     wait_for_position: Callable[[int], bool] | None = None,
     use_live_pipeline: bool = False,
     sample_every_frame: bool = False,
     recognition_strategy: str = "two_valid_streak",
     output_root: Path | None = None,
     persist_frame_log: bool = True,
+    advisor: Any | None = None,
+    advice_timeout_sec: float = 60.0,
 ) -> VisualPipelineReplayResult:
     """Run timestamped recorded frames through the production live pipeline.
 
     ``on_turn`` receives each per-turn comparison dict as soon as it is
     produced, so callers can stream readable lines during the replay.
+    ``on_progress`` receives ``(processed, total, frame_index)`` for every
+    processed frame.  ``total`` comes from the immutable frame index so UI
+    callers can expose a stable scan percentage without inspecting the video.
     ``wait_for_position(target_frame)`` gates the scan so recognition only
     advances as fast as the playback position (pause stops the scan).
     ``use_live_pipeline=True`` runs the replay through the real
@@ -686,6 +713,7 @@ def replay_video_through_live_pipeline(
     del sample_every_frame
     session = Path(session)
     using_truth_log = truth_log is not None
+    explicit_output_root = output_root is not None
     artifact_root = Path(output_root) if output_root is not None else session
     artifact_root.mkdir(parents=True, exist_ok=True)
     output = artifact_root / (
@@ -729,6 +757,7 @@ def replay_video_through_live_pipeline(
                 comparison_path=comparison_path,
                 report_path=report_path,
                 on_turn=on_turn,
+                on_progress=on_progress,
                 wait_for_position=wait_for_position,
             )
     else:
@@ -751,11 +780,14 @@ def replay_video_through_live_pipeline(
         raise ValueError("复测基线中的首出座位无效")
 
     video_source = VideoReplaySource(video_path, frame_index_path)
+    indexed_frame_count = video_source.indexed_frame_count
     frames = iter(video_source.frames())
     first = next(frames, None)
     if first is None:
         raise ValueError("录像没有可回放帧")
     first_record, first_frame = first
+    if on_progress is not None:
+        on_progress(0, indexed_frame_count, first_record.frame_index)
     prefetched_frames = [(first_record, first_frame)]
     initial_state_warnings: list[ReplayWarning] = []
     if use_live_pipeline:
@@ -783,6 +815,11 @@ def replay_video_through_live_pipeline(
     actual_events: tuple[LiveEvent, ...] = ()
     frame_count = 0
     last_record = first_record
+    runtime_directory: Path | None = None
+    advice_timeout_count = 0
+    waited_advice_requests: set[str] = set()
+    advice_statuses: Counter[str] = Counter()
+    runtime_artifacts: dict[str, Path] = {}
 
     with tempfile.TemporaryDirectory(prefix="daguandan-visual-replay-") as temp:
         root = Path(temp)
@@ -795,7 +832,7 @@ def replay_video_through_live_pipeline(
             store=store,
             recorder=recorder,
             recognition_service=recognition_service,
-            advisor=None,
+            advisor=advisor,
             minimum_free_bytes=0,
             recognition_strategy=recognition_strategy,
             # 复测无人值守：识别落空不等人确认，自动重置继续。
@@ -823,6 +860,29 @@ def replay_video_through_live_pipeline(
                     frame,
                     monotonic_ms=record.monotonic_ms,
                 )
+                raw_advice = getattr(update, "advice", None)
+                advice_key = getattr(raw_advice, "key", None)
+                if (
+                    advisor is not None
+                    and advice_key is not None
+                    and getattr(raw_advice, "status", "") == "requested"
+                    and advice_key.request_id not in waited_advice_requests
+                ):
+                    waited_advice_requests.add(advice_key.request_id)
+                    resolved_advice = runner.wait_for_advice(
+                        advice_key,
+                        timeout=advice_timeout_sec,
+                    )
+                    if resolved_advice is None:
+                        advice_timeout_count += 1
+                        store.append_advice(
+                            {
+                                "request_id": advice_key.request_id,
+                                "status": "timeout",
+                                "turn_id": advice_key.turn_id,
+                                "state_revision": advice_key.state_revision,
+                            }
+                        )
                 # A committed action can carry lifecycle events produced in
                 # the same frame (finish placement, wind catch, next turn).
                 # Retain the full batch for diagnostics while keeping the
@@ -848,6 +908,12 @@ def replay_video_through_live_pipeline(
                     )
                 last_record = record
                 frame_count += 1
+                if on_progress is not None:
+                    on_progress(
+                        frame_count,
+                        indexed_frame_count,
+                        record.frame_index,
+                    )
                 if on_turn is not None:
                     turn_id_by_event_id: dict[str, int] = {
                         event.event_id: event.turn_id
@@ -864,7 +930,10 @@ def replay_video_through_live_pipeline(
                                 )
                             )
                             continue
-                        if event.event_type != "suit_corrected":
+                        if event.event_type not in {
+                            "suit_corrected",
+                            "event_correction",
+                        }:
                             continue
                         target_event_id = str(
                             event.payload.get("target_event_id", "")
@@ -876,12 +945,19 @@ def replay_video_through_live_pipeline(
                             continue
                         on_turn(
                             {
-                                "kind": "suit_corrected",
+                                # Stream the reducer's effective action
+                                # corrections to the draft assembler instead
+                                # of treating them as additional turns.
+                                "kind": event.event_type,
                                 "target_turn_id": target_turn_id,
                                 "actor": event.actor,
                                 "recognized_cards": list(
                                     event.payload.get("cards", ())
                                 ),
+                                "recognized_pass": bool(
+                                    event.payload.get("is_pass", False)
+                                ),
+                                "trick_id": event.trick_id,
                                 "confidence": round(float(event.confidence), 4),
                                 "frame_index": record.frame_index,
                             }
@@ -910,6 +986,29 @@ def replay_video_through_live_pipeline(
                     },
                 )
             actual_events = runner.events
+
+        advice_records = tuple(read_json_lines(store.advice_path))
+        advice_statuses.update(
+            str(item.get("status", "unknown")) for item in advice_records
+        )
+        if explicit_output_root:
+            runtime_directory = artifact_root / "runtime"
+            runtime_directory.mkdir(parents=True, exist_ok=True)
+            for name in (
+                "manifest.json",
+                "timeline.jsonl",
+                "timeline.md",
+                "advice.jsonl",
+                "decisions.jsonl",
+                "recognition_trace.jsonl",
+                "observations.jsonl.part",
+                "observations.jsonl.gz",
+            ):
+                source = store.directory / name
+                if source.is_file():
+                    target = runtime_directory / name
+                    shutil.copy2(source, target)
+                    runtime_artifacts[name] = target
 
     comparison = compare_timelines(expected_events, actual_events)
     atomic_write_json(
@@ -943,6 +1042,25 @@ def replay_video_through_live_pipeline(
         frame_count=frame_count,
         warnings=(*video_source.warnings, *initial_state_warnings),
         comparison=comparison,
+        run_directory=runtime_directory,
+        processed_turn_count=sum(
+            event.event_type in _ACTION_TYPES for event in actual_events
+        ),
+        completed=(
+            frame_count == indexed_frame_count
+            and not any(
+                warning.reason in {"missing_video_frames", "extra_video_frames"}
+                for warning in video_source.warnings
+            )
+        ),
+        advice_requested=int(advice_statuses.get("requested", 0)),
+        advice_ready=int(advice_statuses.get("ready", 0)),
+        advice_failed=int(advice_statuses.get("failed", 0)),
+        advice_stale=int(advice_statuses.get("stale", 0)),
+        advice_timeouts=advice_timeout_count,
+        advice_withheld=int(advice_statuses.get("withheld", 0)),
+        advice_statuses=dict(sorted(advice_statuses.items())),
+        artifact_paths=runtime_artifacts,
     )
 
 
@@ -958,6 +1076,7 @@ def _replay_truth_by_frame(
     comparison_path: Path,
     report_path: Path,
     on_turn: Callable[[dict[str, object]], None] | None = None,
+    on_progress: Callable[[int, int, int], None] | None = None,
     wait_for_position: Callable[[int], bool] | None = None,
 ) -> VisualPipelineReplayResult:
     """Deterministic per-turn verification against the recorded video.
@@ -972,6 +1091,8 @@ def _replay_truth_by_frame(
     records = tuple(
         FrameIndexRecord.from_dict(raw) for raw in read_json_lines(frame_index_path)
     )
+    if on_progress is not None:
+        on_progress(0, len(records), records[0].frame_index if records else 0)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         capture.release()
@@ -1009,6 +1130,9 @@ def _replay_truth_by_frame(
                     record.frame_index
                 ):
                     break
+                frame_count += 1
+                if on_progress is not None:
+                    on_progress(frame_count, len(records), record.frame_index)
                 result = recognition_service.recognize_play_region(
                     frame,
                     turn.actor,
@@ -1048,6 +1172,8 @@ def _replay_truth_by_frame(
                 except StopIteration:
                     break
                 frame_count += 1
+                if on_progress is not None:
+                    on_progress(frame_count, len(records), record.frame_index)
                 if wait_for_position is not None and not wait_for_position(
                     record.frame_index
                 ):

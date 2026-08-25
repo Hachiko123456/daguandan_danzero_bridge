@@ -219,7 +219,7 @@ class TruthLogEditor(QWidget):
                 "如需重来请清空后从头开始"
             )
             self.resume_banner.setWordWrap(True)
-            self.clear_button = QPushButton("清空记录，从头开始")
+            self.clear_button = QPushButton("清空")
             resume_row.addWidget(self.resume_banner, 1)
             resume_row.addWidget(self.clear_button)
             layout.addLayout(resume_row)
@@ -271,9 +271,9 @@ class TruthLogEditor(QWidget):
         self.hand_scroll.setMinimumHeight(92)
         self.hand_scroll.setMaximumHeight(104)
         info_row.addWidget(self.hand_scroll, 1)
-        self.edit_hand_button = QPushButton("编辑手牌")
+        self.edit_hand_button = QPushButton("改手牌")
         info_row.addWidget(self.edit_hand_button)
-        self.recognize_hand_button = QPushButton("重新识别手牌")
+        self.recognize_hand_button = QPushButton("识别手牌")
         info_row.addWidget(self.recognize_hand_button)
         layout.addLayout(info_row)
         self._hand: tuple[str, ...] = tuple(truth_log.initial_state.my_hand)
@@ -297,10 +297,10 @@ class TruthLogEditor(QWidget):
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table, 1)
         controls = QHBoxLayout()
-        self.add_button = QPushButton("新增一行")
-        self.insert_button = QPushButton("插入行")
-        self.remove_button = QPushButton("删除选中行")
-        self.recognize_frame_button = QPushButton("识别当前画面")
+        self.add_button = QPushButton("新增")
+        self.insert_button = QPushButton("插入")
+        self.remove_button = QPushButton("删除")
+        self.recognize_frame_button = QPushButton("识别本帧")
         controls.addWidget(self.add_button)
         controls.addWidget(self.insert_button)
         controls.addWidget(self.remove_button)
@@ -313,14 +313,14 @@ class TruthLogEditor(QWidget):
         self.recognition_hint.setWordWrap(True)
         layout.addWidget(self.recognition_hint)
         buttons = QHBoxLayout()
-        self.save_button = QPushButton("保存出牌日志")
+        self.save_button = QPushButton("保存日志")
         buttons.addWidget(self.save_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         self.end_status = QLabel("对局状态：进行中")
         self.end_status.setWordWrap(True)
         layout.addWidget(self.end_status)
-        self.save_status = QLabel("未保存（保存后写入 truth_log.json）")
+        self.save_status = QLabel("未保存（点击保存日志后写入 truth_log.json）")
         self.save_status.setWordWrap(True)
         layout.addWidget(self.save_status)
         self.fabledan_training_card = CardWidget(self)
@@ -981,12 +981,14 @@ class TruthLogEditor(QWidget):
     def _recognition_candidate(
         self,
         image: np.ndarray,
-        expected: str,
+        actor: str,
+        *,
+        allow_full_fallback: bool,
     ) -> tuple[_FrameRecognitionCandidate | None, str]:
         recognition = self._recognition()
         region_result = recognition.recognize_play_region(
             image,
-            expected,
+            actor,
             wild_rank=str(self.round_level_combo.currentData()),
             allow_unknown_suit=True,
         )
@@ -1003,6 +1005,12 @@ class TruthLogEditor(QWidget):
                     roi_name=_PLAY_ROI_NAMES.get(str(region_result.player), ""),
                 ),
                 f"仅识别{_SEAT_LABELS.get(str(region_result.player), str(region_result.player))}区域",
+            )
+
+        if not allow_full_fallback:
+            return (
+                None,
+                f"{_SEAT_LABELS.get(actor, actor)}区域未识别到动作",
             )
 
         try:
@@ -1036,13 +1044,20 @@ class TruthLogEditor(QWidget):
         *,
         target_row: int,
         replacing: bool,
+        selected_actor: str | None = None,
     ) -> str:
         expected = self._expected_player_at(target_row)
-        if expected is None:
+        if selected_actor is None and expected is None:
             raise ValueError("无法从当前位置前的有效记录推断玩家")
         if candidate.actor not in TURN_ORDER:
             raise ValueError("识别结果包含无效玩家")
-        if candidate.actor != expected:
+        if selected_actor is not None and candidate.actor != selected_actor:
+            raise ValueError(
+                "识别玩家与选中行玩家不一致："
+                f"选中{_SEAT_LABELS[selected_actor]}，"
+                f"识别为{_SEAT_LABELS.get(candidate.actor, candidate.actor)}"
+            )
+        if selected_actor is None and candidate.actor != expected:
             raise ValueError(
                 "识别玩家与当前位置上下文冲突："
                 f"应为{_SEAT_LABELS[expected]}，识别为{_SEAT_LABELS[candidate.actor]}"
@@ -1056,6 +1071,13 @@ class TruthLogEditor(QWidget):
         for card in candidate.cards:
             card_code_to_text(card)
 
+        if selected_actor is not None and candidate.actor != expected:
+            if expected is None:
+                return "玩家链在本行之前无法推导；已按选中玩家写入，保存前请修正"
+            return (
+                f"玩家链冲突：第 {target_row + 1} 行应为{_SEAT_LABELS[expected]}，"
+                f"已按选中{_SEAT_LABELS[selected_actor]}写入；保存前请修正"
+            )
         if not replacing or target_row + 1 >= self.table.rowCount():
             return ""
         replacement = TruthTurn(
@@ -1306,16 +1328,39 @@ class TruthLogEditor(QWidget):
             return
         replacing = len(selected_rows) == 1
         target_row = selected_rows[0] if replacing else self.table.rowCount()
-        if replacing and self._correct_unknown_suit_row(target_row, frame_index, image):
-            return
         expected = self._expected_player_at(target_row)
-        if expected is None:
+        selected_actor = self._player_at(target_row) if replacing else None
+        if replacing and selected_actor is None:
+            self.recognition_hint.setText(
+                "识别当前画面：选中行的玩家无效；未写入"
+            )
+            return
+        original = (
+            self.table.item(target_row, 0).data(
+                int(Qt.ItemDataRole.UserRole) + 1
+            )
+            if replacing and self.table.item(target_row, 0) is not None
+            else None
+        )
+        if (
+            replacing
+            and isinstance(original, TruthTurn)
+            and original.actor == selected_actor
+            and self._correct_unknown_suit_row(target_row, frame_index, image)
+        ):
+            return
+        actor = selected_actor if replacing else expected
+        if actor is None:
             self.recognition_hint.setText(
                 "识别当前画面：无法从当前位置前的有效记录推断玩家；未写入"
             )
             return
         try:
-            candidate, source_note = self._recognition_candidate(image, expected)
+            candidate, source_note = self._recognition_candidate(
+                image,
+                actor,
+                allow_full_fallback=not replacing,
+            )
             if candidate is None:
                 self.recognition_hint.setText(
                     f"识别当前画面：{source_note}；未写入"
@@ -1325,6 +1370,7 @@ class TruthLogEditor(QWidget):
                 candidate,
                 target_row=target_row,
                 replacing=replacing,
+                selected_actor=selected_actor,
             )
         except Exception as exc:
             self.recognition_hint.setText(f"识别当前画面失败：{exc}；未写入")
@@ -1350,13 +1396,6 @@ class TruthLogEditor(QWidget):
                     )
                     return
 
-        original = (
-            self.table.item(target_row, 0).data(
-                int(Qt.ItemDataRole.UserRole) + 1
-            )
-            if replacing and self.table.item(target_row, 0) is not None
-            else None
-        )
         trick_id = original.trick_id if isinstance(original, TruthTurn) else None
         turn = TruthTurn(
             target_row + 1,

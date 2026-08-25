@@ -50,8 +50,9 @@ class TrickTurnProjection:
 
     ``passed`` must contain only PASS actions after the current trick leader's
     most recent play.  A finished leader's active partner is a *future* trick
-    leader: they do not act, and must not be represented as a synthetic PASS,
-    while the two active opponents respond to the finishing play.
+    leader, but remains an ordinary respondent to that finishing play.  Every
+    active seat must actually PASS before the next trick begins; no synthetic
+    PASS is inferred for the future leader.
     """
 
     leader: Seat
@@ -60,6 +61,7 @@ class TrickTurnProjection:
     wind_receiver: Seat | None
     next_leader: Seat | None
     required_passers: frozenset[Seat]
+    wind_receiver_must_pass: bool = True
 
     @property
     def is_complete(self) -> bool:
@@ -75,15 +77,15 @@ class TrickTurnProjection:
         if self.is_complete:
             return self.next_leader
         try:
-            candidate = next_active_seat(actor, self.finished)
+            next_player = next_active_seat(actor, self.finished)
         except GameStateError:
             return None
-        if self.wind_receiver is not None and candidate == self.wind_receiver:
+        if not self.wind_receiver_must_pass and next_player == self.wind_receiver:
             try:
-                return next_active_seat(candidate, self.finished)
+                return next_active_seat(next_player, self.finished)
             except GameStateError:
-                return None
-        return candidate
+                return self.next_leader
+        return next_player
 
     def closes_if(self, player: Seat) -> bool:
         """Return whether a PASS from ``player`` would close this trick."""
@@ -97,12 +99,17 @@ def project_trick_turn(
     leader: Seat,
     finished: Iterable[Seat],
     passed: Iterable[Seat] = (),
+    *,
+    wind_receiver_must_pass: bool = True,
 ) -> TrickTurnProjection:
     """Project one trick's turn ownership, including the full 接风 rule.
 
     Callers own their card/history state and pass in only the leader, finished
     seats and responders that have already PASSed.  They must not separately
-    implement partner handoff, response counts, or the skipped wind receiver.
+    implement partner handoff or response counts.  In a wind catch, the
+    receiver takes the next trick only after every active seat has responded.
+    ``wind_receiver_must_pass=False`` exists solely for replaying pre-policy
+    timeline artifacts which omitted that historical response.
     """
 
     if leader not in TURN_ORDER:
@@ -140,7 +147,9 @@ def project_trick_turn(
             next_leader = None
 
     required_passers = (
-        active - {next_leader} if next_leader is not None else frozenset()
+        active
+        if wind_receiver is not None and wind_receiver_must_pass
+        else active - {next_leader} if next_leader is not None else frozenset()
     )
     return TrickTurnProjection(
         leader=leader,
@@ -149,4 +158,5 @@ def project_trick_turn(
         wind_receiver=wind_receiver,
         next_leader=next_leader,
         required_passers=required_passers,
+        wind_receiver_must_pass=wind_receiver_must_pass,
     )

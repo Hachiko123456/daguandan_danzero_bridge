@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from .config import DEFAULT_BASE_SIZE
 from .models import Box
@@ -25,12 +27,20 @@ RESERVED_WINDOWS_FILENAMES: set[str] = {
 
 _JSON_LINE_LOCKS: dict[Path, Lock] = {}
 _JSON_LINE_LOCKS_GUARD = Lock()
+_JSON_WRITE_LOCKS: dict[Path, Lock] = {}
+_JSON_WRITE_LOCKS_GUARD = Lock()
 
 
 def _json_line_lock(path: Path) -> Lock:
     key = path.resolve()
     with _JSON_LINE_LOCKS_GUARD:
         return _JSON_LINE_LOCKS.setdefault(key, Lock())
+
+
+def _json_write_lock(path: Path) -> Lock:
+    key = path.resolve()
+    with _JSON_WRITE_LOCKS_GUARD:
+        return _JSON_WRITE_LOCKS.setdefault(key, Lock())
 
 
 def calc_ratio_box(box: Box, base_size: tuple[int, int] = DEFAULT_BASE_SIZE) -> list[float]:
@@ -152,14 +162,28 @@ def load_json_document(config_path: Path, default: Any) -> Any:
 
 
 def atomic_write_json(config_path: Path, data: Any) -> None:
-    """在同目录写临时文件并原子替换 JSON。"""
+    """在同目录写临时文件并原子替换 JSON。
+
+    Windows readers can briefly prevent replacing an open destination.  Use a
+    unique temporary file and bounded retries so status/control files remain
+    reliable under cross-process polling without weakening atomicity.
+    """
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = config_path.with_name(f".{config_path.name}.tmp")
-    temp_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temp_path.replace(config_path)
+    temp_path = config_path.with_name(f".{config_path.name}.{uuid4().hex}.tmp")
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    with _json_write_lock(config_path):
+        try:
+            temp_path.write_text(payload, encoding="utf-8")
+            for attempt in range(20):
+                try:
+                    temp_path.replace(config_path)
+                    return
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.01)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 def make_template_record(

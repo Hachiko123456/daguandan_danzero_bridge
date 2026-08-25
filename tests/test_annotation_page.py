@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QComboBox
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
+from qfluentwidgets import Pivot
 
 from daguandan_bridge.annotation_service import AnnotationService
 from daguandan_bridge.config import PROFILES_ROOT
@@ -46,7 +47,7 @@ def test_annotation_page_displays_regions_and_supports_multi_select():
     assert config.preview_selected_button.text() == "标注选中区域"
     assert config.save_button.text() == "保存修改"
     assert page.template_kind_combo.count() == 7
-    assert page.crop_template_button.text() == "裁剪并保存模板"
+    assert page.crop_template_button.text() == "保存模板"
 
     config.close()
     page.close()
@@ -75,6 +76,83 @@ def test_annotation_page_uses_chinese_dropdowns_and_removes_source_field():
     assert config.region_table.item(0, 1).text() == "[125, 185, 130, 110]"
 
     config.close()
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_page_uses_pivot_navigation_and_keeps_legacy_mode_api():
+    app = QApplication.instance() or QApplication([])
+    page = AnnotationPage(AnnotationService())
+    page.show()
+    app.processEvents()
+
+    assert isinstance(page.mode_pivot, Pivot)
+    assert [
+        page.mode_pivot.items[key].text()
+        for key in ("region", "template", "recognition")
+    ] == ["区域标注", "模板管理", "识别测试"]
+    assert page.mode_combo.isHidden()
+    assert not page.header_card.isAncestorOf(page.region_config_button)
+    assert not page.header_card.isAncestorOf(page.show_selected_button)
+    assert not page.header_card.isAncestorOf(page.single_image_test_button)
+
+    page.mode_pivot.items["template"].click()
+    assert page.mode_combo.currentData() == "template"
+    assert page.mode_detail_stack.currentIndex() == 1
+    page.mode_combo.setCurrentIndex(page.mode_combo.findData("recognition"))
+    assert page.mode_pivot.currentRouteKey() == "recognition"
+    assert page.mode_detail_stack.currentIndex() == 2
+    assert page.single_image_test_button.parentWidget() is page.recognition_detail_widget
+
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_page_uses_three_two_desktop_split_and_stacks_when_narrow():
+    app = QApplication.instance() or QApplication([])
+    page = AnnotationPage(AnnotationService())
+    page.resize(1100, 900)
+    page.show()
+    app.processEvents()
+
+    assert page.content_splitter.orientation() == Qt.Orientation.Horizontal
+    left, right = page.content_splitter.sizes()
+    assert 1.35 <= left / right <= 1.65
+
+    page.resize(900, 900)
+    app.processEvents()
+    assert page.content_splitter.orientation() == Qt.Orientation.Vertical
+
+    page.close()
+    app.processEvents()
+
+
+def test_annotation_playback_uses_progressive_disclosure_in_preview():
+    app = QApplication.instance() or QApplication([])
+    page = AnnotationPage(AnnotationService())
+    page.resize(1100, 900)
+    page.show()
+    app.processEvents()
+    toolbar = page.session_playback_toolbar
+
+    assert toolbar.previous_button.isVisible()
+    assert toolbar.play_button.isVisible()
+    assert toolbar.step_button.isVisible()
+    assert toolbar.more_button.isVisible()
+    assert not toolbar.advanced_panel.isVisible()
+    assert not toolbar.rewind_button.isVisible()
+    assert not toolbar.frame_spin.isVisible()
+    assert page.session_previous_button is toolbar.previous_button
+
+    toolbar.more_button.setEnabled(True)
+    toolbar.more_button.click()
+    app.processEvents()
+    assert toolbar.advanced_panel.isVisible()
+    assert toolbar.rewind_button.isVisible()
+    assert toolbar.forward_button.isVisible()
+    assert toolbar.frame_spin.isVisible()
+    assert toolbar.speed_combo.isVisible()
+
     page.close()
     app.processEvents()
 
@@ -191,8 +269,10 @@ def test_template_editor_uses_coordinate_table_and_selectable_button_values(tmp_
     assert page.template_table.rowCount() > 0
     assert page.template_table.item(0, 3).text().startswith("[")
     assert page.template_table.item(0, 4).text().startswith("[")
-    assert not page.template_table.horizontalScrollBar().isVisible()
-
+    assert not page.delete_template_button.isVisible()
+    page.template_table.selectRow(0)
+    app.processEvents()
+    assert page.delete_template_button.isVisible()
     assert page.template_kind_combo.isEnabled()
     assert page.template_source_role_combo.isEnabled()
     assert page.template_label_edit.isEnabled()
@@ -298,9 +378,9 @@ def test_region_mode_hides_template_editor_and_shows_selected_region_coordinates
     app.processEvents()
 
     assert page.mode_detail_stack.currentIndex() == 0
-    assert page.mode_detail_stack.height() <= 300
     assert page.status.height() <= 60
-    assert page.image_navigation_layout.geometry().top() < 100
+    assert page.content_splitter.orientation() == Qt.Orientation.Horizontal
+    assert page.session_playback_toolbar.parentWidget().parentWidget() is page.preview_card
     assert page.template_detail_widget.isVisible() is False
     assert page.template_kind_combo.isVisible() is False
     assert page.template_label_edit.isVisible() is False
@@ -391,6 +471,18 @@ def test_region_mode_canvas_drag_updates_region_coordinates_before_save(tmp_path
 
     assert page.current_roi is not None
     assert page.current_roi.w > 0 and page.current_roi.h > 0
+    assert (
+        page.x_spin.value(),
+        page.y_spin.value(),
+        page.w_spin.value(),
+        page.h_spin.value(),
+    ) == (
+        page.current_roi.x,
+        page.current_roi.y,
+        page.current_roi.w,
+        page.current_roi.h,
+    )
+    assert page.selected_roi_preview.pixmap() is not None
     assert page.region_coordinate_table.item(0, 3).text() == str(page.current_roi.w)
     assert page.region_coordinate_table.item(0, 4).text() == str(page.current_roi.h)
 

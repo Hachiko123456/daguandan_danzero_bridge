@@ -10,7 +10,7 @@ from typing import Callable
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QScrollArea,
     QStyle,
     QStackedWidget,
@@ -34,6 +35,7 @@ from qfluentwidgets import (
     CardWidget,
     CheckBox,
     ComboBox,
+    InfoBar,
     PrimaryPushButton,
     PushButton,
     StrongBodyLabel,
@@ -236,7 +238,9 @@ class FrameInspectDialog(QDialog):
 class VisualRecognitionReplayThread(QThread):
     completed = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
     turn_result = Signal(object)
+    frame_progress = Signal(int, int, int)
 
     def __init__(
         self,
@@ -251,6 +255,7 @@ class VisualRecognitionReplayThread(QThread):
         self.truth_log = truth_log
         self._position_provider = position_provider
         self._stop_requested = threading.Event()
+        self._last_progress_percent: int | None = None
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -266,6 +271,24 @@ class VisualRecognitionReplayThread(QThread):
             time.sleep(0.02)
         return False
 
+    def _emit_frame_progress(
+        self,
+        processed: int,
+        total: int,
+        frame_index: int,
+    ) -> None:
+        """Forward only percentage changes to the UI thread."""
+
+        safe_total = max(1, total)
+        percent = min(100, max(0, processed) * 100 // safe_total)
+        if (
+            processed not in {0, total}
+            and percent == self._last_progress_percent
+        ):
+            return
+        self._last_progress_percent = percent
+        self.frame_progress.emit(processed, total, frame_index)
+
     def run(self) -> None:
         try:
             profile_root = self.session.parents[2]
@@ -280,11 +303,15 @@ class VisualRecognitionReplayThread(QThread):
                 truth_log=self.truth_log,
                 stop_requested=self._stop_requested.is_set,
                 on_turn=lambda data: self.turn_result.emit(data),
+                on_progress=self._emit_frame_progress,
                 wait_for_position=self._wait_for_position,
                 use_live_pipeline=getattr(self, "replay_mode", "pipeline") == "pipeline",
                 recognition_strategy=getattr(self, "recognition_strategy", "two_valid_streak"),
             )
-            self.completed.emit(result)
+            if self._stop_requested.is_set():
+                self.cancelled.emit()
+            else:
+                self.completed.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -351,8 +378,15 @@ class ReplayPage(QWidget):
         self._seek_frame: int | None = None
         self.truth_log: TruthLog | None = None
         self._truth_scan_base: TruthLog | None = None
+        self._truth_scan_log: TruthLog | None = None
         self._truth_scan_turns: list[dict[str, object]] = []
         self._truth_draft_assembler: ReplayTurnDraftAssembler | None = None
+        self._truth_scan_next_source_turn_id = 1
+        self._truth_scan_failure: str | None = None
+        self._truth_scan_session: Path | None = None
+        self._truth_scan_progress_processed = 0
+        self._truth_scan_progress_total = 0
+        self._truth_scan_progress_frame_index = 0
         self._truth_editor: TruthLogEditor | None = None
         self._content_vertical: bool | None = None
         self._current_record: FrameIndexRecord | None = None
@@ -627,12 +661,12 @@ class ReplayPage(QWidget):
         diag_layout = QVBoxLayout(diag_page)
         diag_layout.setContentsMargins(0, 0, 0, 0)
         diag_layout.addWidget(StrongBodyLabel("复测与诊断"))
-        self.state_replay_button = PushButton("确定性状态重放")
-        self.visual_replay_button = PrimaryPushButton("逐帧分析并编辑出牌日志")
-        self.truth_import_button = PushButton("导入标准日志")
-        self.truth_export_button = PushButton("导出标准日志")
-        self.truth_replay_button = PrimaryPushButton("开始复测")
-        self.truth_edit_button = PushButton("手动编辑出牌日志")
+        self.state_replay_button = PushButton("状态重放")
+        self.visual_replay_button = PrimaryPushButton("扫描出牌")
+        self.truth_import_button = PushButton("导入日志")
+        self.truth_export_button = PushButton("导出日志")
+        self.truth_replay_button = PrimaryPushButton("复测")
+        self.truth_edit_button = PushButton("编辑日志")
         self.diagnostics = TextEdit()
         self.diagnostics.setObjectName("replayDiagnostics")
         self.diagnostics.setReadOnly(True)
@@ -642,6 +676,14 @@ class ReplayPage(QWidget):
         diag_layout.addWidget(self.truth_replay_button)
         self.truth_status = BodyLabel("出牌日志：未维护")
         diag_layout.addWidget(self.truth_status)
+        self.truth_scan_status = BodyLabel("扫描：未开始")
+        self.truth_scan_status.setWordWrap(True)
+        self.truth_scan_progress = QProgressBar()
+        self.truth_scan_progress.setObjectName("truthScanProgress")
+        self.truth_scan_progress.setRange(0, 1)
+        self.truth_scan_progress.setValue(0)
+        self.truth_scan_progress.setVisible(False)
+        self.truth_scan_progress.setEnabled(False)
         mode_row = QHBoxLayout()
         mode_row.addWidget(BodyLabel("复测模式"))
         self.replay_mode_combo = ComboBox()
@@ -687,9 +729,9 @@ class ReplayPage(QWidget):
         editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_header = QHBoxLayout()
         editor_header.addWidget(
-            StrongBodyLabel("出牌日志 · 逐帧分析生成草稿后，在左侧录像中逐条校验和修正")
+            StrongBodyLabel("出牌日志 · 扫描完成后，在左侧录像中逐条校验和修正")
         )
-        self.back_to_diagnostics_button = PushButton("返回复测")
+        self.back_to_diagnostics_button = PushButton("返回")
         editor_header.addStretch(1)
         editor_header.addWidget(self.back_to_diagnostics_button)
         editor_layout.addLayout(editor_header)
@@ -697,7 +739,9 @@ class ReplayPage(QWidget):
         editor_layout.addLayout(self.truth_editor_host)
         self.diagnostics_stack.addWidget(diag_page)
         self.diagnostics_stack.addWidget(editor_page)
-        diagnostics_layout.addWidget(self.diagnostics_stack)
+        diagnostics_layout.addWidget(self.diagnostics_stack, 1)
+        diagnostics_layout.addWidget(self.truth_scan_status)
+        diagnostics_layout.addWidget(self.truth_scan_progress)
         self.content_layout.addWidget(diagnostics_card, 2)
         root.addWidget(self.content_scroll, 1)
 
@@ -772,8 +816,17 @@ class ReplayPage(QWidget):
 
     def select_session(self, session: Path) -> None:
         session = Path(session).resolve()
+        if self._visual_thread is not None and self._visual_thread.isRunning():
+            self._visual_thread.stop()
         self._truth_scan_base = None
+        self._truth_scan_log = None
         self._truth_draft_assembler = None
+        self._truth_scan_next_source_turn_id = 1
+        self._truth_scan_failure = None
+        self._truth_scan_session = None
+        if hasattr(self, "truth_scan_status"):
+            self.truth_scan_status.setText("扫描：未开始")
+        self._reset_truth_scan_progress()
         if self._truth_editor is not None:
             self._truth_editor.shutdown()
         self._truth_editor = None
@@ -825,9 +878,7 @@ class ReplayPage(QWidget):
         pipeline = self.replay_mode_combo.currentData() == "pipeline"
         self.recognition_strategy_combo.setEnabled(pipeline)
         self.advisor_strategy_combo.setEnabled(trusted)
-        self.truth_replay_button.setText(
-            "开始实时助手测试" if trusted else "开始复测"
-        )
+        self.truth_replay_button.setText("助手复测" if trusted else "复测")
 
     def _advisor_strategy_changed(self, _index: int = -1) -> None:
         self.advisor_strategy = normalize_advisor_strategy(
@@ -1143,6 +1194,32 @@ class ReplayPage(QWidget):
             return None
         lead = initial.payload.get("lead_player")
         if lead not in {"self", "right", "opposite", "left"}:
+            first_action_index = next(
+                (
+                    index
+                    for index, event in enumerate(events)
+                    if event.event_type
+                    in {"player_played", "player_passed", "manual_confirmed_event"}
+                ),
+                len(events),
+            )
+            confirmed_lead = next(
+                (
+                    event
+                    for index, event in enumerate(events)
+                    if index < first_action_index
+                    and event.event_type == "lead_player_confirmed"
+                ),
+                None,
+            )
+            if confirmed_lead is not None:
+                candidate = confirmed_lead.payload.get("lead_player")
+                lead = (
+                    candidate
+                    if candidate in {"self", "right", "opposite", "left"}
+                    else confirmed_lead.actor
+                )
+        if lead not in {"self", "right", "opposite", "left"}:
             return None
         return TruthLog(
             source_session_id=str(manifest.get("session_id", self.current_session.name)),
@@ -1177,8 +1254,9 @@ class ReplayPage(QWidget):
                 return
         self._show_truth_log_editor()
 
-    def _show_truth_log_editor(self) -> None:
-        if self.current_session is None or self.truth_log is None:
+    def _show_truth_log_editor(self, log: TruthLog | None = None) -> None:
+        log = log or self.truth_log
+        if self.current_session is None or log is None:
             return
         while self.truth_editor_host.count():
             item = self.truth_editor_host.takeAt(0)
@@ -1187,7 +1265,7 @@ class ReplayPage(QWidget):
                 widget.deleteLater()
         editor = TruthLogEditor(
             self.current_session,
-            self.truth_log,
+            log,
             frame_provider=self._current_frame_bgr_and_index,
             frame_scan_provider=self._frames_after_current,
         )
@@ -1341,7 +1419,7 @@ class ReplayPage(QWidget):
         thread.completed.connect(self._visual_completed)
         thread.failed.connect(self._show_error)
         thread.turn_result.connect(self._append_replay_turn_line)
-        thread.finished.connect(lambda: self._visual_finished(thread))
+        thread.finished.connect(self._on_visual_thread_finished)
         thread.replay_mode = str(self.replay_mode_combo.currentData() or "pipeline")
         thread.recognition_strategy = str(self.recognition_strategy_combo.currentData())
         self._visual_thread = thread
@@ -1376,7 +1454,23 @@ class ReplayPage(QWidget):
         thread.start()
 
     def _truth_scan_failed(self, message: str) -> None:
-        self._show_error(message)
+        sender = self.sender()
+        if sender is not None and sender is not self._visual_thread:
+            return
+        if self._truth_scan_session != self.current_session:
+            return
+        self._fail_truth_scan(str(message))
+
+    @Slot()
+    def _truth_scan_cancelled(self) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._visual_thread:
+            return
+        if self._truth_scan_session != self.current_session:
+            return
+        if self._truth_scan_failure is None:
+            self._fail_truth_scan("扫描已取消")
+        self._reset_truth_scan_progress()
 
     _REPLAY_SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 
@@ -1510,14 +1604,12 @@ class ReplayPage(QWidget):
             return
         try:
             baseline = self._truth_log_for_video_scan()
+            self._begin_truth_scan(baseline)
         except Exception as exc:
-            self._show_error(str(exc))
+            message = str(exc)
+            self.truth_scan_status.setText(f"扫描失败：{message}")
+            self._show_error(message)
             return
-        self._truth_scan_base = baseline
-        self._truth_scan_turns = []
-        self._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
-        self.truth_log = baseline
-        self._show_truth_log_editor()
         thread = VisualRecognitionReplayThread(
             self.current_session,
             baseline,
@@ -1525,17 +1617,20 @@ class ReplayPage(QWidget):
         )
         thread.completed.connect(self._truth_scan_completed)
         thread.failed.connect(self._truth_scan_failed)
+        thread.cancelled.connect(self._truth_scan_cancelled)
         thread.turn_result.connect(self._collect_truth_scan_turn)
-        thread.finished.connect(lambda: self._visual_finished(thread))
+        thread.frame_progress.connect(self._truth_scan_progress_changed)
+        thread.finished.connect(self._on_visual_thread_finished)
         thread.replay_mode = "pipeline"
         thread.recognition_strategy = str(self.recognition_strategy_combo.currentData())
         self._visual_thread = thread
         self.visual_replay_button.setEnabled(False)
         self.truth_edit_button.setEnabled(False)
         self.truth_replay_button.setEnabled(False)
+        self.truth_scan_status.setText("扫描中：正在逐帧识别出牌，编辑与保存暂不可用")
         self.diagnostics.setPlainText(
-            "正在逐帧分析视频并生成出牌日志草稿；使用与实时助手相同的状态机和识别策略。\n"
-            "每确认一手会立即追加到编辑器；请逐条校验，草稿需手动保存。"
+            "正在逐帧识别出牌；使用与实时助手相同的状态机和识别策略。\n"
+            "识别结果仅保留在内存；完成后可编辑并点击『保存日志』写入 truth_log.json。"
         )
         thread.start()
 
@@ -1545,12 +1640,9 @@ class ReplayPage(QWidget):
 
     def _truth_log_for_video_scan(self) -> TruthLog:
         if self.truth_log is None:
-            _frame_index, image = self._current_frame_bgr_and_index()
-            if image is None:
-                image = self._first_frame_bgr()
-            if image is None:
-                raise ValueError("请先选择包含开局画面的录像，再逐帧分析出牌日志")
-            self.truth_log = self._truth_log_from_recognition(image)
+            self.truth_log = self._truth_log_from_session({})
+        if self.truth_log is None:
+            raise ValueError("会话缺少已确认的首出玩家，无法安全扫描出牌日志")
         return TruthLog(
             source_session_id=self.truth_log.source_session_id,
             initial_state=self.truth_log.initial_state,
@@ -1562,21 +1654,121 @@ class ReplayPage(QWidget):
             outcome=self.truth_log.outcome,
         )
 
+    def _begin_truth_scan(self, baseline: TruthLog) -> None:
+        """Prepare an in-memory scan; only the later explicit save writes truth."""
+
+        if self.current_session is None:
+            raise RuntimeError("尚未选择对局")
+        self._truth_scan_base = baseline
+        self._truth_scan_log = baseline
+        self._truth_scan_turns = []
+        self._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
+        self._truth_scan_next_source_turn_id = 1
+        self._truth_scan_failure = None
+        self._truth_scan_session = self.current_session
+        self._start_truth_scan_progress()
+        self._show_truth_log_editor(baseline)
+        if self._truth_editor is not None:
+            self._truth_editor.setEnabled(False)
+
+    def _start_truth_scan_progress(self) -> None:
+        self._truth_scan_progress_processed = 0
+        self._truth_scan_progress_total = 0
+        self._truth_scan_progress_frame_index = 0
+        self.truth_scan_progress.setRange(0, 1)
+        self.truth_scan_progress.setValue(0)
+        self.truth_scan_progress.setEnabled(True)
+        self.truth_scan_progress.setVisible(True)
+
+    def _reset_truth_scan_progress(self) -> None:
+        if not hasattr(self, "truth_scan_progress"):
+            return
+        self._truth_scan_progress_processed = 0
+        self._truth_scan_progress_total = 0
+        self._truth_scan_progress_frame_index = 0
+        self.truth_scan_progress.setRange(0, 1)
+        self.truth_scan_progress.setValue(0)
+        self.truth_scan_progress.setEnabled(False)
+        self.truth_scan_progress.setVisible(False)
+
+    @Slot(int, int, int)
+    def _truth_scan_progress_changed(
+        self,
+        processed: int,
+        total: int,
+        frame_index: int,
+    ) -> None:
+        sender = self.sender()
+        if (
+            sender is not None
+            and sender is not self._visual_thread
+        ):
+            return
+        if (
+            self._truth_scan_base is None
+            or self._truth_scan_session != self.current_session
+            or self._truth_scan_failure is not None
+        ):
+            return
+        safe_total = max(1, int(total))
+        safe_processed = min(safe_total, max(0, int(processed)))
+        self._truth_scan_progress_processed = safe_processed
+        self._truth_scan_progress_total = safe_total
+        self._truth_scan_progress_frame_index = int(frame_index)
+        self.truth_scan_progress.setRange(0, safe_total)
+        self.truth_scan_progress.setValue(safe_processed)
+        self.truth_scan_progress.setVisible(True)
+        percent = (safe_processed * 100 + safe_total // 2) // safe_total
+        self.truth_scan_status.setText(
+            f"扫描中：{safe_processed}/{safe_total} 帧（{percent}%）"
+        )
+
+    def _fail_truth_scan(self, message: str) -> None:
+        """Stop a malformed stream before it can be silently reindexed."""
+
+        if self._truth_scan_failure is not None:
+            return
+        self._truth_scan_failure = message
+        self.truth_scan_status.setText(f"扫描失败：{message}；已保留现有正式日志")
+        self._reset_truth_scan_progress()
+        self.truth_status.setText("出牌日志：扫描未完成，未自动保存")
+        InfoBar.error(
+            title="扫描失败",
+            content=f"{message}；未保存，正式日志保持不变",
+            parent=self,
+        )
+        self.diagnostics.insertPlainText(f"\n[扫描失败] {message}\n")
+        if self._truth_editor is not None:
+            self._truth_editor.setEnabled(True)
+        thread = self._visual_thread
+        if thread is not None and thread.isRunning():
+            thread.stop()
+
     def _collect_truth_scan_turn(self, data: object) -> None:
+        if (
+            self._truth_scan_failure is not None
+            or self._truth_scan_base is None
+            or self._truth_scan_session != self.current_session
+        ):
+            return
         record = dict(data)
         kind = str(record.get("kind", "action"))
-        if kind == "suit_corrected":
+        if kind in {"suit_corrected", "event_correction"}:
             if self._truth_draft_assembler is None and self._truth_scan_base is not None:
                 self._truth_draft_assembler = ReplayTurnDraftAssembler(
                     self._truth_scan_base
                 )
             if self._truth_draft_assembler is None:
                 return
-            corrected = self._truth_draft_assembler.apply_suit_correction(record)
+            corrected = (
+                self._truth_draft_assembler.apply_suit_correction(record)
+                if kind == "suit_corrected"
+                else self._truth_draft_assembler.apply_event_correction(record)
+            )
             if not corrected.accepted or corrected.turn is None:
                 return
             self._truth_scan_turns.append(record)
-            self.truth_log = corrected.truth_log
+            self._truth_scan_log = corrected.truth_log
             if self._truth_editor is not None:
                 self._truth_editor.replace_confirmed_turn(
                     corrected.turn,
@@ -1588,7 +1780,8 @@ class ReplayPage(QWidget):
             )
             cards = " ".join(str(card) for card in record.get("recognized_cards", ()))
             self.diagnostics.insertPlainText(
-                f"\n[逐帧分析] 花色修正　第 {record.get('target_turn_id', '?')} 手"
+                f"\n[逐帧分析] {'花色修正' if kind == 'suit_corrected' else '动作修正'}"
+                f"　第 {record.get('target_turn_id', '?')} 手"
                 f"　{seat} {cards}"
             )
             scrollbar = self.diagnostics.verticalScrollBar()
@@ -1597,16 +1790,35 @@ class ReplayPage(QWidget):
         cards = tuple(str(card) for card in record.get("recognized_cards", ()))
         is_pass = bool(record.get("recognized_pass"))
         if not is_pass and not cards:
+            self._fail_truth_scan(
+                f"第 {record.get('turn_id', '?')} 手缺少有效出牌，未写入"
+            )
             return
-        self._truth_scan_turns.append(record)
         if self._truth_draft_assembler is None and self._truth_scan_base is not None:
             self._truth_draft_assembler = ReplayTurnDraftAssembler(self._truth_scan_base)
         if self._truth_draft_assembler is None:
+            self._fail_truth_scan("扫描状态未初始化，无法写入动作")
+            return
+        try:
+            source_turn_id = int(record.get("turn_id", 0) or 0)
+        except (TypeError, ValueError):
+            self._fail_truth_scan("收到无效的来源 turn_id，未写入动作")
+            return
+        if source_turn_id != self._truth_scan_next_source_turn_id:
+            self._fail_truth_scan(
+                f"来源 turn_id 不连续：应为 {self._truth_scan_next_source_turn_id}，"
+                f"实际为 {source_turn_id}"
+            )
             return
         appended = self._truth_draft_assembler.append(record)
         if not appended.accepted or appended.turn is None:
+            self._fail_truth_scan(
+                f"第 {source_turn_id} 手被拒绝：{appended.reason or appended.status}"
+            )
             return
-        self.truth_log = appended.truth_log
+        self._truth_scan_turns.append(record)
+        self._truth_scan_next_source_turn_id += 1
+        self._truth_scan_log = appended.truth_log
         if self._truth_editor is not None:
             self._truth_editor.append_confirmed_turn(
                 appended.turn,
@@ -1669,21 +1881,58 @@ class ReplayPage(QWidget):
         )
 
     def _truth_scan_completed(self, _value: object) -> None:
-        if self._truth_scan_base is None:
+        sender = self.sender()
+        if sender is not None and sender is not self._visual_thread:
             return
+        if (
+            self._truth_scan_base is None
+            or self._truth_scan_session != self.current_session
+        ):
+            return
+        if self._truth_scan_failure is not None:
+            self._truth_scan_base = None
+            return
+        frame_count = getattr(_value, "frame_count", None)
+        if (
+            isinstance(frame_count, int)
+            and self._truth_scan_progress_total > 0
+            and frame_count < self._truth_scan_progress_total
+        ):
+            self._fail_truth_scan(
+                "扫描未完成：仅处理 "
+                f"{frame_count}/{self._truth_scan_progress_total} 帧"
+            )
+            return
+        if self._truth_scan_progress_total > 0:
+            self._truth_scan_progress_processed = self._truth_scan_progress_total
+            self.truth_scan_progress.setValue(self._truth_scan_progress_total)
+            self.truth_scan_progress.setEnabled(False)
+            self.truth_scan_progress.setVisible(True)
         if self._truth_draft_assembler is not None:
-            self.truth_log = self._truth_draft_assembler.truth_log
+            self._truth_scan_log = self._truth_draft_assembler.truth_log
         else:
-            self.truth_log = self._truth_log_from_scan_turns(
+            self._truth_scan_log = self._truth_log_from_scan_turns(
                 self._truth_scan_base,
                 self._truth_scan_turns,
             )
         self._truth_scan_base = None
+        assert self._truth_scan_log is not None
+        self.truth_log = self._truth_scan_log
         self.truth_status.setText(
-            f"出牌日志：逐帧分析生成 {len(self.truth_log.turns)} 条，待校验保存"
+            f"出牌日志：扫描得到 {len(self._truth_scan_log.turns)} 条（未保存）"
+        )
+        self.truth_scan_status.setText(
+            "扫描完成：可编辑并点击『保存日志』写入 truth_log.json"
+        )
+        InfoBar.success(
+            title="扫描完成",
+            content="可编辑并点击『保存日志』写入 truth_log.json",
+            parent=self,
         )
         if self._truth_editor is None:
-            self._show_truth_log_editor()
+            self._show_truth_log_editor(self._truth_scan_log)
+        if self._truth_editor is not None:
+            self._truth_editor.setEnabled(True)
 
     def _visual_completed(self, value: object) -> None:
         result = value
@@ -1752,6 +2001,12 @@ class ReplayPage(QWidget):
     def _rerender_current_frame(self) -> None:
         if self._current_record is not None and self._current_image is not None:
             self._show_frame(self._current_record, self._current_image)
+
+    @Slot()
+    def _on_visual_thread_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, VisualRecognitionReplayThread):
+            self._visual_finished(thread)
 
     def _visual_finished(self, thread: VisualRecognitionReplayThread) -> None:
         if thread is not self._visual_thread:

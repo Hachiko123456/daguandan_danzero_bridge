@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from daguandan_bridge.application.timeline_truth_migration import (
+    LEGACY_TURN_PROJECTION_POLICY,
     MIGRATION_SOURCE,
     TimelineTruthMigrationService,
 )
@@ -262,7 +263,7 @@ def test_existing_repair_reindexes_only_stale_trick_ids(tmp_path: Path):
 
 def test_source_replay_normalizes_proven_wind_catch_context(tmp_path: Path):
     session = tmp_path / "sessions" / "wind-catch"
-    reducer = LiveReducer("wind-catch")
+    reducer = LiveReducer("wind-catch", wind_receiver_must_pass=False)
     initial = reducer.confirm_initial_state(
         round_level="8", hand=HAND, lead_player="left"
     )
@@ -287,9 +288,64 @@ def test_source_replay_normalizes_proven_wind_catch_context(tmp_path: Path):
         "wind-catch",
         (initial, left_finished, self_finished, declined, stale_catch),
         (left_finished, self_finished, declined, stale_catch),
+        wind_receiver_must_pass=False,
     )
 
     assert context_repairs == (
         "EVT-000005: trick 1 -> 2 after proven wind catch",
     )
     assert normalized[-1].trick_id == 2
+
+
+def test_legacy_wind_timeline_requires_explicit_migration_policy(tmp_path: Path):
+    session = tmp_path / "sessions" / "legacy-wind"
+    producer = LiveReducer(
+        "legacy-wind",
+        wind_receiver_must_pass=False,
+    )
+    initial = producer.confirm_initial_state(
+        round_level="8", hand=HAND, lead_player="right"
+    )
+    right_finished = producer.record_play("right", HAND)
+    opposite_passed = producer.record_pass("opposite")
+    self_passed = producer.record_pass("self")
+    left_caught_wind = producer.record_play("left", ("4S",))
+    _write_timeline(
+        session,
+        [
+            initial,
+            right_finished,
+            opposite_passed,
+            self_passed,
+            left_caught_wind,
+        ],
+    )
+
+    service = TimelineTruthMigrationService()
+    default = service.inspect_session(session)
+
+    assert default.status == "blocked"
+    assert default.code == "source_reducer_replay_failed"
+    assert not (session / "truth_log.json").exists()
+
+    migrated = service.migrate_session(
+        session,
+        turn_projection_policy=LEGACY_TURN_PROJECTION_POLICY,
+    )
+
+    assert migrated.status == "migrated"
+    truth = load_truth_log(session / "truth_log.json", session_id="legacy-wind")
+    assert [turn.actor for turn in truth.turns] == [
+        "right",
+        "opposite",
+        "self",
+        "left",
+    ]
+    receipt = json.loads(
+        (session / "truth_log.migration.json").read_text(encoding="utf-8")
+    )
+    assert receipt["turn_projection_policy"] == LEGACY_TURN_PROJECTION_POLICY
+    assert (
+        receipt["output_truth_log"]["turn_projection_policy"]
+        == LEGACY_TURN_PROJECTION_POLICY
+    )

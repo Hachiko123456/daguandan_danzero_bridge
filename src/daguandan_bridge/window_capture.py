@@ -451,7 +451,9 @@ def capture_client_image(
         "screen",
         "gdi_screen",
     }:
-        raise TargetWindowError("捕获后端只能是 auto、printwindow 或 screen")
+        raise TargetWindowError(
+            "捕获后端只能是 auto、printwindow、screen 或 gdi_screen"
+        )
     rect = get_client_rect_on_screen(target)
     dpi = get_window_dpi(target)
 

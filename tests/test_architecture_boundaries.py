@@ -6,6 +6,17 @@ from pathlib import Path
 
 SOURCE = Path(__file__).parents[1] / "src" / "daguandan_bridge"
 
+# These command-oriented validation modules are composition roots: they wire
+# UI/infrastructure adapters together but do not contain reusable application
+# use cases.  Keep the list explicit so a new boundary exception cannot appear
+# unnoticed.
+APPLICATION_COMPOSITION_ROOTS = {
+    "session_replay_audit.py",
+    "shadow_live_replay.py",
+    "simulated_game_window.py",
+    "window_e2e_validation.py",
+}
+
 
 def _imports(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -22,8 +33,19 @@ def test_domain_and_application_layers_do_not_import_ui_or_infrastructure():
     forbidden = ("PySide6", "qfluentwidgets", "cv2", "daguandan_bridge.gui", "..gui", "..infrastructure")
     for layer in ("domain", "application"):
         for path in (SOURCE / layer).rglob("*.py"):
+            if layer == "application" and path.name in APPLICATION_COMPOSITION_ROOTS:
+                continue
             imports = _imports(path)
             assert not any(name.startswith(forbidden) for name in imports), (path, imports)
+
+
+def test_application_composition_root_exceptions_are_exact_and_present():
+    application = SOURCE / "application"
+    assert APPLICATION_COMPOSITION_ROOTS == {
+        path.name
+        for path in application.glob("*.py")
+        if path.name in APPLICATION_COMPOSITION_ROOTS
+    }
 
 
 def test_orchestrator_depends_on_ports_not_live_concrete_adapters():

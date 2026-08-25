@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     CardWidget,
     CaptionLabel,
+    Pivot,
     PrimaryPushButton,
     PushButton,
     SearchLineEdit,
@@ -335,6 +336,7 @@ class AnnotationPage(QWidget):
         self.current_image_path: Path | None = None
         self.current_image = None
         self.current_roi: Box | None = None
+        self._syncing_coordinates = False
         self.region_config_page: RegionConfigPage | None = None
         self.single_image_danzero_page: SingleImageDanzeroPage | None = None
         self.advisor_strategy = load_profile_advisor_strategy(
@@ -371,25 +373,44 @@ class AnnotationPage(QWidget):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 16, 20, 20)
-        root.setSpacing(14)
+        root.setSpacing(12)
 
         header_card = CardWidget(self)
+        self.header_card = header_card
         header = QHBoxLayout(header_card)
         header.setContentsMargins(20, 16, 20, 16)
-        header.setSpacing(12)
         heading = QVBoxLayout()
         heading.setSpacing(3)
         heading.addWidget(SubtitleLabel("标记与模板"))
-        heading.addWidget(CaptionLabel("从已录制对局定位单帧，配置识别区域并裁剪可复用模板。"))
+        heading.addWidget(CaptionLabel("定位录像帧，标注识别区域并沉淀可复用模板。"))
         header.addLayout(heading, 1)
+        root.addWidget(header_card)
+
+        # AC-001 / AC-007: Pivot is the visible navigation.  The old combo is
+        # retained, hidden and fully synchronized for programmatic callers.
+        self.mode_combo = QComboBox(self)
+        self.mode_combo.addItem("区域标注", "region")
+        self.mode_combo.addItem("模板管理", "template")
+        self.mode_combo.addItem("识别测试", "recognition")
+        self.mode_combo.hide()
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        self.mode_pivot = Pivot(self)
+        self.mode_pivot.addItem("region", "区域标注", lambda: self._set_mode("region"))
+        self.mode_pivot.addItem("template", "模板管理", lambda: self._set_mode("template"))
+        self.mode_pivot.addItem(
+            "recognition", "识别测试", lambda: self._set_mode("recognition")
+        )
+        self.mode_pivot.setCurrentItem("region")
+        root.addWidget(self.mode_pivot)
+
+        # Compatibility actions now live in their relevant context instead of
+        # competing with the title in the page header.
         self.region_config_button = PushButton("查看区域配置")
         self.region_config_button.setToolTip("查看、编辑并多选区域配置")
         self.region_config_button.clicked.connect(self._open_region_config)
-        header.addWidget(self.region_config_button)
         self.show_selected_button = PushButton("标注选中区域")
         self.show_selected_button.setToolTip("再次点击可隐藏当前选中区域的标记框")
         self.show_selected_button.clicked.connect(self._show_selected_regions)
-        header.addWidget(self.show_selected_button)
         self.single_image_test_button = PrimaryPushButton("单图识别 / 策略测试")
         self.single_image_test_button.setEnabled(False)
         self.single_image_test_button.clicked.connect(self._open_single_image_danzero)
@@ -399,17 +420,11 @@ class AnnotationPage(QWidget):
             self.single_image_test_button,
         ):
             control.setMinimumHeight(34)
-        header.addWidget(self.single_image_test_button)
-        root.addWidget(header_card)
 
-        source_card = CardWidget(self)
-        source_layout = QVBoxLayout(source_card)
-        source_layout.setContentsMargins(20, 14, 20, 14)
+        source_widget = QWidget(self)
+        source_layout = QVBoxLayout(source_widget)
+        source_layout.setContentsMargins(0, 0, 0, 0)
         source_layout.setSpacing(8)
-        source_layout.addWidget(StrongBodyLabel("已录制对局"))
-        source_layout.addWidget(
-            CaptionLabel("从 tencent_daguandan/sessions 选择对局，播放或定位到单帧后直接框选。")
-        )
 
         self.folder_source_widget = QWidget(self)
         folder_source_layout = QVBoxLayout(self.folder_source_widget)
@@ -463,6 +478,7 @@ class AnnotationPage(QWidget):
         # Stable aliases keep the older page API working while both pages now
         # render and signal through the exact same toolbar component.
         self.session_play_button = self.session_playback_toolbar.play_button
+        self.session_previous_button = self.session_playback_toolbar.previous_button
         self.session_step_button = self.session_playback_toolbar.step_button
         self.session_rewind_button = self.session_playback_toolbar.rewind_button
         self.session_forward_button = self.session_playback_toolbar.forward_button
@@ -484,7 +500,6 @@ class AnnotationPage(QWidget):
         self.session_playback_toolbar.speed_changed.connect(self._session_speed_changed)
         source_layout.addWidget(self.session_playback_toolbar)
         source_layout.addWidget(self.session_status)
-        root.addWidget(source_card)
 
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.content_splitter.setChildrenCollapsible(False)
@@ -493,6 +508,7 @@ class AnnotationPage(QWidget):
         preview_layout.setContentsMargins(16, 16, 16, 16)
         preview_layout.setSpacing(10)
         preview_layout.addWidget(StrongBodyLabel("图片预览"))
+        preview_layout.addWidget(source_widget)
         self.image_navigation_layout = QHBoxLayout()
         self.image_navigation_layout.setSpacing(8)
         self.previous_image_button = ToolButton()
@@ -501,12 +517,14 @@ class AnnotationPage(QWidget):
         self.previous_image_button.setAccessibleName("上一张图片")
         self.previous_image_button.setFixedSize(40, 56)
         self.previous_image_button.clicked.connect(self._select_previous_image)
+        self.previous_image_button.hide()
         self.next_image_button = ToolButton()
         self.next_image_button.setText("›")
         self.next_image_button.setToolTip("下一张图片")
         self.next_image_button.setAccessibleName("下一张图片")
         self.next_image_button.setFixedSize(40, 56)
         self.next_image_button.clicked.connect(self._select_next_image)
+        self.next_image_button.hide()
         self.canvas = RoiCanvas()
         self.canvas.setText("请选择已录制对局并定位到一帧")
         self.canvas.setMinimumSize(400, 260)
@@ -531,21 +549,56 @@ class AnnotationPage(QWidget):
         right = QVBoxLayout(self.workbench_card)
         right.setContentsMargins(20, 16, 20, 16)
         right.setSpacing(10)
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(StrongBodyLabel("工作模式"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("区域配置", "region")
-        self.mode_combo.addItem("模板裁剪", "template")
-        self.mode_combo.setMinimumHeight(34)
-        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
-        mode_row.addWidget(self.mode_combo, 1)
-        right.addLayout(mode_row)
-        self.mode_detail_stack = QStackedWidget()
+
+        self.roi_editor_widget = QWidget(self.workbench_card)
+        roi_editor = QVBoxLayout(self.roi_editor_widget)
+        roi_editor.setContentsMargins(0, 0, 0, 0)
+        roi_editor.setSpacing(8)
+        roi_editor.addWidget(StrongBodyLabel("当前选区"))
+
+        self.x_spin, self.y_spin, self.w_spin, self.h_spin = (SpinBox() for _ in range(4))
+        for spin, maximum in (
+            (self.x_spin, 1279),
+            (self.y_spin, 719),
+            (self.w_spin, 1280),
+            (self.h_spin, 720),
+        ):
+            spin.setRange(0, maximum)
+            spin.setMinimumHeight(34)
+            spin.valueChanged.connect(self._coordinates_changed)
+
+        coordinate_grid = QGridLayout()
+        coordinate_grid.setHorizontalSpacing(8)
+        for index, (label, spin) in enumerate(
+            (("x", self.x_spin), ("y", self.y_spin), ("w", self.w_spin), ("h", self.h_spin))
+        ):
+            # Two compact rows keep the editor usable in the 40% workbench of
+            # the desktop 3:2 split.  Four SpinBoxes on one row imposed a
+            # ~716px minimum width and forced QSplitter to violate that ratio.
+            row = (index // 2) * 2
+            column = index % 2
+            coordinate_grid.addWidget(CaptionLabel(label.upper()), row, column)
+            coordinate_grid.addWidget(spin, row + 1, column)
+        roi_editor.addLayout(coordinate_grid)
+        self.selected_roi_preview = QLabel("框选后显示选区预览")
+        self.selected_roi_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selected_roi_preview.setMinimumHeight(92)
+        self.selected_roi_preview.setMaximumHeight(120)
+        self.selected_roi_preview.setStyleSheet(
+            "border: 1px solid rgba(120, 120, 120, 0.24); border-radius: 8px;"
+        )
+        roi_editor.addWidget(self.selected_roi_preview)
+        right.addWidget(self.roi_editor_widget)
+
+        self.mode_detail_stack = QStackedWidget(self.workbench_card)
 
         self.region_detail_widget = QWidget()
         region_detail_layout = QVBoxLayout(self.region_detail_widget)
         region_detail_layout.setContentsMargins(0, 0, 0, 0)
-        region_detail_layout.addWidget(CaptionLabel("选择区域后在图片中拖动框选；保存会更新标准化坐标。"))
+        region_detail_layout.setSpacing(8)
+        region_detail_layout.addWidget(
+            CaptionLabel("选择区域并在预览中拖动调整，坐标会实时同步。")
+        )
         region_form = QFormLayout()
         self.region_name_combo = ScrollSafeComboBox()
         for name, label in REGION_DISPLAY_NAMES.items():
@@ -556,7 +609,6 @@ class AnnotationPage(QWidget):
         self.region_role_combo.setVisible(False)
         region_form.addRow("区域名称", self.region_name_combo)
         region_detail_layout.addLayout(region_form)
-        region_detail_layout.addWidget(StrongBodyLabel("已选区域坐标"))
         self.region_coordinate_table = QTableWidget(
             0, len(REGION_COORDINATE_HEADERS)
         )
@@ -572,35 +624,32 @@ class AnnotationPage(QWidget):
         self.region_coordinate_table.setMinimumHeight(92)
         self.region_coordinate_table.setMaximumHeight(140)
         self.region_coordinate_table.horizontalHeader().setStretchLastSection(True)
+        # Kept as a compatibility/readback surface; the four visible fields are
+        # now the editing source of truth.
+        self.region_coordinate_table.hide()
         region_detail_layout.addWidget(self.region_coordinate_table)
-        self.save_region_button = PrimaryPushButton("保存区域坐标")
+        self.save_region_button = PrimaryPushButton("保存区域")
         self.save_region_button.clicked.connect(self._save_region_annotation)
         region_detail_layout.addWidget(self.save_region_button)
-        region_detail_layout.addWidget(CaptionLabel("提示：在“管理区域”中多选后，使用同一个“标注选中区域”按钮显示或隐藏区域框。"))
+        self.region_tools_button = PushButton("更多区域工具")
+        self.region_tools_button.setCheckable(True)
+        region_detail_layout.addWidget(self.region_tools_button)
+        self.region_tools_widget = QWidget(self.region_detail_widget)
+        region_tools = QHBoxLayout(self.region_tools_widget)
+        region_tools.setContentsMargins(0, 0, 0, 0)
+        region_tools.setSpacing(8)
+        region_tools.addWidget(self.region_config_button)
+        region_tools.addWidget(self.show_selected_button)
+        self.region_tools_widget.hide()
+        self.region_tools_button.toggled.connect(self.region_tools_widget.setVisible)
+        region_detail_layout.addWidget(self.region_tools_widget)
+        region_detail_layout.addStretch(1)
         self.region_name_combo.currentIndexChanged.connect(self._region_name_changed)
 
         self.template_detail_widget = QWidget()
         template_detail_layout = QVBoxLayout(self.template_detail_widget)
         template_detail_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.x_spin, self.y_spin, self.w_spin, self.h_spin = (SpinBox() for _ in range(4))
-        for spin, maximum in (
-            (self.x_spin, 1279),
-            (self.y_spin, 719),
-            (self.w_spin, 1280),
-            (self.h_spin, 720),
-        ):
-            spin.setRange(0, maximum)
-            spin.setMinimumHeight(34)
-
-        grid = QGridLayout()
-        for column, (label, spin) in enumerate(
-            (("x", self.x_spin), ("y", self.y_spin), ("w", self.w_spin), ("h", self.h_spin))
-        ):
-            grid.addWidget(QLabel(label), 0, column)
-            grid.addWidget(spin, 1, column)
-        template_detail_layout.addWidget(StrongBodyLabel("模板裁剪坐标"))
-        template_detail_layout.addLayout(grid)
+        template_detail_layout.setSpacing(8)
 
         template_form = QFormLayout()
         self.template_kind_combo = ScrollSafeComboBox()
@@ -619,8 +668,9 @@ class AnnotationPage(QWidget):
         template_form.addRow("模板标签", self.template_label_edit)
         template_form.addRow("来源角色", self.template_source_role_combo)
         template_detail_layout.addLayout(template_form)
-        self.crop_template_button = PrimaryPushButton("裁剪并保存模板")
+        self.crop_template_button = PrimaryPushButton("保存模板")
         self.delete_template_button = PushButton("删除选中模板")
+        self.delete_template_button.hide()
         filter_row = QHBoxLayout()
         filter_row.addWidget(CaptionLabel("模板类型"))
         self.template_filter_combo = ScrollSafeComboBox()
@@ -670,26 +720,43 @@ class AnnotationPage(QWidget):
         ):
             control.setMinimumHeight(34)
         template_detail_layout.addWidget(self.crop_template_button)
-        template_detail_layout.addWidget(self.delete_template_button)
         template_detail_layout.addLayout(filter_row)
         template_detail_layout.addWidget(self.template_table)
+        template_detail_layout.addWidget(self.delete_template_button)
         self.template_filter_combo.currentIndexChanged.connect(
             self._template_filter_changed
         )
         self.template_search_edit.textChanged.connect(
             self._refresh_template_status
         )
+        self.template_table.itemSelectionChanged.connect(
+            self._update_template_delete_action
+        )
+
+        self.recognition_detail_widget = QWidget()
+        recognition_layout = QVBoxLayout(self.recognition_detail_widget)
+        recognition_layout.setContentsMargins(0, 0, 0, 0)
+        recognition_layout.setSpacing(10)
+        recognition_layout.addWidget(StrongBodyLabel("单图识别与策略测试"))
+        recognition_description = CaptionLabel(
+            "使用当前录像帧进入识别测试，复用模板识别结果并可继续运行策略模型。"
+        )
+        recognition_description.setWordWrap(True)
+        recognition_layout.addWidget(recognition_description)
+        recognition_layout.addWidget(self.single_image_test_button)
+        recognition_layout.addStretch(1)
 
         self.mode_detail_stack.addWidget(self.region_detail_widget)
         self.mode_detail_stack.addWidget(self.template_detail_widget)
+        self.mode_detail_stack.addWidget(self.recognition_detail_widget)
         right.addWidget(self.mode_detail_stack, 1)
 
         self.crop_template_button.clicked.connect(self._crop_template)
         self.delete_template_button.clicked.connect(self._delete_selected_templates)
         self.content_splitter.addWidget(self.preview_card)
         self.content_splitter.addWidget(self.workbench_card)
-        self.content_splitter.setStretchFactor(0, 1)
-        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setStretchFactor(0, 3)
+        self.content_splitter.setStretchFactor(1, 2)
         root.addWidget(self.content_splitter, 1)
         self._mode_changed()
         self._template_kind_changed()
@@ -781,6 +848,7 @@ class AnnotationPage(QWidget):
         self.current_image_path = None
         self.current_image = None
         self.current_roi = None
+        self._set_coordinate_values(None)
         self._show_draft_roi = False
         self.single_image_test_button.setEnabled(False)
         self.canvas.clear()
@@ -789,8 +857,10 @@ class AnnotationPage(QWidget):
 
     def _set_session_actions(self, enabled: bool) -> None:
         for widget in (
+            self.session_previous_button,
             self.session_play_button,
             self.session_step_button,
+            self.session_playback_toolbar.more_button,
             self.session_rewind_button,
             self.session_forward_button,
             self.session_frame_spin,
@@ -893,6 +963,7 @@ class AnnotationPage(QWidget):
         self.current_image_path = None
         self.current_image = self._qimage_to_bgr(image)
         self.current_roi = None
+        self._set_coordinate_values(None)
         self._show_draft_roi = False
         self.canvas.set_source_size(self.current_image)
         self.single_image_test_button.setEnabled(True)
@@ -954,44 +1025,82 @@ class AnnotationPage(QWidget):
         return cv2.cvtColor(pixels, cv2.COLOR_RGBA2BGR)
 
     def _mode_changed(self, *_args) -> None:
-        is_template = self.mode_combo.currentData() == "template"
-        self.mode_detail_stack.setCurrentIndex(1 if is_template else 0)
-        if is_template:
-            self.mode_detail_stack.setMaximumHeight(16777215)
-            self.mode_detail_stack.setSizePolicy(
-                QSizePolicy.Policy.Preferred,
-                QSizePolicy.Policy.Expanding,
-            )
-        else:
-            self.mode_detail_stack.setMaximumHeight(290)
-            self.mode_detail_stack.setSizePolicy(
-                QSizePolicy.Policy.Preferred,
-                QSizePolicy.Policy.Fixed,
-            )
-        self.show_selected_button.setVisible(not is_template)
+        mode = str(self.mode_combo.currentData() or "region")
+        stack_index = {"region": 0, "template": 1, "recognition": 2}.get(mode, 0)
+        self.mode_detail_stack.setCurrentIndex(stack_index)
+        self.mode_detail_stack.setMaximumHeight(16777215)
+        self.mode_detail_stack.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.roi_editor_widget.setVisible(mode != "recognition")
+        self.show_selected_button.setVisible(mode == "region")
+        if self.mode_pivot.currentRouteKey() != mode:
+            self.mode_pivot.setCurrentItem(mode)
+        self._refresh_preview()
+
+    def _set_mode(self, mode: str) -> None:
+        index = self.mode_combo.findData(mode)
+        if index >= 0 and index != self.mode_combo.currentIndex():
+            self.mode_combo.setCurrentIndex(index)
+        elif index >= 0:
+            self._mode_changed()
+
+    def _set_coordinate_values(self, box: Box | None) -> None:
+        values = (0, 0, 0, 0) if box is None else (box.x, box.y, box.w, box.h)
+        self._syncing_coordinates = True
+        try:
+            for spin, value in zip(
+                (self.x_spin, self.y_spin, self.w_spin, self.h_spin), values
+            ):
+                spin.setValue(value)
+        finally:
+            self._syncing_coordinates = False
+        self._refresh_roi_preview()
+
+    def _coordinates_changed(self, *_args) -> None:
+        if self._syncing_coordinates:
+            return
+        self.current_roi = Box(
+            self.x_spin.value(),
+            self.y_spin.value(),
+            self.w_spin.value(),
+            self.h_spin.value(),
+        )
+        if self.mode_combo.currentData() == "region":
+            self._show_draft_roi = True
+            if self.region_config_page is not None:
+                self.region_config_page.set_box(self.current_roi)
+            self._refresh_region_coordinate_table()
         self._refresh_preview()
 
     def _update_responsive_layout(self) -> None:
         """Keep the canvas and controls comfortable in normal and full-screen windows."""
-        # Six template columns remain readable only when both panes have room;
-        # otherwise keep a generous vertical, scroll-free work flow.
-        compact = self.width() < 1440
+        compact = self.width() < 1100
         orientation = (
             Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
         )
         orientation_changed = self.content_splitter.orientation() != orientation
         if orientation_changed:
             self.content_splitter.setOrientation(orientation)
-        minimum_height = 250 if compact else 330
-        maximum_height = 440 if compact else 16777215
+        minimum_height = 280 if compact else 330
+        maximum_height = 430 if compact else 16777215
         if self.canvas.minimumHeight() != minimum_height:
             self.canvas.setMinimumHeight(minimum_height)
         if self.canvas.maximumHeight() != maximum_height:
             self.canvas.setMaximumHeight(maximum_height)
-        if orientation_changed:
-            self.content_splitter.setSizes(
-                (470, 500) if compact else (680, 680)
-            )
+        if compact:
+            if orientation_changed:
+                self.content_splitter.setSizes((430, 520))
+            return
+
+        # Re-establish the approved desktop ratio whenever the page itself is
+        # resized.  Dragging the splitter does not resize the page, so a user's
+        # manual pane adjustment is left intact until the containing window is
+        # resized again.
+        available = max(5, self.width() - 40 - self.content_splitter.handleWidth())
+        left = round(available * 3 / 5)
+        self.content_splitter.setSizes((left, available - left))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -1048,6 +1157,7 @@ class AnnotationPage(QWidget):
         )
         self.region_name_combo.blockSignals(False)
         self.region_role_combo.blockSignals(False)
+        self._set_coordinate_values(region.abs_box)
 
     def _region_name_changed(self, *_args) -> None:
         name = str(self.region_name_combo.currentData() or "")
@@ -1063,6 +1173,7 @@ class AnnotationPage(QWidget):
         self.overlay_visible = False
         self._show_draft_roi = False
         self.current_roi = region.abs_box
+        self._set_coordinate_values(region.abs_box)
         self._update_region_overlay_actions()
         self._refresh_region_coordinate_table()
         self._refresh_preview()
@@ -1174,11 +1285,8 @@ class AnnotationPage(QWidget):
 
     def _set_roi(self, box: Box) -> None:
         self.current_roi = box
+        self._set_coordinate_values(box)
         if self.mode_combo.currentData() == "template":
-            self.x_spin.setValue(box.x)
-            self.y_spin.setValue(box.y)
-            self.w_spin.setValue(box.w)
-            self.h_spin.setValue(box.h)
             self.status.setText(f"已选模板框：x={box.x}, y={box.y}, w={box.w}, h={box.h}")
         else:
             self._show_draft_roi = True
@@ -1266,6 +1374,7 @@ class AnnotationPage(QWidget):
             self.template_count_label.setText(f"共 {total} 条")
         else:
             self.template_count_label.setText(f"显示 {len(filtered)} / {total} 条")
+        self._update_template_delete_action()
 
     def _selected_template_ids(self) -> set[str]:
         ids: set[str] = set()
@@ -1274,6 +1383,9 @@ class AnnotationPage(QWidget):
             if item is not None and item.data(Qt.ItemDataRole.UserRole):
                 ids.add(str(item.data(Qt.ItemDataRole.UserRole)))
         return ids
+
+    def _update_template_delete_action(self) -> None:
+        self.delete_template_button.setVisible(bool(self._selected_template_ids()))
 
     def _refresh_template_labels(self, records=()) -> None:
         current = self._template_label_value()
@@ -1399,6 +1511,7 @@ class AnnotationPage(QWidget):
             self.current_image_path = None
             self.current_image = None
             self.current_roi = None
+            self._set_coordinate_values(None)
             self._show_draft_roi = False
             self.single_image_test_button.setEnabled(False)
             if self.single_image_danzero_page is not None:
@@ -1422,6 +1535,7 @@ class AnnotationPage(QWidget):
             return
         self.canvas.set_source_size(self.current_image)
         self.current_roi = None
+        self._set_coordinate_values(None)
         self._show_draft_roi = False
         self.single_image_test_button.setEnabled(True)
         self._update_image_navigation()
@@ -1446,10 +1560,41 @@ class AnnotationPage(QWidget):
             Qt.TransformationMode.SmoothTransformation,
         )
 
+    def _refresh_roi_preview(self) -> None:
+        if not hasattr(self, "selected_roi_preview"):
+            return
+        box = self.current_roi
+        image = self.current_image
+        if (
+            image is None
+            or box is None
+            or not box.fits_within((image.shape[1], image.shape[0]))
+        ):
+            self.selected_roi_preview.clear()
+            self.selected_roi_preview.setText("框选后显示选区预览")
+            return
+        crop = image[box.y:box.y + box.h, box.x:box.x + box.w].copy()
+        height, width, channels = crop.shape
+        qimage = QImage(
+            crop.data,
+            width,
+            height,
+            channels * width,
+            QImage.Format.Format_BGR888,
+        ).copy()
+        pixmap = QPixmap.fromImage(qimage).scaled(
+            self.selected_roi_preview.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.selected_roi_preview.setText("")
+        self.selected_roi_preview.setPixmap(pixmap)
+
     def _refresh_preview(self) -> None:
         if self.current_image is None:
             self.canvas.clear()
             self.canvas.setText("当前文件夹中没有可预览的图片")
+            self._refresh_roi_preview()
             return
 
         regions = (
@@ -1481,6 +1626,7 @@ class AnnotationPage(QWidget):
                 3,
             )
         self.canvas.setPixmap(self._pixmap_for_image(image))
+        self._refresh_roi_preview()
         if regions:
             self.status.setText(f"已标注 {len(regions)} 个区域")
         elif self.current_roi is not None:
@@ -1788,8 +1934,10 @@ class AnnotationPage(QWidget):
             self.template_table,
             self.session_combo,
             self.refresh_sessions_button,
+            self.session_previous_button,
             self.session_play_button,
             self.session_step_button,
+            self.session_playback_toolbar.more_button,
             self.session_rewind_button,
             self.session_forward_button,
             self.session_frame_spin,

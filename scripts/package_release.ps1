@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param()
+param(
+    [Parameter()]
+    [string] $ReleaseRoot = ""
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -27,7 +30,21 @@ $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $profileSource = Join-Path $projectRoot "data\profiles\tencent_daguandan"
 $modelSource = Join-Path $profileSource "models\best.npz"
 $danzeroWeightsSource = Join-Path $projectRoot "src\daguandan_bridge\danzero\_vendor\guandan_rlcard\baselines\danzero\q_network.ckpt"
-$releaseRoot = Join-Path $projectRoot "release"
+if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+    $releaseRoot = Join-Path $projectRoot "release"
+}
+else {
+    $releaseRoot = [System.IO.Path]::GetFullPath($ReleaseRoot)
+}
+$filesystemRoot = [System.IO.Path]::GetPathRoot($releaseRoot)
+if (
+    [string]::IsNullOrWhiteSpace($filesystemRoot) -or
+    $releaseRoot.TrimEnd('\') -eq $filesystemRoot.TrimEnd('\') -or
+    $releaseRoot.TrimEnd('\') -eq $projectRoot.TrimEnd('\')
+) {
+    throw "ReleaseRoot must name a dedicated directory, not a filesystem or project root: $releaseRoot"
+}
+[System.IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
 $distPath = Join-Path $releaseRoot "dist"
 $workPath = Join-Path $releaseRoot "build"
 $specPath = Join-Path $releaseRoot "spec"
@@ -93,6 +110,8 @@ $pyinstallerArguments = @(
     "--workpath", $workPath,
     "--specpath", $specPath,
     "--collect-submodules", "daguandan_bridge",
+    "--collect-submodules", "rlcard",
+    "--collect-data", "rlcard",
     "--collect-data", "qfluentwidgets",
     "--collect-data", "qframelesswindow",
     "--hidden-import", "torch",

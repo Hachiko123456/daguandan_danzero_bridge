@@ -40,6 +40,7 @@ from ..danzero.state import GameStateError, GuanDanState, Seat
 from .action_uncertainty import state_variants_for_action_semantics
 from .consensus import (
     BurstConsensus,
+    canonical_candidate,
     ConsensusCandidate,
     ConsensusContext,
     ConsensusResult,
@@ -62,7 +63,7 @@ from .recognition_strategy import (
 from .models import LiveEvent, LiveSnapshot
 from .latest_worker import LatestOnlyWorker
 from .reducer import LiveReducer
-from .suit_correction import SuitCorrectionTracker
+from .suit_correction import SuitCorrectionObservation, SuitCorrectionTracker
 from .turns import TURN_ORDER, next_active_seat, project_trick_turn
 from .zone_lifecycle import ZoneDecision, ZoneFrameMetrics, ZoneLifecycle, ZonePhase
 
@@ -87,6 +88,7 @@ _TURN_RECOVERY_WITHHOLD_REASON = "turn_recovery_pending"
 _TURN_RECOVERY_WITHHOLD_TEXT = "牌局历史待恢复，暂停推荐"
 _PREVIOUS_ACTION_VERIFICATION_WITHHOLD_REASON = "previous_action_reread_pending"
 _PREVIOUS_ACTION_VERIFICATION_WITHHOLD_TEXT = "上一手牌面待复核，暂停推荐"
+_PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS = 1_200
 _HANDOFF_GLOBAL_GRACE_MS = 3_000
 _HANDOFF_READABLE_CONFIRMATION_MS = 1_000
 # A local turn normally has about 15 seconds.  A delayed foreign action must
@@ -255,6 +257,12 @@ class _TurnOwnershipWindow:
     wind_catch_pass_recovery_detected_ms: int | None = None
     wind_catch_pass_recovery_deadline_ms: int | None = None
     wind_catch_pass_recovery_marker_streak: int = 0
+    # The PASS surface may flash for one frame while the wind receiver's next
+    # play is already visible but the active-seat decoration still lags.  This
+    # recovery is intentionally stricter than timer handoff: it needs that
+    # prior seat-bound PASS edge and two identical, legal receiver reads.
+    wind_catch_receiver_play: RecognitionSample | None = None
+    wind_catch_receiver_play_streak: int = 0
     # Kept independently of the pending state so one owner-provisional frame
     # can establish the false baseline for the immediately following timer
     # handoff without making any card sample eligible.
@@ -286,6 +294,7 @@ class _PreviousActionVerification:
     expected_followup_actor: Seat
     followup_event_id: str | None = None
     state: Literal["armed", "open", "confirmed", "expired"] = "armed"
+    opened_monotonic_ms: int | None = None
     last_probe_monotonic_ms: int | None = None
     advice_withheld: bool = False
 
@@ -593,6 +602,7 @@ class LiveOrchestrator:
         self._opening_controls_seen = False
         self._lead_candidate: Seat | None = None
         self._lead_candidate_frames = 0
+        self._lead_auto_confirmed_from_marker = False
         self._lead_confirmation_frame: tuple[int, np.ndarray] | None = None
         self._lead_stability_frames: deque[tuple[int, np.ndarray]] = deque(maxlen=3)
         self._first_action_pending = False
@@ -624,10 +634,17 @@ class LiveOrchestrator:
         # window opens only once the next legal actor has completed an action;
         # this is when the previous play's animation is expected to be gone.
         self._previous_action_verifications: dict[str, _PreviousActionVerification] = {}
+        # Formal actions are published immediately after reducer mutation.  A
+        # verification retired by that mutation is queued briefly so its
+        # lifecycle terminal is persisted *after* the triggering action.
+        self._pending_previous_action_retirements: list[
+            tuple[str, _PreviousActionVerification]
+        ] = []
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
                 on_result=self._complete_advice_job,
+                on_discard=self._discard_advice_job,
             )
             self._advice_worker.start()
 
@@ -699,7 +716,9 @@ class LiveOrchestrator:
         self._last_pass_marker_players = frozenset()
         self._desynchronized_turn_key = None
         self._previous_action_verifications.clear()
+        self._pending_previous_action_retirements.clear()
         self._first_action_gate_reason = "not_started"
+        self._lead_auto_confirmed_from_marker = False
         self._clear_first_action_candidates()
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
@@ -1068,6 +1087,21 @@ class LiveOrchestrator:
             )
             consensus = self._decide_if_ready(current_metrics, fast)
             handoff_window = self._turn_ownership_window
+            if consensus is None:
+                consensus = self._decide_opening_handoff_anchor(
+                    handoff_window,
+                    current_metrics,
+                    fast,
+                )
+                if consensus is not None:
+                    self._append_recognition_trace(
+                        window=handoff_window,
+                        outcome="opening_handoff_anchor_confirmed",
+                        strategy_result=consensus,
+                        fallback=True,
+                        reason="two_distinct_valid_non_pass_reads",
+                        commit_attempted=True,
+                    )
             if handoff_window is not None and handoff_window.handoff_samples:
                 self._append_recognition_trace(
                     window=handoff_window,
@@ -1080,6 +1114,34 @@ class LiveOrchestrator:
                         handoff_window is not None
                         and handoff_window.turn_recovery_pending
                     ):
+                        if self._confirmed_handoff_precedes_turn_recovery(
+                            handoff_window,
+                            consensus,
+                        ):
+                            # The expected ROI already produced two matching,
+                            # legal non-pass reads.  A fast active-seat jump
+                            # between those reads describes the following
+                            # action; it must not invalidate the action whose
+                            # pixels are still present in the expected ROI.
+                            event, events = self._commit_consensus(
+                                consensus,
+                                monotonic_ms,
+                                fast=fast,
+                            )
+                            self._append_recognition_trace(
+                                window=handoff_window,
+                                outcome="confirmed_handoff_before_turn_recovery",
+                                strategy_result=consensus,
+                                fallback=True,
+                                reason="two_matching_expected_roi_reads_precede_active_cross",
+                                commit_attempted=True,
+                                commit_event_id=event.event_id,
+                            )
+                            return self._update(
+                                event=event,
+                                events=events,
+                                fast_signals=fast,
+                            )
                         if self._turn_recovery_is_ready(
                             handoff_window,
                             consensus,
@@ -1217,7 +1279,11 @@ class LiveOrchestrator:
             if self._lead_candidate_frames >= self.lead_stable_frames:
                 self._lead_candidate = None
                 self._lead_candidate_frames = 0
-                return self._complete_lead(lead, monotonic_ms)
+                return self._complete_lead(
+                    lead,
+                    monotonic_ms,
+                    auto_confirmed_from_marker=True,
+                )
         else:
             self._lead_candidate = None
             self._lead_candidate_frames = 0
@@ -1227,10 +1293,17 @@ class LiveOrchestrator:
             return self._require_lead_review("lead_player_timeout", monotonic_ms, fast)
         return self._update(fast_signals=fast)
 
-    def _complete_lead(self, lead: Seat, monotonic_ms: int) -> LiveUpdate:
+    def _complete_lead(
+        self,
+        lead: Seat,
+        monotonic_ms: int,
+        *,
+        auto_confirmed_from_marker: bool = False,
+    ) -> LiveUpdate:
         event = self.reducer.confirm_lead_player(lead)
         event = self._publish_event(event)
         self.status = "running"
+        self._lead_auto_confirmed_from_marker = bool(auto_confirmed_from_marker)
         turn_started = self._append_lifecycle_event(
             "turn_started",
             {"player": lead},
@@ -1750,6 +1823,14 @@ class LiveOrchestrator:
                 return None
             return advice
 
+    def wait_for_advice_idle(self, *, timeout: float = 60.0) -> bool:
+        """Drain the production advice worker without stopping or bypassing it."""
+
+        worker = self._advice_worker
+        if worker is None:
+            return True
+        return worker.wait_idle(timeout=max(0.0, float(timeout)))
+
     def complete_advice(
         self,
         key: AdviceRequestKey,
@@ -2061,6 +2142,12 @@ class LiveOrchestrator:
             "detected_ms": window.wind_catch_pass_recovery_detected_ms,
             "deadline_ms": window.wind_catch_pass_recovery_deadline_ms,
             "marker_streak": window.wind_catch_pass_recovery_marker_streak,
+            "receiver_play_streak": window.wind_catch_receiver_play_streak,
+            "receiver_play": (
+                list(window.wind_catch_receiver_play.cards)
+                if window.wind_catch_receiver_play is not None
+                else []
+            ),
         }
 
     @staticmethod
@@ -2072,6 +2159,8 @@ class LiveOrchestrator:
         window.wind_catch_pass_recovery_detected_ms = None
         window.wind_catch_pass_recovery_deadline_ms = None
         window.wind_catch_pass_recovery_marker_streak = 0
+        window.wind_catch_receiver_play = None
+        window.wind_catch_receiver_play_streak = 0
 
     @staticmethod
     def _crossed_handoff_recovery_telemetry(
@@ -2444,6 +2533,38 @@ class LiveOrchestrator:
                 for player in required_passes
             )
         )
+
+    @staticmethod
+    def _confirmed_handoff_precedes_turn_recovery(
+        window: _TurnOwnershipWindow | None,
+        result: ConsensusResult,
+    ) -> bool:
+        """Keep a confirmed expected-ROI play across a fast active-seat jump."""
+
+        if (
+            window is None
+            or not window.turn_recovery_pending
+            or window.handoff_detected_ms is None
+            or result.status != "confirmed"
+            or result.is_pass
+            or result.vote_count < 2
+            or len(window.handoff_samples) < 2
+        ):
+            return False
+        expected_cards, _options = canonical_candidate(
+            result.cards,
+            result.suit_options,
+            is_pass=False,
+        )
+        for sample in window.handoff_samples[-2:]:
+            cards, _sample_options = canonical_candidate(
+                sample.cards,
+                sample.suit_options,
+                is_pass=sample.is_pass,
+            )
+            if sample.is_pass or cards != expected_cards:
+                return False
+        return True
 
     def _turn_recovery_cycle_candidate(
         self,
@@ -3033,7 +3154,8 @@ class LiveOrchestrator:
         has_new_turn_surface = bool(
             window.handoff_detected_ms is None
             and (
-                window.disposition in {"unseen", "owner_provisional"}
+                window.disposition
+                in {"unseen", "owner_provisional", "owner_authenticated"}
                 or (
                     window.disposition == "isolated_active_unknown"
                     and window.expected_pass_marker_edge_while_active_unknown
@@ -3045,11 +3167,10 @@ class LiveOrchestrator:
             and window.last_expected_pass_marker_visible
             and not self._is_first_action_turn(expected)
             and bool(self.snapshot.trick_plays)
-            and not window.authenticated
-            # One visible owner frame is still only provisional; the timer
-            # can vanish before a card ROI is readable.  A fresh, two-frame
-            # seat-bound PASS marker remains sufficient to recover that PASS.
-            and window.owner_active_streak < 2
+            # The owner may have stayed active long enough to authenticate
+            # before clicking PASS.  A fresh seat-bound marker still wins
+            # over generic direct-handoff card recovery; otherwise the
+            # successor timer steals this PASS before its second read.
             and window.accepted_sample_count == 0
             and window.crossing_non_owner_streak == 0
             and (has_new_turn_surface or has_empty_direct_handoff)
@@ -3093,8 +3214,13 @@ class LiveOrchestrator:
             window.expected_player,
         )
         window.unseen_direct_next_pass_marker_player = fast.pass_marker_player
+        # Once a fresh direct-next edge opened this narrowly scoped recovery,
+        # the timer is allowed to disappear while its PASS badge remains.  A
+        # timer-only jump never starts the recovery; this only retains the
+        # same expected-seat marker through a transitional ``active=None``
+        # frame until two reads can commit it.
         readable = bool(
-            active_is_direct_next
+            (active_is_direct_next or fast.active_player is None)
             and not fast.effect_visible
             and not metrics.effect_visible
         )
@@ -3342,6 +3468,136 @@ class LiveOrchestrator:
             reason="waiting_for_second_pass_marker",
         )
         return None
+
+    def _advance_wind_catch_receiver_play_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        frame: np.ndarray,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+    ) -> _OwnershipResolution | None:
+        """Recover a one-frame wind PASS followed by the receiver's play.
+
+        A pass badge can exist for exactly one decoded frame.  On some table
+        skins the active-seat highlight lingers on that passer while the wind
+        receiver's next cards are already fully visible.  A highlight is not
+        proof of an action, so this path is intentionally available only after
+        the preceding frame recorded the expected seat's own PASS edge.  It
+        then needs two identical legal cards from the *proven next receiver*
+        before atomically applying the PASS and that next play.
+        """
+
+        if not window.expected_pass_marker_edge_while_active_unknown:
+            return None
+        receiver = self.reducer.wind_receiver_after_current_pass(
+            window.expected_player
+        )
+        if receiver is None:
+            window.wind_catch_receiver_play = None
+            window.wind_catch_receiver_play_streak = 0
+            return None
+        try:
+            observation = self._recognize_play_region(
+                frame,
+                receiver,
+                wild_rank=self.snapshot.wild_rank,
+                allow_pass=False,
+            )
+        except (cv2.error, OSError, RuntimeError, ValueError):
+            return None
+        if (
+            observation.player != receiver
+            or observation.is_pass
+            or not observation.cards
+            or observation.confidence < 0.80
+        ):
+            window.wind_catch_receiver_play = None
+            window.wind_catch_receiver_play_streak = 0
+            return None
+
+        marker_pass = ConsensusResult(
+            status="confirmed",
+            cards=(),
+            is_pass=True,
+            confidence=1.0,
+            source="wind_catch_pass_then_receiver_play",
+            vote_count=1,
+            candidates=(),
+        )
+        preview = self._turn_recovery_preview_reducer(marker_pass)
+        if preview is None:
+            return None
+        candidate = self._turn_recovery_cycle_candidate(
+            preview,
+            observation,
+            metrics=metrics,
+            fast=fast,
+        )
+        if candidate is None or candidate.is_pass or not candidate.cards:
+            window.wind_catch_receiver_play = None
+            window.wind_catch_receiver_play_streak = 0
+            return None
+
+        sample = RecognitionSample(
+            cards=tuple(candidate.cards),
+            is_pass=False,
+            confidence=float(candidate.confidence),
+            source=str(candidate.source),
+            suit_options=tuple(candidate.suit_options),
+        )
+        previous = window.wind_catch_receiver_play
+        if previous is not None and (
+            previous.cards,
+            previous.suit_options,
+        ) == (sample.cards, sample.suit_options):
+            window.wind_catch_receiver_play_streak += 1
+        else:
+            window.wind_catch_receiver_play = sample
+            window.wind_catch_receiver_play_streak = 1
+        if window.wind_catch_receiver_play_streak < 2:
+            window.disposition = "wind_catch_receiver_play_pending"
+            window.sample_allowed = False
+            return None
+
+        receiver_play = replace(
+            candidate,
+            confidence=(
+                float(previous.confidence) + float(candidate.confidence)
+                if previous is not None
+                else float(candidate.confidence)
+            ) / 2,
+            source="wind_catch_pass_then_receiver_play",
+            vote_count=window.wind_catch_receiver_play_streak,
+        )
+        self._append_recognition_trace(
+            window=window,
+            outcome="wind_catch_pass_then_receiver_play",
+            strategy_result=receiver_play,
+            fallback=True,
+            reason="pass_edge_plus_two_receiver_plays",
+            commit_attempted=True,
+        )
+        pass_event, pass_events = self._commit_consensus(
+            marker_pass,
+            monotonic_ms,
+            fast=fast,
+            suppress_turn_side_effects=True,
+        )
+        play_event, play_events = self._commit_consensus(
+            receiver_play,
+            monotonic_ms,
+            fast=fast,
+            suppress_turn_side_effects=True,
+        )
+        self._clear_wind_catch_pass_recovery(window)
+        turn_started = self._append_current_turn_started()
+        self._request_advice_if_needed()
+        events = [*pass_events, *play_events]
+        if turn_started is not None:
+            events.append(turn_started)
+        return _OwnershipResolution(play_event, tuple(events))
 
     def _advance_direct_handoff(
         self,
@@ -3646,11 +3902,32 @@ class LiveOrchestrator:
                 metrics=metrics,
                 decision=decision,
             )
+        # The visual PASS edge can precede a stale expected-player highlight.
+        # Probe only the reducer-proven wind receiver before the normal
+        # expected-owner branch clears that edge; no generic foreign card is
+        # accepted here.
+        receiver_play_recovery = self._advance_wind_catch_receiver_play_recovery(
+            window,
+            frame,
+            fast,
+            monotonic_ms,
+            metrics=metrics,
+        )
+        if receiver_play_recovery is not None:
+            return receiver_play_recovery
         if active == expected:
-            self._clear_wind_catch_pass_recovery(window)
-            window.expected_pass_marker_edge_while_active_unknown = False
+            if window.wind_catch_receiver_play_streak:
+                # Do not mix a stale owner-highlight ROI into the receiver
+                # recovery burst.  The next frame either confirms the same
+                # receiver cards or clears this narrowly-scoped fallback.
+                window.disposition = "wind_catch_receiver_play_pending"
+                window.sample_allowed = False
+                return None
+            if not window.expected_pass_marker_edge_while_active_unknown:
+                self._clear_wind_catch_pass_recovery(window)
             window.owner_active_streak += 1
-            self._clear_owner_handoff(window)
+            if not window.expected_pass_marker_edge_while_active_unknown:
+                self._clear_owner_handoff(window)
             window.crossing_active_player = None
             window.crossing_active_streak = 0
             window.crossing_non_owner_streak = 0
@@ -3881,7 +4158,24 @@ class LiveOrchestrator:
             window.crossing_active_player = None
             window.crossing_active_streak = 0
             window.crossing_non_owner_streak = 0
-            window.disposition = "isolated_active_unknown"
+            # The active-seat decoration can vanish during a card animation.
+            # The expected player's own ROI still has normal two-frame
+            # consensus and rule validation, so keep that direct evidence
+            # eligible instead of discarding a visible terminal play merely
+            # because the timer is temporarily unknown.
+            readable_expected_roi = bool(
+                decision.collect_sample
+                and decision.phase == ZonePhase.BURST_READ
+                and not fast.effect_visible
+                and not metrics.effect_visible
+                and not expected_pass_marker_visible
+            )
+            window.disposition = (
+                "owner_active_unknown"
+                if readable_expected_roi
+                else "isolated_active_unknown"
+            )
+            window.sample_allowed = readable_expected_roi
             return None
         self._clear_owner_handoff(window)
         if active == window.crossing_active_player:
@@ -3939,6 +4233,9 @@ class LiveOrchestrator:
             if verification.state == "open" and verification.followup_event_id != event.event_id:
                 verification.state = "expired"
                 self._suit_correction_tracker.clear(verification.target.event_id)
+                self._pending_previous_action_retirements.append(
+                    (event.event_id, verification)
+                )
 
         for verification in self._previous_action_verifications.values():
             if (
@@ -3947,6 +4244,7 @@ class LiveOrchestrator:
             ):
                 verification.followup_event_id = event.event_id
                 verification.state = "open"
+                verification.opened_monotonic_ms = self._last_monotonic_ms
 
         if event.event_type == "player_passed" or bool(event.payload.get("is_pass", False)):
             return
@@ -4011,39 +4309,86 @@ class LiveOrchestrator:
     ) -> LiveEvent | None:
         """Confirm or correct an adjacent action from two distinct rereads."""
 
-        if (
-            target is None
-            or target.state != "open"
-            or result is None
-            or result.is_pass
-            or result.player != target.target.actor
-            or target.last_probe_monotonic_ms == int(monotonic_ms)
-        ):
+        if target is None or target.state != "open":
             return None
-        target.last_probe_monotonic_ms = int(monotonic_ms)
-        original_cards = tuple(str(card) for card in target.target.payload.get("cards", ()))
-        observation = self._suit_correction_tracker.observe_visual_action(
-            target.target.event_id,
-            original_cards,
-            tuple(str(card) for card in result.cards),
+        valid_distinct_result = bool(
+            result is not None
+            and not result.is_pass
+            and result.player == target.target.actor
+            and result.cards
+            and target.last_probe_monotonic_ms != int(monotonic_ms)
         )
-        if not observation.confirmed:
-            return None
+        if valid_distinct_result:
+            assert result is not None
+            target.last_probe_monotonic_ms = int(monotonic_ms)
+            original_cards = tuple(
+                str(card) for card in target.target.payload.get("cards", ())
+            )
+            observation = self._suit_correction_tracker.observe_visual_action(
+                target.target.event_id,
+                original_cards,
+                tuple(str(card) for card in result.cards),
+                tuple(tuple(str(suit) for suit in options) for options in result.suit_options),
+            )
+            if observation.confirmed:
+                return self._complete_previous_action_verification(
+                    target,
+                    result,
+                    observation=observation,
+                    original_cards=original_cards,
+                    monotonic_ms=monotonic_ms,
+                )
+
+        return self._expire_previous_action_verification(
+            target,
+            monotonic_ms=monotonic_ms,
+        )
+
+    def _complete_previous_action_verification(
+        self,
+        target: _PreviousActionVerification,
+        result: PlayRegionResult,
+        *,
+        observation: SuitCorrectionObservation,
+        original_cards: tuple[str, ...],
+        monotonic_ms: int,
+    ) -> LiveEvent | None:
+        """Persist one confirmed exact/compatible reread or safe correction."""
+
+        observed_cards = tuple(str(card) for card in observation.cards)
+        evidence_kind = str(observation.evidence_kind)
 
         target.state = "confirmed"
         self._suit_correction_tracker.clear(target.target.event_id)
-        if observation.cards == tuple(sorted(original_cards)):
+        if observed_cards == tuple(sorted(original_cards)):
+            compatible = evidence_kind == "compatible"
+            reason = (
+                "two_distinct_candidate_compatible_rereads"
+                if compatible
+                else "two_distinct_adjacent_action_rereads"
+            )
+            source = (
+                "two_frame_candidate_compatible_reread"
+                if compatible
+                else "two_frame_adjacent_action_reread"
+            )
             event = self._append_lifecycle_event(
                 "previous_action_verified",
                 {
                     "target_event_id": target.target.event_id,
                     "followup_event_id": target.followup_event_id,
-                    "cards": list(observation.cards),
-                    "reason": "two_distinct_adjacent_action_rereads",
+                    "cards": list(observed_cards),
+                    "reason": reason,
+                    "verification_mode": evidence_kind or "exact",
+                    "original_cards_preserved": True,
+                    "observed_cards": list(result.cards),
+                    "observed_suit_options": [
+                        list(options) for options in result.suit_options
+                    ],
                 },
                 actor=target.target.actor,
                 confidence=result.confidence,
-                source="two_frame_adjacent_action_reread",
+                source=source,
             )
             self._request_advice_if_needed()
             return event
@@ -4054,7 +4399,7 @@ class LiveOrchestrator:
                 target.target.event_id,
                 expected_followup_actor=target.expected_followup_actor,
                 followup_event_id=target.followup_event_id or "",
-                cards=observation.cards,
+                cards=observed_cards,
                 reason="two_distinct_adjacent_action_rereads",
                 confidence=result.confidence,
                 source="two_frame_adjacent_action_reread",
@@ -4075,6 +4420,46 @@ class LiveOrchestrator:
         self._activate_zone(monotonic_ms)
         self._request_advice_if_needed()
         return published
+
+    def _expire_previous_action_verification(
+        self,
+        target: _PreviousActionVerification,
+        *,
+        monotonic_ms: int,
+    ) -> LiveEvent | None:
+        """Release advice after a bounded reread while preserving history."""
+
+        opened_ms = target.opened_monotonic_ms
+        if (
+            target.state != "open"
+            or opened_ms is None
+            or int(monotonic_ms) - opened_ms
+            < _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS
+        ):
+            return None
+        target.state = "expired"
+        self._suit_correction_tracker.clear(target.target.event_id)
+        event = self._append_lifecycle_event(
+            "previous_action_verification_expired",
+            {
+                "target_event_id": target.target.event_id,
+                "followup_event_id": target.followup_event_id,
+                "cards": list(target.target.payload.get("cards", ())),
+                "reason": "reread_timeout_original_preserved",
+                "opened_monotonic_ms": opened_ms,
+                "deadline_monotonic_ms": (
+                    opened_ms + _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS
+                ),
+                "expired_monotonic_ms": int(monotonic_ms),
+                "timeout_ms": _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS,
+                "original_cards_preserved": True,
+            },
+            actor=target.target.actor,
+            confidence=0.0,
+            source="previous_action_verification_timeout",
+        )
+        self._request_advice_if_needed()
+        return event
 
     def _withhold_advice_for_previous_action_verification(
         self,
@@ -4492,6 +4877,15 @@ class LiveOrchestrator:
             return key
 
     def _run_advice(self, job: _AdviceJob) -> _AdviceCompletion:
+        self.store.append_advice(
+            {
+                "request_id": job.key.request_id,
+                "status": "worker_started",
+                "turn_id": job.key.turn_id,
+                "state_revision": job.key.state_revision,
+                **self._advisor_identity(),
+            }
+        )
         suit_expansion = state_variants_for_unknown_suits_detailed(
             job.state,
             limit=_MAX_SUIT_STATE_VARIANTS,
@@ -5257,6 +5651,59 @@ class LiveOrchestrator:
             self._signal_advice_completion(key)
             self._notify_update_listener()
 
+    def _discard_advice_job(self, value: object, reason: str) -> None:
+        """Give every requested-but-unconsumed advice job an auditable terminal."""
+
+        if not isinstance(value, _AdviceJob):
+            return
+        key = value.key
+        status = "stale" if reason in {"latest_replaced", "preserved_evicted"} else "cancelled"
+        error = (
+            "advice request superseded by a newer state"
+            if status == "stale"
+            else "advice request cancelled while stopping"
+        )
+        with self._advice_lock:
+            self.store.append_advice(
+                {
+                    "request_id": key.request_id,
+                    "status": status,
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                    "discard_reason": reason,
+                    "error": error,
+                    "engine_input": self._fallback_engine_input(value),
+                    **self._advisor_identity(),
+                }
+            )
+            self.store.upsert_decision(
+                {
+                    "decision_id": key.decision_id,
+                    "request_id": key.request_id,
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                    "status": status,
+                    "error": error,
+                    "discard_reason": reason,
+                }
+            )
+            self._append_advice_event(
+                "advice_stale" if status == "stale" else "advice_cancelled",
+                {
+                    "request_id": key.request_id,
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                    "discard_reason": reason,
+                },
+            )
+            if self.latest_advice is not None and self.latest_advice.key == key:
+                self.latest_advice = LiveAdvice(
+                    key=key,
+                    status="stale",
+                    error=error,
+                )
+        self._signal_advice_completion(key)
+
     def _notify_update_listener(self) -> None:
         """Expose an advice transition immediately instead of waiting for a frame."""
 
@@ -5368,6 +5815,9 @@ class LiveOrchestrator:
         """Persist the action first, then append its non-semantic outcomes."""
 
         published = self._publish_event(event)
+        verification_retirements = self._publish_previous_action_retirements(
+            published
+        )
         if published.actor == "self":
             decision_id = self._decision_id_by_revision.get(
                 published.state_revision_before
@@ -5392,7 +5842,57 @@ class LiveOrchestrator:
             trigger_action_event_id=published.event_id,
             trigger_actor=published.actor,
         )
-        return published, outcomes
+        return published, (*verification_retirements, *outcomes)
+
+    def _publish_previous_action_retirements(
+        self,
+        trigger: LiveEvent,
+    ) -> tuple[LiveEvent, ...]:
+        """Make next-action retirement explicit without changing advancement."""
+
+        matching: list[_PreviousActionVerification] = []
+        retained: list[tuple[str, _PreviousActionVerification]] = []
+        for trigger_event_id, verification in self._pending_previous_action_retirements:
+            if trigger_event_id == trigger.event_id:
+                matching.append(verification)
+            else:
+                retained.append((trigger_event_id, verification))
+        self._pending_previous_action_retirements = retained
+
+        published: list[LiveEvent] = []
+        emitted_target_ids: set[str] = set()
+        for verification in matching:
+            target_id = verification.target.event_id
+            if target_id in emitted_target_ids:
+                continue
+            emitted_target_ids.add(target_id)
+            opened_ms = verification.opened_monotonic_ms
+            published.append(
+                self._append_lifecycle_event(
+                    "previous_action_verification_expired",
+                    {
+                        "target_event_id": target_id,
+                        "followup_event_id": verification.followup_event_id,
+                        "retirement_action_event_id": trigger.event_id,
+                        "cards": list(
+                            verification.target.payload.get("cards", ())
+                        ),
+                        "reason": "next_formal_action_original_preserved",
+                        "opened_monotonic_ms": opened_ms,
+                        "retired_monotonic_ms": self._last_monotonic_ms,
+                        "elapsed_ms": (
+                            None
+                            if opened_ms is None
+                            else max(0, self._last_monotonic_ms - opened_ms)
+                        ),
+                        "original_cards_preserved": True,
+                    },
+                    actor=verification.target.actor,
+                    confidence=0.0,
+                    source="previous_action_verification_retirement",
+                )
+            )
+        return tuple(published)
 
     @staticmethod
     def _decision_state(state: GuanDanState) -> dict[str, object]:
@@ -5523,6 +6023,18 @@ class LiveOrchestrator:
             if player not in by_player:
                 self._placement_streaks.pop(player, None)
 
+        if self._placement_is_deferred_for_expected_action(fast, defer_player):
+            # A rank badge is not action evidence.  In particular, the second
+            # teammate badge can arrive while the other opponent's PASS is
+            # still visible, and marking that teammate as finished would
+            # immediately decide the round before the PASS (and the following
+            # expected play) can reach the normal reducer path.  Do not retain
+            # a partial badge streak across an actionable turn either: the
+            # fallback must be freshly stable once that action surface is gone.
+            for player in by_player:
+                self._placement_streaks.pop(player, None)
+            return ()
+
         completed: list[LiveEvent] = []
         placement_order = {"head": 0, "second": 1, "third": 2, "last": 3}
         placement_sequence = ("head", "second", "third")
@@ -5533,6 +6045,16 @@ class LiveOrchestrator:
         for signal in signals:
             player = signal.player
             if player in self.reducer.snapshot().finished_seats:
+                self._placement_streaks.pop(player, None)
+                continue
+            if player == defer_player:
+                # A placement badge frequently appears before the final cards
+                # have stopped animating.  When it belongs to the player whose
+                # action is currently awaited, treating it as completion would
+                # erase a still-readable terminal play (and any following
+                # PASS/接风 chain).  Let the ordinary action recognizer prove
+                # the final play; once it commits, reducer lifecycle events
+                # record the same placement without a history gap.
                 self._placement_streaks.pop(player, None)
                 continue
             placement = str(signal.placement).strip().lower()
@@ -5604,6 +6126,35 @@ class LiveOrchestrator:
                         )
                     )
         return tuple(completed)
+
+    def _placement_is_deferred_for_expected_action(
+        self,
+        fast: FastSignalResult,
+        expected: Seat | None,
+    ) -> bool:
+        """Keep visual fallback behind an unresolved expected-seat PASS.
+
+        An ordinary active timer, PASS marker or local action control defers
+        the same frame.  More importantly, a fresh direct-next PASS recovery
+        owns its complete two-marker decision window; a placement badge must
+        not decide the round while that reducer-valid recovery remains
+        pending.  No timer-only or fixed-frame extension is used.
+        """
+
+        if expected is None:
+            return False
+        window = self._turn_ownership_window
+        if (
+            window is not None
+            and window.expected_player == expected
+            and window.unseen_direct_next_pass_pending
+        ):
+            return True
+        return bool(
+            fast.active_player == expected
+            or self._matching_expected_pass_marker(fast, expected)
+            or (expected == "self" and fast.self_action_buttons_visible)
+        )
 
     def _append_lifecycle_event(
         self,
@@ -5678,6 +6229,7 @@ class LiveOrchestrator:
         )
         accepted_for_consensus = owner_disposition in {
             "owner_authenticated",
+            "owner_active_unknown",
             "self_lead_handoff_authenticated",
             "direct_next_handoff",
             "crossed_handoff_recovery",
@@ -5857,6 +6409,105 @@ class LiveOrchestrator:
         ):
             return "conflicting_valid_candidates"
         return None
+
+    def _decide_opening_handoff_anchor(
+        self,
+        window: _TurnOwnershipWindow | None,
+        metrics: ZoneFrameMetrics,
+        fast: FastSignalResult,
+    ) -> ConsensusResult | None:
+        """Recover a stable opening play after its timer has already advanced.
+
+        This is deliberately not another general consensus strategy.  It only
+        covers the narrow asynchronous opening handoff where the lead is
+        already known, the table is still empty, and the timer is on that
+        lead's direct successor.  The normal strategy always has first
+        priority; this receives only its ``None`` result.
+        """
+
+        if (
+            window is None
+            or not self._lead_auto_confirmed_from_marker
+            or not self._is_first_action_turn(window.expected_player)
+            or bool(self.snapshot.trick_plays)
+            or not self._is_direct_next_active(window.expected_player, fast.active_player)
+            or fast.effect_visible
+            or metrics.effect_visible
+            or window.disposition != "direct_next_handoff"
+        ):
+            return None
+
+        latest_samples = window.handoff_samples[-2:]
+        if len(latest_samples) != 2:
+            return None
+
+        context = self._consensus_context(metrics, fast)
+        valid: list[RecognitionSample] = []
+        for sample in latest_samples:
+            if sample.is_pass:
+                return None
+            cards, suit_options = canonical_candidate(
+                sample.cards,
+                sample.suit_options,
+                is_pass=False,
+            )
+            if not cards or BurstConsensus.validate_candidate(
+                False,
+                cards,
+                context,
+                suit_options=suit_options,
+            ):
+                return None
+            valid.append(RecognitionSample(
+                cards=cards,
+                is_pass=False,
+                confidence=sample.confidence,
+                source=sample.source,
+                evidence_ref=sample.evidence_ref,
+                suit_options=suit_options,
+                post_hand=sample.post_hand,
+            ))
+        if (
+            len({sample.evidence_ref for sample in valid if sample.evidence_ref}) != 2
+            or (valid[0].cards, valid[0].suit_options)
+            != (valid[1].cards, valid[1].suit_options)
+        ):
+            return None
+
+        sample = valid[-1]
+        confidence = sum(item.confidence for item in valid) / len(valid)
+        candidate = ConsensusCandidate(
+            cards=sample.cards,
+            is_pass=False,
+            votes=len(valid),
+            mean_confidence=confidence,
+            valid=True,
+        )
+        return ConsensusResult(
+            status="confirmed",
+            cards=sample.cards,
+            is_pass=False,
+            confidence=confidence,
+            source="opening_handoff_two_valid_anchor",
+            vote_count=len(valid),
+            candidates=(candidate,),
+            resolved_cards=BurstConsensus.resolve_commit_cards(
+                False,
+                sample.cards,
+                context,
+                suit_options=sample.suit_options,
+            ),
+            evidence_refs=tuple(
+                item.evidence_ref for item in valid if item.evidence_ref
+            ),
+            suit_options=sample.suit_options,
+            integrity_warnings=BurstConsensus.integrity_warnings(
+                False,
+                sample.cards,
+                context,
+                suit_options=sample.suit_options,
+            ),
+        )
 
     def _decide_timeout_candidate(
         self,
