@@ -16,7 +16,7 @@ from ..application.ports import (
     RecordingPort,
     SessionPersistencePort,
 )
-from ..advisor_strategy import load_profile_session_data_recording_enabled
+from ..advisor_strategy import load_profile_recording_mode
 from ..live.orchestrator import LiveOrchestrator
 from ..live.recorder import InMemorySessionRecorder, SessionRecorder
 from ..live.reducer import LiveReducer
@@ -74,6 +74,79 @@ class LiveSessionRecording:
         self._closed = True
 
 
+@dataclass
+class ListenerRecording:
+    """Persist raw listener frames before a complete initial state exists."""
+
+    store: SessionPersistencePort
+    recorder: RecordingPort
+    _recognition_sample_count: int = 0
+    _closed: bool = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def record_frame(
+        self,
+        image: Any,
+        *,
+        monotonic_ms: int,
+        wall_time: str,
+    ) -> None:
+        if self._closed:
+            return
+        warning = self.recorder.write_frame(image, monotonic_ms, wall_time)
+        if warning is not None:
+            self.store.append_recognition_trace(
+                {
+                    "phase": "recording_frame_dropped",
+                    "reason": warning.reason,
+                    "monotonic_ms": warning.monotonic_ms,
+                    "details": warning.details,
+                }
+            )
+
+    def record_recognition(self, result: object) -> None:
+        if self._closed:
+            return
+        self._recognition_sample_count += 1
+        self.store.append_recognition_trace(
+            {
+                "phase": "waiting_for_initial_state",
+                "round_level": getattr(result, "round_level", None),
+                "hand_count": len(tuple(getattr(result, "my_hand", ()) or ())),
+                "diagnostics": list(getattr(result, "diagnostics", ()) or ()),
+            }
+        )
+
+    def close(self, *, reason: str) -> None:
+        if self._closed:
+            return
+        recording = self.recorder.close()
+        update_metadata = getattr(self.store, "update_session_metadata", None)
+        if callable(update_metadata):
+            update_metadata(
+                {
+                    "recording_phase": "ended_without_initial_state",
+                    "initial_state_status": "unconfirmed",
+                    "termination_reason": str(reason),
+                }
+            )
+        self.store.seal(
+            frame_count=recording.frame_count,
+            dropped_frames=recording.dropped_frames,
+            metrics={
+                "recording_mode": "listening_only",
+                "recognition_sample_count": self._recognition_sample_count,
+            },
+            incident_media_failures=(
+                failure.to_dict() for failure in recording.incident_media_failures
+            ),
+        )
+        self._closed = True
+
+
 class DefaultLiveSessionFactory:
     """Construct one live session from concrete infrastructure adapters."""
 
@@ -117,6 +190,51 @@ class DefaultLiveSessionFactory:
             recognition_strategy=recognition_strategy,
             on_update=on_update,
         )
+
+    def start_listener_recording(
+        self,
+        *,
+        recognition_strategy: str,
+    ) -> ListenerRecording | None:
+        """Start a replay that survives even when the deal is never recognized."""
+
+        if (
+            load_profile_recording_mode(
+                self.capture.profiles_root,
+                self.profile_name,
+            )
+            != "all"
+        ):
+            return None
+        loaded = self.capture.load_profile(self.profile_name)
+        store = LiveSessionStore(
+            self.capture.profiles_root,
+            self.profile_name,
+        )
+        manifest = build_session_manifest(
+            loaded.paths.profile_config_path,
+            loaded.paths.templates_config_path,
+        )
+        manifest.update(
+            {
+                "recognition_strategy": recognition_strategy,
+                "recording_phase": "listening",
+                "initial_state_status": "unconfirmed",
+                "recording_mode": "all",
+                "advisor": self._advisor_manifest(),
+            }
+        )
+        store.start(manifest)
+        try:
+            recorder = SessionRecorder(
+                store.directory,
+                size=loaded.config.base_size,
+                fps=10,
+            )
+        except Exception:
+            store.seal(frame_count=0, dropped_frames=0)
+            raise
+        return ListenerRecording(store=store, recorder=recorder)
 
     def _start_session_with_recording(
         self,
@@ -162,11 +280,11 @@ class DefaultLiveSessionFactory:
         recognition_strategy: str,
     ) -> LiveSessionRecording:
         loaded = self.capture.load_profile(self.profile_name)
-        save_session_data = load_profile_session_data_recording_enabled(
+        recording_mode = load_profile_recording_mode(
             self.capture.profiles_root,
             self.profile_name,
         )
-        if not save_session_data:
+        if recording_mode == "none":
             store = InMemoryLiveSessionStore(
                 self.capture.profiles_root,
                 self.profile_name,
@@ -190,6 +308,7 @@ class DefaultLiveSessionFactory:
                 "recognition_strategy": recognition_strategy,
                 "recording_phase": "live",
                 "initial_state_status": "pending",
+                "recording_mode": recording_mode,
                 "advisor": self._advisor_manifest(),
             }
         )

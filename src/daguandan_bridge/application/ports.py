@@ -148,3 +148,9 @@ class SessionFactoryPort(Protocol):
         recognition_strategy: str,
         on_update: Callable[[Any], None] | None = None,
     ) -> LiveSessionConstruction: ...
+
+    def start_listener_recording(
+        self,
+        *,
+        recognition_strategy: str,
+    ) -> Any | None: ...

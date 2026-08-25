@@ -27,13 +27,12 @@ from qfluentwidgets import (
     PushButton,
     ScrollArea,
     StrongBodyLabel,
-    SwitchButton,
     TitleLabel,
     isDarkTheme,
     qconfig,
 )
 
-from ..advisor_strategy import ADVISOR_OPTIONS
+from ..advisor_strategy import ADVISOR_OPTIONS, RECORDING_MODE_OPTIONS
 from ..danzero.state import RANKS
 from ..live.display_text import (
     event_action_text,
@@ -172,6 +171,7 @@ class LiveAssistantPage(ScrollArea):
         self.lead_player_combo.addItem("待自动识别", userData="")
         for seat in ("self", "right", "opposite", "left"):
             self.lead_player_combo.addItem(_SEAT_LABELS[seat], userData=seat)
+        self.lead_player_combo.setToolTip("仅作提示；实时开局时会再次确认。")
         self.recognition_strategy_combo = ComboBox()
         for value, label in RECOGNITION_STRATEGY_OPTIONS:
             self.recognition_strategy_combo.addItem(label, userData=value)
@@ -191,24 +191,26 @@ class LiveAssistantPage(ScrollArea):
         self.advisor_strategy_combo.setToolTip(
             "只影响下一局；实时对局开始后锁定，结束后可重新选择。"
         )
-        self.session_data_switch = SwitchButton()
-        self.session_data_switch.setOnText("开启")
-        self.session_data_switch.setOffText("关闭")
-        self.session_data_switch.setChecked(
-            bool(getattr(self.runtime, "session_data_recording_enabled", True))
+        self.recording_mode_combo = ComboBox()
+        for value, label in RECORDING_MODE_OPTIONS:
+            self.recording_mode_combo.addItem(label, userData=value)
+        recording_mode = str(
+            getattr(
+                self.runtime,
+                "recording_mode",
+                "game"
+                if bool(getattr(self.runtime, "session_data_recording_enabled", True))
+                else "none",
+            )
         )
-        self.session_data_switch.setToolTip(
-            "默认开启并会记住你的选择。关闭后仍提供实时识别和建议，"
-            "但不会创建新的 sessions 目录、录像、时间线、建议日志、事故资料或训练样本。"
+        recording_index = self.recording_mode_combo.findData(recording_mode)
+        if recording_index >= 0:
+            self.recording_mode_combo.setCurrentIndex(recording_index)
+        self.recording_mode_combo.setToolTip(
+            "不保存：仅实时建议。\n"
+            "对局录制：确认起手牌后开始保存。\n"
+            "全程录制：从开始监听即保存画面。"
         )
-        session_data_row = QWidget()
-        session_data_layout = QHBoxLayout(session_data_row)
-        session_data_layout.setContentsMargins(0, 0, 0, 0)
-        session_data_layout.addWidget(self.session_data_switch)
-        session_data_layout.addWidget(
-            CaptionLabel("关闭后仅本次实时使用，不保存完整回放资料")
-        )
-        session_data_layout.addStretch(1)
         # Internal normalized codes remain here for the state machine; the
         # user edits the visible card strip through the existing picker.
         self.hand_edit = LineEdit(self)
@@ -216,6 +218,7 @@ class LiveAssistantPage(ScrollArea):
         self.initial_hand_badges: list[CardBadge] = []
         self.initial_hand_scroll = ScrollArea()
         self.initial_hand_scroll.setObjectName("liveInitialHandCards")
+        self.initial_hand_scroll.setToolTip("点击牌面可修改。")
         self.initial_hand_scroll.setWidgetResizable(False)
         # CardBadge(compact=True) is 36 x 50.  The old 50-pixel scroll area
         # then forced every badge down to 27 x 40, clipping ranks and suits
@@ -235,11 +238,11 @@ class LiveAssistantPage(ScrollArea):
         self.initial_hand_scroll.setWidget(self.initial_hand_cards)
         self._render_initial_hand_cards(())
         form.addRow("当前级牌", self.round_level_combo)
-        form.addRow("首发候选（实时会再次验证）", self.lead_player_combo)
-        form.addRow("动作识别策略", self.recognition_strategy_combo)
-        form.addRow("建议模型（下一局）", self.advisor_strategy_combo)
-        form.addRow("保存对局数据（下一局）", session_data_row)
-        form.addRow("初始手牌（点击牌面可修改）", self.initial_hand_scroll)
+        form.addRow("首发候选", self.lead_player_combo)
+        form.addRow("识别策略", self.recognition_strategy_combo)
+        form.addRow("建议模型", self.advisor_strategy_combo)
+        form.addRow("保存方式", self.recording_mode_combo)
+        form.addRow("起手牌", self.initial_hand_scroll)
         initial_layout.addLayout(form)
         initial_actions = QHBoxLayout()
         self.recognize_initial_button = PushButton("识别当前页面（持续监听）")
@@ -399,8 +402,8 @@ class LiveAssistantPage(ScrollArea):
         self.advisor_strategy_combo.currentIndexChanged.connect(
             self._update_advisor_strategy
         )
-        self.session_data_switch.checkedChanged.connect(
-            self._update_session_data_recording
+        self.recording_mode_combo.currentIndexChanged.connect(
+            self._update_recording_mode
         )
         self._update_recognition_strategy()
         self._set_live_controls(False)
@@ -512,21 +515,41 @@ class LiveAssistantPage(ScrollArea):
         except Exception as exc:
             self.show_error(str(exc))
 
-    def _update_session_data_recording(self, enabled: bool) -> None:
+    def _update_recording_mode(self, *_args) -> None:
         if self._session_active:
             return
-        setter = getattr(self.runtime, "set_session_data_recording_enabled", None)
-        if not callable(setter):
+        mode = str(self.recording_mode_combo.currentData())
+        mode_setter = getattr(self.runtime, "set_recording_mode", None)
+        legacy_setter = getattr(
+            self.runtime,
+            "set_session_data_recording_enabled",
+            None,
+        )
+        if not callable(mode_setter) and (mode == "all" or not callable(legacy_setter)):
             return
         try:
-            setter(bool(enabled))
+            if callable(mode_setter):
+                mode_setter(mode)
+            else:
+                legacy_setter(mode != "none")
         except Exception as exc:
             self.show_error(str(exc))
-            self.session_data_switch.blockSignals(True)
-            self.session_data_switch.setChecked(
-                bool(getattr(self.runtime, "session_data_recording_enabled", True))
+            restored = str(
+                getattr(
+                    self.runtime,
+                    "recording_mode",
+                    "game"
+                    if bool(
+                        getattr(self.runtime, "session_data_recording_enabled", True)
+                    )
+                    else "none",
+                )
             )
-            self.session_data_switch.blockSignals(False)
+            index = self.recording_mode_combo.findData(restored)
+            if index >= 0:
+                self.recording_mode_combo.blockSignals(True)
+                self.recording_mode_combo.setCurrentIndex(index)
+                self.recording_mode_combo.blockSignals(False)
 
     def apply_initial_recognition(self, result: object, snapshot: object | None) -> None:
         level = getattr(result, "round_level", None)
@@ -566,7 +589,7 @@ class LiveAssistantPage(ScrollArea):
         self.lead_player_combo.setEnabled(enabled)
         self.recognition_strategy_combo.setEnabled(enabled)
         self.advisor_strategy_combo.setEnabled(enabled)
-        self.session_data_switch.setEnabled(enabled)
+        self.recording_mode_combo.setEnabled(enabled)
 
     def _render_initial_hand_cards(self, cards: tuple[str, ...]) -> None:
         while self.initial_hand_cards_layout.count():

@@ -17,10 +17,10 @@ from ..application.ports import (
 from ..advisor_strategy import (
     build_advisor,
     load_profile_advisor_strategy,
-    load_profile_session_data_recording_enabled,
+    load_profile_recording_mode,
     normalize_advisor_strategy,
     save_profile_advisor_strategy,
-    save_profile_session_data_recording_enabled,
+    save_profile_recording_mode,
 )
 from ..capture_service import FrameSnapshot
 from ..danzero.state import GuanDanState, RANKS, Seat
@@ -144,12 +144,11 @@ class LiveAssistantController(QObject):
             raise ValueError("capture_interval_sec must be positive")
         self.capture_interval_sec = float(capture_interval_sec)
         self.deduplicate_analysis_frames = bool(deduplicate_analysis_frames)
-        self.session_data_recording_enabled = (
-            load_profile_session_data_recording_enabled(
-                self.capture_service.profiles_root,
-                self.profile_name,
-            )
+        self.recording_mode = load_profile_recording_mode(
+            self.capture_service.profiles_root,
+            self.profile_name,
         )
+        self.session_data_recording_enabled = self.recording_mode != "none"
         self.orchestrator: LiveOrchestrator | None = None
         self._live_source = None
         self._capture_worker: WorkerHandle | None = None
@@ -171,6 +170,8 @@ class LiveAssistantController(QObject):
         self._waiting_generation = 0
         self._waiting_candidate: _AutoSessionSeed | None = None
         self._pending_auto_session: _AutoSessionSeed | None = None
+        self._listener_recording: object | None = None
+        self._listener_recording_stop_reason: str | None = None
         self._table_anchor_observed = False
         self._recognition_strategy = "two_valid_streak"
         self._auto_finish_requested = False
@@ -254,17 +255,21 @@ class LiveAssistantController(QObject):
             self._start_danzero_warmup()
 
     def set_session_data_recording_enabled(self, enabled: bool) -> None:
-        """Persist whether the next live game writes any session artifacts."""
+        """Compatibility setter for the former binary recording setting."""
 
-        if self.orchestrator is not None:
-            raise RuntimeError("实时对局开始后不能切换对局数据保存")
-        self.session_data_recording_enabled = (
-            save_profile_session_data_recording_enabled(
-                self.capture_service.profiles_root,
-                self.profile_name,
-                enabled,
-            )
+        self.set_recording_mode("game" if enabled else "none")
+
+    def set_recording_mode(self, mode: str) -> None:
+        """Persist the replay policy before a listener or live game begins."""
+
+        if self.orchestrator is not None or self._listening_enabled:
+            raise RuntimeError("开始监听页面后不能切换保存方式")
+        self.recording_mode = save_profile_recording_mode(
+            self.capture_service.profiles_root,
+            self.profile_name,
+            mode,
         )
+        self.session_data_recording_enabled = self.recording_mode != "none"
 
     def start_listening(self) -> bool:
         """Continuously inspect the current page and start only on a stable deal."""
@@ -280,6 +285,7 @@ class LiveAssistantController(QObject):
                 return False
         self._listening_enabled = True
         self._table_anchor_observed = False
+        self._listener_recording_stop_reason = None
         self._start_danzero_warmup()
         if self.orchestrator is None and self._finish_thread is None:
             self._start_waiting_workers()
@@ -290,7 +296,9 @@ class LiveAssistantController(QObject):
         self._waiting_candidate = None
         self._pending_auto_session = None
         self._table_anchor_observed = False
-        self._stop_waiting_workers()
+        self._listener_recording_stop_reason = "listener_stopped"
+        if self._stop_waiting_workers():
+            self._close_listener_recording()
 
     def _start_waiting_workers(self) -> None:
         if (
@@ -303,6 +311,13 @@ class LiveAssistantController(QObject):
             source = self.capture_service.open_live_source(self.profile_name)
         except Exception as exc:
             self.error.emit(str(exc))
+            self._listening_enabled = False
+            return
+        if not self._start_listener_recording():
+            try:
+                source.close()
+            except Exception:
+                pass
             self._listening_enabled = False
             return
         self._waiting_source = source
@@ -319,8 +334,10 @@ class LiveAssistantController(QObject):
             snapshot: FrameSnapshot = source.capture()
             if generation != self._waiting_generation:
                 return snapshot
+            self._record_listener_frame(snapshot)
             # Opening probes stay in memory.  Storage starts only after a
-            # complete initial state has been confirmed.
+            # complete initial state has been confirmed, unless the user has
+            # selected full recording for this listening pass.
             active_analysis = self._waiting_analysis_worker
             if active_analysis is not None:
                 active_analysis.submit(snapshot)
@@ -362,10 +379,18 @@ class LiveAssistantController(QObject):
         if self.orchestrator is None:
             self._listening_enabled = False
             self._waiting_candidate = None
+            self._listener_recording_stop_reason = "waiting_capture_failed"
 
     def _consume_waiting_recognition(self, result: object, snapshot: object) -> None:
         """Require two identical normalized 27-card results before starting."""
 
+        recording = self._listener_recording
+        record_recognition = getattr(recording, "record_recognition", None)
+        if callable(record_recognition):
+            try:
+                record_recognition(result)
+            except Exception as exc:
+                self.error.emit(f"监听录像写入识别记录失败：{exc}")
         self.initial_recognized.emit(result, snapshot)
         if not self._listening_enabled or self.orchestrator is not None:
             return
@@ -423,7 +448,9 @@ class LiveAssistantController(QObject):
         if seed is None:
             return
         self._pending_auto_session = seed
+        self._listener_recording_stop_reason = "initial_state_confirmed"
         if self._stop_waiting_workers():
+            self._close_listener_recording()
             self._start_pending_auto_session()
 
     def _start_pending_auto_session(self) -> None:
@@ -539,9 +566,56 @@ class LiveAssistantController(QObject):
         if self._waiting_capture_worker is worker:
             self._waiting_capture_worker = None
         self._close_waiting_source()
+        self._close_listener_recording()
         if self._pending_auto_session is not None:
             self._start_pending_auto_session()
             return
+
+    def _start_listener_recording(self) -> bool:
+        if self.recording_mode != "all":
+            return True
+        starter = getattr(self.session_factory, "start_listener_recording", None)
+        if not callable(starter):
+            self.error.emit("当前会话工厂不支持全程录制")
+            return False
+        try:
+            recording = starter(recognition_strategy=self._recognition_strategy)
+        except Exception as exc:
+            self.error.emit(f"无法启动全程录制：{exc}")
+            return False
+        if recording is None:
+            self.error.emit("全程录制未启动，请检查保存方式配置")
+            return False
+        self._listener_recording = recording
+        return True
+
+    def _record_listener_frame(self, snapshot: FrameSnapshot) -> None:
+        recording = self._listener_recording
+        record_frame = getattr(recording, "record_frame", None)
+        if not callable(record_frame):
+            return
+        try:
+            record_frame(
+                snapshot.image,
+                monotonic_ms=monotonic_ns() // 1_000_000,
+                wall_time=snapshot.captured_at.isoformat(),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"全程录制写入失败：{exc}") from exc
+
+    def _close_listener_recording(self) -> None:
+        recording, self._listener_recording = self._listener_recording, None
+        reason, self._listener_recording_stop_reason = (
+            self._listener_recording_stop_reason or "listener_stopped",
+            None,
+        )
+        close = getattr(recording, "close", None)
+        if not callable(close):
+            return
+        try:
+            close(reason=reason)
+        except Exception as exc:
+            self.error.emit(f"封存全程录像失败：{exc}")
 
     def _initial_result(self, value: object) -> None:
         result, snapshot = value  # type: ignore[misc]
@@ -1254,6 +1328,8 @@ class LiveAssistantController(QObject):
                 self._waiting_capture_worker.wait(10_000)
             self._waiting_capture_worker = None
             self._close_waiting_source()
+        self._listener_recording_stop_reason = "application_shutdown"
+        self._close_listener_recording()
         if self._initial_thread is not None and self._initial_thread.isRunning():
             self._initial_thread.wait(10_000)
         if (

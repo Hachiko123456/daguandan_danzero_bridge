@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -264,6 +265,32 @@ class _UnknownSuitAwareRecognitionStub:
         return _initial_recognition(())
 
 
+class _ListenerRecordingStub:
+    def __init__(self) -> None:
+        self.frames = []
+        self.recognitions = []
+        self.closed_with = []
+
+    def record_frame(self, image, *, monotonic_ms, wall_time):
+        self.frames.append((image, monotonic_ms, wall_time))
+
+    def record_recognition(self, result):
+        self.recognitions.append(result)
+
+    def close(self, *, reason):
+        self.closed_with.append(reason)
+
+
+class _ListenerRecordingFactory:
+    def __init__(self, recording):
+        self.recording = recording
+        self.started_with = []
+
+    def start_listener_recording(self, *, recognition_strategy):
+        self.started_with.append(recognition_strategy)
+        return self.recording
+
+
 def test_waiting_scan_keeps_unknown_suits_in_the_initial_hand(tmp_path):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
@@ -276,6 +303,58 @@ def test_waiting_scan_keeps_unknown_suits_in_the_initial_hand(tmp_path):
     assert recognition.allow_unknown_suit is True
     assert result.my_hand == ()
     assert returned_snapshot is snapshot
+
+
+def test_full_recording_keeps_listener_frames_when_initial_hand_is_empty(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    recording = _ListenerRecordingStub()
+    factory = _ListenerRecordingFactory(recording)
+    controller.session_factory = factory  # type: ignore[assignment]
+    controller.recording_mode = "all"
+
+    assert controller._start_listener_recording() is True
+    snapshot = SimpleNamespace(
+        image=np.zeros((1, 1, 3), dtype=np.uint8),
+        captured_at=datetime.now().astimezone(),
+    )
+    controller._record_listener_frame(snapshot)
+    controller._consume_waiting_recognition(_initial_recognition(()), snapshot)
+    controller.stop_listening()
+
+    assert factory.started_with == ["two_valid_streak"]
+    assert len(recording.frames) == 1
+    assert recording.recognitions == [_initial_recognition(())]
+    assert recording.closed_with == ["listener_stopped"]
+
+
+def test_full_recording_seals_listener_clip_before_starting_a_confirmed_game(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    recording = _ListenerRecordingStub()
+    controller._listener_recording = recording
+    controller._listening_enabled = True
+    controller._table_anchor_observed = True
+    started = []
+    monkeypatch.setattr(
+        controller,
+        "_start_pending_auto_session",
+        lambda: started.append(True),
+    )
+
+    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+
+    assert recording.closed_with == ["initial_state_confirmed"]
+    assert started == [True]
 
 
 def test_listener_locks_target_client_before_starting_waiting_capture(

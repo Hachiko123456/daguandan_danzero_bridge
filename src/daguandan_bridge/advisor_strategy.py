@@ -21,10 +21,17 @@ DEFAULT_ADVISOR_STRATEGY = "fabledan"
 DEFAULT_FABLEDAN_DEBUG = False
 DEFAULT_FABLEDAN_DIAGNOSTICS = "off"
 DEFAULT_SESSION_DATA_RECORDING_ENABLED = True
+RECORDING_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("none", "不保存"),
+    ("game", "对局录制"),
+    ("all", "全程录制"),
+)
+DEFAULT_RECORDING_MODE = "game"
 _VALID_ADVISORS = {value for value, _label in ADVISOR_OPTIONS}
 _VALID_EVALUATION_STRATEGIES = {
     value for value, _label in EVALUATION_STRATEGY_OPTIONS
 } | {"fabledan_rule"}
+_VALID_RECORDING_MODES = {value for value, _label in RECORDING_MODE_OPTIONS}
 
 
 def normalize_advisor_strategy(value: object) -> str:
@@ -67,17 +74,40 @@ def load_profile_session_data_recording_enabled(
     profiles_root: Path | str = PROFILES_ROOT,
     profile_name: str = "tencent_daguandan",
 ) -> bool:
-    """Return whether new live games should create session/replay artifacts."""
+    """Compatibility wrapper for callers that only need an on/off answer."""
+
+    return load_profile_recording_mode(profiles_root, profile_name) != "none"
+
+
+def normalize_recording_mode(value: object) -> str:
+    normalized = str(value or DEFAULT_RECORDING_MODE).strip().lower()
+    if normalized not in _VALID_RECORDING_MODES:
+        raise ValueError(f"不支持的保存方式：{value}")
+    return normalized
+
+
+def load_profile_recording_mode(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> str:
+    """Load the persisted replay policy, upgrading the former boolean setting."""
 
     path = Path(profiles_root) / profile_name / "profile.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return DEFAULT_SESSION_DATA_RECORDING_ENABLED
+        return DEFAULT_RECORDING_MODE
     if not isinstance(raw, dict):
-        return DEFAULT_SESSION_DATA_RECORDING_ENABLED
-    value = raw.get("save_session_data", DEFAULT_SESSION_DATA_RECORDING_ENABLED)
-    return value if isinstance(value, bool) else DEFAULT_SESSION_DATA_RECORDING_ENABLED
+        return DEFAULT_RECORDING_MODE
+    if "recording_mode" in raw:
+        try:
+            return normalize_recording_mode(raw["recording_mode"])
+        except ValueError:
+            pass
+    legacy = raw.get(
+        "save_session_data", DEFAULT_SESSION_DATA_RECORDING_ENABLED
+    )
+    return "game" if legacy is not False else "none"
 
 
 def normalize_fabledan_diagnostics(value: object) -> str:
@@ -151,8 +181,33 @@ def save_profile_session_data_recording_enabled(
     if not isinstance(raw, dict):
         raise ValueError("profile.json 顶层结构必须是 JSON 对象")
     raw["save_session_data"] = enabled
+    raw["recording_mode"] = "game" if enabled else "none"
     atomic_write_json(path, raw)
     return enabled
+
+
+def save_profile_recording_mode(
+    profiles_root: Path | str,
+    profile_name: str,
+    mode: object,
+) -> str:
+    """Persist one of ``none``, ``game``, or ``all`` recording modes."""
+
+    normalized = normalize_recording_mode(mode)
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"缺少 profile 配置：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"profile 配置已损坏：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("profile.json 顶层结构必须是 JSON 对象")
+    raw["recording_mode"] = normalized
+    # Keep this key for existing scripts and older app versions.
+    raw["save_session_data"] = normalized != "none"
+    atomic_write_json(path, raw)
+    return normalized
 
 
 def build_advisor(

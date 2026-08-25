@@ -33,6 +33,8 @@ class FakeRuntime(QObject):
 
     def __init__(self):
         super().__init__()
+        self.recording_mode = "game"
+        self.recording_mode_updates = []
         self.session_data_recording_enabled = True
         self.session_data_recording_updates = []
         self.started = None
@@ -83,6 +85,11 @@ class FakeRuntime(QObject):
     def set_session_data_recording_enabled(self, enabled):
         self.session_data_recording_enabled = bool(enabled)
         self.session_data_recording_updates.append(bool(enabled))
+
+    def set_recording_mode(self, mode):
+        self.recording_mode = str(mode)
+        self.recording_mode_updates.append(self.recording_mode)
+        self.session_data_recording_enabled = self.recording_mode != "none"
 
     def shutdown(self):
         pass
@@ -172,17 +179,23 @@ def test_live_page_keeps_full_assistant_visible_when_window_lock_fails():
     page.close()
 
 
-def test_live_page_persists_session_data_switch_for_the_next_game():
+def test_live_page_persists_selected_recording_mode_for_the_next_listener():
     app = _app()
     runtime = FakeRuntime()
     page = LiveAssistantPage(runtime)
 
-    assert page.session_data_switch.isChecked()
-    page.session_data_switch.setChecked(False)
+    assert {
+        page.recording_mode_combo.itemData(index)
+        for index in range(page.recording_mode_combo.count())
+    } == {"none", "game", "all"}
+    page.recording_mode_combo.setCurrentIndex(
+        page.recording_mode_combo.findData("all")
+    )
     app.processEvents()
 
-    assert runtime.session_data_recording_updates == [False]
-    assert runtime.session_data_recording_enabled is False
+    assert runtime.recording_mode_updates == ["all"]
+    assert runtime.recording_mode == "all"
+    assert runtime.session_data_recording_enabled is True
     page.close()
 
 

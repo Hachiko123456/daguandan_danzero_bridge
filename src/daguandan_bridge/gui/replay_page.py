@@ -807,7 +807,20 @@ class ReplayPage(QWidget):
                 reverse=True,
             )
             for path in sessions:
-                self.session_combo.addItem(path.name, userData=str(path))
+                label = path.name
+                try:
+                    manifest = json.loads(
+                        (path / "manifest.json").read_text(encoding="utf-8")
+                    )
+                    metrics = manifest.get("performance_metrics", {})
+                    if (
+                        isinstance(metrics, dict)
+                        and metrics.get("recording_mode") == "listening_only"
+                    ):
+                        label = f"监听录像 · {path.name}"
+                except (OSError, json.JSONDecodeError):
+                    pass
+                self.session_combo.addItem(label, userData=str(path))
         self.session_combo.blockSignals(False)
         if selected is not None and selected.is_dir():
             self.select_session(selected)
