@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from time import perf_counter
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 from uuid import uuid4
 
 from .build_manifest import BUILD_MANIFEST_FILENAME, verify_build_manifest
@@ -83,6 +83,92 @@ DEPENDENCIES: tuple[DependencySpec, ...] = (
         "rlcard",
     ),
 )
+
+DOCTOR_REQUIRED_CHECK_IDS: tuple[str, ...] = (
+    "IDENTITY-RUNTIME",
+    "ENV-OS",
+    "ENV-PYTHON",
+    "ENV-ARCHITECTURE",
+    "STORAGE-DIAGNOSTICS",
+    "BUILD-INTEGRITY",
+    "STORAGE-BUNDLE-DATA",
+    "STORAGE-RUNTIME-LAYOUT",
+    "STORAGE-DATA",
+    "RESOURCE-PROFILE-JSON",
+    "RESOURCE-REGIONS-JSON",
+    "RESOURCE-TEMPLATES-JSON",
+    "RESOURCE-TEMPLATE-FILES",
+    "RESOURCE-MODEL-FABLEDAN",
+    "RESOURCE-MODEL-DANZERO",
+    *(dependency.check_id for dependency in DEPENDENCIES),
+)
+
+
+def validate_frozen_doctor_report(
+    report: Mapping[str, object],
+    *,
+    expected_build_id: str,
+) -> dict[str, object]:
+    """Validate the complete frozen-doctor contract used for activation.
+
+    Process exit code alone is not evidence: a hand-written report containing
+    ``checks: []`` used to be accepted.  This gate binds the report to the
+    candidate build and requires every documented frozen check exactly once.
+    """
+
+    failures: list[str] = []
+    if report.get("schema") != DOCTOR_SCHEMA:
+        failures.append("schema_invalid")
+    if report.get("overall_status") != "PASS":
+        failures.append("overall_status_not_pass")
+    identity = report.get("identity")
+    if not isinstance(identity, Mapping):
+        identity = {}
+        failures.append("identity_missing")
+    if identity.get("frozen") is not True:
+        failures.append("identity_not_frozen")
+    if identity.get("build_status") != "identified":
+        failures.append("identity_build_not_identified")
+    if identity.get("build_id") != expected_build_id:
+        failures.append("identity_build_id_mismatch")
+
+    raw_checks = report.get("checks")
+    checks = raw_checks if isinstance(raw_checks, list) else []
+    ids = [
+        str(item.get("id"))
+        for item in checks
+        if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+    ]
+    if len(ids) != len(checks):
+        failures.append("check_record_invalid")
+    if len(set(ids)) != len(ids):
+        failures.append("duplicate_check_ids")
+    required = set(DOCTOR_REQUIRED_CHECK_IDS)
+    present = set(ids)
+    missing = sorted(required - present)
+    unexpected = sorted(present - required)
+    if missing:
+        failures.append("required_checks_missing")
+    if unexpected:
+        failures.append("unexpected_check_ids")
+    nonpassing = sorted(
+        str(item.get("id"))
+        for item in checks
+        if isinstance(item, Mapping) and item.get("status") != "PASS"
+    )
+    if nonpassing:
+        failures.append("required_checks_not_pass")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "expected_build_id": expected_build_id,
+        "reported_build_id": identity.get("build_id"),
+        "required_check_count": len(DOCTOR_REQUIRED_CHECK_IDS),
+        "reported_check_count": len(checks),
+        "missing_check_ids": missing,
+        "unexpected_check_ids": unexpected,
+        "nonpassing_check_ids": nonpassing,
+        "failures": failures,
+    }
 
 
 def collect_doctor_report(

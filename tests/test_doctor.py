@@ -161,6 +161,63 @@ def test_run_entrypoint_routes_doctor_before_dpi_and_gui_imports():
     assert "daguandan_bridge.gui" not in source.split("if args.doctor:", 1)[0]
 
 
+def _complete_frozen_doctor(build_id: str = "BUILD-test") -> dict[str, object]:
+    return {
+        "schema": doctor.DOCTOR_SCHEMA,
+        "overall_status": "PASS",
+        "identity": {
+            "schema": "guandan.runtime-identity/1",
+            "frozen": True,
+            "build_status": "identified",
+            "build_id": build_id,
+        },
+        "checks": [
+            {
+                "id": check_id,
+                "status": "PASS",
+                "summary": "ok",
+                "evidence": {},
+                "duration_ms": 0.0,
+            }
+            for check_id in doctor.DOCTOR_REQUIRED_CHECK_IDS
+        ],
+    }
+
+
+def test_frozen_doctor_acceptance_requires_complete_unique_checks_and_identity():
+    report = _complete_frozen_doctor()
+
+    passed = doctor.validate_frozen_doctor_report(
+        report,
+        expected_build_id="BUILD-test",
+    )
+
+    assert passed["status"] == "PASS"
+    assert passed["required_check_count"] == len(doctor.DOCTOR_REQUIRED_CHECK_IDS)
+
+    report["checks"].append(dict(report["checks"][0]))
+    failed = doctor.validate_frozen_doctor_report(
+        report,
+        expected_build_id="BUILD-other",
+    )
+    assert failed["status"] == "FAIL"
+    assert "duplicate_check_ids" in failed["failures"]
+    assert "identity_build_id_mismatch" in failed["failures"]
+
+
+def test_frozen_doctor_acceptance_rejects_empty_checks_despite_pass_status():
+    report = _complete_frozen_doctor()
+    report["checks"] = []
+
+    result = doctor.validate_frozen_doctor_report(
+        report,
+        expected_build_id="BUILD-test",
+    )
+
+    assert result["status"] == "FAIL"
+    assert "required_checks_missing" in result["failures"]
+
+
 def test_frozen_doctor_fails_when_build_manifest_is_missing_or_invalid(tmp_path):
     root = _portable_root(tmp_path)
     missing = doctor.collect_doctor_report(

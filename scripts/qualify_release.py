@@ -33,6 +33,7 @@ from daguandan_bridge.build_manifest import (  # noqa: E402
     verify_build_manifest,
 )
 from daguandan_bridge.release_lock import verify_release_inputs  # noqa: E402
+from daguandan_bridge.doctor import validate_frozen_doctor_report  # noqa: E402
 from daguandan_bridge.release_manager import (  # noqa: E402
     BASELINE_SOURCE_COMMIT,
     ReleaseManagerError,
@@ -307,16 +308,13 @@ class Qualification:
         command = [str(self.executable), "--doctor", "--doctor-output", str(report_path)]
         completed = self._run(command, self.work_root / "frozen-doctor.log", env=environment)
         report = _read_json(report_path)
-        checks = report.get("checks") if isinstance(report.get("checks"), list) else []
-        failed = [item.get("id") for item in checks if isinstance(item, Mapping) and item.get("status") == "FAIL"]
-        if (
-            completed.returncode != 0
-            or report.get("schema") != "guandan.doctor/1"
-            or report.get("overall_status") != "PASS"
-            or failed
-        ):
-            raise _StageFailure("frozen doctor failed", completed.returncode, command, completed.log_path, {"report": str(report_path), "failed_checks": failed, "doctor": report})
-        return {"report": str(report_path), "failed_checks": [], "build_id": _nested(report, "identity", "build_id")}
+        validation = validate_frozen_doctor_report(
+            report,
+            expected_build_id=str(_build_id(self.bundle_root) or ""),
+        )
+        if completed.returncode != 0 or validation.get("status") != "PASS":
+            raise _StageFailure("frozen doctor failed", completed.returncode, command, completed.log_path, {"report": str(report_path), "validation": validation, "doctor": report})
+        return {"report": str(report_path), **validation}
 
     def _support_export(self) -> Mapping[str, object]:
         assert self.executable is not None
