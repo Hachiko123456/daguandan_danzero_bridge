@@ -1,0 +1,29 @@
+{
+  "schema": "guandan.release-toolchain-lock/1",
+  "platform": {
+    "architecture": "AMD64",
+    "python_cache_tag": "cpython-312",
+    "python_version": "3.12.0",
+    "system": "Windows"
+  },
+  "python_executable": {
+    "bytes": 270616,
+    "sha256": "d55736b9f3d6b4ca7985b82db8ce11edfa09994cf93ce31c6b506543b74f32eb"
+  },
+  "tools": {
+    "pip": "23.2.1",
+    "pyinstaller": "6.21.0"
+  },
+  "locks": {
+    "requirements_input_sha256": "e896c122c966c5f3b53539ec4a8f8cfa01876da048c28758bc29cef28e522f5e",
+    "requirements_lock_sha256": "0158e4ff4ed3100bfcc67c2e66ab92cd7e99944bd7103f1d2d16f4cffaa4a741",
+    "wheelhouse_lock_sha256": "dc72bc5cc2c87e071e282e1f93ff3c2c885e0766388ffb113a953a0576c3537f"
+  },
+  "policy": {
+    "allow_index_during_build": false,
+    "allow_user_site": false,
+    "ignore_rlcard_python_upper_bound": true,
+    "require_hashes": true,
+    "require_isolated_build_environment": true
+  }
+}

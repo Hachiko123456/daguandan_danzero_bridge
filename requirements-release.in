@@ -1,0 +1,32 @@
+# Runtime and build graph validated on CPython 3.12 / Windows x64.
+# This input is resolved only by scripts/prepare_release_wheelhouse.ps1;
+# package_release.ps1 consumes the hashed lock and never contacts an index.
+altgraph==0.17.5
+darkdetect==0.8.0
+filelock==3.32.2
+fsspec==2026.7.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+mpmath==1.3.0
+mss==10.2.0
+networkx==3.6.1
+numpy==2.3.5
+opencv-python==4.13.0.92
+packaging==26.3
+pefile==2024.8.26
+PyInstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+PySide6-Fluent-Widgets==1.11.2
+PySideSix-Frameless-Window==0.8.2
+pywin32==311
+pywin32-ctypes==0.2.3
+rlcard==1.2.0
+setuptools==83.0.0
+shiboken6==6.11.1
+sympy==1.14.0
+termcolor==3.3.0
+torch==2.13.0
+typing_extensions==4.16.0
