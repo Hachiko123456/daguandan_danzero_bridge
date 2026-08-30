@@ -8,6 +8,7 @@ import zipfile
 
 import pytest
 
+import daguandan_bridge.release_manager as release_manager_module
 from daguandan_bridge.build_manifest import write_build_manifest, write_release_record
 from daguandan_bridge.release_manager import (
     BASELINE_AUTH_SCHEMA,
@@ -23,6 +24,13 @@ from daguandan_bridge.release_manager import (
     write_baseline_auth,
 )
 from daguandan_bridge.doctor import DOCTOR_REQUIRED_CHECK_IDS
+from daguandan_bridge.runtime_layout import (
+    activate_generation,
+    copy_seed_resources,
+    layout_for_generation,
+    resolve_runtime_layout,
+    write_generation_marker,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -253,10 +261,15 @@ def test_failed_candidate_doctor_never_changes_active_pointer(tmp_path):
     )
     activate_release(baseline.release_id, runtime_root=runtime, doctor_runner=_doctor)
     before = (runtime / "install" / "active.json").read_bytes()
+    data_pointer = runtime / "data" / "v1" / "active.json"
+    data_before = data_pointer.read_bytes()
+    observed_probe_roots = []
 
-    def failed_doctor(_release, _runtime, _output):
+    def failed_doctor(_release, probe_runtime, _output):
+        observed_probe_roots.append(probe_runtime)
         return {
             "schema": "guandan.doctor/1",
+            "overall_status": "FAIL",
             "checks": [{"id": "FAIL", "status": "FAIL"}],
         }
 
@@ -264,6 +277,10 @@ def test_failed_candidate_doctor_never_changes_active_pointer(tmp_path):
         activate_release(candidate.release_id, runtime_root=runtime, doctor_runner=failed_doctor)
 
     assert (runtime / "install" / "active.json").read_bytes() == before
+    assert data_pointer.read_bytes() == data_before
+    assert observed_probe_roots
+    assert observed_probe_roots[0] != runtime
+    assert str(observed_probe_roots[0]).startswith(str(runtime / "install" / "activation-probes"))
 
 
 def test_rollback_refuses_tampered_previous_version_and_keeps_candidate_active(tmp_path):
@@ -347,3 +364,117 @@ def test_preauthorized_legacy_activation_uses_nonempty_hash_bound_doctor(tmp_pat
         "LEGACY-BASELINE-PREAUTH",
         "LEGACY-ARTIFACT-INTEGRITY",
     }
+
+
+def test_activation_preserves_real_migrated_generation_and_rollback_restores_marker(
+    tmp_path,
+):
+    baseline_files = _release(tmp_path, "baseline", commit=BASELINE_SOURCE_COMMIT)
+    candidate_files = _release(tmp_path, "candidate", commit="f" * 40)
+    runtime = tmp_path / "runtime"
+    baseline = install_release(
+        baseline_files[0],
+        release_record_path=baseline_files[1],
+        checksum_path=baseline_files[2],
+        runtime_root=runtime,
+        baseline=True,
+    )
+    candidate = install_release(
+        candidate_files[0],
+        release_record_path=candidate_files[1],
+        checksum_path=candidate_files[2],
+        runtime_root=runtime,
+    )
+    baseline_active = activate_release(
+        baseline.release_id,
+        runtime_root=runtime,
+        doctor_runner=_doctor,
+    )
+    baseline_pointer = baseline_active["data_pointer"]
+    baseline_marker_hash = baseline_active["data_marker_sha256"]
+
+    candidate_layout = resolve_runtime_layout(
+        frozen=True,
+        bundle_root=candidate.executable.parent,
+        environ={"DAGUANDAN_DATA_ROOT": str(runtime)},
+    )
+    migrated = layout_for_generation(candidate_layout, "B-m-test-generation")
+    seed = copy_seed_resources(migrated, migrated.generation_root)
+    write_generation_marker(migrated.generation_root, migrated, seed_summary=seed)
+    activate_generation(migrated, migrated.generation_id)
+
+    candidate_active = activate_release(
+        candidate.release_id,
+        runtime_root=runtime,
+        doctor_runner=_doctor,
+    )
+
+    assert candidate_active["data_generation"] == "B-m-test-generation"
+    assert candidate_active["data_pointer"]["generation_id"] == "B-m-test-generation"
+    assert candidate_active["previous"]["data_pointer"] == baseline_pointer
+    rolled = rollback_release(
+        runtime_root=runtime,
+        support_exporter=lambda _release, _destination: {"status": "PASS"},
+    )
+    restored_pointer = json.loads(
+        (runtime / "data" / "v1" / "active.json").read_text(encoding="utf-8")
+    )
+    assert rolled["release_id"] == baseline.release_id
+    assert restored_pointer == baseline_pointer
+    assert rolled["data_marker_sha256"] == baseline_marker_hash
+    receipt_path = next(
+        (runtime / "install" / "rollback-receipts").glob("rollback-*/receipt.json")
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["restored_pointer_verified"] is True
+    assert receipt["restored_data_snapshot"]["generation_marker_sha256"] == baseline_marker_hash
+
+
+def test_pointer_transaction_restores_both_files_when_release_publish_fails(
+    tmp_path,
+    monkeypatch,
+):
+    baseline_files = _release(tmp_path, "baseline", commit=BASELINE_SOURCE_COMMIT)
+    candidate_files = _release(tmp_path, "candidate", commit="9" * 40)
+    runtime = tmp_path / "runtime"
+    baseline = install_release(
+        baseline_files[0],
+        release_record_path=baseline_files[1],
+        checksum_path=baseline_files[2],
+        runtime_root=runtime,
+        baseline=True,
+    )
+    candidate = install_release(
+        candidate_files[0],
+        release_record_path=candidate_files[1],
+        checksum_path=candidate_files[2],
+        runtime_root=runtime,
+    )
+    activate_release(baseline.release_id, runtime_root=runtime, doctor_runner=_doctor)
+    release_path = runtime / "install" / "active.json"
+    data_path = runtime / "data" / "v1" / "active.json"
+    release_before = release_path.read_bytes()
+    data_before = data_path.read_bytes()
+    real_write = release_manager_module.atomic_write_json
+    failed_once = False
+
+    def fail_release_pointer(path, value):
+        nonlocal failed_once
+        target = Path(path)
+        if target == release_path and not failed_once:
+            failed_once = True
+            raise OSError("simulated release pointer publication failure")
+        return real_write(path, value)
+
+    monkeypatch.setattr(release_manager_module, "atomic_write_json", fail_release_pointer)
+
+    with pytest.raises(OSError, match="simulated"):
+        activate_release(candidate.release_id, runtime_root=runtime, doctor_runner=_doctor)
+
+    assert release_path.read_bytes() == release_before
+    assert data_path.read_bytes() == data_before
+    transactions = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (runtime / "install" / "transactions").glob("activate-*.json")
+    ]
+    assert any(item["phase"] == "ROLLED_BACK" for item in transactions)

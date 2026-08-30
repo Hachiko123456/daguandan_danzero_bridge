@@ -25,11 +25,18 @@ from .build_manifest import (
 )
 from .doctor import validate_frozen_doctor_report
 from .runtime_layout import (
+    ACTIVE_GENERATION_SCHEMA,
     APP_DIRECTORY_NAME,
+    DATA_SCHEMA_DIRECTORY,
+    DATA_SCHEMA_VERSION,
+    GENERATION_MARKER,
+    GENERATION_SCHEMA,
     RUNTIME_ROOT_MARKER,
     RUNTIME_ROOT_SCHEMA,
     assert_safe_tree,
     atomic_write_json,
+    prepare_runtime_layout,
+    resolve_runtime_layout,
     safe_tree_files,
 )
 
@@ -121,7 +128,7 @@ def ensure_install_root(runtime_root: Path | str | None = None) -> Path:
                 "created_at": datetime.now(UTC).isoformat(),
             },
         )
-    for name in ("versions", "rollback-receipts"):
+    for name in ("versions", "rollback-receipts", "activation-probes", "transactions"):
         path = install / name
         _assert_no_reparse_chain(path)
         path.mkdir(exist_ok=True)
@@ -361,16 +368,20 @@ def activate_release(
     selected = _installed_by_id(install, release_id)
     runtime = install.parent
     doctor_path = install / "rollback-receipts" / f"doctor-{selected.release_id}-{uuid4().hex[:8]}.json"
+    data_path = _data_pointer_path(runtime)
+    data_before_doctor = _file_snapshot(data_path)
     if selected.receipt_schema == LEGACY_BASELINE_SCHEMA:
         if doctor_runner is not None:
             raise ReleaseManagerError("legacy baseline activation does not accept a custom doctor")
         doctor = _run_preauthorized_legacy_doctor(selected, doctor_path)
         doctor_validation = _validate_legacy_doctor(selected, doctor)
     else:
+        probe_root = install / "activation-probes" / f"{selected.release_id}-{uuid4().hex[:8]}"
+        _assert_below(probe_root, install / "activation-probes", "activation probe")
         doctor = (
-            dict(doctor_runner(selected, runtime, doctor_path))
+            dict(doctor_runner(selected, probe_root, doctor_path))
             if doctor_runner is not None
-            else _run_frozen_doctor(selected, runtime, doctor_path)
+            else _run_frozen_doctor(selected, probe_root, doctor_path)
         )
         doctor_validation = validate_frozen_doctor_report(
             doctor,
@@ -378,27 +389,34 @@ def activate_release(
         )
     if doctor_validation.get("status") != "PASS":
         raise ReleaseManagerError("candidate doctor did not pass; active release was not changed")
+    if _file_snapshot(data_path) != data_before_doctor:
+        raise ReleaseManagerError("candidate doctor modified the real active data pointer")
+    desired_data, data_marker_sha256 = _prepare_release_data(selected, runtime)
     current = _read_active(install)
+    previous = _previous_release_document(current)
+    transition_id = f"activate-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
     document = {
         "schema": ACTIVE_RELEASE_SCHEMA,
         "release_id": selected.release_id,
         "build_id": selected.build_id,
         "version_directory": selected.version_root.name,
         "executable_relative": selected.executable.relative_to(selected.version_root).as_posix(),
-        "data_generation": selected.build_id,
+        "data_generation": desired_data.get("generation_id") if desired_data else None,
+        "data_pointer": desired_data,
+        "data_pointer_sha256": _json_document_sha256(desired_data) if desired_data else None,
+        "data_marker_sha256": data_marker_sha256,
+        "transition_id": transition_id,
         "activated_at": datetime.now(UTC).isoformat(),
-        "previous": (
-            {
-                "release_id": current.get("release_id"),
-                "build_id": current.get("build_id"),
-                "data_generation": current.get("data_generation"),
-            }
-            if current is not None
-            else None
-        ),
+        "previous": previous,
         "doctor_report": doctor_path.name,
     }
-    atomic_write_json(install / _ACTIVE_FILE, document)
+    _transactional_pointer_switch(
+        install,
+        transition_id=transition_id,
+        release_document=document,
+        data_document=desired_data,
+        expected_marker_sha256=data_marker_sha256,
+    )
     _append_history(install, {**document, "operation": "activate"})
     return document
 
@@ -434,18 +452,44 @@ def rollback_release(
             "message": str(exc)[:1000],
         }
     data_snapshot = _snapshot_data_pointer(install.parent, receipt_root)
+    target_data = previous.get("data_pointer")
+    if target_data is not None and not isinstance(target_data, Mapping):
+        raise ReleaseManagerError("previous release data pointer is invalid")
+    target_data_document = dict(target_data) if isinstance(target_data, Mapping) else None
+    expected_target_marker = str(previous.get("data_marker_sha256") or "") or None
+    _verify_data_pointer_target(
+        install.parent,
+        target_data_document,
+        expected_marker_sha256=expected_target_marker,
+    )
+    transition_id = f"rollback-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
     target_document = {
         "schema": ACTIVE_RELEASE_SCHEMA,
         "release_id": target.release_id,
         "build_id": target.build_id,
         "version_directory": target.version_root.name,
         "executable_relative": target.executable.relative_to(target.version_root).as_posix(),
-        "data_generation": previous.get("data_generation") or target.build_id,
+        "data_generation": (
+            target_data_document.get("generation_id")
+            if target_data_document is not None
+            else None
+        ),
+        "data_pointer": target_data_document,
+        "data_pointer_sha256": (
+            _json_document_sha256(target_data_document)
+            if target_data_document is not None
+            else None
+        ),
+        "data_marker_sha256": expected_target_marker,
+        "transition_id": transition_id,
         "activated_at": datetime.now(UTC).isoformat(),
         "previous": {
             "release_id": bad.release_id,
             "build_id": bad.build_id,
             "data_generation": current.get("data_generation"),
+            "data_pointer": current.get("data_pointer"),
+            "data_pointer_sha256": current.get("data_pointer_sha256"),
+            "data_marker_sha256": current.get("data_marker_sha256"),
         },
         "rollback_receipt": receipt_id,
     }
@@ -460,7 +504,26 @@ def rollback_release(
         "data_snapshot": data_snapshot,
     }
     atomic_write_json(receipt_root / "receipt.json", receipt)
-    atomic_write_json(install / _ACTIVE_FILE, target_document)
+    _transactional_pointer_switch(
+        install,
+        transition_id=transition_id,
+        release_document=target_document,
+        data_document=target_data_document,
+        expected_marker_sha256=expected_target_marker,
+    )
+    restored = _snapshot_data_pointer(
+        install.parent,
+        receipt_root,
+        filename="data_snapshot_restored.json",
+    )
+    receipt["restored_data_snapshot"] = restored
+    receipt["restored_pointer_verified"] = bool(
+        restored.get("active_pointer") == target_data_document
+        and restored.get("generation_marker_sha256") == expected_target_marker
+    )
+    if not receipt["restored_pointer_verified"]:
+        raise ReleaseManagerError("rollback data pointer/marker verification failed")
+    atomic_write_json(receipt_root / "receipt.json", receipt)
     _append_history(install, {**target_document, "operation": "rollback"})
     return target_document
 
@@ -761,7 +824,232 @@ def _export_bad_release_support(
     }
 
 
-def _snapshot_data_pointer(runtime_root: Path, receipt_root: Path) -> dict[str, object]:
+def _prepare_release_data(
+    release: InstalledRelease,
+    runtime_root: Path,
+) -> tuple[dict[str, object] | None, str | None]:
+    if release.receipt_schema == LEGACY_BASELINE_SCHEMA:
+        return None, None
+    layout = resolve_runtime_layout(
+        frozen=True,
+        bundle_root=release.executable.parent,
+        environ={"DAGUANDAN_DATA_ROOT": str(runtime_root)},
+    )
+    prepared = prepare_runtime_layout(layout)
+    document = {
+        "schema": ACTIVE_GENERATION_SCHEMA,
+        "data_schema": DATA_SCHEMA_VERSION,
+        "build_id": prepared.build_id,
+        "generation_id": prepared.generation_id,
+    }
+    marker = prepared.generation_root / GENERATION_MARKER
+    marker_hash = sha256_file(marker)
+    _verify_data_pointer_target(
+        runtime_root,
+        document,
+        expected_marker_sha256=marker_hash,
+    )
+    return document, marker_hash
+
+
+def _previous_release_document(
+    current: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if current is None:
+        return None
+    data_pointer = current.get("data_pointer")
+    if data_pointer is not None and not isinstance(data_pointer, Mapping):
+        raise ReleaseManagerError("active release has an invalid data pointer")
+    return {
+        "release_id": current.get("release_id"),
+        "build_id": current.get("build_id"),
+        "data_generation": current.get("data_generation"),
+        "data_pointer": dict(data_pointer) if isinstance(data_pointer, Mapping) else None,
+        "data_pointer_sha256": current.get("data_pointer_sha256"),
+        "data_marker_sha256": current.get("data_marker_sha256"),
+    }
+
+
+def _transactional_pointer_switch(
+    install: Path,
+    *,
+    transition_id: str,
+    release_document: Mapping[str, object],
+    data_document: Mapping[str, object] | None,
+    expected_marker_sha256: str | None,
+) -> None:
+    transaction_path = install / "transactions" / f"{_safe_segment(transition_id, 'transition id')}.json"
+    active_release_path = install / _ACTIVE_FILE
+    active_data_path = _data_pointer_path(install.parent)
+    release_before = _read_file_bytes(active_release_path)
+    data_before = _read_file_bytes(active_data_path)
+    transaction = {
+        "schema": "guandan.pointer-transaction/1",
+        "transition_id": transition_id,
+        "phase": "PREPARED",
+        "release_before_sha256": _bytes_sha256(release_before),
+        "data_before_sha256": _bytes_sha256(data_before),
+        "release_id": release_document.get("release_id"),
+        "data_generation": (
+            data_document.get("generation_id") if data_document is not None else None
+        ),
+        "expected_data_pointer_sha256": (
+            _json_document_sha256(data_document) if data_document is not None else None
+        ),
+        "expected_marker_sha256": expected_marker_sha256,
+    }
+    atomic_write_json(transaction_path, transaction)
+    try:
+        _verify_data_pointer_target(
+            install.parent,
+            dict(data_document) if data_document is not None else None,
+            expected_marker_sha256=expected_marker_sha256,
+        )
+        _publish_optional_json(active_data_path, data_document)
+        transaction["phase"] = "DATA_PUBLISHED"
+        atomic_write_json(transaction_path, transaction)
+        atomic_write_json(active_release_path, release_document)
+        transaction["phase"] = "COMMITTED"
+        if _read_optional_json(active_data_path) != (
+            dict(data_document) if data_document is not None else None
+        ):
+            raise ReleaseManagerError("active data pointer did not publish exactly")
+        if _read_optional_json(active_release_path) != dict(release_document):
+            raise ReleaseManagerError("active release pointer did not publish exactly")
+        if data_document is not None and sha256_file(active_data_path) != _json_document_sha256(data_document):
+            raise ReleaseManagerError("active data pointer hash changed during publication")
+        _verify_data_pointer_target(
+            install.parent,
+            dict(data_document) if data_document is not None else None,
+            expected_marker_sha256=expected_marker_sha256,
+        )
+        atomic_write_json(transaction_path, transaction)
+    except BaseException as exc:
+        _restore_file(active_data_path, data_before)
+        _restore_file(active_release_path, release_before)
+        transaction["phase"] = "ROLLED_BACK"
+        transaction["error_type"] = type(exc).__name__
+        atomic_write_json(transaction_path, transaction)
+        if _read_file_bytes(active_data_path) != data_before or _read_file_bytes(active_release_path) != release_before:
+            raise ReleaseManagerError("pointer transaction failed and could not restore its snapshots") from exc
+        raise
+
+
+def _verify_data_pointer_target(
+    runtime_root: Path,
+    document: Mapping[str, object] | None,
+    *,
+    expected_marker_sha256: str | None,
+) -> None:
+    if document is None:
+        if expected_marker_sha256 is not None:
+            raise ReleaseManagerError("absent data pointer cannot have a marker hash")
+        return
+    if (
+        document.get("schema") != ACTIVE_GENERATION_SCHEMA
+        or document.get("data_schema") != DATA_SCHEMA_VERSION
+    ):
+        raise ReleaseManagerError("data pointer schema is invalid")
+    build_id = _safe_segment(document.get("build_id"), "data build id")
+    generation_id = _safe_segment(document.get("generation_id"), "generation id")
+    marker = (
+        runtime_root
+        / "data"
+        / DATA_SCHEMA_DIRECTORY
+        / "generations"
+        / generation_id
+        / GENERATION_MARKER
+    )
+    _assert_no_reparse_chain(marker)
+    marker_document = _json_file(marker, "data generation marker")
+    if (
+        marker_document.get("schema") != GENERATION_SCHEMA
+        or marker_document.get("data_schema") != DATA_SCHEMA_VERSION
+        or marker_document.get("build_id") != build_id
+        or marker_document.get("generation_id") != generation_id
+    ):
+        raise ReleaseManagerError("data generation marker does not match its pointer")
+    marker_hash = sha256_file(marker)
+    if not expected_marker_sha256 or marker_hash != expected_marker_sha256:
+        raise ReleaseManagerError("data generation marker hash mismatch")
+
+
+def _data_pointer_path(runtime_root: Path) -> Path:
+    return runtime_root / "data" / DATA_SCHEMA_DIRECTORY / "active.json"
+
+
+def _publish_optional_json(
+    path: Path,
+    value: Mapping[str, object] | None,
+) -> None:
+    if value is None:
+        if path.exists():
+            if _is_link_or_reparse(path) or not path.is_file():
+                raise ReleaseManagerError("active data pointer is unsafe")
+            path.unlink()
+        return
+    atomic_write_json(path, value)
+
+
+def _json_bytes(value: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _json_document_sha256(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(_json_bytes(value)).hexdigest()
+
+
+def _read_file_bytes(path: Path) -> bytes | None:
+    if not path.exists():
+        return None
+    if _is_link_or_reparse(path) or not path.is_file():
+        raise ReleaseManagerError(f"managed pointer is unsafe: {path.name}")
+    return path.read_bytes()
+
+
+def _file_snapshot(path: Path) -> dict[str, object] | None:
+    payload = _read_file_bytes(path)
+    if payload is None:
+        return None
+    return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def _bytes_sha256(value: bytes | None) -> str | None:
+    return hashlib.sha256(value).hexdigest() if value is not None else None
+
+
+def _restore_file(path: Path, payload: bytes | None) -> None:
+    if payload is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.restore.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _snapshot_data_pointer(
+    runtime_root: Path,
+    receipt_root: Path,
+    *,
+    filename: str = "data_snapshot.json",
+) -> dict[str, object]:
     active = runtime_root / "data" / "v1" / "active.json"
     document = _read_optional_json(active)
     generation_marker: Path | None = None
@@ -793,7 +1081,7 @@ def _snapshot_data_pointer(runtime_root: Path, receipt_root: Path) -> dict[str, 
         ),
         "data_preserved_in_place": True,
     }
-    atomic_write_json(receipt_root / "data_snapshot.json", snapshot)
+    atomic_write_json(receipt_root / filename, snapshot)
     return snapshot
 
 

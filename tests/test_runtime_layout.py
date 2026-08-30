@@ -14,6 +14,7 @@ from daguandan_bridge.runtime_layout import (
     GENERATION_MARKER,
     RuntimeLayoutError,
     ensure_runtime_layout,
+    prepare_runtime_layout,
     resolve_runtime_layout,
 )
 
@@ -130,6 +131,18 @@ def test_frozen_first_run_seeds_external_versioned_generation_without_bundle_wri
     assert active["schema"] == ACTIVE_GENERATION_SCHEMA
     assert active["build_id"] == layout.build_id
     assert active["generation_id"] == layout.generation_id
+
+
+def test_prepare_runtime_layout_never_publishes_active_generation_pointer(tmp_path):
+    bundle = _bundle(tmp_path)
+    user_root = tmp_path / "prepared-runtime"
+
+    prepared = prepare_runtime_layout(_layout(bundle, user_root))
+
+    assert prepared.generation_root.is_dir()
+    assert (prepared.generation_root / GENERATION_MARKER).is_file()
+    assert prepared.active_generation_path is not None
+    assert not prepared.active_generation_path.exists()
 
 
 def test_existing_user_customizations_and_sessions_are_not_reseeded(tmp_path):

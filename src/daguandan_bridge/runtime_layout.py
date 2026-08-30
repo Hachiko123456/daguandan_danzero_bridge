@@ -220,6 +220,15 @@ def resolve_runtime_layout(
 def ensure_runtime_layout(layout: RuntimeLayout | None = None) -> RuntimeLayout:
     """Atomically seed and validate the writable generation for a frozen app."""
 
+    selected = prepare_runtime_layout(layout)
+    if selected.frozen:
+        _write_active_generation(selected, selected.generation_id)
+    return selected
+
+
+def prepare_runtime_layout(layout: RuntimeLayout | None = None) -> RuntimeLayout:
+    """Seed/validate one generation without changing the active pointer."""
+
     selected = layout or resolve_runtime_layout()
     if not selected.frozen:
         return selected
@@ -246,7 +255,6 @@ def ensure_runtime_layout(layout: RuntimeLayout | None = None) -> RuntimeLayout:
         )
     else:
         _seed_generation(selected)
-    _write_active_generation(selected, selected.generation_id)
     return selected
 
 
@@ -882,6 +890,7 @@ __all__ = [
     "ensure_runtime_layout",
     "generation_marker",
     "layout_for_generation",
+    "prepare_runtime_layout",
     "resolve_runtime_layout",
     "safe_tree_files",
     "seed_entries",
