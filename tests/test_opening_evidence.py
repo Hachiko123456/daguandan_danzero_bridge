@@ -104,7 +104,7 @@ def test_opening_timeout_is_deduplicated_and_exports_complete_evidence(tmp_path)
     monitor.close()
 
 
-def test_lobby_wait_does_not_arm_opening_field_timeouts(tmp_path):
+def test_empty_listener_emits_generic_and_anchor_timeouts_after_begin(tmp_path):
     now = [0]
     monitor = OpeningEvidenceMonitor(
         diagnostics_root=tmp_path,
@@ -117,7 +117,12 @@ def test_lobby_wait_does_not_arm_opening_field_timeouts(tmp_path):
     now[0] = 5_000
     monitor.observe_anchor(snapshot, 0.1, required_score=0.85)
     assert monitor.flush(1)
-    assert not (tmp_path / "opening" / "incidents").exists()
+    incident_files = (tmp_path / "opening" / "incidents").glob("*/incident.json")
+    codes = {
+        json.loads(path.read_text(encoding="utf-8"))["code"]
+        for path in incident_files
+    }
+    assert {"OPENING-TIMEOUT", "OPENING-ANCHOR-TIMEOUT"}.issubset(codes)
 
 
 def test_nonblocking_proxy_contains_slow_and_throwing_sinks():

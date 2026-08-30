@@ -11,7 +11,9 @@ from ..live.latest_worker import LatestOnlyWorker
 
 class CaptureWorker(QObject):
     frame_ready = Signal(object)
-    error = Signal(str)
+    # Preserve typed exceptions for diagnostic consumers. UI adapters decide
+    # where to stringify them; the worker must not destroy machine codes/types.
+    error = Signal(object)
     finished = Signal()
 
     def __init__(self, operation: Callable[[], Any], interval_sec: float = 0.1):
@@ -27,7 +29,7 @@ class CaptureWorker(QObject):
                 try:
                     value = self.operation()
                 except Exception as exc:
-                    self.error.emit(str(exc))
+                    self.error.emit(exc)
                     break
                 if self._stop_event.is_set():
                     break
@@ -43,7 +45,7 @@ class CaptureWorker(QObject):
 
 class WorkerHandle(QObject):
     frame_ready = Signal(object)
-    error = Signal(str)
+    error = Signal(object)
     finished = Signal()
 
     def __init__(self, operation: Callable[[], Any], interval_sec: float = 0.1):

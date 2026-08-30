@@ -9,7 +9,7 @@ memory ring and are serialized only after an incident has been queued.
 """
 
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
@@ -17,7 +17,7 @@ import json
 import os
 from pathlib import Path
 from threading import BoundedSemaphore, RLock
-from threading import Thread
+from threading import Thread, current_thread
 from time import monotonic_ns
 from time import monotonic as monotonic_seconds
 from time import sleep
@@ -31,6 +31,7 @@ import numpy as np
 from .danzero.state import RANKS
 from .image_io import save_image_unicode
 from .runtime_identity import get_runtime_identity
+from .resource_fingerprint import recognition_resource_identity
 from .startup_diagnostics import current_startup_diagnostics
 from .storage import atomic_write_json
 
@@ -56,6 +57,7 @@ OPENING_TIMEOUT = "OPENING-TIMEOUT"
 
 @dataclass
 class _OpeningFrame:
+    frame_id: str
     seq: int
     monotonic_ms: int
     wall_time: str
@@ -78,6 +80,9 @@ class OpeningEvidenceMetrics:
     incidents_queued: int
     incidents_written: int
     writer_failures: int
+    orphan_recognitions: int
+    pending_snapshot_bytes: int
+    incident_occurrences: int
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -90,7 +95,71 @@ class OpeningEvidenceMetrics:
             "incidents_queued": self.incidents_queued,
             "incidents_written": self.incidents_written,
             "writer_failures": self.writer_failures,
+            "orphan_recognitions": self.orphan_recognitions,
+            "pending_snapshot_bytes": self.pending_snapshot_bytes,
+            "incident_occurrences": self.incident_occurrences,
         }
+
+
+class _DaemonSingleWorker:
+    """Minimal Future executor whose worker cannot block interpreter shutdown."""
+
+    def __init__(self, *, name: str) -> None:
+        self._queue: Queue[tuple[Future[None], Callable[..., None], tuple[object, ...]] | None] = Queue()
+        self._lock = RLock()
+        self._closed = False
+        self._thread = Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, operation: Callable[..., None], *args: object) -> Future[None]:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("opening evidence writer is closed")
+            future: Future[None] = Future()
+            self._queue.put_nowait((future, operation, args))
+            return future
+
+    def shutdown(
+        self,
+        *,
+        wait: bool,
+        cancel_futures: bool,
+        timeout: float | None = None,
+    ) -> bool:
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                if cancel_futures:
+                    while True:
+                        try:
+                            item = self._queue.get_nowait()
+                        except Empty:
+                            break
+                        if item is not None:
+                            item[0].cancel()
+                        self._queue.task_done()
+                self._queue.put_nowait(None)
+        if wait and self._thread is not current_thread():
+            self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                future, operation, args = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    operation(*args)
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(None)
+            finally:
+                self._queue.task_done()
 
 
 class OpeningEvidenceMonitor:
@@ -132,6 +201,9 @@ class OpeningEvidenceMonitor:
         self._clock_ms = clock_ms or (lambda: monotonic_ns() // 1_000_000)
         self._ring: deque[_OpeningFrame] = deque()
         self._frame_by_identity: dict[int, _OpeningFrame] = {}
+        self._frame_by_id: dict[str, _OpeningFrame] = {}
+        self._ambiguous_frame_ids: set[str] = set()
+        self._ring_record_ids: set[int] = set()
         self._retained_bytes = 0
         self._latest_seq = 0
         self._dropped_age = 0
@@ -140,7 +212,11 @@ class OpeningEvidenceMonitor:
         self._incidents_queued = 0
         self._incidents_written = 0
         self._writer_failures = 0
+        self._orphan_recognitions = 0
+        self._incident_occurrences = 0
         self._dedup: set[tuple[str, str]] = set()
+        self._active_incident_ids: dict[tuple[str, str], str] = {}
+        self._occurrences_by_incident: dict[str, int] = {}
         self._future_keys: dict[Future[None], tuple[str, str]] = {}
         self._levels: deque[str] = deque(maxlen=3)
         self._hands: deque[tuple[str, ...]] = deque(maxlen=3)
@@ -150,23 +226,35 @@ class OpeningEvidenceMonitor:
         self._field_blocked_since: dict[str, int] = {}
         self._lock = RLock()
         self._writer_slots = BoundedSemaphore(int(writer_queue_size))
-        self._executor: ThreadPoolExecutor | None = None
+        self._executor: _DaemonSingleWorker | None = None
         self._futures: set[Future[None]] = set()
+        self._future_record_ids: dict[Future[None], tuple[int, ...]] = {}
+        self._pending_record_refs: dict[int, tuple[int, int]] = {}
+        self._pending_record_bytes = 0
+        self._closed = False
 
     def begin(self, *, monotonic_ms: int | None = None) -> None:
         """Start a fresh listener interval without touching captured evidence."""
 
         try:
             with self._lock:
+                if self._closed:
+                    return
                 self._listener_started_ms = int(monotonic_ms if monotonic_ms is not None else self._clock_ms())
                 self._armed_ms = None
-                self._field_blocked_since.clear()
+                self._field_blocked_since = {
+                    "table_anchor": self._listener_started_ms,
+                }
                 self._dedup.clear()
+                self._active_incident_ids.clear()
                 self._levels.clear()
                 self._hands.clear()
                 self._anchor_ready = False
                 self._ring.clear()
                 self._frame_by_identity.clear()
+                self._frame_by_id.clear()
+                self._ambiguous_frame_ids.clear()
+                self._ring_record_ids.clear()
                 self._retained_bytes = 0
         except BaseException:
             return
@@ -193,8 +281,21 @@ class OpeningEvidenceMonitor:
                 metadata["raw_pixel_sha256"] = _array_sha256(raw)
             black = _is_black_frame(standard)
             with self._lock:
+                if self._closed:
+                    return
                 self._latest_seq += 1
+                requested_frame_id = str(
+                    getattr(snapshot, "evidence_frame_id", "") or uuid4().hex
+                )
+                frame_id = requested_frame_id
+                if frame_id in self._frame_by_id or frame_id in self._ambiguous_frame_ids:
+                    self._ambiguous_frame_ids.add(requested_frame_id)
+                    self._frame_by_id.pop(requested_frame_id, None)
+                    frame_id = uuid4().hex
+                    metadata["duplicate_source_frame_id"] = requested_frame_id
+                metadata["frame_id"] = frame_id
                 item = _OpeningFrame(
+                    frame_id=frame_id,
                     seq=self._latest_seq,
                     monotonic_ms=now,
                     wall_time=_wall_time(snapshot),
@@ -204,8 +305,14 @@ class OpeningEvidenceMonitor:
                 )
                 self._ring.append(item)
                 self._frame_by_identity[id(snapshot)] = item
+                if requested_frame_id not in self._ambiguous_frame_ids:
+                    self._frame_by_id[requested_frame_id] = item
+                self._frame_by_id[frame_id] = item
+                self._ring_record_ids.add(id(item))
                 self._retained_bytes += byte_size
                 self._trim_locked(now)
+                if not black:
+                    self._clear_error_stage_locked("capture")
             if black:
                 self.emit_incident(
                     OPENING_CAPTURE_BLACK_FRAME,
@@ -214,6 +321,7 @@ class OpeningEvidenceMonitor:
                     monotonic_ms=now,
                     evidence={"pixel_max": int(np.max(standard)) if isinstance(standard, np.ndarray) and standard.size else 0},
                 )
+            self._emit_timeouts_if_due()
         except BaseException:
             return
 
@@ -227,7 +335,7 @@ class OpeningEvidenceMonitor:
         try:
             now = self._clock_ms()
             with self._lock:
-                item = self._frame_by_identity.get(id(snapshot))
+                item = self._correlated_frame_locked(snapshot)
                 if item is not None:
                     item.anchor_score = float(score)
                 if float(score) >= float(required_score):
@@ -256,12 +364,13 @@ class OpeningEvidenceMonitor:
             hand = tuple(str(card) for card in document.get("my_hand", []))
             now = self._clock_ms()
             with self._lock:
-                item = self._frame_by_identity.get(id(snapshot))
-                if item is None and self._ring:
-                    item = self._ring[-1]
+                item = self._correlated_frame_locked(snapshot, trace=trace)
                 if item is not None:
                     item.recognition = document
                     item.recognition_trace = dict(trace) if isinstance(trace, Mapping) else None
+                else:
+                    self._orphan_recognitions += 1
+                self._clear_error_stage_locked("recognition")
                 if level in RANKS:
                     self._levels.append(level)
                 if len(hand) == 27:
@@ -270,7 +379,13 @@ class OpeningEvidenceMonitor:
                     self._armed_ms = now
                     if not self._anchor_ready:
                         self._field_blocked_since.setdefault("table_anchor", now)
-                self._set_field_state_locked("round_level", level in RANKS, now)
+                level_conflict = len(set(self._levels)) > 1
+                if level in RANKS and not level_conflict:
+                    self._set_field_state_locked("round_level", True, now)
+                elif level not in RANKS:
+                    self._set_field_state_locked("round_level", False, now)
+                else:
+                    self._field_blocked_since.pop("round_level", None)
                 self._set_field_state_locked("hand_count", len(hand) == 27, now)
                 hand_stable = len(self._hands) >= 2 and len(set(self._hands)) == 1
                 self._set_field_state_locked(
@@ -280,10 +395,15 @@ class OpeningEvidenceMonitor:
                 )
                 if len(hand) == 27 and hand_stable:
                     self._clear_field_dedup_locked("my_hand")
-                level_conflict = len(set(self._levels)) > 1
                 hand_unstable = len(self._hands) >= 2 and len(set(self._hands)) > 1
                 if level in RANKS and len(hand) == 27 and opening_seed_valid is not None:
                     self._set_field_state_locked("lead_player", bool(opening_seed_valid), now)
+                if not level_conflict:
+                    self._resolve_episode_locked(
+                        (OPENING_LEVEL_CONFLICT, "round_level")
+                    )
+                if not hand_unstable:
+                    self._resolve_episode_locked((OPENING_HAND_UNSTABLE, "my_hand"))
             trace_candidates = (
                 trace.get("candidates", ())
                 if isinstance(trace, Mapping)
@@ -361,17 +481,42 @@ class OpeningEvidenceMonitor:
         *,
         stage: str = "capture",
         monotonic_ms: int | None = None,
+        snapshot: object | None = None,
     ) -> str:
         """Classify a window/capture/resource failure and queue it once."""
 
+        normalized_stage = str(stage).strip().lower() or "unknown"
         code = classify_opening_failure(error)
+        if normalized_stage in {"recognition", "anchor"} and code == OPENING_CAPTURE_ERROR:
+            code = "OPENING-RECOGNITION-ERROR"
         try:
+            source_code = str(getattr(error, "code", "") or "") or None
+            evidence: dict[str, object] = {
+                "error_type": type(error).__name__,
+                "source_error_code": source_code,
+            }
+            with self._lock:
+                correlated = (
+                    self._correlated_frame_locked(snapshot)
+                    if snapshot is not None
+                    else None
+                )
+                if correlated is not None:
+                    evidence.update(
+                        {
+                            "frame_id": correlated.frame_id,
+                            "frame_seq": correlated.seq,
+                            "input_pixel_sha256": correlated.frame_metadata.get(
+                                "standardized_pixel_sha256"
+                            ),
+                        }
+                    )
             self.emit_incident(
                 code,
-                field=str(stage),
+                field=normalized_stage,
                 reason=str(error),
                 monotonic_ms=monotonic_ms,
-                evidence={"error_type": type(error).__name__},
+                evidence=evidence,
             )
         except BaseException:
             pass
@@ -406,18 +551,32 @@ class OpeningEvidenceMonitor:
             normalized_field = str(field).strip().lower() or "unknown"
             key = (normalized_code, normalized_field)
             with self._lock:
-                if key in self._dedup:
+                if self._closed:
                     return False
-                self._dedup.add(key)
-                records = tuple(self._ring)
-                metrics = self._metrics_locked().to_dict()
+                if key in self._dedup:
+                    incident_id = self._active_incident_ids.get(key)
+                    if incident_id is not None:
+                        self._occurrences_by_incident[incident_id] = (
+                            self._occurrences_by_incident.get(incident_id, 1) + 1
+                        )
+                        self._incident_occurrences += 1
+                    return False
+                records = tuple(self._ring)[-self.max_persisted_frames :]
             if not self._writer_slots.acquire(blocking=False):
                 with self._lock:
                     self._dropped_writer_queue += 1
-                    self._dedup.discard(key)
                 return False
             slot_acquired = True
             incident_id = f"OPEN-{now}-{uuid4().hex[:8]}"
+            with self._lock:
+                if self._closed:
+                    self._writer_slots.release()
+                    return False
+                self._dedup.add(key)
+                self._active_incident_ids[key] = incident_id
+                self._occurrences_by_incident[incident_id] = 1
+                self._incident_occurrences += 1
+                metrics = self._metrics_locked().to_dict()
             payload = {
                 "schema": OPENING_INCIDENT_SCHEMA,
                 "incident_id": incident_id,
@@ -428,15 +587,14 @@ class OpeningEvidenceMonitor:
                 "monotonic_ms": now,
                 "wall_time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                 "evidence": _json_safe(dict(evidence or {})),
+                "episode": {"occurrence_count": 1},
                 "runtime_identity": get_runtime_identity(),
             }
             with self._lock:
                 if self._executor is None:
-                    self._executor = ThreadPoolExecutor(
-                        max_workers=1,
-                        thread_name_prefix="opening-evidence",
-                    )
+                    self._executor = _DaemonSingleWorker(name="opening-evidence")
                 self._incidents_queued += 1
+                record_ids = self._retain_pending_records_locked(records)
                 future = self._executor.submit(
                     self._write_incident,
                     incident_id,
@@ -446,6 +604,7 @@ class OpeningEvidenceMonitor:
                 )
                 self._futures.add(future)
                 self._future_keys[future] = key
+                self._future_record_ids[future] = record_ids
                 future.add_done_callback(self._writer_finished)
             return True
         except BaseException:
@@ -458,22 +617,35 @@ class OpeningEvidenceMonitor:
 
     def flush(self, timeout: float = 10.0) -> bool:
         try:
+            deadline = monotonic_seconds() + max(0.0, float(timeout))
             with self._lock:
                 futures = tuple(self._futures)
-            deadline = max(0.0, float(timeout))
             for future in futures:
-                future.result(timeout=deadline)
+                remaining = deadline - monotonic_seconds()
+                if remaining <= 0:
+                    return False
+                future.result(timeout=remaining)
+            self._sync_episode_occurrences()
             with self._lock:
                 return self._writer_failures == 0
         except BaseException:
             return False
 
     def close(self, timeout: float = 5.0) -> None:
-        self.flush(timeout)
+        deadline = monotonic_seconds() + max(0.0, float(timeout))
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.flush(max(0.0, deadline - monotonic_seconds()))
         with self._lock:
             executor, self._executor = self._executor, None
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=False)
+            executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+                timeout=max(0.0, deadline - monotonic_seconds()),
+            )
 
     def metrics(self) -> OpeningEvidenceMetrics:
         with self._lock:
@@ -490,6 +662,9 @@ class OpeningEvidenceMonitor:
             incidents_queued=self._incidents_queued,
             incidents_written=self._incidents_written,
             writer_failures=self._writer_failures,
+            orphan_recognitions=self._orphan_recognitions,
+            pending_snapshot_bytes=self._pending_record_bytes,
+            incident_occurrences=self._incident_occurrences,
         )
 
     def _trim_locked(self, now_ms: int) -> None:
@@ -500,8 +675,17 @@ class OpeningEvidenceMonitor:
 
     def _drop_left_locked(self, *, age: bool) -> None:
         item = self._ring.popleft()
-        self._frame_by_identity.pop(id(item.snapshot), None)
-        self._retained_bytes = max(0, self._retained_bytes - item.byte_size)
+        if self._frame_by_identity.get(id(item.snapshot)) is item:
+            self._frame_by_identity.pop(id(item.snapshot), None)
+        for frame_id in (item.frame_id, str(getattr(item.snapshot, "evidence_frame_id", ""))):
+            if self._frame_by_id.get(frame_id) is item:
+                self._frame_by_id.pop(frame_id, None)
+        self._ring_record_ids.discard(id(item))
+        pending = self._pending_record_refs.get(id(item))
+        if pending is None:
+            self._retained_bytes = max(0, self._retained_bytes - item.byte_size)
+        else:
+            self._pending_record_bytes += item.byte_size
         if age:
             self._dropped_age += 1
         else:
@@ -511,9 +695,17 @@ class OpeningEvidenceMonitor:
         now = self._clock_ms()
         with self._lock:
             armed = self._armed_ms
+            listener_started = self._listener_started_ms
             blocked = dict(self._field_blocked_since)
-        if armed is None:
+        if listener_started is None:
             return
+        if now - listener_started >= self.field_timeout_ms:
+            self.emit_incident(
+                OPENING_TIMEOUT,
+                field="opening",
+                reason="opening listener did not form a session before timeout",
+                monotonic_ms=now,
+            )
         if now - blocked.get("table_anchor", now) >= self.field_timeout_ms:
             self.emit_incident(
                 OPENING_ANCHOR_TIMEOUT,
@@ -521,6 +713,8 @@ class OpeningEvidenceMonitor:
                 reason="table anchor did not meet the readiness score before timeout",
                 monotonic_ms=now,
             )
+        if armed is None:
+            return
         if now - blocked.get("round_level", now) >= self.field_timeout_ms:
             self.emit_incident(
                 OPENING_LEVEL_MISSING,
@@ -561,9 +755,117 @@ class OpeningEvidenceMonitor:
 
     def _clear_field_dedup_locked(self, field: str) -> None:
         normalized = field.casefold()
-        self._dedup = {
-            key for key in self._dedup if key[1].casefold() != normalized
-        }
+        for key in tuple(self._dedup):
+            if key[1].casefold() == normalized:
+                self._resolve_episode_locked(key)
+
+    def _resolve_episode_locked(self, key: tuple[str, str]) -> None:
+        self._dedup.discard(key)
+        self._active_incident_ids.pop(key, None)
+
+    def _clear_error_stage_locked(self, stage: str) -> None:
+        normalized = str(stage).casefold()
+        for key in tuple(self._dedup):
+            if key[1].casefold() == normalized:
+                self._resolve_episode_locked(key)
+
+    def _correlated_frame_locked(
+        self,
+        snapshot: object,
+        *,
+        trace: Mapping[str, object] | None = None,
+    ) -> _OpeningFrame | None:
+        """Correlate only by a unique frame id plus exact standardized pixels."""
+
+        if snapshot is None:
+            return None
+        requested_id = str(getattr(snapshot, "evidence_frame_id", "") or "")
+        direct = self._frame_by_identity.get(id(snapshot))
+        if direct is not None:
+            candidate = direct
+        elif requested_id and requested_id not in self._ambiguous_frame_ids:
+            candidate = self._frame_by_id.get(requested_id)
+        else:
+            candidate = None
+        if candidate is None:
+            return None
+        if direct is None and requested_id not in {
+            candidate.frame_id,
+            str(getattr(candidate.snapshot, "evidence_frame_id", "") or ""),
+        }:
+            return None
+        expected_hash = str(
+            candidate.frame_metadata.get("standardized_pixel_sha256") or ""
+        )
+        image = getattr(snapshot, "image", None)
+        if not isinstance(image, np.ndarray) or not image.size:
+            return None
+        actual_hash = _array_sha256(image)
+        trace_hash = (
+            str(trace.get("input_sha256") or "")
+            if isinstance(trace, Mapping)
+            else ""
+        )
+        if expected_hash and actual_hash != expected_hash:
+            return None
+        if trace_hash and trace_hash != expected_hash:
+            return None
+        return candidate
+
+    def _retain_pending_records_locked(
+        self,
+        records: tuple[_OpeningFrame, ...],
+    ) -> tuple[int, ...]:
+        ids: list[int] = []
+        for record in records:
+            identity = id(record)
+            count, byte_size = self._pending_record_refs.get(
+                identity,
+                (0, record.byte_size),
+            )
+            self._pending_record_refs[identity] = (count + 1, byte_size)
+            ids.append(identity)
+        return tuple(ids)
+
+    def _release_pending_records_locked(self, record_ids: tuple[int, ...]) -> None:
+        for identity in record_ids:
+            value = self._pending_record_refs.get(identity)
+            if value is None:
+                continue
+            count, byte_size = value
+            if count > 1:
+                self._pending_record_refs[identity] = (count - 1, byte_size)
+                continue
+            self._pending_record_refs.pop(identity, None)
+            if identity not in self._ring_record_ids:
+                self._pending_record_bytes = max(
+                    0,
+                    self._pending_record_bytes - byte_size,
+                )
+                self._retained_bytes = max(0, self._retained_bytes - byte_size)
+
+    def _sync_episode_occurrences(self) -> None:
+        with self._lock:
+            occurrences = dict(self._occurrences_by_incident)
+        incidents_root = self.root / "incidents"
+        for incident_id, count in occurrences.items():
+            path = incidents_root / incident_id / "incident.json"
+            if not path.is_file():
+                continue
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(document, dict):
+                    continue
+                episode = document.get("episode")
+                episode = dict(episode) if isinstance(episode, Mapping) else {}
+                if int(episode.get("occurrence_count", 0) or 0) == int(count):
+                    continue
+                episode["occurrence_count"] = int(count)
+                document["episode"] = episode
+                atomic_write_json(path, document)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                with self._lock:
+                    self._writer_failures += 1
 
     def _writer_finished(self, future: Future[None]) -> None:
         failed = False
@@ -577,8 +879,10 @@ class OpeningEvidenceMonitor:
             with self._lock:
                 self._futures.discard(future)
                 key = self._future_keys.pop(future, None)
+                record_ids = self._future_record_ids.pop(future, ())
+                self._release_pending_records_locked(record_ids)
                 if failed and key is not None:
-                    self._dedup.discard(key)
+                    self._resolve_episode_locked(key)
             try:
                 self._writer_slots.release()
             except ValueError:
@@ -604,6 +908,7 @@ class OpeningEvidenceMonitor:
             image_bytes = 0
             for record in selected:
                 document = {
+                    "frame_id": record.frame_id,
                     "seq": record.seq,
                     "monotonic_ms": record.monotonic_ms,
                     "wall_time": record.wall_time,
@@ -667,6 +972,7 @@ class OpeningEvidenceMonitor:
                     "resource_identity": evidence["resource_identity"],
                     "frame_sequence": [
                         {
+                            "frame_id": item.get("frame_id"),
                             "seq": item["seq"],
                             "monotonic_ms": item["monotonic_ms"],
                             "artifacts": item.get("artifacts", []),
@@ -725,6 +1031,7 @@ class OpeningEvidenceMonitor:
             written += size
             artifacts.append(
                 {
+                    "frame_id": record.frame_id,
                     "frame_seq": record.seq,
                     "kind": kind,
                     "field": None,
@@ -735,7 +1042,7 @@ class OpeningEvidenceMonitor:
                 }
             )
         if isinstance(standard, np.ndarray) and standard.size:
-            for name, crop in self._opening_rois(standard):
+            for name, box, crop in self._opening_rois(standard):
                 relative = Path("roi") / f"{name}_{record.seq:06d}.png"
                 estimated = int(crop.nbytes)
                 if estimated + written > remaining:
@@ -746,6 +1053,7 @@ class OpeningEvidenceMonitor:
                 written += size
                 artifacts.append(
                     {
+                        "frame_id": record.frame_id,
                         "frame_seq": record.seq,
                         "kind": "roi",
                         "field": name,
@@ -753,11 +1061,15 @@ class OpeningEvidenceMonitor:
                         "bytes": size,
                         "sha256": _sha256_file(path),
                         "pixel_sha256": _array_sha256(crop),
+                        "box": list(box),
                     }
                 )
         return written, artifacts
 
-    def _opening_rois(self, image: np.ndarray) -> Iterable[tuple[str, np.ndarray]]:
+    def _opening_rois(
+        self,
+        image: np.ndarray,
+    ) -> Iterable[tuple[str, tuple[int, int, int, int], np.ndarray]]:
         if self.profiles_root is None:
             return ()
         try:
@@ -772,7 +1084,7 @@ class OpeningEvidenceMonitor:
                 "first_play_opposite",
                 "first_play_right",
             }
-            crops: list[tuple[str, np.ndarray]] = []
+            crops: list[tuple[str, tuple[int, int, int, int], np.ndarray]] = []
             for region in service.list_regions():
                 if region.name not in allowed:
                     continue
@@ -781,7 +1093,13 @@ class OpeningEvidenceMonitor:
                     continue
                 crop = image[box.y : box.y + box.h, box.x : box.x + box.w]
                 if crop.size:
-                    crops.append((region.name, crop))
+                    crops.append(
+                        (
+                            region.name,
+                            (box.x, box.y, box.w, box.h),
+                            crop,
+                        )
+                    )
             return tuple(crops)
         except BaseException:
             return ()
@@ -789,37 +1107,7 @@ class OpeningEvidenceMonitor:
     def _resource_identity(self) -> dict[str, object]:
         if self.profiles_root is None:
             return {"status": "unavailable", "files": []}
-        root = self.profiles_root / self.profile_name
-        try:
-            selected = [
-                root / "profile.json",
-                root / "regions_config.json",
-                root / "templates_config.json",
-            ]
-            selected.extend(sorted((root / "templates").rglob("*")))
-            records = [
-                {
-                    "path": path.relative_to(root).as_posix(),
-                    "bytes": path.stat().st_size,
-                    "sha256": _sha256_file(path),
-                }
-                for path in selected
-                if path.is_file()
-            ]
-            aggregate = hashlib.sha256(
-                json.dumps(
-                    records,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            return {"status": "identified", "sha256": aggregate, "files": records}
-        except BaseException as exc:
-            return {
-                "status": "unavailable",
-                "error_type": type(exc).__name__,
-                "files": [],
-            }
+        return recognition_resource_identity(self.profiles_root, self.profile_name)
 
 
 class NonBlockingOpeningEvidenceSink:
@@ -839,6 +1127,7 @@ class NonBlockingOpeningEvidenceSink:
         )
         self._lock = RLock()
         self._worker: Thread | None = None
+        self._closed = False
         self.dropped_calls = 0
         self.failed_calls = 0
         self.completed_calls = 0
@@ -881,11 +1170,24 @@ class NonBlockingOpeningEvidenceSink:
             return False
 
     def close(self, timeout: float = 5.0) -> None:
-        self.flush(timeout)
+        deadline = monotonic_seconds() + max(0.0, float(timeout))
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.flush(max(0.0, deadline - monotonic_seconds()))
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            try:
+                self._queue.put_nowait(None)
+            except Full:
+                pass
+            if worker is not current_thread():
+                worker.join(max(0.0, deadline - monotonic_seconds()))
         close = getattr(self.target, "close", None)
         try:
             if callable(close):
-                close(timeout=max(0.0, float(timeout)))
+                close(timeout=max(0.0, deadline - monotonic_seconds()))
         except TypeError:
             try:
                 close()
@@ -901,8 +1203,12 @@ class NonBlockingOpeningEvidenceSink:
         kwargs: dict[str, object],
     ) -> None:
         try:
-            self._ensure_worker()
-            self._queue.put_nowait((method, args, dict(kwargs)))
+            with self._lock:
+                if self._closed:
+                    self.dropped_calls += 1
+                    return
+                self._ensure_worker()
+                self._queue.put_nowait((method, args, dict(kwargs)))
         except Full:
             with self._lock:
                 self.dropped_calls += 1
@@ -912,6 +1218,8 @@ class NonBlockingOpeningEvidenceSink:
 
     def _ensure_worker(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             if self._worker is not None and self._worker.is_alive():
                 return
             self._worker = Thread(
@@ -999,6 +1307,17 @@ def _frame_metadata(snapshot: object) -> dict[str, object]:
     rect = getattr(captured, "rect", None)
     source_viewport = getattr(standardization, "source_viewport", None)
     content_box = getattr(standardization, "content_box", None)
+    standard_image = getattr(snapshot, "image", None)
+    source_viewport_values = _box_like(source_viewport)
+    content_box_values = _box_like(content_box)
+    interpolation = None
+    if source_viewport_values is not None and content_box_values is not None:
+        interpolation = (
+            "INTER_AREA"
+            if source_viewport_values[2] > content_box_values[2]
+            or source_viewport_values[3] > content_box_values[3]
+            else "INTER_LINEAR"
+        )
     return {
         "backend": str(getattr(captured, "backend", "unknown")),
         "dpi": int(getattr(captured, "dpi", 0) or 0),
@@ -1006,10 +1325,17 @@ def _frame_metadata(snapshot: object) -> dict[str, object]:
         "client_rect": _box_like(rect, client=True),
         "standardization": {
             "source_size": list(getattr(standardization, "source_size", ()) or ()),
-            "source_viewport": _box_like(source_viewport),
-            "content_box": _box_like(content_box),
+            "source_viewport": source_viewport_values,
+            "content_box": content_box_values,
             "scale": float(getattr(standardization, "scale", 0.0) or 0.0),
             "padding": list(getattr(standardization, "padding", ()) or ()),
+            "standardized_size": (
+                [int(standard_image.shape[1]), int(standard_image.shape[0])]
+                if isinstance(standard_image, np.ndarray) and standard_image.ndim >= 2
+                else []
+            ),
+            "interpolation": interpolation,
+            "border_value": 0,
             "aspect_error": float(getattr(standardization, "aspect_error", 0.0) or 0.0),
             "aspect_compatible": bool(getattr(standardization, "aspect_compatible", False)),
         },

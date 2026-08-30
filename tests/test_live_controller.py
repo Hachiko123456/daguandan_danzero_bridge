@@ -7,6 +7,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -303,6 +304,53 @@ def test_waiting_scan_keeps_unknown_suits_in_the_initial_hand(tmp_path):
     assert recognition.allow_unknown_suit is True
     assert result.my_hand == ()
     assert returned_snapshot is snapshot
+
+
+def test_e002_waiting_worker_error_keeps_typed_exception_and_input_snapshot(tmp_path):
+    _app()
+
+    class TypedRecognitionError(RuntimeError):
+        code = "RESOURCE-MISMATCH"
+
+    class FailingRecognizer:
+        calls = 0
+
+        def recognize(self, _image, *, allow_unknown_suit=False):
+            assert allow_unknown_suit is True
+            self.calls += 1
+            raise TypedRecognitionError("template unavailable")
+
+    class EvidenceSpy:
+        def __init__(self):
+            self.failures = []
+
+        def observe_failure(self, error, **kwargs):
+            self.failures.append((error, kwargs))
+
+    spy = EvidenceSpy()
+    controller = LiveAssistantController(
+        _CaptureServiceStub(tmp_path),
+        opening_evidence_monitor=spy,
+    )
+    recognizer = FailingRecognizer()
+    controller.recognition_service = recognizer
+    snapshot = SimpleNamespace(image=np.zeros((2, 2, 3), dtype=np.uint8))
+    errors = []
+    controller.error.connect(errors.append)
+
+    with pytest.raises(RuntimeError) as captured:
+        controller._recognize_waiting_frame(snapshot)
+    controller._accept_waiting_recognition_error(captured.value)
+    assert controller.opening_evidence.flush(2)
+
+    assert recognizer.calls == 1
+    assert errors == ["template unavailable"]
+    assert len(spy.failures) == 1
+    original, context = spy.failures[0]
+    assert isinstance(original, TypedRecognitionError)
+    assert original.code == "RESOURCE-MISMATCH"
+    assert context == {"stage": "recognition", "snapshot": snapshot}
+    controller.shutdown()
 
 
 def test_full_recording_keeps_listener_frames_when_initial_hand_is_empty(tmp_path):

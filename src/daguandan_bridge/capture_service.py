@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from time import monotonic_ns
 from typing import Any
+from uuid import uuid4
 
 from .config import PROFILES_ROOT
 from .profiles import ProfileConfig, ProfilePaths, get_profile_paths, load_profile_config
@@ -28,6 +29,7 @@ class FrameSnapshot:
     captured_monotonic_ms: int = field(
         default_factory=lambda: monotonic_ns() // 1_000_000
     )
+    evidence_frame_id: str = field(default_factory=lambda: uuid4().hex)
 
     @property
     def image(self) -> Any:

@@ -23,13 +23,18 @@ from ..advisor_strategy import (
     save_profile_recording_mode,
 )
 from ..capture_service import FrameSnapshot
-from ..danzero.state import GuanDanState, RANKS, Seat
+from ..danzero.state import GuanDanState, RANKS
 from ..live.orchestrator import AdviceRequestKey, LiveAdvice, LiveOrchestrator, LiveUpdate
 from ..live.latest_worker import LatestOnlyWorker
-from ..live.turns import TURN_ORDER, next_active_seat
 from ..opening_evidence import (
     NonBlockingOpeningEvidenceSink,
     build_opening_evidence_monitor,
+)
+from ..opening_gate import (
+    OpeningActionSeed as _OpeningActionSeed,
+    OpeningSessionSeed as _AutoSessionSeed,
+    build_opening_seed,
+    evaluate_opening_gate,
 )
 from ..infrastructure.win32_hand_preselector import Win32HandPreselector
 from .hand_preselection import HandPreselectionPlanner, PreselectionResult
@@ -62,25 +67,13 @@ class _AnalysisFrameTask:
     captured_ms: int
 
 
-@dataclass(frozen=True)
-class _OpeningActionSeed:
-    """A fully visual, already-observed first action at listener startup."""
+class _WaitingRecognitionFailure(RuntimeError):
+    """Carry the exact input snapshot without erasing the original exception."""
 
-    actor: Seat
-    cards: tuple[str, ...]
-    next_player: Seat
-    confidence: float
-    source: str
-
-
-@dataclass(frozen=True)
-class _AutoSessionSeed:
-    """The stable opening state passed from the listener to the live session."""
-
-    round_level: str
-    hand: tuple[str, ...]
-    lead_player: Seat | None
-    opening_action: _OpeningActionSeed | None = None
+    def __init__(self, error: Exception, snapshot: FrameSnapshot) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.snapshot = snapshot
 
 
 class LiveAssistantController(QObject):
@@ -346,7 +339,7 @@ class LiveAssistantController(QObject):
         analysis = LatestOnlyWorker(
             self._recognize_waiting_frame,
             on_result=lambda value: self._waiting_recognized.emit(value[0], value[1]),
-            on_error=lambda exc: self.error.emit(str(exc)),
+            on_error=self._accept_waiting_recognition_error,
         )
         self._waiting_analysis_worker = analysis
         analysis.start()
@@ -379,7 +372,10 @@ class LiveAssistantController(QObject):
         self,
         snapshot: FrameSnapshot,
     ) -> tuple[object, FrameSnapshot]:
-        result = self._recognize_initial_image(snapshot.image)
+        try:
+            result = self._recognize_initial_image(snapshot.image)
+        except Exception as exc:
+            raise _WaitingRecognitionFailure(exc, snapshot) from exc
         trace_reader = getattr(
             self.recognition_service,
             "get_last_diagnostic_trace",
@@ -426,13 +422,25 @@ class LiveAssistantController(QObject):
     def _accept_waiting_frame(self, snapshot: object) -> None:
         self.frame_ready.emit(snapshot)
 
-    def _accept_waiting_error(self, message: str) -> None:
-        self.opening_evidence.observe_failure(message, stage="capture")
-        self.error.emit(message)
+    def _accept_waiting_error(self, error: object) -> None:
+        self.opening_evidence.observe_failure(error, stage="capture")
+        self.error.emit(str(error))
         if self.orchestrator is None:
             self._listening_enabled = False
             self._waiting_candidate = None
             self._listener_recording_stop_reason = "waiting_capture_failed"
+
+    def _accept_waiting_recognition_error(self, error: Exception) -> None:
+        """Preserve the typed failure and the already-buffered capture evidence."""
+
+        original = error.error if isinstance(error, _WaitingRecognitionFailure) else error
+        snapshot = error.snapshot if isinstance(error, _WaitingRecognitionFailure) else None
+        self.opening_evidence.observe_failure(
+            original,
+            stage="recognition",
+            snapshot=snapshot,
+        )
+        self.error.emit(str(original))
 
     def _consume_waiting_recognition(self, result: object, snapshot: object) -> None:
         """Require two identical normalized 27-card results before starting."""
@@ -461,22 +469,12 @@ class LiveAssistantController(QObject):
                 self._waiting_candidate = None
                 return
             self._table_anchor_observed = True
-        hand = tuple(str(card) for card in getattr(result, "my_hand", ()))
-        round_level = str(getattr(result, "round_level", ""))
-        if round_level not in RANKS or len(hand) != 27:
-            self._waiting_candidate = None
-            return
-        try:
-            normalizer = GuanDanState()
-            normalizer.confirm_hand(hand)
-        except Exception:
-            self._waiting_candidate = None
-            return
-        candidate = self._auto_session_seed(
+        evaluation = evaluate_opening_gate(
             result,
-            round_level=round_level,
-            hand=normalizer.my_hand,
+            anchor_score=self._TABLE_ANCHOR_READY_SCORE,
+            anchor_required=self._TABLE_ANCHOR_READY_SCORE,
         )
+        candidate = evaluation.seed
         if candidate is None:
             self._waiting_candidate = None
             return
@@ -553,50 +551,7 @@ class LiveAssistantController(QObject):
         round_level: str,
         hand: tuple[str, ...],
     ) -> _AutoSessionSeed | None:
-        lead_player = getattr(result, "lead_player", None)
-        current_player = getattr(result, "current_player", None)
-        events = tuple(getattr(result, "events", ()) or ())
-        if not events:
-            # Before the first play, the lead marker may be present while the
-            # active indicator is either absent or still points at that lead.
-            if lead_player is None and current_player is None:
-                return _AutoSessionSeed(round_level, hand, None)
-            if (
-                lead_player in TURN_ORDER
-                and current_player in {None, lead_player}
-            ):
-                return _AutoSessionSeed(round_level, hand, lead_player)
-            return None
-        if len(events) != 1 or lead_player not in TURN_ORDER:
-            return None
-        event = events[0]
-        actor = getattr(event, "player", None)
-        cards = tuple(str(card) for card in getattr(event, "cards", ()) or ())
-        if (
-            actor != lead_player
-            or actor not in TURN_ORDER
-            or bool(getattr(event, "is_pass", False))
-            or not cards
-            or any("?" in card for card in cards)
-            or current_player != next_active_seat(actor, frozenset())
-        ):
-            # A complete hand on an already-running table is not a valid
-            # opening anchor.  Do not invent a history or request FableDan
-            # from that unknown state.
-            return None
-        opening_action = _OpeningActionSeed(
-            actor=actor,
-            cards=cards,
-            next_player=current_player,
-            confidence=float(getattr(event, "confidence", 0.0)),
-            source=str(getattr(event, "source", "visual_opening_anchor")),
-        )
-        return _AutoSessionSeed(
-            round_level,
-            hand,
-            lead_player,
-            opening_action,
-        )
+        return build_opening_seed(result, round_level=round_level, hand=hand)
 
     def _stop_waiting_workers(self) -> bool:
         worker = self._waiting_capture_worker
@@ -930,7 +885,7 @@ class LiveAssistantController(QObject):
             lambda value, current=token: self._accept_live_frame(current, value)
         )
         worker.error.connect(
-            lambda message, current=token: self._accept_live_error(current, message)
+            lambda error, current=token: self._accept_live_error(current, error)
         )
         worker.finished.connect(lambda: self._capture_finished(worker, token))
         self._capture_worker = worker
@@ -1176,9 +1131,10 @@ class LiveAssistantController(QObject):
         self.latest_preselection_result = result
         self.preselection_result.emit(result)
 
-    def _accept_live_error(self, token: _LiveRunToken, message: str) -> None:
+    def _accept_live_error(self, token: _LiveRunToken, error: object) -> None:
         if not self._live_token_is_current(token):
             return
+        message = str(error)
         self._stop_analysis_worker()
         if token.orchestrator.status not in {
             "finalizing",
