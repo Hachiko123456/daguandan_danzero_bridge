@@ -37,6 +37,47 @@ def test_release_lock_has_hash_for_every_wheel():
         assert f"--hash=sha256:{record['sha256']}" in requirements
 
 
+def test_toolchain_locks_python_dll_and_critical_runtime_inventory():
+    toolchain = json.loads(
+        (PROJECT_ROOT / "release_toolchain.lock.json").read_text(encoding="utf-8")
+    )
+    runtime = toolchain["python_runtime"]
+    records = runtime["files"]
+    python_dll = runtime["python_dll"]
+
+    assert toolchain["schema"] == "guandan.release-toolchain-lock/2"
+    assert python_dll["path"] == "python312.dll"
+    assert python_dll in records
+    assert any(item["path"] == "Lib/encodings/__init__.py" for item in records)
+    assert runtime["aggregate_sha256"] == release_lock.runtime_inventory_sha256(records)
+
+
+def test_runtime_lock_detects_derived_python_dll_mismatch(tmp_path):
+    base = tmp_path / "python"
+    base.mkdir()
+    dll = base / "python312.dll"
+    dll.write_bytes(b"runtime")
+    record = {
+        "path": "python312.dll",
+        "bytes": len(b"runtime"),
+        "sha256": hashlib.sha256(b"runtime").hexdigest(),
+    }
+    toolchain = {
+        "platform": {"python_version": "3.12.0", "python_cache_tag": "cpython-312"},
+        "python_runtime": {
+            "files": [record],
+            "python_dll": {**record, "path": "python311.dll"},
+            "aggregate_sha256": release_lock.runtime_inventory_sha256([record]),
+        },
+    }
+    errors = []
+
+    release_lock._verify_python_runtime_lock(toolchain, base, errors)
+
+    codes = {item["code"] for item in errors}
+    assert "LOCK-PYTHON-DLL-DERIVED" in codes
+
+
 def test_prepared_release_wheelhouse_matches_all_committed_locks():
     if not WHEELHOUSE.is_dir():
         pytest.skip("external release wheelhouse has not been prepared")
