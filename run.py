@@ -69,6 +69,72 @@ def main(argv: list[str] | None = None) -> int:
         "--_doctor-import-probe",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--export-support",
+        type=Path,
+        metavar="ZIP",
+        help="导出脱敏支持包；默认不包含截图，需显式 --include-support-images。",
+    )
+    parser.add_argument(
+        "--support-run-dir",
+        type=Path,
+        help="指定诊断 run 目录；省略时自动选择最近的证据 run。",
+    )
+    parser.add_argument(
+        "--support-session-dir",
+        type=Path,
+        help="可选的已封存 session 目录。",
+    )
+    parser.add_argument(
+        "--include-support-images",
+        action="store_true",
+        help="明确同意把原始/标准化截图放入支持包。",
+    )
+    parser.add_argument(
+        "--include-support-trace",
+        action="store_true",
+        help="明确同意把识别 trace 放入支持包。",
+    )
+    parser.add_argument(
+        "--repro-support",
+        type=Path,
+        metavar="ZIP",
+        help="使用支持包运行确定性复现。",
+    )
+    parser.add_argument("--repro-output", type=Path, metavar="JSON")
+    parser.add_argument("--repro-truth", type=Path, metavar="JSON")
+    parser.add_argument("--expected-level", type=str)
+    parser.add_argument(
+        "--expected-hand",
+        type=str,
+        help="独立真值手牌，使用逗号分隔，例如 2S,3H,...；不会修改支持包。",
+    )
+    parser.add_argument("--repro-repeats", type=int, default=20)
+    parser.add_argument(
+        "--repro-deterministic",
+        action="store_true",
+        help="复现时固定随机种子、OpenCV 单线程并关闭 OpenCL。",
+    )
+    parser.add_argument(
+        "--_repro-probe",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--compare-repro",
+        nargs=2,
+        type=Path,
+        metavar=("REFERENCE", "CANDIDATE"),
+        help="比较两个 repro-report 并输出 guandan.repro-gate/1。",
+    )
+    parser.add_argument("--repro-gate-output", type=Path, metavar="JSON")
+    parser.add_argument(
+        "--annotate-repro-truth",
+        type=Path,
+        metavar="SUPPORT_ZIP",
+        help="为支持包创建外部真值 annotation。",
+    )
+    parser.add_argument("--truth-output", type=Path, metavar="JSON")
     args = parser.parse_args(argv)
     selected_modes = sum(
         (
@@ -78,11 +144,16 @@ def main(argv: list[str] | None = None) -> int:
             bool(args.doctor),
             args.migrate_portable_data is not None,
             args._doctor_import_probe is not None,
+            args.export_support is not None,
+            args.repro_support is not None,
+            args._repro_probe is not None,
+            args.compare_repro is not None,
+            args.annotate_repro_truth is not None,
         )
     )
     if selected_modes > 1:
         parser.error(
-            "基准、模拟窗口、窗口 E2E、doctor 和便携数据迁移模式不能同时启用"
+            "基准、模拟窗口、窗口 E2E、doctor、迁移、支持导出和复现模式不能同时启用"
         )
     if args.doctor_output is not None and not (
         args.doctor or args._doctor_import_probe is not None
@@ -92,6 +163,79 @@ def main(argv: list[str] | None = None) -> int:
         from daguandan_bridge.doctor import run_import_probe
 
         return int(run_import_probe(args._doctor_import_probe, args.doctor_output))
+    if args.compare_repro is not None:
+        from daguandan_bridge.support_repro import compare_repro_reports
+
+        report = compare_repro_reports(
+            args.compare_repro[0],
+            args.compare_repro[1],
+            output_path=args.repro_gate_output,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report.get("status") == "PASS" else 2
+    if args.annotate_repro_truth is not None:
+        if args.truth_output is None:
+            parser.error("--annotate-repro-truth 必须同时指定 --truth-output")
+        from daguandan_bridge.support_repro import write_truth_annotation
+
+        expected_hand = _parse_expected_hand(args.expected_hand)
+        truth = write_truth_annotation(
+            args.truth_output,
+            args.annotate_repro_truth,
+            expected_level=args.expected_level,
+            expected_hand=expected_hand,
+        )
+        print(json.dumps(truth, ensure_ascii=False, indent=2))
+        return 0
+    if args.repro_support is not None or args._repro_probe is not None:
+        from daguandan_bridge.support_repro import reproduce_support_bundle
+
+        support_path = args.repro_support or args._repro_probe
+        output_path = args.repro_output
+        expected_hand = _parse_expected_hand(args.expected_hand)
+        report = reproduce_support_bundle(
+            support_path,
+            output_path=output_path,
+            truth_path=args.repro_truth,
+            expected_level=args.expected_level,
+            expected_hand=expected_hand,
+            repeats=args.repro_repeats,
+            deterministic=bool(args.repro_deterministic or args._repro_probe is not None),
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.export_support is not None:
+        from daguandan_bridge.support_export import (
+            SupportExportRequest,
+            export_collected_support_bundle,
+        )
+
+        runtime_layout = None
+        try:
+            from daguandan_bridge.runtime_layout import resolve_runtime_layout
+
+            runtime_layout = resolve_runtime_layout()
+        except Exception:
+            runtime_layout = None
+        current = STARTUP_DIAGNOSTICS.run_directory
+        evidence_run = args.support_run_dir or _latest_evidence_run(
+            STARTUP_DIAGNOSTICS.root,
+            current,
+        )
+        result = export_collected_support_bundle(
+            SupportExportRequest(
+                destination=args.export_support,
+                diagnostics_run_directory=current,
+                evidence_run_directory=evidence_run,
+                bundle_root=(runtime_layout.bundle_root if runtime_layout else PROJECT_ROOT),
+                session_directory=args.support_session_dir,
+                include_frames=bool(args.include_support_images),
+                include_roi=bool(args.include_support_images),
+                include_recognition_trace=bool(args.include_support_trace),
+            )
+        )
+        print(json.dumps(result.bundle.manifest, ensure_ascii=False, indent=2))
+        return 0
     if args.doctor:
         from daguandan_bridge.doctor import run_doctor
 
@@ -138,6 +282,41 @@ def main(argv: list[str] | None = None) -> int:
     from daguandan_bridge.gui.app import main as gui_main
 
     return int(gui_main(argv))
+
+
+def _parse_expected_hand(raw: str | None) -> tuple[str, ...] | None:
+    if raw is None:
+        return None
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError("--expected-hand cannot be empty")
+    return values
+
+
+def _latest_evidence_run(root: Path | None, current: Path | None) -> Path | None:
+    """Select the newest run containing an opening incident, safely."""
+
+    if current is not None and (current / "opening" / "incidents").is_dir():
+        if any((current / "opening" / "incidents").iterdir()):
+            return current
+    if root is None:
+        return current
+    runs = root / "runs"
+    if not runs.is_dir():
+        return current
+    candidates: list[tuple[int, Path]] = []
+    for path in runs.iterdir():
+        if not path.is_dir() or path.is_symlink():
+            continue
+        incidents = path / "opening" / "incidents"
+        if not incidents.is_dir() or not any(incidents.iterdir()):
+            continue
+        try:
+            stamp = max(item.stat().st_mtime_ns for item in incidents.iterdir())
+        except (OSError, ValueError):
+            continue
+        candidates.append((stamp, path))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else current
 
 
 if __name__ == "__main__":

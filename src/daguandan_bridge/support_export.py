@@ -44,6 +44,10 @@ _ROI_IMAGE = re.compile(
 class SupportExportRequest:
     destination: Path
     diagnostics_run_directory: Path | None = None
+    # A launcher may run a fresh doctor while exporting a prior failed run.
+    # Keeping the roots explicit lets the bundle contain both without writing
+    # new files into the original evidence directory.
+    evidence_run_directory: Path | None = None
     bundle_root: Path | None = None
     session_directory: Path | None = None
     opening_incident_directory: Path | None = None
@@ -68,10 +72,14 @@ class SupportExportService:
         if destination.suffix.lower() != ".zip":
             raise SupportBundleError("support bundle destination must end with .zip")
         run_root = _optional_root(request.diagnostics_run_directory, "diagnostics run")
+        evidence_run_root = _optional_root(
+            request.evidence_run_directory,
+            "diagnostics evidence run",
+        )
         bundle_root = _optional_root(request.bundle_root, "bundle")
         session_root = _optional_root(request.session_directory, "session")
         opening_incident = _select_opening_incident(
-            run_root,
+            evidence_run_root or run_root,
             request.opening_incident_directory,
         )
         session_incident = (

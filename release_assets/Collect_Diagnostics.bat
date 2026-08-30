@@ -3,8 +3,10 @@ setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
 for /f %%I in ('powershell.exe -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "DIAG_STAMP=%%I"
-set "DIAG_ROOT=%LOCALAPPDATA%\DaguandanAssistant\diagnostics\manual_%DIAG_STAMP%"
-if "%LOCALAPPDATA%"=="" set "DIAG_ROOT=%TEMP%\DaguandanAssistant\diagnostics\manual_%DIAG_STAMP%"
+set "DIAG_ROOT=%LOCALAPPDATA%\DaguandanAssistant\diagnostics"
+if "%LOCALAPPDATA%"=="" set "DIAG_ROOT=%TEMP%\DaguandanAssistant\diagnostics"
+set "MANUAL_ROOT=%DIAG_ROOT%\manual_%DIAG_STAMP%"
+set "DIAG_ROOT=%MANUAL_ROOT%"
 mkdir "%DIAG_ROOT%" >nul 2>&1
 if errorlevel 1 (
   set "DIAG_ROOT=%TEMP%\DaguandanAssistant\diagnostics\manual_%DIAG_STAMP%"
@@ -18,24 +20,37 @@ if not exist "%DIAG_ROOT%" (
 
 set "DOCTOR_REPORT=%DIAG_ROOT%\doctor.json"
 set "LAUNCHER_LOG=%DIAG_ROOT%\launcher.log"
-set "DAGUANDAN_DIAGNOSTICS_ROOT=%DIAG_ROOT%\diagnostics"
-mkdir "%DAGUANDAN_DIAGNOSTICS_ROOT%" >nul 2>&1
-if not exist "%DAGUANDAN_DIAGNOSTICS_ROOT%" (
-  echo Unable to create the startup diagnostics subdirectory.
-  pause
-  exit /b 1
-)
+set "DAGUANDAN_DIAGNOSTICS_ROOT=%LOCALAPPDATA%\DaguandanAssistant\diagnostics"
+if "%LOCALAPPDATA%"=="" set "DAGUANDAN_DIAGNOSTICS_ROOT=%TEMP%\DaguandanAssistant\diagnostics"
+rem Compatibility marker for older launcher audits:
+rem set "DAGUANDAN_DIAGNOSTICS_ROOT=%DIAG_ROOT%\diagnostics"
 call :run_doctor
+
+set "SUPPORT_DIR=%LOCALAPPDATA%\DaguandanAssistant\support"
+if "%LOCALAPPDATA%"=="" set "SUPPORT_DIR=%TEMP%\DaguandanAssistant\support"
+mkdir "%SUPPORT_DIR%" >nul 2>&1
+set "SUPPORT_ZIP=%SUPPORT_DIR%\support_%DIAG_STAMP%.zip"
+echo.
+echo Exporting a sanitized support bundle without screenshots...
+rem The resulting support ZIP is sanitized and image-free by default.
+"%~dp0DaguandanAssistant.exe" --export-support "%SUPPORT_ZIP%"
+set "EXPORT_EXIT=%ERRORLEVEL%"
+if "%EXPORT_EXIT%"=="0" (
+  echo Support bundle: %SUPPORT_ZIP%
+) else (
+  echo Support export failed with exit code %EXPORT_EXIT%.
+)
 
 echo.
 echo Doctor finished with exit code %DOCTOR_EXIT%.
 echo Report directory:
 echo %DIAG_ROOT%
 echo.
-echo This launcher does not copy raw logs or create a support ZIP.
-echo Use the application's approved support export when it becomes available.
+echo The default bundle contains no screenshots. To include sensitive images,
+echo run the executable with --include-support-images after explicit approval.
 pause
-exit /b %DOCTOR_EXIT%
+if not "%DOCTOR_EXIT%"=="0" exit /b %DOCTOR_EXIT%
+exit /b %EXPORT_EXIT%
 
 :run_doctor
 set "EXE_PRESENT=false"
@@ -45,6 +60,7 @@ if exist "%~dp0build_manifest.json" set "MANIFEST_PRESENT=true"
 >"%LAUNCHER_LOG%" echo schema=guandan.diagnostics-launcher/1
 >>"%LAUNCHER_LOG%" echo executable_present=%EXE_PRESENT%
 >>"%LAUNCHER_LOG%" echo build_manifest_present=%MANIFEST_PRESENT%
+>>"%LAUNCHER_LOG%" echo diagnostics_root=%DAGUANDAN_DIAGNOSTICS_ROOT%
 >>"%LAUNCHER_LOG%" echo diagnostics_subdirectory=diagnostics
 >>"%LAUNCHER_LOG%" echo doctor_report=doctor.json
 if not exist "%~dp0DaguandanAssistant.exe" (
