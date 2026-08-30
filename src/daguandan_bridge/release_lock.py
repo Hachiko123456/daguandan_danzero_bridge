@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import stat
 import sys
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 RELEASE_INPUT_AUDIT_SCHEMA = "guandan.release-input-audit/1"
@@ -28,6 +28,7 @@ def verify_release_inputs(
     wheelhouse_root: Path | str,
     python_executable: Path | str | None = None,
     verify_installed: bool = False,
+    installed_distribution_paths: Sequence[Path | str] | None = None,
 ) -> dict[str, object]:
     project = Path(project_root).resolve()
     wheelhouse = Path(wheelhouse_root).resolve()
@@ -142,7 +143,11 @@ def verify_release_inputs(
     _verify_requirements_hashes(requirements_lock, records, errors)
     installed: dict[str, str] | None = None
     if verify_installed:
-        installed = collect_installed_distributions()
+        installed = (
+            collect_installed_distributions()
+            if installed_distribution_paths is None
+            else collect_installed_distributions(installed_distribution_paths)
+        )
         expected = {
             _canonical_name(str(item.get("distribution", ""))): str(
                 item.get("version", "")
@@ -190,11 +195,48 @@ def verify_release_inputs(
     }
 
 
-def collect_installed_distributions() -> dict[str, str]:
-    """Return every distribution visible to the isolated build interpreter."""
+def interpreter_distribution_paths(
+    prefix: Path | str | None = None,
+) -> tuple[Path, ...]:
+    """Return only this interpreter's own site-packages directories.
+
+    Deliberately do not consult ``sys.path``, the current directory, user site,
+    or ``sys.base_prefix``.  Release verification must describe the fresh venv
+    itself, not editable metadata from the repository running the verifier.
+    """
+
+    selected = Path(prefix or sys.prefix).resolve()
+    candidates = (
+        selected / "Lib" / "site-packages",
+        selected
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages",
+    )
+    return tuple(
+        path
+        for path in dict.fromkeys(candidate.resolve() for candidate in candidates)
+        if path.is_dir()
+    )
+
+
+def collect_installed_distributions(
+    paths: Sequence[Path | str] | None = None,
+) -> dict[str, str]:
+    """Return distributions installed in explicit fresh-interpreter roots."""
+
+    selected = (
+        interpreter_distribution_paths()
+        if paths is None
+        else tuple(Path(path).resolve() for path in paths)
+    )
+    if not selected:
+        raise ReleaseLockError("fresh interpreter has no site-packages directory")
 
     inventory: dict[str, str] = {}
-    for distribution in importlib.metadata.distributions():
+    for distribution in importlib.metadata.distributions(
+        path=[str(path) for path in selected]
+    ):
         raw_name = distribution.metadata.get("Name")
         if not raw_name:
             continue
@@ -287,5 +329,6 @@ __all__ = [
     "RELEASE_INPUT_AUDIT_SCHEMA",
     "ReleaseLockError",
     "collect_installed_distributions",
+    "interpreter_distribution_paths",
     "verify_release_inputs",
 ]

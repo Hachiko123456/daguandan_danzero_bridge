@@ -126,3 +126,89 @@ def test_fresh_venv_uses_the_hash_locked_python_launcher_and_pip(tmp_path):
     )
     assert queried.returncode == 0, queried.stderr
     assert queried.stdout.strip() == toolchain["tools"]["pip"]
+
+
+def _install_distribution_metadata(
+    site_packages: Path,
+    name: str,
+    version: str,
+    *,
+    egg_info: bool = False,
+) -> None:
+    normalized = name.replace("-", "_").replace(".", "_")
+    suffix = ".egg-info" if egg_info else ".dist-info"
+    metadata_root = site_packages / f"{normalized}-{version}{suffix}"
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    filename = "PKG-INFO" if egg_info else "METADATA"
+    (metadata_root / filename).write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        encoding="utf-8",
+    )
+
+
+def test_fresh_inventory_ignores_repo_egg_info_even_when_repo_is_on_sys_path(
+    tmp_path,
+    monkeypatch,
+):
+    fresh_site = tmp_path / "fresh" / "Lib" / "site-packages"
+    repo_src = tmp_path / "repo" / "src"
+    _install_distribution_metadata(fresh_site, "pip", "23.2.1")
+    _install_distribution_metadata(
+        repo_src,
+        "daguandan-danzero-bridge",
+        "0.1.0",
+        egg_info=True,
+    )
+    monkeypatch.syspath_prepend(str(repo_src))
+    monkeypatch.chdir(repo_src.parent)
+
+    inventory = release_lock.collect_installed_distributions([fresh_site])
+
+    assert inventory == {"pip": "23.2.1"}
+    assert "daguandan-danzero-bridge" not in inventory
+
+
+def test_extra_distribution_really_in_fresh_site_packages_still_fails_gate(
+    tmp_path,
+):
+    if not WHEELHOUSE.is_dir():
+        pytest.skip("external release wheelhouse has not been prepared")
+    wheel_lock = json.loads(
+        (PROJECT_ROOT / "wheelhouse.lock.json").read_text(encoding="utf-8")
+    )
+    toolchain = json.loads(
+        (PROJECT_ROOT / "release_toolchain.lock.json").read_text(encoding="utf-8")
+    )
+    fresh_site = tmp_path / "fresh" / "Lib" / "site-packages"
+    for record in wheel_lock["files"]:
+        _install_distribution_metadata(
+            fresh_site,
+            record["distribution"],
+            record["version"],
+        )
+    _install_distribution_metadata(fresh_site, "pip", toolchain["tools"]["pip"])
+
+    passed = verify_release_inputs(
+        project_root=PROJECT_ROOT,
+        wheelhouse_root=WHEELHOUSE,
+        python_executable=PROJECT_ROOT / ".venv" / "Scripts" / "python.exe",
+        verify_installed=True,
+        installed_distribution_paths=[fresh_site],
+    )
+    assert passed["status"] == "PASS", passed["errors"]
+
+    _install_distribution_metadata(fresh_site, "unlocked-package", "1.0")
+    failed = verify_release_inputs(
+        project_root=PROJECT_ROOT,
+        wheelhouse_root=WHEELHOUSE,
+        python_executable=PROJECT_ROOT / ".venv" / "Scripts" / "python.exe",
+        verify_installed=True,
+        installed_distribution_paths=[fresh_site],
+    )
+    assert failed["status"] == "FAIL"
+    issue = next(
+        item
+        for item in failed["errors"]
+        if item["code"] == "LOCK-INSTALLED-DISTRIBUTIONS"
+    )
+    assert issue["evidence"]["unexpected"] == ["unlocked-package"]
