@@ -12,6 +12,30 @@ py -3.12 -m venv .venv
 
 也可以双击 `start_gui.bat`。在“标记与模板”页选择包含截图的本地文件夹，即可开始配置区域或裁剪模板。
 
+### 源码与发布版数据目录
+
+源码运行仍使用仓库内的 `data/`，便于本机开发和现有流程保持不变。打包后的
+EXE 会把发布目录中的 `data/` 当作不可写的资源种子；首次启动时按 build ID
+原子复制到：
+
+```text
+%LOCALAPPDATA%\DaguandanAssistant\data\v1\generations\<build-id>\data\
+```
+
+发布版的 sessions、截图、模型/模板修改、日志、诊断、偏好和缓存都写在
+`%LOCALAPPDATA%\DaguandanAssistant` 下，不会修改 EXE 所在目录。测试或便携
+部署可用绝对路径环境变量 `DAGUANDAN_DATA_ROOT` 替换该根目录。
+
+从旧便携版迁移时必须显式执行：
+
+```powershell
+.\DaguandanAssistant.exe --migrate-portable-data "D:\旧版目录"
+```
+
+迁移只复制白名单内的 profile、模板、模型、sessions 和截图，旧目录保持原样；
+自动校准缓存、诊断缓存和未知文件不会导入。迁移会创建新的数据 generation 与
+本地回执，不会覆盖当前 generation，因而可以保留旧版本作为快速回滚入口。
+
 ## 标记与模板
 
 页面会递归读取所选本地文件夹中的 PNG、JPG、JPEG 和 BMP 图片；图片两侧提供上一张/下一张箭头，并显示当前序号，方便连续检查样本。
@@ -70,7 +94,11 @@ advice = DanzeroAdvisor().recommend(state)
 print(advice.cards)
 ```
 
-发布版的模型文件位于 `data/profiles/tencent_daguandan/models/`：FableDan 使用 `best.npz`，DanZero 使用 `danzero/q_network.ckpt`。退出程序后用兼容模型覆盖同名文件、再重新启动即可生效；也可通过 `DAGUANDAN_DANZERO_CKPT` 环境变量临时指定 DanZero 权重路径。
+源码版模型位于 `data/profiles/tencent_daguandan/models/`；发布版则使用当前
+用户数据 generation 下同样的相对路径。FableDan 使用 `best.npz`，DanZero
+使用 `danzero/q_network.ckpt`。请勿覆盖 EXE 旁边的只读种子；退出程序后替换
+当前 generation 中的同名文件、再重新启动即可生效。也可通过
+`DAGUANDAN_DANZERO_CKPT` 环境变量临时指定 DanZero 权重路径。
 
 ## 验证
 
@@ -100,7 +128,8 @@ Reducer 一旦从已确认动作推导出轮到自己，就会异步计算当前
 
 ## 对局日志、录像和异常包
 
-当保存方式不是“不保存”时，每段录像的数据会物理隔离在：
+当保存方式不是“不保存”时，每段录像的数据会物理隔离在当前 profile 下；
+源码版位于仓库 `data/`，发布版位于上述用户数据 generation：
 
 ```text
 data/profiles/tencent_daguandan/sessions/game_YYYYMMDD_HHMMSS_<id>/

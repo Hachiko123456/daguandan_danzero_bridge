@@ -19,6 +19,7 @@ from .startup_diagnostics import (
     record_startup_event,
     resolve_diagnostics_root,
 )
+from .runtime_layout import resolve_runtime_layout
 
 
 BUILD_MANIFEST_ENV = "DAGUANDAN_BUILD_MANIFEST"
@@ -103,6 +104,22 @@ def build_runtime_identity(
     if not fingerprint:
         fingerprint = _module_fingerprint()
 
+    try:
+        storage = resolve_runtime_layout(
+            environ=values,
+            frozen=is_frozen,
+            bundle_root=application_root(
+                executable_path=executable,
+                frozen=is_frozen,
+            ),
+        ).sanitized_identity()
+    except BaseException as exc:
+        storage = {
+            "frozen": is_frozen,
+            "status": "invalid",
+            "error_type": type(exc).__name__,
+        }
+
     return {
         "schema": RUNTIME_IDENTITY_SCHEMA,
         "run_id": str(run_id or get_process_run_id()),
@@ -122,6 +139,7 @@ def build_runtime_identity(
             "root_source": diagnostics_source,
             "run_directory": f"runs/{str(run_id or get_process_run_id())}",
         },
+        "storage": storage,
     }
 
 

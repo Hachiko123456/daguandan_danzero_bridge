@@ -3,13 +3,23 @@
 
 请先退出程序，再替换模型文件；替换完成后重新启动程序。
 
+发布包中的 `data` 是只读种子，请勿再覆盖 EXE 旁边的模型。程序首次启动后会在
+以下目录创建按构建版本隔离、可写的数据副本：
+
+  %LOCALAPPDATA%\DaguandanAssistant\data\v1\generations\<build-id>\data\profiles\
+
+如果设置了 `DAGUANDAN_DATA_ROOT`，则以该目录替代上面的
+`%LOCALAPPDATA%\DaguandanAssistant`。替换前可运行
+`DaguandanAssistant.exe --doctor` 确认当前 build/generation 身份。
+
 1. FableDan（默认策略）
-   文件：data\profiles\tencent_daguandan\models\best.npz
+   当前 profiles 目录下的文件：tencent_daguandan\models\best.npz
    操作：用兼容的 FableDan .npz 模型覆盖 best.npz。
    注意：程序不支持 best.pt；把 .pt 文件直接改名为 .npz 并不是格式转换，仍无法加载。
 
 2. DanZero
-   文件：data\profiles\tencent_daguandan\models\danzero\q_network.ckpt
+   当前 profiles 目录下的文件：
+   tencent_daguandan\models\danzero\q_network.ckpt
    操作：用兼容的 DanZero .ckpt 模型覆盖 q_network.ckpt。
 
 建议：替换前先在同一目录保留备份，例如 best.backup.npz。

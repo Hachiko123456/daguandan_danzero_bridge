@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,6 +166,7 @@ def test_frozen_doctor_fails_when_build_manifest_is_missing_or_invalid(tmp_path)
     missing = doctor.collect_doctor_report(
         root=root,
         frozen=True,
+        data_root=tmp_path / "missing-user-data",
         dependencies=(),
         startup_state=_startup_state(tmp_path),
     )
@@ -177,6 +179,7 @@ def test_frozen_doctor_fails_when_build_manifest_is_missing_or_invalid(tmp_path)
     invalid = doctor.collect_doctor_report(
         root=root,
         frozen=True,
+        data_root=tmp_path / "invalid-user-data",
         dependencies=(),
         startup_state=_startup_state(tmp_path),
     )
@@ -195,6 +198,7 @@ def test_build_integrity_classifies_mutable_model_and_immutable_executable_tampe
     valid = doctor.collect_doctor_report(
         root=root,
         frozen=True,
+        data_root=tmp_path / "user-data",
         dependencies=(),
         startup_state=_startup_state(tmp_path),
     )
@@ -209,14 +213,18 @@ def test_build_integrity_classifies_mutable_model_and_immutable_executable_tampe
     tampered = doctor.collect_doctor_report(
         root=root,
         frozen=True,
+        data_root=tmp_path / "user-data",
         dependencies=(),
         startup_state=_startup_state(tmp_path),
     )
     tampered_check = next(
         item for item in tampered["checks"] if item["id"] == "BUILD-INTEGRITY"
     )
-    assert tampered_check["status"] == "WARN"
-    assert tampered_check["evidence"]["errors"] == []
+    assert tampered_check["status"] == "FAIL"
+    assert any(
+        "immutable bundle resource changed" in error
+        for error in tampered_check["evidence"]["errors"]
+    )
     assert any(
         "best.npz" in difference
         for difference in tampered_check["evidence"]["mutable_differences"]
@@ -228,6 +236,7 @@ def test_build_integrity_classifies_mutable_model_and_immutable_executable_tampe
     immutable_tamper = doctor.collect_doctor_report(
         root=root,
         frozen=True,
+        data_root=tmp_path / "user-data",
         dependencies=(),
         startup_state=_startup_state(tmp_path),
     )
@@ -241,6 +250,36 @@ def test_build_integrity_classifies_mutable_model_and_immutable_executable_tampe
         "DaguandanAssistant.exe" in error
         for error in immutable_check["evidence"]["errors"]
     )
+
+
+def test_frozen_doctor_seeds_external_data_and_never_write_probes_bundle(tmp_path):
+    root = _portable_root(tmp_path)
+    _write_valid_build_manifest(root)
+
+    def snapshot() -> dict[str, str]:
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    report = doctor.collect_doctor_report(
+        root=root,
+        frozen=True,
+        data_root=tmp_path / "external-user-data",
+        dependencies=(),
+        startup_state=_startup_state(tmp_path),
+    )
+    checks = {item["id"]: item for item in report["checks"]}
+
+    assert report["overall_status"] == "PASS"
+    assert checks["STORAGE-BUNDLE-DATA"]["status"] == "PASS"
+    assert checks["STORAGE-BUNDLE-DATA"]["evidence"]["write_probe"] is False
+    assert checks["STORAGE-RUNTIME-LAYOUT"]["status"] == "PASS"
+    assert checks["STORAGE-DATA"]["status"] == "PASS"
+    assert snapshot() == before
+    assert not tuple(root.rglob(".doctor-write-*.tmp"))
 
 
 def test_critical_dependency_probes_include_concrete_qtgui_and_blackjack_modules(

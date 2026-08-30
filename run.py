@@ -58,6 +58,14 @@ def main(argv: list[str] | None = None) -> int:
         help="将 doctor JSON 另存到指定路径。",
     )
     parser.add_argument(
+        "--migrate-portable-data",
+        type=Path,
+        help=(
+            "显式复制旧便携版的 data/profiles 到新的版本化用户目录；"
+            "旧目录保持只读且不会被移动或覆盖。"
+        ),
+    )
+    parser.add_argument(
         "--_doctor-import-probe",
         help=argparse.SUPPRESS,
     )
@@ -68,11 +76,14 @@ def main(argv: list[str] | None = None) -> int:
             args.simulated_game_window_config is not None,
             args.window_e2e_validation_config is not None,
             bool(args.doctor),
+            args.migrate_portable_data is not None,
             args._doctor_import_probe is not None,
         )
     )
     if selected_modes > 1:
-        parser.error("基准、模拟窗口、窗口 E2E 验证和 doctor 模式不能同时启用")
+        parser.error(
+            "基准、模拟窗口、窗口 E2E、doctor 和便携数据迁移模式不能同时启用"
+        )
     if args.doctor_output is not None and not (
         args.doctor or args._doctor_import_probe is not None
     ):
@@ -85,6 +96,16 @@ def main(argv: list[str] | None = None) -> int:
         from daguandan_bridge.doctor import run_doctor
 
         return int(run_doctor(args.doctor_output))
+    if args.migrate_portable_data is not None:
+        from daguandan_bridge.portable_data_migration import migrate_portable_data
+
+        result = migrate_portable_data(args.migrate_portable_data)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    from daguandan_bridge.runtime_layout import ensure_runtime_layout
+
+    ensure_runtime_layout()
     if args.fabledan_fixed_benchmark:
         from daguandan_bridge.application.fabledan_benchmark import (
             FableDanBenchmarkService,

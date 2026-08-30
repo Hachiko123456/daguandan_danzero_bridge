@@ -3,14 +3,26 @@ Daguandan Assistant - Model replacement
 
 Exit the application before replacing a model. Restart it after the replacement.
 
+The packaged data directory is an immutable seed. Do not replace a model next
+to DaguandanAssistant.exe. On first launch the program creates a versioned,
+writable data generation below:
+
+  %LOCALAPPDATA%\DaguandanAssistant\data\v1\generations\<build-id>\data\profiles\
+
+If DAGUANDAN_DATA_ROOT is set, that directory replaces
+%LOCALAPPDATA%\DaguandanAssistant. Run DaguandanAssistant.exe --doctor to see
+the active build/generation identity before changing a model.
+
 1. FableDan (the default strategy)
-   File: data\profiles\tencent_daguandan\models\best.npz
+   File below the active profiles directory:
+   tencent_daguandan\models\best.npz
    Action: overwrite best.npz with a compatible FableDan .npz model.
    Note: best.pt is not supported. Renaming a .pt file to .npz does not
    convert it and will not make it loadable.
 
 2. DanZero
-   File: data\profiles\tencent_daguandan\models\danzero\q_network.ckpt
+   File below the active profiles directory:
+   tencent_daguandan\models\danzero\q_network.ckpt
    Action: overwrite q_network.ckpt with a compatible DanZero .ckpt model.
 
 Keep a backup in the same folder before replacement, for example best.backup.npz.

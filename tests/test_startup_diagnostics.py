@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from daguandan_bridge.startup_diagnostics import resolve_diagnostics_root
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -124,3 +126,53 @@ def test_run_entrypoint_writes_a_sanitized_atomic_runtime_identity_snapshot(tmp_
     assert payload["run_id"] == run_directory.name
     assert "snapshot-secret-user" not in snapshot.read_text(encoding="utf-8")
     assert not tuple(run_directory.glob(".runtime_identity.json.*.tmp"))
+
+
+def test_data_root_override_also_routes_early_diagnostics_outside_bundle(tmp_path):
+    data_root = tmp_path / "用户 数据"
+    resolved = resolve_diagnostics_root(
+        environ={
+            "DAGUANDAN_DATA_ROOT": str(data_root),
+            "LOCALAPPDATA": str(tmp_path / "ignored"),
+        },
+        frozen=True,
+    )
+
+    assert resolved.path == data_root / "diagnostics"
+    assert resolved.source == "data_root_environment"
+
+
+def test_relative_early_overrides_never_select_the_working_directory(tmp_path):
+    resolved = resolve_diagnostics_root(
+        environ={
+            "DAGUANDAN_DATA_ROOT": "relative-data",
+            "DAGUANDAN_DIAGNOSTICS_ROOT": "relative-diagnostics",
+            "LOCALAPPDATA": str(tmp_path / "local"),
+        },
+        frozen=True,
+    )
+
+    assert resolved.path == tmp_path / "local" / "DaguandanAssistant" / "diagnostics"
+    assert resolved.source == "local_app_data_frozen"
+
+
+def test_early_frozen_diagnostics_rejects_paths_inside_the_bundle(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    executable = bundle / "DaguandanAssistant.exe"
+    bundle.mkdir()
+    executable.write_bytes(b"exe")
+    monkeypatch.setattr(sys, "executable", str(executable))
+
+    resolved = resolve_diagnostics_root(
+        environ={
+            "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "diagnostics"),
+            "DAGUANDAN_DATA_ROOT": str(bundle / "data-root"),
+            "LOCALAPPDATA": str(tmp_path / "safe-local"),
+        },
+        frozen=True,
+    )
+
+    assert resolved.path == (
+        tmp_path / "safe-local" / "DaguandanAssistant" / "diagnostics"
+    )
+    assert resolved.source == "local_app_data_frozen"

@@ -21,6 +21,13 @@ from uuid import uuid4
 
 from .build_manifest import BUILD_MANIFEST_FILENAME, verify_build_manifest
 from .runtime_identity import application_root, get_runtime_identity
+from .runtime_layout import (
+    DATA_ROOT_ENV,
+    RuntimeLayout,
+    RuntimeLayoutError,
+    ensure_runtime_layout,
+    resolve_runtime_layout,
+)
 from .startup_diagnostics import current_startup_diagnostics, record_startup_event
 
 
@@ -86,12 +93,14 @@ def collect_doctor_report(
     dependency_probe: Callable[[DependencySpec], dict[str, object]] | None = None,
     startup_state: object | None = None,
     frozen: bool | None = None,
+    data_root: Path | str | None = None,
+    environ: dict[str, str] | None = None,
+    layout: RuntimeLayout | None = None,
 ) -> dict[str, object]:
     """Collect deterministic checks without constructing GUI/game services."""
 
     started = perf_counter()
     bundle_root = Path(root) if root is not None else application_root()
-    profile_root = bundle_root / "data" / "profiles" / profile_name
     startup = startup_state or current_startup_diagnostics()
     checks: list[dict[str, object]] = []
 
@@ -118,8 +127,65 @@ def collect_doctor_report(
     checks.append(_diagnostics_storage_check(startup))
     checks.append(_build_integrity_check(bundle_root, frozen=is_frozen))
 
-    data_root = bundle_root / "data"
-    checks.append(_storage_check("STORAGE-DATA", data_root, must_exist=True))
+    bundle_data_root = bundle_root / "data"
+    checks.append(
+        _readable_directory_check(
+            "STORAGE-BUNDLE-DATA",
+            bundle_data_root,
+        )
+    )
+    selected_layout: RuntimeLayout | None = None
+    layout_error: BaseException | None = None
+    layout_started = perf_counter()
+    try:
+        if layout is not None:
+            selected_layout = layout
+        else:
+            layout_environment = dict(os.environ if environ is None else environ)
+            if data_root is not None:
+                layout_environment[DATA_ROOT_ENV] = str(Path(data_root))
+            selected_layout = resolve_runtime_layout(
+                environ=layout_environment,
+                frozen=is_frozen,
+                bundle_root=bundle_root,
+            )
+        selected_layout = ensure_runtime_layout(selected_layout)
+    except BaseException as exc:
+        layout_error = exc
+
+    if selected_layout is None or layout_error is not None:
+        checks.append(
+            _timed_result(
+                "STORAGE-RUNTIME-LAYOUT",
+                "FAIL",
+                "Writable runtime data layout could not be initialized",
+                {
+                    "frozen": is_frozen,
+                    "error_type": type(layout_error).__name__ if layout_error else None,
+                    "reason": _sanitize_diagnostic_text(layout_error or "unavailable"),
+                },
+                (perf_counter() - layout_started) * 1000,
+            )
+        )
+        profile_root = bundle_data_root / "profiles" / profile_name
+    else:
+        checks.append(
+            _timed_result(
+                "STORAGE-RUNTIME-LAYOUT",
+                "PASS",
+                "Writable runtime data layout is initialized",
+                selected_layout.sanitized_identity(),
+                (perf_counter() - layout_started) * 1000,
+            )
+        )
+        checks.append(
+            _storage_check(
+                "STORAGE-DATA",
+                selected_layout.data_dir,
+                must_exist=True,
+            )
+        )
+        profile_root = selected_layout.profiles_root / profile_name
 
     json_documents: dict[str, object] = {}
     for check_id, filename, expected_key in (
@@ -483,6 +549,15 @@ def _build_integrity_check(bundle_root: Path, *, frozen: bool) -> dict[str, obje
             _sanitize_integrity_error(path, bundle_root)
             for path in verification.unexpected_files
         ]
+        # Runtime resources are copied to a writable generation.  Therefore a
+        # profile/template/model difference inside a frozen package is package
+        # corruption, even while the phase-one manifest schema still labels
+        # those entries as historically mutable.
+        if frozen and mutable_differences:
+            errors.extend(
+                f"immutable bundle resource changed: {difference}"
+                for difference in mutable_differences
+            )
         if errors or not verification.ok:
             status = "FAIL"
             summary = "Build manifest or an immutable file failed integrity verification"
@@ -661,6 +736,38 @@ def _storage_check(check_id: str, path: Path, *, must_exist: bool) -> dict[str, 
             "free_bytes": free_bytes,
             "required_free_bytes": MINIMUM_FREE_BYTES,
         },
+        (perf_counter() - started) * 1000,
+    )
+
+
+def _readable_directory_check(check_id: str, path: Path) -> dict[str, object]:
+    """Check immutable bundle data without ever creating or writing a probe."""
+
+    started = perf_counter()
+    try:
+        exists = path.is_dir()
+        if not exists:
+            raise FileNotFoundError(path.name)
+        # Enumerating one entry proves the directory can be read while keeping
+        # the package byte-for-byte unchanged.
+        next(iter(path.iterdir()), None)
+    except BaseException as exc:
+        return _timed_result(
+            check_id,
+            "FAIL",
+            "Immutable bundle data directory is missing or unreadable",
+            {
+                "directory": path.name,
+                "exists": path.is_dir(),
+                "error_type": type(exc).__name__,
+            },
+            (perf_counter() - started) * 1000,
+        )
+    return _timed_result(
+        check_id,
+        "PASS",
+        "Immutable bundle data directory is readable",
+        {"directory": path.name, "exists": True, "write_probe": False},
         (perf_counter() - started) * 1000,
     )
 

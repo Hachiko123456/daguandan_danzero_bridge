@@ -27,6 +27,7 @@ from uuid import uuid4
 
 DIAGNOSTICS_ROOT_ENV = "DAGUANDAN_DIAGNOSTICS_ROOT"
 _DIAGNOSTICS_ROOT_ENV_ALIAS = "DAGUANDAN_DIAGNOSTICS_DIR"
+DATA_ROOT_ENV = "DAGUANDAN_DATA_ROOT"
 _RUN_ID_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _PROCESS_RUN_ID = (
     datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -79,26 +80,55 @@ def resolve_diagnostics_root(
     """Select a writable-data location without depending on project modules."""
 
     values = os.environ if environ is None else environ
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
     override = str(
         values.get(DIAGNOSTICS_ROOT_ENV)
         or values.get(_DIAGNOSTICS_ROOT_ENV_ALIAS)
         or ""
     ).strip()
     if override:
-        return DiagnosticsRoot(Path(override).expanduser(), "environment")
+        candidate = Path(override).expanduser()
+        if candidate.is_absolute() and (
+            not is_frozen or _is_external_to_frozen_bundle(candidate)
+        ):
+            return DiagnosticsRoot(candidate, "environment")
+
+    data_override = str(values.get(DATA_ROOT_ENV) or "").strip()
+    if data_override:
+        candidate = Path(data_override).expanduser()
+        # Never let early diagnostics turn a malformed relative override into
+        # writes beside the executable.  The main runtime-layout validation
+        # will report the invalid override after argument parsing.
+        if candidate.is_absolute() and (
+            not is_frozen or _is_external_to_frozen_bundle(candidate)
+        ):
+            return DiagnosticsRoot(candidate / "diagnostics", "data_root_environment")
 
     local_app_data = str(values.get("LOCALAPPDATA") or "").strip()
     if local_app_data:
         return DiagnosticsRoot(
             Path(local_app_data) / "DaguandanAssistant" / "diagnostics",
-            "local_app_data_frozen"
-            if (getattr(sys, "frozen", False) if frozen is None else frozen)
-            else "local_app_data_source",
+            "local_app_data_frozen" if is_frozen else "local_app_data_source",
         )
 
     temp_root = str(values.get("TEMP") or values.get("TMP") or "").strip()
     base = Path(temp_root) if temp_root else Path(tempfile.gettempdir())
     return DiagnosticsRoot(base / "DaguandanAssistant" / "diagnostics", "temporary")
+
+
+def _is_external_to_frozen_bundle(candidate: Path) -> bool:
+    try:
+        selected = os.path.normcase(str(candidate.resolve(strict=False)))
+        bundle = os.path.normcase(str(Path(sys.executable).resolve().parent))
+        selected_prefix = selected.rstrip("\\/") + os.sep
+        bundle_prefix = bundle.rstrip("\\/") + os.sep
+        return not (
+            selected == bundle
+            or selected.startswith(bundle_prefix)
+            or bundle.startswith(selected_prefix)
+        )
+    except OSError:
+        return False
 
 
 def initialize_startup_diagnostics(

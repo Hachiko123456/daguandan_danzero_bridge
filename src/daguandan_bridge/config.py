@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
+
+from .runtime_layout import resolve_runtime_layout
 
 
-# 开发时使用仓库根目录；PyInstaller 打包后则始终使用启动 exe 所在目录。
-# 运行数据需要可写，因此不能把它放在 PyInstaller 的 _internal 临时运行目录。
-PROJECT_ROOT: Path = (
-    Path(sys.executable).resolve().parent
-    if getattr(sys, "frozen", False)
-    else Path(__file__).resolve().parents[2]
-)
-DATA_DIR: Path = PROJECT_ROOT / "data"
-PROFILES_ROOT: Path = DATA_DIR / "profiles"
+# Source mode keeps the historical repository paths.  Frozen mode resolves an
+# immutable bundle resource root plus a versioned, writable user generation.
+# ``run.py`` atomically seeds that generation before constructing services.
+RUNTIME_LAYOUT = resolve_runtime_layout()
+PROJECT_ROOT: Path = RUNTIME_LAYOUT.bundle_root
+RESOURCE_DATA_DIR: Path = RUNTIME_LAYOUT.resource_data_dir
+RUNTIME_ROOT: Path = RUNTIME_LAYOUT.runtime_root
+DATA_DIR: Path = RUNTIME_LAYOUT.data_dir
+PROFILES_ROOT: Path = RUNTIME_LAYOUT.profiles_root
+LOGS_ROOT: Path = RUNTIME_LAYOUT.logs_root
+DIAGNOSTICS_ROOT: Path = RUNTIME_LAYOUT.diagnostics_root
+PREFERENCES_ROOT: Path = RUNTIME_LAYOUT.preferences_root
+CACHE_ROOT: Path = RUNTIME_LAYOUT.cache_root
 
 DEFAULT_BASE_SIZE: tuple[int, int] = (1280, 720)
 DEFAULT_AUTO_CAPTURE_INTERVAL_SEC: float = 1.0

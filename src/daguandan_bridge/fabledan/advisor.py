@@ -14,7 +14,7 @@ from typing import Any, Iterable, Literal
 import numpy as np
 
 from ..action_semantics import canonical_fabledan_type
-from ..config import PROFILES_ROOT
+from ..config import LOGS_ROOT, PROFILES_ROOT
 from ..danzero.state import (
     GameStateError,
     GuanDanState,
@@ -202,9 +202,7 @@ class FableDanAdvisor:
         self.log_directory = (
             Path(log_directory)
             if log_directory is not None
-            else Path(__file__).resolve().parents[3]
-            / "logs"
-            / "fabledan_traces"
+            else LOGS_ROOT / "fabledan_traces"
         )
         self.weights_path = (
             self.profiles_root

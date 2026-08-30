@@ -19,6 +19,8 @@ def test_runtime_identity_is_process_stable_and_returns_a_defensive_copy():
     assert first["run_id"] == second["run_id"]
     assert first["implementation_fingerprint"]
     assert Path(str(first["executable_path"])).name == first["executable_path"]
+    assert first["storage"]["frozen"] is False
+    assert first["storage"]["runtime_root_source"] == "source_checkout"
 
     first["run_id"] = "mutated"
     assert get_runtime_identity()["run_id"] == second["run_id"]
@@ -102,6 +104,10 @@ def test_build_manifest_identity_is_sanitized_and_supports_nested_source(tmp_pat
     assert identity["build_id"] == "BUILD-123"
     assert identity["implementation_fingerprint"] == "fingerprint-123"
     assert identity["executable_path"] == "DaguandanAssistant.exe"
+    assert identity["storage"]["runtime_root_source"] == "local_app_data"
+    # The explicit identity manifest is outside this simulated executable's
+    # bundle, so storage correctly refuses to treat it as a seed manifest.
+    assert identity["storage"]["generation_id"] == "unidentified"
     assert username not in encoded
     assert "private_path" not in encoded
 
