@@ -88,6 +88,13 @@ class SessionPersistencePort(Protocol):
         metrics: dict[str, object] | None = None,
         incident_media_failures: Iterable[dict[str, object]] = (),
     ) -> None: ...
+    def append_post_seal_health_audit(
+        self,
+        report: dict[str, object],
+        *,
+        state: dict[str, object],
+        monotonic_ms: int,
+    ) -> None: ...
 
 
 @runtime_checkable

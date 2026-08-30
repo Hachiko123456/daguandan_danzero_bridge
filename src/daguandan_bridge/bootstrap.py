@@ -78,6 +78,7 @@ def build_application_dependencies(
 ) -> ApplicationDependencies:
     from .annotation_service import AnnotationService
     from .gui.live_controller import LiveAssistantController
+    from .opening_evidence import build_opening_evidence_monitor
 
     if live_runtime is None:
         live = build_live_controller_dependencies(profile_name=profile_name)
@@ -87,6 +88,10 @@ def build_application_dependencies(
             recognition_service=live.recognizer,
             advisor=live.advisor,
             session_factory=live.session_factory,
+            opening_evidence_monitor=build_opening_evidence_monitor(
+                profiles_root=live.capture.profiles_root,
+                profile_name=profile_name,
+            ),
         )
         profiles_root = Path(live.capture.profiles_root)
     else:

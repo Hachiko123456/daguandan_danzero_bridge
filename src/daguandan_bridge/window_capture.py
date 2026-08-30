@@ -14,6 +14,10 @@ from .profiles import ProfileConfig
 class TargetWindowError(RuntimeError):
     """无法定位或截取目标窗口时抛出的错误。"""
 
+    def __init__(self, message: str, *, code: str = "CAPTURE-BACKEND-FAILED") -> None:
+        super().__init__(message)
+        self.code = str(code)
+
 
 _SW_RESTORE = 9
 _SWP_NOZORDER = 0x0004
@@ -36,6 +40,10 @@ class CapturedStandardizedFrame:
     backend: str
     dpi: int
     window_title: str
+    # The unscaled client image is retained only in memory.  Opening evidence
+    # may persist it after an incident, while support export still requires an
+    # explicit sensitive-image opt-in.
+    raw_image: Any | None = None
 
     @property
     def image(self) -> Any:
@@ -74,7 +82,7 @@ def backend_uses_visible_screen(backend: str) -> bool:
 def find_target_window(title_keywords: tuple[str, ...]) -> TargetWindow:
     """按标题关键字查找目标窗口，优先精确匹配，再做包含匹配。"""
     if sys.platform != "win32":
-        raise TargetWindowError("窗口截图功能只能在 Windows 上运行")
+        raise TargetWindowError("窗口截图功能只能在 Windows 上运行", code="CAPTURE-UNSUPPORTED")
 
     win32gui = import_required("win32gui", "pywin32")
     candidates: list[TargetWindow] = []
@@ -103,10 +111,14 @@ def find_target_window(title_keywords: tuple[str, ...]) -> TargetWindow:
         )
         raise TargetWindowError(
             f"找到多个标题匹配的窗口：{titles}。请收窄 profile 的窗口关键字"
+            , code="WINDOW-AMBIGUOUS"
         )
 
     keywords = "、".join(title_keywords)
-    raise TargetWindowError(f"没有找到标题包含 {keywords} 的可见窗口")
+    raise TargetWindowError(
+        f"没有找到标题包含 {keywords} 的可见窗口",
+        code="WINDOW-NOT-FOUND",
+    )
 
 
 def get_client_rect_on_screen(target: TargetWindow) -> ClientRect:
@@ -114,15 +126,21 @@ def get_client_rect_on_screen(target: TargetWindow) -> ClientRect:
     win32gui = import_required("win32gui", "pywin32")
 
     if not win32gui.IsWindow(target.hwnd):
-        raise TargetWindowError("目标窗口句柄已经失效，请重新进入采集模式")
+        raise TargetWindowError(
+            "目标窗口句柄已经失效，请重新进入采集模式",
+            code="WINDOW-NOT-FOUND",
+        )
     if win32gui.IsIconic(target.hwnd):
-        raise TargetWindowError("目标窗口处于最小化状态，无法可靠截图")
+        raise TargetWindowError(
+            "目标窗口处于最小化状态，无法可靠截图",
+            code="WINDOW-MINIMIZED",
+        )
 
     left, top, right, bottom = win32gui.GetClientRect(target.hwnd)
     width = int(right - left)
     height = int(bottom - top)
     if width <= 0 or height <= 0:
-        raise TargetWindowError("目标窗口客户区尺寸无效")
+        raise TargetWindowError("目标窗口客户区尺寸无效", code="GEOMETRY-CHANGED")
 
     screen_left, screen_top = win32gui.ClientToScreen(target.hwnd, (left, top))
     return ClientRect(
@@ -209,15 +227,16 @@ def get_window_dpi(target: TargetWindow) -> int:
 
 def _validate_captured_image(image: Any, rect: ClientRect, backend: str) -> Any:
     if image is None or not hasattr(image, "shape"):
-        raise TargetWindowError(f"{backend} 没有返回图像")
+        raise TargetWindowError(f"{backend} 没有返回图像", code="CAPTURE-BACKEND-FAILED")
     if len(image.shape) < 2 or tuple(image.shape[:2]) != (rect.height, rect.width):
         raise TargetWindowError(
             f"{backend} 返回尺寸无效：期望 {rect.width}x{rect.height}"
+            , code="GEOMETRY-CHANGED"
         )
     if image.size == 0:
-        raise TargetWindowError(f"{backend} 返回空图像")
+        raise TargetWindowError(f"{backend} 返回空图像", code="CAPTURE-BLACK-FRAME")
     if backend == "printwindow" and float(image.max()) <= 0:
-        raise TargetWindowError("PrintWindow 返回全黑图像")
+        raise TargetWindowError("PrintWindow 返回全黑图像", code="CAPTURE-BLACK-FRAME")
     return image
 
 
@@ -519,4 +538,5 @@ def capture_standardized_client_frame(
         backend=captured.backend,
         dpi=captured.dpi,
         window_title=target.title,
+        raw_image=captured.image,
     )

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, replace
+import hashlib
 from pathlib import Path
-from threading import RLock
+from threading import RLock, local
 from time import perf_counter
 from typing import Iterable
 
@@ -141,6 +142,8 @@ class ScreenshotRecognitionService:
         self,
         annotation_service: AnnotationService | None = None,
         template_service: TemplateService | None = None,
+        *,
+        diagnostic_tracing: bool = True,
     ) -> None:
         self.annotation_service = annotation_service or AnnotationService()
         self.template_service = template_service or TemplateService(
@@ -152,6 +155,25 @@ class ScreenshotRecognitionService:
             tuple[dict[str, object], np.ndarray], ...
         ] | None = None
         self._black_suit_hog_cache: tuple[tuple[str, np.ndarray], ...] | None = None
+        self._diagnostic_tracing = bool(diagnostic_tracing)
+        self._diagnostic_local = local()
+
+    def set_diagnostic_tracing_enabled(self, enabled: bool) -> None:
+        """Toggle read-only traces without changing recognition decisions."""
+
+        self._diagnostic_tracing = bool(enabled)
+
+    def get_last_diagnostic_trace(self) -> dict[str, object] | None:
+        """Return a defensive copy of the trace produced on this thread."""
+
+        value = getattr(self._diagnostic_local, "last_trace", None)
+        if not isinstance(value, dict):
+            return None
+        return {
+            **value,
+            "candidates": [dict(item) for item in value.get("candidates", [])],
+            "result": dict(value.get("result", {})),
+        }
 
     def recognize_table_anchor(self, image: np.ndarray | Path) -> float:
         """Return the best ``table_anchor_1`` score on the current table page.
@@ -247,6 +269,67 @@ class ScreenshotRecognitionService:
         return image[box.y : box.y + box.h, box.x : box.x + box.w]
 
     def recognize(
+        self,
+        image: np.ndarray | Path,
+        *,
+        allow_unknown_suit: bool = False,
+    ) -> RecognitionResult:
+        """Run one unchanged recognition pass and expose its read-only trace."""
+
+        if not self._diagnostic_tracing:
+            self._diagnostic_local.collector = None
+            self._diagnostic_local.last_trace = None
+            return self._recognize_impl(
+                image,
+                allow_unknown_suit=allow_unknown_suit,
+            )
+        collector: list[dict[str, object]] = []
+        self._diagnostic_local.collector = collector
+        self._diagnostic_local.last_trace = None
+        try:
+            result = self._recognize_impl(
+                image,
+                allow_unknown_suit=allow_unknown_suit,
+            )
+            source_image = read_image_unicode(image) if isinstance(image, Path) else image
+            input_hash = (
+                hashlib.sha256(memoryview(np.ascontiguousarray(source_image))).hexdigest()
+                if isinstance(source_image, np.ndarray)
+                else None
+            )
+            ordered = sorted(
+                collector,
+                key=lambda item: (
+                    str(item.get("field", "")),
+                    -float(item.get("score", -1.0)),
+                    str(item.get("label", "")),
+                    str(item.get("source", "")),
+                ),
+            )
+            self._diagnostic_local.last_trace = {
+                "schema": "guandan.recognition-trace/1",
+                "input_sha256": input_hash,
+                "input_shape": list(source_image.shape)
+                if isinstance(source_image, np.ndarray)
+                else None,
+                "threshold_policy": "production-unchanged",
+                "candidates": ordered,
+                "result": {
+                    "round_level": result.round_level,
+                    "my_hand": list(result.my_hand),
+                    "hand_count": len(result.my_hand),
+                    "lead_player": result.lead_player,
+                    "current_player": result.current_player,
+                    "field_confidences": dict(result.field_confidences),
+                    "unresolved_fields": list(result.unresolved_fields),
+                    "diagnostics": list(result.diagnostics),
+                },
+            }
+            return result
+        finally:
+            self._diagnostic_local.collector = None
+
+    def _recognize_impl(
         self,
         image: np.ndarray | Path,
         *,
@@ -1599,8 +1682,26 @@ class ScreenshotRecognitionService:
                 gray_template,
                 cv2.TM_CCOEFF_NORMED,
             )
-            for _ in range(limit):
+            diagnostic_record: dict[str, object] | None = None
+            for iteration in range(limit):
                 _, score, _, location = cv2.minMaxLoc(scores)
+                if iteration == 0:
+                    collector = getattr(self._diagnostic_local, "collector", None)
+                    if isinstance(collector, list) and len(collector) < 1024:
+                        diagnostic_record = {
+                            "field": str(getattr(region, "name", "unknown")),
+                            "label": str(raw.get("label", "")),
+                            "kind": str(raw.get("kind", "")),
+                            "source_role": str(raw.get("source_role", "")),
+                            "source": f"template:{raw.get('file', '')}",
+                            "score": float(score),
+                            "threshold": float(threshold),
+                            "accepted": bool(score >= threshold),
+                            "rejection_reason": (
+                                None if score >= threshold else "below_threshold"
+                            ),
+                        }
+                        collector.append(diagnostic_record)
                 if score < threshold:
                     break
                 x, y = location
@@ -1611,6 +1712,9 @@ class ScreenshotRecognitionService:
                     and str(raw.get("label", "")) in {"small_joker", "big_joker"}
                     and not self._joker_colors_compatible(template, candidate)
                 ):
+                    if diagnostic_record is not None and iteration == 0:
+                        diagnostic_record["accepted"] = False
+                        diagnostic_record["rejection_reason"] = "joker_color_mismatch"
                     self._suppress_match_score(
                         scores,
                         x,
@@ -1625,6 +1729,9 @@ class ScreenshotRecognitionService:
                     box.x - margin_x <= center_x <= box.x + box.w + margin_x
                     and box.y - margin_y <= center_y <= box.y + box.h + margin_y
                 ):
+                    if diagnostic_record is not None and iteration == 0:
+                        diagnostic_record["accepted"] = False
+                        diagnostic_record["rejection_reason"] = "center_outside_roi"
                     self._suppress_match_score(
                         scores,
                         x,
@@ -1646,6 +1753,9 @@ class ScreenshotRecognitionService:
                         h=template_height,
                     )
                 )
+                if diagnostic_record is not None and iteration == 0:
+                    diagnostic_record["accepted"] = True
+                    diagnostic_record["rejection_reason"] = None
                 self._suppress_match_score(
                     scores,
                     x,

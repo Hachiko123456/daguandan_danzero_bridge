@@ -27,6 +27,10 @@ from ..danzero.state import GuanDanState, RANKS, Seat
 from ..live.orchestrator import AdviceRequestKey, LiveAdvice, LiveOrchestrator, LiveUpdate
 from ..live.latest_worker import LatestOnlyWorker
 from ..live.turns import TURN_ORDER, next_active_seat
+from ..opening_evidence import (
+    NonBlockingOpeningEvidenceSink,
+    build_opening_evidence_monitor,
+)
 from ..infrastructure.win32_hand_preselector import Win32HandPreselector
 from .hand_preselection import HandPreselectionPlanner, PreselectionResult
 from .workers import OneShotThread, WorkerHandle
@@ -103,6 +107,7 @@ class LiveAssistantController(QObject):
         session_factory: SessionFactoryPort | None = None,
         capture_interval_sec: float = 0.1,
         deduplicate_analysis_frames: bool = False,
+        opening_evidence_monitor: object | None = None,
     ) -> None:
         super().__init__()
         if (
@@ -144,6 +149,15 @@ class LiveAssistantController(QObject):
             raise ValueError("capture_interval_sec must be positive")
         self.capture_interval_sec = float(capture_interval_sec)
         self.deduplicate_analysis_frames = bool(deduplicate_analysis_frames)
+        evidence_target = opening_evidence_monitor or build_opening_evidence_monitor(
+            profiles_root=self.capture_service.profiles_root,
+            profile_name=self.profile_name,
+        )
+        self.opening_evidence = (
+            evidence_target
+            if isinstance(evidence_target, NonBlockingOpeningEvidenceSink)
+            else NonBlockingOpeningEvidenceSink(evidence_target)
+        )
         self.recording_mode = load_profile_recording_mode(
             self.capture_service.profiles_root,
             self.profile_name,
@@ -276,11 +290,13 @@ class LiveAssistantController(QObject):
 
         if self._listening_enabled or self.orchestrator is not None:
             return True
+        self.opening_evidence.begin(monotonic_ms=monotonic_ns() // 1_000_000)
         lock_client = getattr(self.capture_service, "lock_target_client_size", None)
         if callable(lock_client):
             try:
                 lock_client(self.profile_name)
             except Exception as exc:
+                self.opening_evidence.observe_failure(exc, stage="window")
                 self.error.emit(f"无法锁定牌桌客户区尺寸：{exc}")
                 return False
         self._listening_enabled = True
@@ -307,9 +323,14 @@ class LiveAssistantController(QObject):
             or self._waiting_capture_worker is not None
         ):
             return
+        # Every listening pass (including the one after a sealed game) owns a
+        # fresh field-timer/dedup scope.  No opening evidence can leak across
+        # rounds.
+        self.opening_evidence.begin(monotonic_ms=monotonic_ns() // 1_000_000)
         try:
             source = self.capture_service.open_live_source(self.profile_name)
         except Exception as exc:
+            self.opening_evidence.observe_failure(exc, stage="window")
             self.error.emit(str(exc))
             self._listening_enabled = False
             return
@@ -334,6 +355,10 @@ class LiveAssistantController(QObject):
             snapshot: FrameSnapshot = source.capture()
             if generation != self._waiting_generation:
                 return snapshot
+            self.opening_evidence.observe_frame(
+                snapshot,
+                monotonic_ms=snapshot.captured_monotonic_ms,
+            )
             self._record_listener_frame(snapshot)
             # Opening probes stay in memory.  Storage starts only after a
             # complete initial state has been confirmed, unless the user has
@@ -354,7 +379,34 @@ class LiveAssistantController(QObject):
         self,
         snapshot: FrameSnapshot,
     ) -> tuple[object, FrameSnapshot]:
-        return self._recognize_initial_image(snapshot.image), snapshot
+        result = self._recognize_initial_image(snapshot.image)
+        trace_reader = getattr(
+            self.recognition_service,
+            "get_last_diagnostic_trace",
+            None,
+        )
+        trace = trace_reader() if callable(trace_reader) else None
+        hand = tuple(str(card) for card in getattr(result, "my_hand", ()) or ())
+        level = str(getattr(result, "round_level", "") or "")
+        seed_valid: bool | None = None
+        if level in RANKS and len(hand) == 27:
+            try:
+                normalizer = GuanDanState()
+                normalizer.confirm_hand(hand)
+                seed_valid = self._auto_session_seed(
+                    result,
+                    round_level=level,
+                    hand=normalizer.my_hand,
+                ) is not None
+            except Exception:
+                seed_valid = False
+        self.opening_evidence.observe_recognition(
+            snapshot,
+            result,
+            trace,
+            opening_seed_valid=seed_valid,
+        )
+        return result, snapshot
 
     def _recognize_initial_image(self, image: object) -> object:
         """Keep an occluded hand card as ``5?`` instead of losing the deal."""
@@ -375,6 +427,7 @@ class LiveAssistantController(QObject):
         self.frame_ready.emit(snapshot)
 
     def _accept_waiting_error(self, message: str) -> None:
+        self.opening_evidence.observe_failure(message, stage="capture")
         self.error.emit(message)
         if self.orchestrator is None:
             self._listening_enabled = False
@@ -481,8 +534,15 @@ class LiveAssistantController(QObject):
         if image is None or not callable(recognize_anchor):
             return 0.0
         try:
-            return float(recognize_anchor(image))
+            score = float(recognize_anchor(image))
+            self.opening_evidence.observe_anchor(
+                snapshot,
+                score,
+                required_score=self._TABLE_ANCHOR_READY_SCORE,
+            )
+            return score
         except Exception as exc:
+            self.opening_evidence.observe_failure(exc, stage="anchor")
             self.error.emit(f"牌桌锚点识别失败：{exc}")
             return 0.0
 
@@ -723,6 +783,7 @@ class LiveAssistantController(QObject):
                 self.orchestrator = None
                 self.error.emit(f"首出动作锚定失败：{exc}")
                 return False
+        self.opening_evidence.mark_session_started()
         self._activate_live_token(constructed.orchestrator)
         self._auto_finish_requested = False
         self._latest_live_frame = None
@@ -836,7 +897,7 @@ class LiveAssistantController(QObject):
             nonlocal capture_seq, last_analysis_fingerprint
             snapshot: FrameSnapshot = source.capture()
             capture_seq += 1
-            captured_ms = monotonic_ns() // 1_000_000
+            captured_ms = snapshot.captured_monotonic_ms
             if not self._live_token_is_current(token):
                 return snapshot
             token.orchestrator.record_frame(
@@ -1337,3 +1398,4 @@ class LiveAssistantController(QObject):
             and self._danzero_warmup_thread.isRunning()
         ):
             self._danzero_warmup_thread.wait(30_000)
+        self.opening_evidence.close(timeout=5.0)

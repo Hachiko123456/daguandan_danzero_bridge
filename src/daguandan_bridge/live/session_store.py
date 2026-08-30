@@ -361,6 +361,8 @@ class LiveSessionStore:
                     "media_manifest": "media.json",
                     "media_error": "media_error.json",
                 }
+                if re.fullmatch(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+", str(reason)):
+                    incident["code"] = str(reason)
                 if trigger_ms is not None:
                     incident["trigger_ms"] = int(trigger_ms)
                 atomic_write_json(staging_path / "incident.json", incident)
@@ -450,6 +452,103 @@ class LiveSessionStore:
                 changes["incident_media_failures"] = failures
             self._update_manifest(changes)
             self._sealed = True
+
+    def append_post_seal_health_audit(
+        self,
+        report: dict[str, object],
+        *,
+        state: dict[str, object],
+        monotonic_ms: int,
+    ) -> None:
+        """Append derived FAIL evidence after sealing, never edit the timeline."""
+
+        with self._lock:
+            if not self._started or not self._sealed:
+                raise RuntimeError("封局健康审计只能在对局封存后追加")
+            document = dict(report)
+            if document.get("schema") != "guandan.session-health/1":
+                raise ValueError("unsupported session health schema")
+            atomic_write_json(self.directory / "health_audit.json", document)
+            issues = tuple(document.get("issues", ()) or ())
+            created: list[str] = []
+            for raw_issue in issues:
+                if not isinstance(raw_issue, dict):
+                    continue
+                code = str(raw_issue.get("code", "")).strip()
+                if re.fullmatch(r"HEALTH(?:-[A-Z0-9]+)+", code) is None:
+                    continue
+                incident_number = len(self._incident_ids) + 1
+                while (self.incidents_directory / f"INC-{incident_number:04d}").exists():
+                    incident_number += 1
+                incident_id = f"INC-{incident_number:04d}"
+                target = self.incidents_directory / incident_id
+                staging = self.directory / f".{incident_id}.{uuid4().hex}.tmp"
+                staging.mkdir()
+                try:
+                    wall_time = _now_text()
+                    observation = {
+                        "id": f"{incident_id}-HEALTH",
+                        "phase": "post_seal_health_audit",
+                        "code": code,
+                        "severity": "FAIL",
+                        "summary": raw_issue.get("summary"),
+                        "evidence": raw_issue.get("evidence", {}),
+                    }
+                    incident = {
+                        "schema_version": SCHEMA_VERSION,
+                        "incident_id": incident_id,
+                        "session_id": self.session_id,
+                        "code": code,
+                        "reason": code,
+                        "wall_time": wall_time,
+                        "trigger_ms": int(monotonic_ms),
+                        "post_seal": True,
+                        "observation_ids": [observation["id"]],
+                        "frames": [],
+                        "state_advanced": False,
+                    }
+                    atomic_write_json(staging / "incident.json", incident)
+                    atomic_write_json(staging / "state_before.json", state)
+                    atomic_write_json(staging / "state_after.json", state)
+                    atomic_write_json(staging / "observations.json", [observation])
+                    _append_json_line(
+                        staging / "occurrences.jsonl",
+                        {
+                            "monotonic_ms": int(monotonic_ms),
+                            "wall_time": wall_time,
+                            "reason": code,
+                            "coalesced": False,
+                            "post_seal": True,
+                        },
+                        durable=False,
+                    )
+                    (staging / "llm_report.md").write_text(
+                        f"# 封局健康异常 {incident_id}\n\n"
+                        f"- 错误码：`{code}`\n"
+                        f"- 说明：{raw_issue.get('summary', '')}\n",
+                        encoding="utf-8",
+                    )
+                    staging.replace(target)
+                except BaseException:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise
+                self._incident_ids.append(incident_id)
+                created.append(incident_id)
+            self._update_manifest(
+                {
+                    "incidents": list(self._incident_ids),
+                    "health_audit": {
+                        "schema": document.get("schema"),
+                        "status": document.get("status"),
+                        "issue_codes": [
+                            str(item.get("code"))
+                            for item in issues
+                            if isinstance(item, dict)
+                        ],
+                        "post_seal_incidents": created,
+                    },
+                }
+            )
 
     def _ensure_writable(self) -> None:
         if not self._started:
@@ -616,3 +715,12 @@ class InMemoryLiveSessionStore:
         incident_media_failures: Iterable[dict[str, object]] = (),
     ) -> None:
         del frame_count, dropped_frames, metrics, incident_media_failures
+
+    def append_post_seal_health_audit(
+        self,
+        report: dict[str, object],
+        *,
+        state: dict[str, object],
+        monotonic_ms: int,
+    ) -> None:
+        del report, state, monotonic_ms

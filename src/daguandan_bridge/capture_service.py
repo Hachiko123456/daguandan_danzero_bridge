@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from time import monotonic_ns
 from typing import Any
 
 from .config import PROFILES_ROOT
@@ -24,6 +25,9 @@ from .window_capture import (
 class FrameSnapshot:
     frame: CapturedStandardizedFrame
     captured_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
+    captured_monotonic_ms: int = field(
+        default_factory=lambda: monotonic_ns() // 1_000_000
+    )
 
     @property
     def image(self) -> Any:
@@ -38,6 +42,10 @@ class LoadedProfile:
 
 class LiveCaptureInterrupted(RuntimeError):
     """A persistent source can no longer guarantee aligned window frames."""
+
+    def __init__(self, message: str, *, code: str = "CAPTURE-BACKEND-FAILED") -> None:
+        super().__init__(message)
+        self.code = str(code)
 
 
 class LiveCaptureSource:
@@ -56,7 +64,8 @@ class LiveCaptureSource:
             current_rect = get_client_rect_on_screen(self.target)
             if current_rect != self._initial_rect:
                 raise LiveCaptureInterrupted(
-                    "target window geometry changed; reopen live capture source"
+                    "target window geometry changed; reopen live capture source",
+                    code="GEOMETRY-CHANGED",
                 )
             frame = capture_standardized_client_frame(
                 self.target,
@@ -72,12 +81,16 @@ class LiveCaptureSource:
                     raise LiveCaptureInterrupted(
                         "屏幕采集已暂停：目标牌桌被其他窗口遮挡"
                         f"（{names}）。请把推荐浮窗和完整助手移到牌桌客户区外，"
-                        "再点击继续；被遮挡帧不会进入识别或策略计算。"
+                        "再点击继续；被遮挡帧不会进入识别或策略计算。",
+                        code="CAPTURE-OCCLUDED",
                     )
         except LiveCaptureInterrupted:
             raise
         except TargetWindowError as exc:
-            raise LiveCaptureInterrupted(str(exc)) from exc
+            raise LiveCaptureInterrupted(
+                str(exc),
+                code=str(getattr(exc, "code", "CAPTURE-BACKEND-FAILED")),
+            ) from exc
         return FrameSnapshot(frame)
 
     def close(self) -> None:

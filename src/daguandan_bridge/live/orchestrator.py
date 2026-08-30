@@ -37,6 +37,7 @@ from ..danzero.rules import (
     wildcard_substitutions,
 )
 from ..danzero.state import GameStateError, GuanDanState, Seat
+from ..session_health import audit_session_health
 from .action_uncertainty import state_variants_for_action_semantics
 from .consensus import (
     BurstConsensus,
@@ -1849,6 +1850,7 @@ class LiveOrchestrator:
         if self._advice_worker is not None:
             self._advice_worker.stop(timeout=5.0)
         with self._state_lock:
+            health_report = self._build_seal_health_audit()
             recording = self.recorder.close()
             self.store.seal(
                 frame_count=recording.frame_count,
@@ -1859,6 +1861,20 @@ class LiveOrchestrator:
                     for failure in recording.incident_media_failures
                 ),
             )
+            post_seal_audit = getattr(
+                self.store,
+                "append_post_seal_health_audit",
+                None,
+            )
+            if callable(post_seal_audit):
+                try:
+                    post_seal_audit(
+                        health_report,
+                        state=self._snapshot_document(),
+                        monotonic_ms=self._last_monotonic_ms,
+                    )
+                except Exception:
+                    _LOGGER.warning("封局后健康报告写入失败", exc_info=True)
             self.status = "sealed"
             self._zone = None
             self._clear_burst()
@@ -1875,6 +1891,21 @@ class LiveOrchestrator:
             except Exception:
                 _LOGGER.warning("FableDan 训练数据待确认文件创建失败", exc_info=True)
         return update
+
+    def _build_seal_health_audit(self) -> dict[str, object]:
+        """Compute facts before close; persistence happens strictly post-seal."""
+        try:
+            return audit_session_health(self.snapshot, self._all_events)
+        except Exception:
+            # Health auditing is evidence-only.  A full disk or malformed
+            # diagnostic sink must never leave a genuine game unsealed.
+            _LOGGER.warning("封局健康审计失败", exc_info=True)
+            return {
+                "schema": "guandan.session-health/1",
+                "status": "UNKNOWN",
+                "issues": [],
+                "audit_error": "health_audit_failed",
+            }
 
     def _self_lead_waiting_for_action(
         self,
