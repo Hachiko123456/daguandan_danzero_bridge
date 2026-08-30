@@ -267,7 +267,9 @@ $requiredFiles = @(
     (Join-Path $projectRoot "scripts\generate_build_manifest.py"),
     (Join-Path $projectRoot "release_assets\MODEL_REPLACEMENT.txt"),
     (Join-Path $projectRoot "release_assets\Run_FableDan_Fixed_Benchmark.bat"),
-    (Join-Path $projectRoot "release_assets\Collect_Diagnostics.bat")
+    (Join-Path $projectRoot "release_assets\Collect_Diagnostics.bat"),
+    (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.bat"),
+    (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.ps1")
 )
 $profileSource = Join-Path $projectRoot "data\profiles\tencent_daguandan"
 $modelSource = Join-Path $profileSource "models\best.npz"
@@ -412,6 +414,8 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "app.ico") -Destination $bundlePa
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\MODEL_REPLACEMENT.txt") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Run_FableDan_Fixed_Benchmark.bat") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Collect_Diagnostics.bat") -Destination $bundlePath
+Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.bat") -Destination $bundlePath
+Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.ps1") -Destination $bundlePath
 Copy-Item -LiteralPath $releaseInputAuditPath -Destination $bundledInputAuditPath
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     (Join-Path $projectRoot "scripts\audit_frozen_bundle.py") `

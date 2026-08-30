@@ -47,6 +47,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-timeout", type=float, default=3600.0)
     parser.add_argument("--drain-timeout", type=float, default=60.0)
     parser.add_argument(
+        "--bundle-root",
+        type=Path,
+        help="使用已经构建并审计的 frozen bundle；指定后绝不重新打包。",
+    )
+    parser.add_argument(
+        "--executable",
+        type=Path,
+        help="已经构建的 EXE（通常位于 --bundle-root 内）。",
+    )
+    parser.add_argument(
+        "--wheelhouse-root",
+        type=Path,
+        help="仅在脚本需要自行打包时指定外部离线 wheelhouse。",
+    )
+    parser.add_argument(
+        "--frozen-data-root",
+        type=Path,
+        help="frozen 运行使用的外部数据根；省略时使用 output 下的隔离目录。",
+    )
+    parser.add_argument(
         "--scenarios",
         default="initial_capture,move_recovery,resize_recovery,minimize_recovery,occlusion,dpi,full_chain",
     )
@@ -184,28 +204,56 @@ def main(argv: list[str] | None = None) -> int:
             host_errors.append(f"source validator exited {source_exit}")
         if not args.source_only:
             _simulator_command(control_path, status_path, "reset", timeout=15.0)
-            build_root.parent.mkdir(parents=True, exist_ok=True)
-            package_exit = _run_logged(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(PROJECT_ROOT / "scripts" / "package_release.ps1"),
-                    "-ReleaseRoot",
-                    str(build_root),
-                ],
-                package_log,
-            )
-            executable = (
-                build_root
-                / "dist"
-                / "DaguandanAssistant"
-                / "DaguandanAssistant.exe"
-            )
+            if args.executable is not None:
+                executable = args.executable.resolve()
+                package_exit = 0
+                package_log.write_text(
+                    "reused caller-supplied frozen executable; no rebuild\n",
+                    encoding="utf-8",
+                )
+            elif args.bundle_root is not None:
+                executable = (
+                    args.bundle_root.resolve()
+                    / "DaguandanAssistant.exe"
+                )
+                package_exit = 0
+                package_log.write_text(
+                    "reused caller-supplied frozen bundle; no rebuild\n",
+                    encoding="utf-8",
+                )
+            else:
+                if args.wheelhouse_root is None:
+                    raise ValueError(
+                        "--wheelhouse-root is required when --bundle-root/--executable is omitted"
+                    )
+                build_root.parent.mkdir(parents=True, exist_ok=True)
+                package_exit = _run_logged(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(PROJECT_ROOT / "scripts" / "package_release.ps1"),
+                        "-ReleaseRoot",
+                        str(build_root),
+                        "-WheelhouseRoot",
+                        str(args.wheelhouse_root.resolve()),
+                    ],
+                    package_log,
+                )
+                executable = (
+                    build_root
+                    / "dist"
+                    / "DaguandanAssistant"
+                    / "DaguandanAssistant.exe"
+                )
+            if args.bundle_root is not None:
+                bundle_directory = args.bundle_root.resolve()
+            else:
+                bundle_directory = executable.parent
             bundle_profile = (
-                executable.parent / "data" / "profiles" / "tencent_daguandan"
+                bundle_directory / "data" / "profiles" / "tencent_daguandan"
             )
             if package_exit != 0 or not executable.is_file():
                 host_errors.append(
@@ -221,6 +269,15 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 bundle_config_path = run_directory / "bundle_validation_config.json"
                 atomic_write_json(bundle_config_path, bundle_config)
+                frozen_environment = os.environ.copy()
+                frozen_data_root = (
+                    args.frozen_data_root.resolve()
+                    if args.frozen_data_root is not None
+                    else output_root / "frozen-data" / run_id
+                )
+                frozen_environment["DAGUANDAN_DATA_ROOT"] = str(frozen_data_root)
+                frozen_environment.pop("PYTHONPATH", None)
+                frozen_environment.pop("PYTHONHOME", None)
                 bundle_exit = _run_logged(
                     [
                         str(executable),
@@ -228,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                         str(bundle_config_path),
                     ],
                     bundle_log,
+                    env=frozen_environment,
                 )
                 bundle_summary = _read_json(run_directory / "bundle" / "summary.json")
                 if bundle_exit != 0:
@@ -324,13 +382,19 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if execution_ok else 1
 
 
-def _run_logged(command: list[str], log_path: Path) -> int:
+def _run_logged(
+    command: list[str],
+    log_path: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> int:
     with log_path.open("wb") as handle:
         completed = subprocess.run(
             command,
             cwd=PROJECT_ROOT,
             stdout=handle,
             stderr=subprocess.STDOUT,
+            env=env,
             check=False,
         )
     return int(completed.returncode)
