@@ -12,8 +12,10 @@ import os
 from pathlib import Path, PurePosixPath
 import random
 import stat
+import struct
 import subprocess
 import sys
+import tempfile
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 import zipfile
@@ -22,6 +24,9 @@ import cv2
 import numpy as np
 
 from .diagnostic_root_cause import diagnose_root_cause
+from .danzero.state import GuanDanState, RANKS
+from .opening_gate import evaluate_opening_gate, serialized_result
+from .resource_fingerprint import recognition_resource_identity
 from .runtime_identity import get_runtime_identity
 from .storage import atomic_write_json
 
@@ -36,6 +41,9 @@ _MAX_ENTRY_BYTES = 64 * 1024 * 1024
 _MAX_TOTAL_BYTES = 512 * 1024 * 1024
 _MAX_COMPRESSION_RATIO = 1000.0
 _MAX_IMAGE_PIXELS = 32_000_000
+_MAX_IMAGES = 256
+_MAX_TOTAL_IMAGE_PIXELS = 128_000_000
+_MAX_TOTAL_DECODED_BYTES = 512 * 1024 * 1024
 
 
 class SupportReproError(RuntimeError):
@@ -48,6 +56,31 @@ class VerifiedSupport:
     sha256: str
     manifest: dict[str, object]
     payloads: dict[str, bytes]
+
+
+@dataclass(frozen=True)
+class _ImageHeader:
+    width: int
+    height: int
+    decoded_bytes: int
+
+
+@dataclass
+class _ImageBudget:
+    count: int = 0
+    pixels: int = 0
+    decoded_bytes: int = 0
+
+    def add(self, header: _ImageHeader, name: str) -> None:
+        self.count += 1
+        self.pixels += int(header.width) * int(header.height)
+        self.decoded_bytes += int(header.decoded_bytes)
+        if self.count > _MAX_IMAGES:
+            raise SupportReproError("support image count exceeds hard limit")
+        if self.pixels > _MAX_TOTAL_IMAGE_PIXELS:
+            raise SupportReproError("support cumulative image pixels exceed hard limit")
+        if self.decoded_bytes > _MAX_TOTAL_DECODED_BYTES:
+            raise SupportReproError("support cumulative decoded image bytes exceed hard limit")
 
 
 def verify_support_archive(path: Path | str) -> VerifiedSupport:
@@ -126,6 +159,8 @@ def verify_support_archive(path: Path | str) -> VerifiedSupport:
         raise SupportReproError(
             f"support payload declaration mismatch: extra={extra}, missing={missing}"
         )
+    _preflight_support_images(payloads)
+    _validate_incident_artifact_bindings(payloads)
     if _sha256_file(source) != archive_hash:
         raise SupportReproError("support ZIP changed during verification")
     return VerifiedSupport(source, archive_hash, manifest, payloads)
@@ -139,30 +174,38 @@ def write_truth_annotation(
     expected_level: str | None = None,
     expected_hand: Sequence[str] | None = None,
 ) -> dict[str, object]:
-    if expected_level is None and expected_hand is None:
-        raise SupportReproError("truth annotation needs expected_level or expected_hand")
+    normalized_level, normalized_hand = _validated_expected_truth(
+        expected_level,
+        expected_hand,
+    )
     verified = verify_support_archive(support_zip)
+    opening = _optional_json(
+        verified.payloads,
+        ("evidence/opening_evidence.json", "opening/opening_evidence.json"),
+    )
+    indexed = _image_index(verified.payloads, opening)
+    frames = _standardized_frames(verified, indexed)
+    if not frames:
+        raise SupportReproError("truth annotation needs at least one standardized input")
     if input_pixel_sha256 is None:
-        opening = _optional_json(
-            verified.payloads,
-            ("evidence/opening_evidence.json", "opening/opening_evidence.json"),
-        )
-        indexed = _image_index(verified.payloads, opening)
-        frames = _standardized_frames(verified, indexed)
         hashes = sorted({str(item["pixel_sha256"]) for item in frames})
         if len(hashes) != 1:
             raise SupportReproError(
                 "truth annotation needs input_pixel_sha256 when support contains multiple distinct inputs"
             )
         input_pixel_sha256 = hashes[0]
+    elif input_pixel_sha256 not in {
+        str(item["pixel_sha256"]) for item in frames
+    }:
+        raise SupportReproError("truth input_pixel_sha256 is not in the support sequence")
+    sequence_sha256 = _input_sequence_sha256(frames)
     document: dict[str, object] = {
         "schema": REPRO_TRUTH_SCHEMA,
         "support_sha256": verified.sha256,
         "input_pixel_sha256": input_pixel_sha256,
-        "expected_level": str(expected_level) if expected_level is not None else None,
-        "expected_hand": sorted(str(card) for card in expected_hand)
-        if expected_hand is not None
-        else None,
+        "input_sequence_sha256": sequence_sha256,
+        "expected_level": normalized_level,
+        "expected_hand": list(normalized_hand) if normalized_hand is not None else None,
         "created_at": datetime.now(UTC).isoformat(),
     }
     atomic_write_json(Path(destination), document)
@@ -180,6 +223,7 @@ def reproduce_support_bundle(
     recognizer_factory: Callable[[], object] | None = None,
     deterministic: bool = True,
     child_probe: Mapping[str, object] | None = None,
+    role: str = "unspecified",
 ) -> dict[str, object]:
     if repeats <= 0 or repeats > 1000:
         raise SupportReproError("repeats must be between 1 and 1000")
@@ -202,6 +246,7 @@ def reproduce_support_bundle(
     truth = _load_truth(
         truth_path,
         support_sha256=verified.sha256,
+        frames=frames,
         expected_level=expected_level,
         expected_hand=expected_hand,
     )
@@ -224,7 +269,11 @@ def reproduce_support_bundle(
     runtime = get_runtime_identity()
     runner_build_id = str(runtime.get("build_id") or "") or None
     support_build_id = str(verified.manifest.get("build_id") or "") or None
-    standard_equal = _standardization_equality(verified, image_index, opening)
+    standard_equal, roi_equal = _standardization_equality(
+        verified,
+        image_index,
+        opening,
+    )
     root_cause = diagnose_root_cause(
         support_verified=True,
         opening_evidence=opening,
@@ -234,13 +283,14 @@ def reproduce_support_bundle(
         support_build_id=support_build_id,
         runner_build_id=runner_build_id,
         standardization_equal=standard_equal,
-        roi_equal=None,
+        roi_equal=roi_equal,
         child_probe=child_probe,
     )
     report: dict[str, object] = {
         "schema": REPRO_REPORT_SCHEMA,
         "created_at": datetime.now(UTC).isoformat(),
         "mode": "frozen" if getattr(sys, "frozen", False) else "source",
+        "verification_role": str(role),
         "deterministic": bool(deterministic),
         "support": {
             "sha256": verified.sha256,
@@ -272,6 +322,15 @@ def reproduce_support_bundle(
             "unique_outcome_count": len(set(fingerprints)),
         },
         "truth": truth_evaluation,
+        "truth_identity": (
+            {
+                "sha256": truth.get("_truth_sha256"),
+                "support_sha256": truth.get("support_sha256"),
+                "input_sequence_sha256": truth.get("input_sequence_sha256"),
+            }
+            if truth is not None
+            else None
+        ),
         "outcomes": outcomes,
         "root_cause": root_cause,
         "comparison": {
@@ -353,6 +412,107 @@ def run_child_probe(
     }
 
 
+def reproduce_support_suite(
+    support_zip: Path | str,
+    *,
+    output_path: Path | str | None = None,
+    truth_path: Path | str | None = None,
+    expected_level: str | None = None,
+    expected_hand: Sequence[str] | None = None,
+    repeats: int = 20,
+    role: str = "unspecified",
+) -> dict[str, object]:
+    """Automatically compare ordinary, deterministic, and fresh-child probes."""
+
+    ordinary = reproduce_support_bundle(
+        support_zip,
+        truth_path=truth_path,
+        expected_level=expected_level,
+        expected_hand=expected_hand,
+        repeats=repeats,
+        deterministic=False,
+        role=role,
+    )
+    deterministic_report = reproduce_support_bundle(
+        support_zip,
+        truth_path=truth_path,
+        expected_level=expected_level,
+        expected_hand=expected_hand,
+        repeats=repeats,
+        deterministic=True,
+        role=role,
+    )
+    with tempfile.TemporaryDirectory(prefix="daguandan-repro-child-") as temporary:
+        child = run_child_probe(
+            support_zip,
+            Path(temporary) / "child-report.json",
+            truth_path=truth_path,
+            repeats=repeats,
+            deterministic=True,
+        )
+    ordinary_matches = _normalized_probe_signature(ordinary) == _normalized_probe_signature(
+        deterministic_report
+    )
+    child_report = child.get("report") if isinstance(child, Mapping) else None
+    child_matches = bool(
+        isinstance(child_report, Mapping)
+        and _normalized_probe_signature(child_report)
+        == _normalized_probe_signature(deterministic_report)
+    )
+    child_summary = {
+        **dict(child),
+        "matches_same_process": child_matches,
+    }
+    final_report = reproduce_support_bundle(
+        support_zip,
+        truth_path=truth_path,
+        expected_level=expected_level,
+        expected_hand=expected_hand,
+        repeats=repeats,
+        deterministic=True,
+        child_probe=child_summary,
+        role=role,
+    )
+    final_report["probes"] = {
+        "same_process_ordinary": {
+            "normalized_sha256": _normalized_probe_signature(ordinary),
+        },
+        "same_process_deterministic": {
+            "normalized_sha256": _normalized_probe_signature(deterministic_report),
+            "matches_ordinary": ordinary_matches,
+        },
+        "fresh_child_deterministic": child_summary,
+    }
+    if output_path is not None:
+        atomic_write_json(Path(output_path), final_report)
+    return final_report
+
+
+def _normalized_probe_signature(report: Mapping[str, object]) -> str:
+    normalized = {
+        "support_sha256": _nested(report, "support", "sha256"),
+        "inputs": [
+            {
+                "frame_seq": item.get("frame_seq"),
+                "pixel_sha256": item.get("pixel_sha256"),
+            }
+            for item in report.get("inputs", [])
+            if isinstance(item, Mapping)
+        ],
+        "outcomes": [
+            {
+                "output_fingerprint": item.get("output_fingerprint"),
+                "opening_gate": item.get("opening_gate"),
+                "single_frame_level": item.get("single_frame_level"),
+                "single_frame_hand": item.get("single_frame_hand"),
+            }
+            for item in report.get("outcomes", [])
+            if isinstance(item, Mapping)
+        ],
+    }
+    return hashlib.sha256(_canonical_json(normalized)).hexdigest()
+
+
 def compare_repro_reports(
     reference: Mapping[str, object] | Path | str,
     candidate: Mapping[str, object] | Path | str,
@@ -368,6 +528,20 @@ def compare_repro_reports(
     new_inputs = [item.get("pixel_sha256") for item in new.get("inputs", []) if isinstance(item, Mapping)]
     if old_inputs != new_inputs:
         failures.append("input_pixel_hash_mismatch")
+    if old.get("verification_role") != "reference":
+        failures.append("reference_role_invalid")
+    if new.get("verification_role") != "candidate":
+        failures.append("candidate_role_invalid")
+    if _nested(old, "truth_identity", "sha256") != _nested(
+        new, "truth_identity", "sha256"
+    ):
+        failures.append("truth_sha256_mismatch")
+    old_build = _nested(old, "runner", "build_id")
+    new_build = _nested(new, "runner", "build_id")
+    if not old_build or not new_build:
+        failures.append("runner_build_id_missing")
+    elif old_build == new_build:
+        failures.append("reference_candidate_build_not_distinct")
     if old.get("repeat_count") != 20 or not _nested(old, "repeatability", "repeatable"):
         failures.append("reference_not_repeatable_20_of_20")
     if not _nested(old, "truth", "eligible_for_fix_verification"):
@@ -386,8 +560,9 @@ def compare_repro_reports(
         "failures": failures,
         "support_sha256": _nested(old, "support", "sha256"),
         "input_pixel_sha256": old_inputs,
-        "reference_build_id": _nested(old, "runner", "build_id"),
-        "candidate_build_id": _nested(new, "runner", "build_id"),
+        "truth_sha256": _nested(old, "truth_identity", "sha256"),
+        "reference_build_id": old_build,
+        "candidate_build_id": new_build,
     }
     if output_path is not None:
         atomic_write_json(Path(output_path), report)
@@ -400,8 +575,9 @@ def _run_sequence(
     repeat_index: int,
 ) -> dict[str, object]:
     frame_results: list[dict[str, object]] = []
-    stable_seed: tuple[str, tuple[str, ...]] | None = None
-    previous_seed: tuple[str, tuple[str, ...]] | None = None
+    stable_seed: object | None = None
+    previous_seed: object | None = None
+    observed_seed_fingerprints: set[str] = set()
     for frame in frames:
         operation = getattr(recognizer, "recognize", None)
         if not callable(operation):
@@ -411,9 +587,20 @@ def _run_sequence(
         trace = trace_reader() if callable(trace_reader) else None
         level = str(getattr(result, "round_level", "") or "")
         hand = tuple(sorted(str(card) for card in getattr(result, "my_hand", ()) or ()))
-        seed = (level, hand) if level and len(hand) == 27 else None
+        opening_frame = frame.get("opening_frame")
+        anchor_score = (
+            _number(opening_frame.get("anchor_score"), default=-1.0)
+            if isinstance(opening_frame, Mapping)
+            else None
+        )
+        gate = evaluate_opening_gate(result, anchor_score=anchor_score)
+        seed = gate.seed
         if seed is not None and seed == previous_seed:
             stable_seed = seed
+        if seed is not None:
+            observed_seed_fingerprints.add(
+                hashlib.sha256(_canonical_json(_opening_seed_document(seed))).hexdigest()
+            )
         previous_seed = seed
         frame_results.append(
             {
@@ -421,7 +608,7 @@ def _run_sequence(
                 "round_level": level or None,
                 "hand": list(hand),
                 "hand_count": len(hand),
-                "gate": "ready" if stable_seed is not None else _gate_reason(level, hand),
+                "production_gate": "ready" if gate.ready else gate.reason,
                 "candidate_vector": list(trace.get("candidates", []))
                 if isinstance(trace, Mapping)
                 else [],
@@ -430,15 +617,22 @@ def _run_sequence(
                 else frame["pixel_sha256"],
             }
         )
+    if stable_seed is not None:
+        consensus = {"status": "READY", "reason": "two_frame_consensus"}
+    elif len(observed_seed_fingerprints) > 1:
+        consensus = {"status": "FAIL", "reason": "opening_seed_oscillation"}
+    else:
+        consensus = {"status": "PENDING", "reason": "opening_stability_pending"}
     normalized = {
-        "stable_level": stable_seed[0] if stable_seed else None,
-        "stable_hand": list(stable_seed[1]) if stable_seed else None,
+        "stable_level": getattr(stable_seed, "round_level", None),
+        "stable_hand": list(getattr(stable_seed, "hand", ())) if stable_seed else None,
+        "multi_frame_gate": consensus,
         "frames": [
             {
                 "frame_seq": item["frame_seq"],
                 "round_level": item["round_level"],
                 "hand": item["hand"],
-                "gate": item["gate"],
+                "production_gate": item["production_gate"],
             }
             for item in frame_results
         ],
@@ -452,18 +646,34 @@ def _run_sequence(
         "stable_hand": normalized["stable_hand"],
         "final_level": final["round_level"],
         "final_hand": final["hand"],
-        "opening_gate": final["gate"] if stable_seed is None else "ready",
+        "single_frame_level": final["round_level"],
+        "single_frame_hand": final["hand"],
+        "single_frame_gate": final["production_gate"],
+        "multi_frame_gate": consensus,
+        "opening_gate": (
+            "ready" if consensus["status"] == "READY" else consensus["reason"]
+        ),
         "candidate_vector": final["candidate_vector"],
         "frame_results": frame_results,
     }
 
 
-def _gate_reason(level: str, hand: Sequence[str]) -> str:
-    if not level:
-        return "round_level_unresolved"
-    if len(hand) != 27:
-        return "hand_count_mismatch"
-    return "opening_stability_pending"
+def _opening_seed_document(seed: object) -> dict[str, object]:
+    opening_action = getattr(seed, "opening_action", None)
+    return {
+        "round_level": getattr(seed, "round_level", None),
+        "hand": list(getattr(seed, "hand", ())),
+        "lead_player": getattr(seed, "lead_player", None),
+        "opening_action": (
+            {
+                "actor": getattr(opening_action, "actor", None),
+                "cards": list(getattr(opening_action, "cards", ())),
+                "next_player": getattr(opening_action, "next_player", None),
+            }
+            if opening_action is not None
+            else None
+        ),
+    }
 
 
 def _evaluate_truth(
@@ -486,8 +696,11 @@ def _evaluate_truth(
     )
     correct = 0
     for item in outcomes:
-        level_ok = expected_level is None or item.get("stable_level") == expected_level
-        hand_ok = expected_hand_normalized is None or item.get("stable_hand") == expected_hand_normalized
+        # Correctness is a single-frame truth assertion.  Multi-frame
+        # readiness is reported separately and must never erase a correct
+        # one-frame observation.
+        level_ok = expected_level is None or item.get("single_frame_level") == expected_level
+        hand_ok = expected_hand_normalized is None or item.get("single_frame_hand") == expected_hand_normalized
         if level_ok and hand_ok:
             correct += 1
     return {
@@ -505,26 +718,81 @@ def _load_truth(
     path: Path | str | None,
     *,
     support_sha256: str,
+    frames: Sequence[Mapping[str, object]],
     expected_level: str | None,
     expected_hand: Sequence[str] | None,
 ) -> dict[str, object] | None:
+    sequence_sha256 = _input_sequence_sha256(frames)
     if path is not None:
-        document = _json_object(Path(path).read_bytes(), "truth annotation")
+        raw = Path(path).read_bytes()
+        document = _json_object(raw, "truth annotation")
         if document.get("schema") != REPRO_TRUTH_SCHEMA:
             raise SupportReproError("unsupported truth annotation schema")
         if document.get("support_sha256") != support_sha256:
             raise SupportReproError("truth annotation is bound to a different support ZIP")
+        if document.get("input_sequence_sha256") != sequence_sha256:
+            raise SupportReproError("truth annotation is bound to a different input sequence")
+        normalized_level, normalized_hand = _validated_expected_truth(
+            document.get("expected_level"),
+            document.get("expected_hand") if isinstance(document.get("expected_hand"), list) else None,
+        )
+        document["expected_level"] = normalized_level
+        document["expected_hand"] = (
+            list(normalized_hand) if normalized_hand is not None else None
+        )
+        document["_truth_sha256"] = hashlib.sha256(raw).hexdigest()
         return document
     if expected_level is None and expected_hand is None:
         return None
-    return {
+    normalized_level, normalized_hand = _validated_expected_truth(
+        expected_level,
+        expected_hand,
+    )
+    document = {
         "schema": REPRO_TRUTH_SCHEMA,
         "support_sha256": support_sha256,
-        "expected_level": expected_level,
-        "expected_hand": sorted(str(card) for card in expected_hand)
-        if expected_hand is not None
-        else None,
+        "input_sequence_sha256": sequence_sha256,
+        "expected_level": normalized_level,
+        "expected_hand": list(normalized_hand) if normalized_hand is not None else None,
     }
+    document["_truth_sha256"] = hashlib.sha256(_canonical_json(document)).hexdigest()
+    return document
+
+
+def _validated_expected_truth(
+    expected_level: object,
+    expected_hand: Sequence[object] | None,
+) -> tuple[str | None, tuple[str, ...] | None]:
+    level = None if expected_level is None or str(expected_level) == "" else str(expected_level)
+    hand_values = None if expected_hand is None else tuple(str(card) for card in expected_hand)
+    if level is None and not hand_values:
+        raise SupportReproError(
+            "truth annotation needs at least one non-empty expected value"
+        )
+    if level is not None and level not in RANKS:
+        raise SupportReproError("truth expected_level is not a legal GuanDan rank")
+    normalized_hand: tuple[str, ...] | None = None
+    if hand_values is not None:
+        if len(hand_values) != 27:
+            raise SupportReproError("truth expected_hand must contain exactly 27 cards")
+        try:
+            state = GuanDanState()
+            state.confirm_hand(hand_values)
+        except Exception as exc:
+            raise SupportReproError("truth expected_hand is not a legal GuanDan hand") from exc
+        normalized_hand = tuple(state.my_hand)
+    return level, normalized_hand
+
+
+def _input_sequence_sha256(frames: Sequence[Mapping[str, object]]) -> str:
+    sequence = [
+        {
+            "frame_seq": int(item.get("frame_seq", index)),
+            "pixel_sha256": str(item.get("pixel_sha256") or ""),
+        }
+        for index, item in enumerate(frames, start=1)
+    ]
+    return hashlib.sha256(_canonical_json(sequence)).hexdigest()
 
 
 def _image_index(
@@ -533,35 +801,54 @@ def _image_index(
 ) -> list[dict[str, object]]:
     document = _optional_json(payloads, ("evidence/image_index.json", "image_index.json"))
     if isinstance(document, Mapping):
+        if document.get("schema") != "guandan.support-image-index/1":
+            raise SupportReproError("unsupported support image index schema")
         entries = document.get("entries")
         if isinstance(entries, list):
             return [dict(item) for item in entries if isinstance(item, Mapping)]
-    entries: list[dict[str, object]] = []
-    for name in payloads:
-        if "standardized" in name.casefold() and name.casefold().endswith((".png", ".jpg", ".jpeg")):
-            entries.append(
-                {
-                    "archive_path": name,
-                    "frame_seq": len(entries) + 1,
-                    "kind": "standardized",
-                    "field": None,
-                }
-            )
-    return entries
+    return []
 
 
 def _standardized_frames(
     support: VerifiedSupport,
     image_index: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
-    frames: list[dict[str, object]] = []
+    opening = _optional_json(
+        support.payloads,
+        ("evidence/opening_evidence.json", "opening/opening_evidence.json"),
+    )
+    opening_by_seq = {
+        int(item.get("seq", item.get("frame_seq"))): item
+        for item in (opening.get("frames", []) if isinstance(opening, Mapping) else [])
+        if isinstance(item, Mapping)
+        and _safe_int(item.get("seq", item.get("frame_seq"))) is not None
+    }
+    selected: list[tuple[Mapping[str, object], str, bytes, _ImageHeader]] = []
+    budget = _ImageBudget()
+    identities: set[tuple[int, str, str | None]] = set()
     for raw in image_index:
-        if str(raw.get("kind", "")).casefold() != "standardized":
+        kind = str(raw.get("kind", "")).casefold()
+        if kind not in {"raw_client", "standardized", "roi"}:
+            raise SupportReproError("support image index kind is invalid")
+        frame_seq = _safe_int(raw.get("frame_seq"))
+        if frame_seq is None or frame_seq < 0:
+            raise SupportReproError("support image index frame_seq is invalid")
+        field = None if raw.get("field") in {None, ""} else str(raw.get("field"))
+        identity = (frame_seq, kind, field)
+        if identity in identities:
+            raise SupportReproError("support image index contains duplicate identity")
+        identities.add(identity)
+        if kind != "standardized":
             continue
         name = _safe_archive_name(str(raw.get("archive_path", "")))
         content = support.payloads.get(name)
         if content is None:
             raise SupportReproError(f"indexed standardized image is missing: {name}")
+        header = _image_header(content, name)
+        budget.add(header, name)
+        selected.append((raw, name, content, header))
+    frames: list[dict[str, object]] = []
+    for raw, name, content, _header in selected:
         if raw.get("source_sha256") and raw.get("source_sha256") != hashlib.sha256(content).hexdigest():
             raise SupportReproError(f"indexed standardized image hash mismatch: {name}")
         image = _decode_image(content, name)
@@ -575,12 +862,14 @@ def _standardized_frames(
                 "file_sha256": hashlib.sha256(content).hexdigest(),
                 "pixel_sha256": pixel_hash,
                 "image": image,
+                "opening_frame": opening_by_seq.get(int(raw.get("frame_seq", -1))),
             }
         )
     return sorted(frames, key=lambda item: int(item["frame_seq"]))
 
 
 def _decode_image(content: bytes, name: str) -> np.ndarray:
+    _image_header(content, name)
     data = np.frombuffer(content, dtype=np.uint8)
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None or image.ndim != 3 or image.size == 0:
@@ -590,26 +879,349 @@ def _decode_image(content: bytes, name: str) -> np.ndarray:
     return image
 
 
+def _preflight_support_images(payloads: Mapping[str, bytes]) -> None:
+    budget = _ImageBudget()
+    for name, content in sorted(payloads.items()):
+        if not name.casefold().endswith((".png", ".jpg", ".jpeg")):
+            continue
+        budget.add(_image_header(content, name), name)
+
+
+def _validate_incident_artifact_bindings(payloads: Mapping[str, bytes]) -> None:
+    opening = _optional_json(
+        payloads,
+        ("evidence/opening_evidence.json", "opening/opening_evidence.json"),
+    )
+    index = _optional_json(payloads, ("evidence/image_index.json", "image_index.json"))
+    if not isinstance(opening, Mapping) or not isinstance(index, Mapping):
+        return
+    declared: dict[str, tuple[int, str, str | None, str, str, str | None]] = {}
+    has_artifacts = False
+    frames = opening.get("frames")
+    for frame in frames if isinstance(frames, list) else []:
+        if not isinstance(frame, Mapping):
+            continue
+        seq = _safe_int(frame.get("seq", frame.get("frame_seq")))
+        frame_id = str(frame.get("frame_id") or "") or None
+        artifacts = frame.get("artifacts")
+        for artifact in artifacts if isinstance(artifacts, list) else []:
+            if not isinstance(artifact, Mapping):
+                continue
+            has_artifacts = True
+            path = _safe_archive_name(str(artifact.get("path") or ""))
+            artifact_seq = _safe_int(artifact.get("frame_seq"))
+            kind = str(artifact.get("kind") or "").casefold()
+            field = None if artifact.get("field") in {None, ""} else str(artifact.get("field"))
+            file_sha = str(artifact.get("sha256") or "")
+            pixel_sha = str(artifact.get("pixel_sha256") or "")
+            artifact_frame_id = str(artifact.get("frame_id") or "") or None
+            if (
+                seq is None
+                or artifact_seq != seq
+                or kind not in {"raw_client", "standardized", "roi"}
+                or (kind == "roi") != (field is not None)
+                or re_full_sha256(file_sha) is False
+                or re_full_sha256(pixel_sha) is False
+                or (frame_id is not None and artifact_frame_id != frame_id)
+            ):
+                raise SupportReproError("opening incident artifact declaration is invalid")
+            if path in declared:
+                raise SupportReproError("opening incident artifact path is duplicated")
+            declared[path] = (seq, kind, field, file_sha, pixel_sha, frame_id)
+    if not has_artifacts:
+        return
+    entries = index.get("entries")
+    if not isinstance(entries, list):
+        raise SupportReproError("support image index is missing incident bindings")
+    seen_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise SupportReproError("support image index entry is invalid")
+        incident_path = _safe_archive_name(str(entry.get("incident_path") or ""))
+        expected = declared.get(incident_path)
+        if expected is None:
+            raise SupportReproError("support image is not declared by the incident")
+        seq, kind, field, file_sha, pixel_sha, frame_id = expected
+        if (
+            _safe_int(entry.get("frame_seq")) != seq
+            or str(entry.get("kind") or "").casefold() != kind
+            or (None if entry.get("field") in {None, ""} else str(entry.get("field"))) != field
+            or str(entry.get("incident_sha256") or "") != file_sha
+            or str(entry.get("source_sha256") or "") != file_sha
+            or str(entry.get("pixel_sha256") or "") != pixel_sha
+            or (frame_id is not None and str(entry.get("frame_id") or "") != frame_id)
+        ):
+            raise SupportReproError("support image index disagrees with incident artifact")
+        if incident_path in seen_paths:
+            raise SupportReproError("support incident artifact is indexed more than once")
+        seen_paths.add(incident_path)
+    image_payloads = {
+        name
+        for name in payloads
+        if name.casefold().endswith((".png", ".jpg", ".jpeg"))
+    }
+    indexed_payloads = {
+        _safe_archive_name(str(entry.get("archive_path") or ""))
+        for entry in entries
+        if isinstance(entry, Mapping)
+    }
+    if image_payloads != indexed_payloads:
+        raise SupportReproError("support image payloads are not exactly indexed")
+
+
+def re_full_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _image_header(content: bytes, name: str) -> _ImageHeader:
+    lowered = name.casefold()
+    if lowered.endswith(".png"):
+        if (
+            len(content) < 29
+            or not content.startswith(b"\x89PNG\r\n\x1a\n")
+            or content[12:16] != b"IHDR"
+        ):
+            raise SupportReproError(f"support PNG header is invalid: {name}")
+        width, height = struct.unpack(">II", content[16:24])
+        bit_depth = int(content[24])
+        color_type = int(content[25])
+        channels_by_type = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+        channels = channels_by_type.get(color_type)
+        if channels is None or bit_depth not in {1, 2, 4, 8, 16}:
+            raise SupportReproError(f"support PNG format is unsafe: {name}")
+        bytes_per_channel = 2 if bit_depth == 16 else 1
+        decoded_bytes = int(width) * int(height) * max(3, channels) * bytes_per_channel
+    elif lowered.endswith((".jpg", ".jpeg")):
+        width, height, channels = _jpeg_header(content, name)
+        decoded_bytes = int(width) * int(height) * max(3, channels)
+    else:
+        raise SupportReproError(f"support image type is unsupported: {name}")
+    if width <= 0 or height <= 0 or int(width) * int(height) > _MAX_IMAGE_PIXELS:
+        raise SupportReproError(f"support image exceeds pixel limit: {name}")
+    if decoded_bytes <= 0 or decoded_bytes > _MAX_TOTAL_DECODED_BYTES:
+        raise SupportReproError(f"support image decoded size exceeds hard limit: {name}")
+    return _ImageHeader(int(width), int(height), int(decoded_bytes))
+
+
+def _jpeg_header(content: bytes, name: str) -> tuple[int, int, int]:
+    if len(content) < 4 or not content.startswith(b"\xff\xd8"):
+        raise SupportReproError(f"support JPEG header is invalid: {name}")
+    position = 2
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    while position < len(content):
+        while position < len(content) and content[position] != 0xFF:
+            position += 1
+        while position < len(content) and content[position] == 0xFF:
+            position += 1
+        if position >= len(content):
+            break
+        marker = int(content[position])
+        position += 1
+        if marker in {0x01, *range(0xD0, 0xDA)}:
+            continue
+        if position + 2 > len(content):
+            break
+        segment_length = int.from_bytes(content[position : position + 2], "big")
+        if segment_length < 2 or position + segment_length > len(content):
+            break
+        if marker in sof_markers and segment_length >= 8:
+            height = int.from_bytes(content[position + 3 : position + 5], "big")
+            width = int.from_bytes(content[position + 5 : position + 7], "big")
+            channels = int(content[position + 7])
+            if channels not in {1, 3, 4}:
+                raise SupportReproError(f"support JPEG channel count is unsafe: {name}")
+            return width, height, channels
+        position += segment_length
+    raise SupportReproError(f"support JPEG header is invalid: {name}")
+
+
+def _safe_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _number(value: object, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _standardization_equality(
     support: VerifiedSupport,
     image_index: Sequence[Mapping[str, object]],
     opening: Mapping[str, object] | None,
-) -> bool | None:
-    del support, opening
-    raw_seq = {
-        int(item.get("frame_seq", -1))
-        for item in image_index
-        if item.get("kind") == "raw_client"
+) -> tuple[bool | None, bool | None]:
+    frames = {
+        int(item.get("seq", item.get("frame_seq"))): item
+        for item in (opening.get("frames", []) if isinstance(opening, Mapping) else [])
+        if isinstance(item, Mapping)
+        and _safe_int(item.get("seq", item.get("frame_seq"))) is not None
     }
-    standard_seq = {
-        int(item.get("frame_seq", -1))
-        for item in image_index
-        if item.get("kind") == "standardized"
-    }
-    if not raw_seq or not standard_seq:
+    by_identity: dict[tuple[int, str, str | None], Mapping[str, object]] = {}
+    for item in image_index:
+        seq = _safe_int(item.get("frame_seq"))
+        if seq is None:
+            continue
+        kind = str(item.get("kind") or "").casefold()
+        field = None if item.get("field") in {None, ""} else str(item.get("field"))
+        by_identity[(seq, kind, field)] = item
+    paired = sorted(
+        seq
+        for seq in frames
+        if (seq, "raw_client", None) in by_identity
+        and (seq, "standardized", None) in by_identity
+    )
+    standard_equal: bool | None = None
+    standardized_images: dict[int, np.ndarray] = {}
+    if paired:
+        standard_equal = True
+        for seq in paired:
+            raw = _decode_indexed_image(support, by_identity[(seq, "raw_client", None)])
+            saved = _decode_indexed_image(
+                support,
+                by_identity[(seq, "standardized", None)],
+            )
+            regenerated = _regenerate_standardized(raw, frames[seq])
+            if regenerated is None or not np.array_equal(regenerated, saved):
+                standard_equal = False
+            standardized_images[seq] = saved
+    roi_entries = [
+        (identity, item)
+        for identity, item in by_identity.items()
+        if identity[1] == "roi"
+    ]
+    roi_equal: bool | None = None
+    if roi_entries:
+        roi_equal = True
+        for (seq, _kind, field), entry in roi_entries:
+            standard = standardized_images.get(seq)
+            if standard is None and (seq, "standardized", None) in by_identity:
+                standard = _decode_indexed_image(
+                    support,
+                    by_identity[(seq, "standardized", None)],
+                )
+                standardized_images[seq] = standard
+            artifact = _opening_artifact(frames.get(seq), "roi", field)
+            box = artifact.get("box") if isinstance(artifact, Mapping) else None
+            if standard is None or not _valid_box(box, standard):
+                roi_equal = False
+                continue
+            x, y, width, height = (int(value) for value in box)
+            expected = standard[y : y + height, x : x + width]
+            actual = _decode_indexed_image(support, entry, unchanged=True)
+            if not np.array_equal(expected, actual):
+                roi_equal = False
+    return standard_equal, roi_equal
+
+
+def _decode_indexed_image(
+    support: VerifiedSupport,
+    entry: Mapping[str, object],
+    *,
+    unchanged: bool = False,
+) -> np.ndarray:
+    name = _safe_archive_name(str(entry.get("archive_path") or ""))
+    content = support.payloads.get(name)
+    if content is None:
+        raise SupportReproError(f"indexed image is missing: {name}")
+    _image_header(content, name)
+    flag = cv2.IMREAD_UNCHANGED if unchanged else cv2.IMREAD_COLOR
+    image = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), flag)
+    if image is None or image.size == 0:
+        raise SupportReproError(f"support image is invalid: {name}")
+    return image
+
+
+def _regenerate_standardized(
+    raw: np.ndarray,
+    frame: Mapping[str, object],
+) -> np.ndarray | None:
+    capture = frame.get("capture")
+    standardization = (
+        capture.get("standardization") if isinstance(capture, Mapping) else None
+    )
+    if not isinstance(standardization, Mapping):
         return None
-    # Exact pixel regeneration is performed by a later layer when viewport
-    # parameters are available. Presence alone must never be labelled equal.
+    viewport = standardization.get("source_viewport")
+    content_box = standardization.get("content_box")
+    target_size = standardization.get("standardized_size")
+    if not _valid_box(viewport, raw) or not (
+        isinstance(content_box, list) and len(content_box) == 4
+    ):
+        return None
+    try:
+        vx, vy, vw, vh = (int(value) for value in viewport)
+        cx, cy, cw, ch = (int(value) for value in content_box)
+        width, height = (int(value) for value in target_size)
+    except (TypeError, ValueError):
+        return None
+    if min(cx, cy) < 0 or min(cw, ch, width, height) <= 0:
+        return None
+    if cx + cw > width or cy + ch > height:
+        return None
+    interpolation_name = str(standardization.get("interpolation") or "")
+    interpolation = {
+        "INTER_AREA": cv2.INTER_AREA,
+        "INTER_LINEAR": cv2.INTER_LINEAR,
+    }.get(interpolation_name)
+    if interpolation is None:
+        return None
+    crop = raw[vy : vy + vh, vx : vx + vw]
+    resized = cv2.resize(crop, (cw, ch), interpolation=interpolation)
+    shape = (height, width, *resized.shape[2:])
+    canvas = np.zeros(shape, dtype=resized.dtype)
+    canvas[cy : cy + ch, cx : cx + cw] = resized
+    return canvas
+
+
+def _valid_box(value: object, image: np.ndarray) -> bool:
+    if not isinstance(value, list) or len(value) != 4:
+        return False
+    try:
+        x, y, width, height = (int(item) for item in value)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        x >= 0
+        and y >= 0
+        and width > 0
+        and height > 0
+        and x + width <= image.shape[1]
+        and y + height <= image.shape[0]
+    )
+
+
+def _opening_artifact(
+    frame: Mapping[str, object] | None,
+    kind: str,
+    field: str | None,
+) -> Mapping[str, object] | None:
+    artifacts = frame.get("artifacts") if isinstance(frame, Mapping) else None
+    for item in artifacts or []:
+        if not isinstance(item, Mapping):
+            continue
+        item_field = None if item.get("field") in {None, ""} else str(item.get("field"))
+        if str(item.get("kind") or "").casefold() == kind and item_field == field:
+            return item
     return None
 
 
@@ -619,32 +1231,7 @@ def _local_resource_identity(recognizer: object) -> dict[str, object] | None:
     profile_name = getattr(annotation, "profile_name", None)
     if profiles_root is None or profile_name is None:
         return None
-    root = Path(profiles_root) / str(profile_name)
-    try:
-        files = [
-            path
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-            and (
-                path.name in {"profile.json", "regions_config.json", "templates_config.json"}
-                or "templates" in path.relative_to(root).parts
-            )
-        ]
-        records = [
-            {
-                "path": path.relative_to(root).as_posix(),
-                "bytes": path.stat().st_size,
-                "sha256": _sha256_file(path),
-            }
-            for path in files
-        ]
-        return {
-            "status": "identified",
-            "sha256": hashlib.sha256(_canonical_json(records)).hexdigest(),
-            "files": records,
-        }
-    except OSError:
-        return {"status": "unavailable"}
+    return recognition_resource_identity(Path(profiles_root), str(profile_name))
 
 
 def _default_recognizer_factory() -> object:
@@ -756,6 +1343,7 @@ __all__ = [
     "VerifiedSupport",
     "compare_repro_reports",
     "reproduce_support_bundle",
+    "reproduce_support_suite",
     "run_child_probe",
     "verify_support_archive",
     "write_truth_annotation",

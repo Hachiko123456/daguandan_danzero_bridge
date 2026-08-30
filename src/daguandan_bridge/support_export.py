@@ -11,9 +11,10 @@ atomic ZIP publication to :mod:`daguandan_bridge.support_bundle`.
 """
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import tempfile
@@ -386,45 +387,109 @@ def _collect_opening_images(
     include_frames: bool,
     include_roi: bool,
 ) -> tuple[SupportImageSource, ...]:
-    monotonic_by_seq = _monotonic_by_frame_seq(evidence)
-    candidates: list[tuple[Path, int, int, str, str | None]] = []
-    if include_frames:
-        frames_root = incident_root / "frames"
-        for path in _safe_image_files(frames_root):
-            match = _FRAME_IMAGE.fullmatch(path.name)
-            if match is None:
+    if not isinstance(evidence, Mapping):
+        raise SupportBundleError(
+            "opening image export requires opening_evidence.json artifact declarations"
+        )
+    frames = evidence.get("frames")
+    if not isinstance(frames, list):
+        raise SupportBundleError("opening evidence frame artifact list is invalid")
+    candidates: list[
+        tuple[Path, int, int, str, str | None, str, str, str, str | None]
+    ] = []
+    declared_selected: set[str] = set()
+    for raw_frame in frames:
+        if not isinstance(raw_frame, Mapping):
+            raise SupportBundleError("opening evidence frame record is invalid")
+        try:
+            seq = int(raw_frame.get("seq", raw_frame.get("frame_seq")))
+            monotonic_ms = int(raw_frame.get("monotonic_ms"))
+        except (TypeError, ValueError) as exc:
+            raise SupportBundleError("opening evidence frame identity is invalid") from exc
+        if seq < 0 or monotonic_ms < 0:
+            raise SupportBundleError("opening evidence frame identity is negative")
+        frame_id = str(raw_frame.get("frame_id") or "") or None
+        artifacts = raw_frame.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise SupportBundleError("opening evidence frame artifacts are missing")
+        for raw_artifact in artifacts:
+            if not isinstance(raw_artifact, Mapping):
+                raise SupportBundleError("opening evidence artifact record is invalid")
+            try:
+                artifact_seq = int(raw_artifact.get("frame_seq"))
+            except (TypeError, ValueError) as exc:
+                raise SupportBundleError("opening artifact frame_seq is invalid") from exc
+            if artifact_seq != seq:
+                raise SupportBundleError("opening artifact frame_seq does not match its frame")
+            artifact_frame_id = str(raw_artifact.get("frame_id") or "") or None
+            if frame_id is not None and artifact_frame_id != frame_id:
+                raise SupportBundleError("opening artifact frame_id does not match its frame")
+            kind = str(raw_artifact.get("kind") or "").strip().lower()
+            field = (
+                str(raw_artifact.get("field")).strip()
+                if raw_artifact.get("field") not in {None, ""}
+                else None
+            )
+            if kind not in {"raw_client", "standardized", "roi"}:
+                raise SupportBundleError("opening artifact kind is invalid")
+            if (kind == "roi") != (field is not None):
+                raise SupportBundleError("opening artifact field/kind declaration is invalid")
+            selected = (kind in {"raw_client", "standardized"} and include_frames) or (
+                kind == "roi" and include_roi
+            )
+            if not selected:
                 continue
-            kind = match.group(1).lower()
-            seq = int(match.group(2))
+            portable = _portable_incident_artifact_path(raw_artifact.get("path"))
+            expected_root = "roi" if kind == "roi" else "frames"
+            if not portable.parts or portable.parts[0] != expected_root:
+                raise SupportBundleError("opening artifact path does not match its kind")
+            source = _safe_source_file(incident_root, Path(*portable.parts))
+            if source is None:
+                raise SupportBundleError(f"declared opening artifact is missing: {portable}")
+            file_sha = str(raw_artifact.get("sha256") or "")
+            pixel_sha = str(raw_artifact.get("pixel_sha256") or "")
+            _verify_incident_artifact(
+                source,
+                raw_artifact,
+                expected_file_sha=file_sha,
+                expected_pixel_sha=pixel_sha,
+            )
+            identity = portable.as_posix().casefold()
+            if identity in declared_selected:
+                raise SupportBundleError(f"duplicate opening artifact path: {portable}")
+            declared_selected.add(identity)
             candidates.append(
                 (
-                    path,
+                    source,
                     seq,
-                    monotonic_by_seq.get(seq, 0),
+                    monotonic_ms,
                     kind,
-                    None,
-                )
-            )
-    if include_roi:
-        roi_root = incident_root / "roi"
-        for path in _safe_image_files(roi_root):
-            match = _ROI_IMAGE.fullmatch(path.name)
-            if match is None:
-                continue
-            field = match.group(1)
-            seq = int(match.group(2))
-            candidates.append(
-                (
-                    path,
-                    seq,
-                    monotonic_by_seq.get(seq, 0),
-                    "roi",
                     field,
+                    portable.as_posix(),
+                    file_sha,
+                    pixel_sha,
+                    frame_id,
                 )
             )
+    _reject_unmanifested_opening_images(
+        incident_root,
+        declared_selected,
+        include_frames=include_frames,
+        include_roi=include_roi,
+    )
     images: list[SupportImageSource] = []
-    for index, (source, seq, monotonic_ms, kind, field) in enumerate(
-        sorted(candidates, key=lambda item: (item[1], item[3], item[4] or "", item[0].name)),
+    for index, (
+        source,
+        seq,
+        monotonic_ms,
+        kind,
+        field,
+        incident_path,
+        file_sha,
+        pixel_sha,
+        frame_id,
+    ) in enumerate(
+        sorted(candidates, key=lambda item: (item[1], item[3], item[4] or "", item[5])),
         start=1,
     ):
         destination = Path("sensitive") / f"image_{index:06d}{source.suffix.lower()}"
@@ -439,9 +504,86 @@ def _collect_opening_images(
                 monotonic_ms=monotonic_ms,
                 kind=kind,
                 field=field,
+                incident_path=incident_path,
+                incident_sha256=file_sha,
+                incident_pixel_sha256=pixel_sha,
+                frame_id=frame_id,
             )
         )
     return tuple(images)
+
+
+def _portable_incident_artifact_path(value: object) -> PurePosixPath:
+    raw = str(value or "")
+    if not raw or "\\" in raw or ":" in raw or raw.startswith("/"):
+        raise SupportBundleError("opening artifact path is unsafe")
+    path = PurePosixPath(raw)
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise SupportBundleError("opening artifact path is unsafe")
+    if path.suffix.lower() not in _IMAGE_SUFFIXES:
+        raise SupportBundleError("opening artifact is not a supported image")
+    return path
+
+
+def _verify_incident_artifact(
+    path: Path,
+    artifact: Mapping[str, object],
+    *,
+    expected_file_sha: str,
+    expected_pixel_sha: str,
+) -> None:
+    if re.fullmatch(r"[0-9a-f]{64}", expected_file_sha) is None or re.fullmatch(
+        r"[0-9a-f]{64}", expected_pixel_sha
+    ) is None:
+        raise SupportBundleError("opening artifact hashes are invalid")
+    size = int(path.stat().st_size)
+    try:
+        declared_size = int(artifact.get("bytes"))
+    except (TypeError, ValueError) as exc:
+        raise SupportBundleError("opening artifact byte count is invalid") from exc
+    if size != declared_size:
+        raise SupportBundleError(f"opening artifact size changed: {path.name}")
+    with path.open("rb") as handle:
+        content = handle.read(_MAX_STAGE_FILE_BYTES + 1)
+    if len(content) != size or len(content) > _MAX_STAGE_FILE_BYTES:
+        raise SupportBundleError(f"opening artifact changed while reading: {path.name}")
+    if hashlib.sha256(content).hexdigest() != expected_file_sha:
+        raise SupportBundleError(f"opening artifact file hash changed: {path.name}")
+    try:
+        import cv2
+        import numpy as np
+
+        decoded = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    except Exception as exc:
+        raise SupportBundleError(f"opening artifact cannot be decoded: {path.name}") from exc
+    if decoded is None or decoded.size == 0:
+        raise SupportBundleError(f"opening artifact cannot be decoded: {path.name}")
+    if hashlib.sha256(decoded.tobytes(order="C")).hexdigest() != expected_pixel_sha:
+        raise SupportBundleError(f"opening artifact pixel hash changed: {path.name}")
+
+
+def _reject_unmanifested_opening_images(
+    incident_root: Path,
+    declared: set[str],
+    *,
+    include_frames: bool,
+    include_roi: bool,
+) -> None:
+    roots = []
+    if include_frames:
+        roots.append(incident_root / "frames")
+    if include_roi:
+        roots.append(incident_root / "roi")
+    actual = {
+        path.relative_to(incident_root).as_posix().casefold()
+        for root in roots
+        for path in _safe_image_files(root)
+    }
+    extras = sorted(actual - declared)
+    if extras:
+        raise SupportBundleError(
+            f"opening incident contains unmanifested image artifacts: {extras}"
+        )
 
 
 def _monotonic_by_frame_seq(

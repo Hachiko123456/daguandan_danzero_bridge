@@ -35,6 +35,22 @@ def _png(path: Path, value: int) -> Path:
     return path
 
 
+def _artifact(path: Path, *, root: Path, frame_id: str, seq: int, kind: str, field=None):
+    content = path.read_bytes()
+    decoded = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert decoded is not None
+    return {
+        "frame_id": frame_id,
+        "frame_seq": seq,
+        "kind": kind,
+        "field": field,
+        "path": path.relative_to(root).as_posix(),
+        "bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "pixel_sha256": hashlib.sha256(decoded.tobytes(order="C")).hexdigest(),
+    }
+
+
 def _archive(path: Path) -> tuple[dict[str, bytes], dict[str, object]]:
     with zipfile.ZipFile(path) as archive:
         assert archive.testzip() is None
@@ -63,16 +79,45 @@ def _diagnostic_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     latest = incidents / "OPEN-latest"
     _json(old / "incident.json", {"code": "OPENING-OLD", "monotonic_ms": 100})
     _json(latest / "incident.json", {"code": "OPENING-LEVEL-MISSING", "monotonic_ms": 200})
+    raw_path = _png(latest / "frames" / "raw_client_000007.png", 30)
+    standard_path = _png(latest / "frames" / "standardized_000007.png", 60)
+    roi_path = _png(latest / "roi" / "level_rank_000007.png", 90)
+    frame_id = "frame-7"
     _json(
         latest / "opening_evidence.json",
         {
             "schema": "guandan.opening-evidence/1",
             "frames": [
                 {
+                    "frame_id": frame_id,
                     "seq": 7,
                     "monotonic_ms": 1_234,
                     "wall_time": "2026-08-31T00:00:00+08:00",
                     "capture": {"backend": "printwindow", "dpi": 120},
+                    "artifacts": [
+                        _artifact(
+                            raw_path,
+                            root=latest,
+                            frame_id=frame_id,
+                            seq=7,
+                            kind="raw_client",
+                        ),
+                        _artifact(
+                            standard_path,
+                            root=latest,
+                            frame_id=frame_id,
+                            seq=7,
+                            kind="standardized",
+                        ),
+                        _artifact(
+                            roi_path,
+                            root=latest,
+                            frame_id=frame_id,
+                            seq=7,
+                            kind="roi",
+                            field="level_rank",
+                        ),
+                    ],
                 }
             ],
         },
@@ -89,10 +134,6 @@ def _diagnostic_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         json.dumps({"frame_seq": 7, "result": "blocked"}) + "\n",
         encoding="utf-8",
     )
-    _png(latest / "frames" / "raw_client_000007.png", 30)
-    _png(latest / "frames" / "standardized_000007.png", 60)
-    _png(latest / "roi" / "level_rank_000007.png", 90)
-
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     _json(
@@ -186,6 +227,66 @@ def test_collector_opt_in_emits_trace_and_correlated_image_index(tmp_path: Path)
             entries[item["archive_path"]]
         ).hexdigest()
     assert manifest["privacy"]["contains_sensitive_images"] is True
+
+
+def test_e012_replaced_or_injected_opening_artifacts_are_rejected(tmp_path: Path) -> None:
+    run, bundle, session, latest = _diagnostic_tree(tmp_path)
+    target = latest / "frames" / "standardized_000007.png"
+    target.write_bytes(_png(tmp_path / "replacement.png", 61).read_bytes())
+    with pytest.raises(SupportBundleError, match="artifact .*changed"):
+        export_collected_support_bundle(
+            SupportExportRequest(
+                destination=tmp_path / "replaced.zip",
+                diagnostics_run_directory=run,
+                bundle_root=bundle,
+                session_directory=session,
+                include_frames=True,
+            )
+        )
+
+    run, bundle, session, latest = _diagnostic_tree(tmp_path / "injected")
+    _png(latest / "frames" / "injected_000007.png", 62)
+    with pytest.raises(SupportBundleError, match="unmanifested"):
+        export_collected_support_bundle(
+            SupportExportRequest(
+                destination=tmp_path / "injected.zip",
+                diagnostics_run_directory=run,
+                bundle_root=bundle,
+                session_directory=session,
+                include_frames=True,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("frame_seq", 8, "frame_seq"),
+        ("kind", "roi", "field/kind"),
+        ("field", "level_rank", "field/kind"),
+    ],
+)
+def test_e012_artifact_identity_must_match_parent_and_kind(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    run, bundle, session, latest = _diagnostic_tree(tmp_path)
+    evidence_path = latest / "opening_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["frames"][0]["artifacts"][0][field] = value
+    _json(evidence_path, evidence)
+    with pytest.raises(SupportBundleError, match=message):
+        export_collected_support_bundle(
+            SupportExportRequest(
+                destination=tmp_path / "bad.zip",
+                diagnostics_run_directory=run,
+                bundle_root=bundle,
+                session_directory=session,
+                include_frames=True,
+            )
+        )
 
 
 def test_collector_falls_back_to_latest_sealed_session_incident(tmp_path: Path) -> None:

@@ -111,6 +111,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repro-repeats", type=int, default=20)
     parser.add_argument(
+        "--repro-role",
+        choices=("reference", "candidate", "unspecified"),
+        default="unspecified",
+        help="标记复现报告在修复门禁中的角色。",
+    )
+    parser.add_argument(
         "--repro-deterministic",
         action="store_true",
         help="复现时固定随机种子、OpenCV 单线程并关闭 OpenCL。",
@@ -188,20 +194,35 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(truth, ensure_ascii=False, indent=2))
         return 0
     if args.repro_support is not None or args._repro_probe is not None:
-        from daguandan_bridge.support_repro import reproduce_support_bundle
+        from daguandan_bridge.support_repro import (
+            reproduce_support_bundle,
+            reproduce_support_suite,
+        )
 
         support_path = args.repro_support or args._repro_probe
         output_path = args.repro_output
         expected_hand = _parse_expected_hand(args.expected_hand)
-        report = reproduce_support_bundle(
-            support_path,
-            output_path=output_path,
-            truth_path=args.repro_truth,
-            expected_level=args.expected_level,
-            expected_hand=expected_hand,
-            repeats=args.repro_repeats,
-            deterministic=bool(args.repro_deterministic or args._repro_probe is not None),
-        )
+        if args._repro_probe is not None:
+            report = reproduce_support_bundle(
+                support_path,
+                output_path=output_path,
+                truth_path=args.repro_truth,
+                expected_level=args.expected_level,
+                expected_hand=expected_hand,
+                repeats=args.repro_repeats,
+                deterministic=True,
+                role=args.repro_role,
+            )
+        else:
+            report = reproduce_support_suite(
+                support_path,
+                output_path=output_path,
+                truth_path=args.repro_truth,
+                expected_level=args.expected_level,
+                expected_hand=expected_hand,
+                repeats=args.repro_repeats,
+                role=args.repro_role,
+            )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if args.export_support is not None:

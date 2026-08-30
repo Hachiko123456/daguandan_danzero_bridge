@@ -135,6 +135,12 @@ class SupportImageSource:
     monotonic_ms: int
     kind: str
     field: str | None = None
+    # Immutable identity from the selected incident's artifact manifest.
+    # Generic callers may omit it; SupportExportService always supplies it.
+    incident_path: str | None = None
+    incident_sha256: str | None = None
+    incident_pixel_sha256: str | None = None
+    frame_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +175,10 @@ class _NormalizedImageSource:
     kind: str
     field: str | None
     archive_stem: str
+    incident_path: str | None
+    incident_sha256: str | None
+    incident_pixel_sha256: str | None
+    frame_id: str | None
 
 
 @dataclass
@@ -650,6 +660,19 @@ def _normalized_image_sources(
             raise SupportBundleError("support image field is not a safe diagnostic identifier")
         if kind != "roi" and field is not None:
             raise SupportBundleError("only ROI support images may declare a field")
+        incident_path = None
+        if image.incident_path not in {None, ""}:
+            incident_path = _validated_archive_path(
+                str(image.incident_path).replace("\\", "/")
+            )
+        for label, digest in (
+            ("incident_sha256", image.incident_sha256),
+            ("incident_pixel_sha256", image.incident_pixel_sha256),
+        ):
+            if digest not in {None, ""} and re.fullmatch(
+                r"[0-9a-f]{64}", str(digest)
+            ) is None:
+                raise SupportBundleError(f"support image {label} is not SHA256")
         identity = (kind, int(image.frame_seq), field)
         if identity in seen:
             raise SupportBundleError(
@@ -665,6 +688,20 @@ def _normalized_image_sources(
                 kind=kind,
                 field=field,
                 archive_stem=compatibility_stem or kind,
+                incident_path=incident_path,
+                incident_sha256=(
+                    str(image.incident_sha256)
+                    if image.incident_sha256 not in {None, ""}
+                    else None
+                ),
+                incident_pixel_sha256=(
+                    str(image.incident_pixel_sha256)
+                    if image.incident_pixel_sha256 not in {None, ""}
+                    else None
+                ),
+                frame_id=(
+                    str(image.frame_id) if image.frame_id not in {None, ""} else None
+                ),
             )
         )
     return tuple(normalized)
@@ -736,6 +773,17 @@ def _append_structured_image_payloads(
             capability = "frames"
         archive_path = _validated_archive_path(archive_path)
         source_sha256 = hashlib.sha256(content).hexdigest()
+        if image.incident_sha256 is not None and image.incident_sha256 != source_sha256:
+            raise SupportBundleError(
+                f"incident artifact file hash changed before export: {relative}"
+            )
+        if (
+            image.incident_pixel_sha256 is not None
+            and image.incident_pixel_sha256 != pixel_sha256
+        ):
+            raise SupportBundleError(
+                f"incident artifact pixel hash changed before export: {relative}"
+            )
         budget.add_payload(len(content), relative)
         payloads.append(
             _Payload(
@@ -759,6 +807,9 @@ def _append_structured_image_payloads(
                 "height": height,
                 "channels": channels,
                 "dtype": dtype,
+                "incident_path": image.incident_path,
+                "incident_sha256": image.incident_sha256,
+                "frame_id": image.frame_id,
             }
         )
     return index_entries

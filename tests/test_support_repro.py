@@ -40,7 +40,10 @@ def _support_zip(tmp_path: Path, *, undeclared: bool = False) -> Path:
             {
                 "schema": "guandan.opening-evidence/1",
                 "resource_identity": {"status": "identified", "sha256": "remote"},
-                "frames": [],
+                "frames": [
+                    {"seq": index, "anchor_score": 0.90, "capture": {}}
+                    for index in (1, 2)
+                ],
             }
         ).encode(),
         "repro/repro.json": json.dumps(
@@ -181,13 +184,17 @@ def test_old_new_gate_requires_same_support_failure_then_correct_20_of_20(tmp_pa
         expected_level="7",
         repeats=20,
         recognizer_factory=lambda: _Recognizer("2"),
+        role="reference",
     )
     candidate = reproduce_support_bundle(
         support,
         expected_level="7",
         repeats=20,
         recognizer_factory=lambda: _Recognizer("7"),
+        role="candidate",
     )
+    reference["runner"]["build_id"] = "BUILD-reference"
+    candidate["runner"]["build_id"] = "BUILD-candidate"
 
     gate = compare_repro_reports(reference, candidate)
 
