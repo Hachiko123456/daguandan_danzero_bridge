@@ -95,6 +95,43 @@ def test_advice_log_keeps_full_engine_input(tmp_path):
     assert record["timings"]["agent_step"] == 12.5
 
 
+def test_runtime_identity_updates_merge_without_replacing_first_run_fields(tmp_path):
+    store = LiveSessionStore(tmp_path, "profile", session_id="identity-merge")
+    store.start(
+        {
+            "runtime_identity": {
+                "schema": "guandan.runtime-identity/1",
+                "run_id": "RUN-FIRST",
+                "implementation_fingerprint": "initial-fingerprint",
+                "executable_path": "DaguandanAssistant.exe",
+                "build": {"status": "identified", "build_id": "BUILD-1"},
+            }
+        }
+    )
+
+    store.update_runtime_identity(
+        {
+            "implementation_fingerprint": "later-fingerprint",
+            "executable_path": "C:/Users/private/python.exe",
+            "orchestrator_probe": "available",
+            "build": {"extra": "preserved"},
+        }
+    )
+
+    identity = json.loads(store.manifest_path.read_text(encoding="utf-8"))[
+        "runtime_identity"
+    ]
+    assert identity["run_id"] == "RUN-FIRST"
+    assert identity["implementation_fingerprint"] == "initial-fingerprint"
+    assert identity["executable_path"] == "DaguandanAssistant.exe"
+    assert identity["orchestrator_probe"] == "available"
+    assert identity["build"] == {
+        "status": "identified",
+        "build_id": "BUILD-1",
+        "extra": "preserved",
+    }
+
+
 def test_decision_upsert_keeps_one_correlated_record(tmp_path):
     store = LiveSessionStore(tmp_path, "profile", session_id="decision-test")
     store.start({})

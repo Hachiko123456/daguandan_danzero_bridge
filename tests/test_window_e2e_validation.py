@@ -247,13 +247,39 @@ def test_package_script_keeps_default_and_accepts_explicit_release_root():
     )
 
     assert "[string] $ReleaseRoot" in script
-    assert '$releaseRoot = Join-Path $projectRoot "release"' in script
-    assert "$distPath = Join-Path $releaseRoot \"dist\"" in script
-    assert "$workPath = Join-Path $releaseRoot \"build\"" in script
-    assert "$specPath = Join-Path $releaseRoot \"spec\"" in script
-    assert "$payloadPath = Join-Path $releaseRoot \"payload\"" in script
+    assert "[switch] $AllowDirtyDevelopmentBuild" in script
+    assert '$releaseRoot = Join-Path $projectRoot "artifacts\\release"' in script
+    assert 'Resolve-ManagedChildPath -Root $releaseRoot' in script
+    assert ".daguandan-release-root" in script
+    assert "guandan.package-release-root/1" in script
+    assert "Existing non-empty ReleaseRoot is not owned" in script
+    assert "Assert-NoReparsePathChain" in script
+    assert "Assert-NoReparseTree" in script
+    assert "--porcelain=v1 --untracked-files=all" in script
+    assert "Source tree is dirty" in script
+    assert script.index("$sourceTreeDirty") < script.index(
+        "[System.IO.Directory]::CreateDirectory($releaseRoot)"
+    )
+    assert script.index("Assert-NoReparseTree -LiteralPath $path") < script.index(
+        "Remove-Item -LiteralPath $path -Recurse -Force"
+    )
     assert '"--collect-submodules", "rlcard"' in script
     assert '"--collect-data", "rlcard"' in script
+    assert '"--noupx"' in script
+    assert '"_internal\\icuuc.dll"' in script
+    assert '"_internal\\icudt78.dll"' in script
+    assert "generate_build_manifest.py" in script
+    assert "build_manifest.json" in script
+    assert 'Resolve-ManagedChildPath -Root $releaseRoot -Child "$archivePath.sha256"' in script
+    assert "DaguandanAssistant.release.json" in script
+    assert "Collect_Diagnostics.bat" in script
+
+    launcher = (PROJECT_ROOT / "package_release.bat").read_text(encoding="utf-8")
+    assert "artifacts\\release\\dist\\DaguandanAssistant" in launcher
+    assert "artifacts\\release\\DaguandanAssistant.zip" in launcher
+
+    gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "/artifacts/" in gitignore
 
 
 def _profile_fixture(path: Path) -> Path:

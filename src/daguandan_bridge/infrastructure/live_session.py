@@ -21,6 +21,7 @@ from ..live.orchestrator import LiveOrchestrator
 from ..live.recorder import InMemorySessionRecorder, SessionRecorder
 from ..live.reducer import LiveReducer
 from ..live.session_store import InMemoryLiveSessionStore, LiveSessionStore
+from ..runtime_identity import get_runtime_identity
 
 
 @dataclass
@@ -347,6 +348,7 @@ def build_session_manifest(config_path: Path, templates_path: Path) -> dict[str,
         "owner_pid": os.getpid(),
         "configuration_hash": _file_hash(config_path),
         "template_manifest_hash": _file_hash(templates_path),
+        "runtime_identity": get_runtime_identity(),
         "target_fps": 10,
         "codec": "MJPG",
     }

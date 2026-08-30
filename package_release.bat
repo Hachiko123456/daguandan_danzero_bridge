@@ -9,6 +9,6 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Packaging complete. Release: release\dist\DaguandanAssistant
-echo Archive: release\DaguandanAssistant.zip
+echo Packaging complete. Release: artifacts\release\dist\DaguandanAssistant
+echo Archive: artifacts\release\DaguandanAssistant.zip
 pause

@@ -74,6 +74,23 @@ def read_json_lines(path: Path) -> list[dict[str, object]]:
     return records
 
 
+def _merge_identity(
+    existing: dict[str, object],
+    additional: dict[str, object],
+) -> dict[str, object]:
+    """Add newly observed identity fields without rewriting first-run facts."""
+
+    merged = dict(existing)
+    for key, value in additional.items():
+        if key not in merged:
+            merged[key] = value
+            continue
+        current = merged[key]
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_identity(current, value)
+    return merged
+
+
 class LiveSessionStore:
     """Own all append-only diagnostics for exactly one game session."""
 
@@ -247,7 +264,13 @@ class LiveSessionStore:
     def update_runtime_identity(self, identity: dict[str, object]) -> None:
         with self._lock:
             self._ensure_writable()
-            self._update_manifest({"runtime_identity": dict(identity)})
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            current = manifest.get("runtime_identity")
+            manifest["runtime_identity"] = _merge_identity(
+                current if isinstance(current, dict) else {},
+                dict(identity),
+            )
+            atomic_write_json(self.manifest_path, manifest)
 
     def update_session_metadata(self, metadata: dict[str, object]) -> None:
         """Attach lifecycle metadata without mutating append-only evidence."""

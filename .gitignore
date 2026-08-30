@@ -30,6 +30,7 @@ junit*.xml
 build/
 dist/
 release/
+/artifacts/
 *.egg-info/
 .worktrees/
 .superpowers/

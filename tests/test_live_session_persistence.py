@@ -12,7 +12,10 @@ from daguandan_bridge.advisor_strategy import (
     save_profile_recording_mode,
     save_profile_session_data_recording_enabled,
 )
-from daguandan_bridge.infrastructure.live_session import DefaultLiveSessionFactory
+from daguandan_bridge.infrastructure.live_session import (
+    DefaultLiveSessionFactory,
+    build_session_manifest,
+)
 from daguandan_bridge.live.recorder import InMemorySessionRecorder
 from daguandan_bridge.live.session_store import InMemoryLiveSessionStore, read_json_lines
 
@@ -73,6 +76,21 @@ def test_session_data_preference_defaults_on_and_persists_false(tmp_path):
     ) is False
     assert load_profile_session_data_recording_enabled(tmp_path, profile.name) is False
     assert json.loads((profile / "profile.json").read_text("utf-8"))["save_session_data"] is False
+
+
+def test_session_manifest_contains_runtime_identity_on_first_write(tmp_path):
+    config = tmp_path / "profile.json"
+    templates = tmp_path / "templates_config.json"
+    config.write_text("{}", encoding="utf-8")
+    templates.write_text("{}", encoding="utf-8")
+
+    manifest = build_session_manifest(config, templates)
+
+    identity = manifest["runtime_identity"]
+    assert identity["schema"] == "guandan.runtime-identity/1"
+    assert identity["run_id"]
+    assert identity["implementation_fingerprint"]
+    assert Path(str(identity["executable_path"])).name == identity["executable_path"]
 
 
 def test_recording_mode_upgrades_the_legacy_boolean_and_persists_all(tmp_path):
