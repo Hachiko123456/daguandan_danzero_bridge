@@ -73,6 +73,17 @@ def test_collect_toc_provenance_detects_conflicting_sources(tmp_path):
     assert provenance["pyside6/qt6core.dll"] == str(source.resolve())
 
 
+def test_provenance_identity_canonicalizes_source_before_comparison(tmp_path):
+    source = tmp_path / "venv" / "Lib" / "module.dll"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"dll")
+    logical_alias = source.parent / ".." / "Lib" / "module.dll"
+
+    assert audit_module._path_identity(source) == audit_module._path_identity(
+        logical_alias
+    )
+
+
 def test_windows_media_and_system_icu_imports_are_not_reported_missing(
     tmp_path,
     monkeypatch,

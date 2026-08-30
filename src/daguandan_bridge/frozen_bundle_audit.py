@@ -397,7 +397,11 @@ def _error(code: str, path: str, evidence: Mapping[str, object]) -> dict[str, ob
 
 
 def _path_identity(value: Path | str) -> str:
-    return os.path.normcase(os.path.abspath(str(value)))
+    # Windows packaged-app LocalAppData may expose the same physical file via
+    # both the logical user path and Packages/.../LocalCache.  Provenance is
+    # stored resolved, so comparisons must use the same canonicalization on
+    # both sides; distinct physical sources still retain distinct identities.
+    return os.path.normcase(str(Path(value).resolve(strict=False)))
 
 
 def _sha256_file(path: Path) -> str:
