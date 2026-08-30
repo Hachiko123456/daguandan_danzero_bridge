@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import daguandan_bridge.frozen_bundle_audit as audit_module
 from daguandan_bridge.frozen_bundle_audit import (
     audit_frozen_bundle,
     collect_pyinstaller_provenance,
@@ -56,10 +57,46 @@ def test_collect_toc_provenance_detects_conflicting_sources(tmp_path):
     source.parent.mkdir(parents=True)
     source.write_bytes(b"dll")
     (work / "Analysis-00.toc").write_text(
-        repr([("_internal/PySide6/Qt6Core.dll", str(source), "BINARY")]),
+        repr(
+            [
+                ("struct", str(tmp_path / "one" / "struct.py"), "PYMODULE"),
+                ("struct", str(tmp_path / "two" / "struct.py"), "PYMODULE"),
+                ("PySide6/Qt6Core.dll", str(source), "BINARY"),
+            ]
+        ),
         encoding="utf-8",
     )
 
     provenance = collect_pyinstaller_provenance(work)
 
     assert provenance["_internal/pyside6/qt6core.dll"] == str(source.resolve())
+    assert provenance["pyside6/qt6core.dll"] == str(source.resolve())
+
+
+def test_windows_media_and_system_icu_imports_are_not_reported_missing(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = tmp_path / "bundle"
+    target = bundle / "_internal" / "module.pyd"
+    source = tmp_path / "venv" / "Lib" / "site-packages" / "module.pyd"
+    _fake_pe(target)
+    _fake_pe(source)
+    monkeypatch.setattr(
+        audit_module,
+        "_pe_metadata",
+        lambda _path: (["MFPlat.dll", "icuuc.dll", "not_bundled.dll"], [".text"], None),
+    )
+
+    result = audit_frozen_bundle(
+        bundle,
+        provenance={"_internal/module.pyd": str(source)},
+        allowed_venv_root=tmp_path / "venv",
+    )
+    missing = [
+        item["evidence"]["import"]
+        for item in result.document["errors"]
+        if item["code"] == "NATIVE-MISSING-IMPORT"
+    ]
+
+    assert missing == ["not_bundled.dll"]

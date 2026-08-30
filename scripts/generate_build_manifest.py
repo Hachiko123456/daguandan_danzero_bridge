@@ -16,10 +16,13 @@ if str(SRC_ROOT) not in sys.path:
 from daguandan_bridge.build_manifest import (  # noqa: E402
     BUILD_MANIFEST_FILENAME,
     BuildManifestError,
+    collect_release_build_inputs,
+    collect_source_identity,
     verify_build_manifest,
     write_build_manifest,
     write_release_record,
 )
+from daguandan_bridge.storage import atomic_write_json  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--output", type=Path)
     create.add_argument("--executable-name", default="DaguandanAssistant.exe")
     create.add_argument("--profile-name", default="tencent_daguandan")
+    create.add_argument("--source-identity", type=Path)
+    create.add_argument("--release-input-audit", type=Path)
+    create.add_argument("--native-audit", type=Path)
+
+    source = subparsers.add_parser(
+        "source-identity",
+        help="capture Git source identity before the sanitized build environment",
+    )
+    source.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
+    source.add_argument("--output", type=Path, required=True)
 
     verify = subparsers.add_parser("verify", help="verify files against a manifest")
     verify.add_argument("--bundle-root", type=Path, required=True)
@@ -63,12 +76,33 @@ def main(argv: list[str] | None = None) -> int:
                 if args.output is not None
                 else bundle_root / BUILD_MANIFEST_FILENAME
             )
+            if (args.release_input_audit is None) != (args.native_audit is None):
+                raise BuildManifestError(
+                    "release-input-audit and native-audit must be supplied together"
+                )
+            source_identity = (
+                _read_json_object(args.source_identity)
+                if args.source_identity is not None
+                else None
+            )
+            build_inputs = (
+                collect_release_build_inputs(
+                    args.project_root,
+                    bundle_root,
+                    release_input_audit=args.release_input_audit,
+                    native_audit=args.native_audit,
+                )
+                if args.release_input_audit is not None
+                else None
+            )
             document = write_build_manifest(
                 args.project_root,
                 bundle_root,
                 output,
                 executable_name=args.executable_name,
                 profile_name=args.profile_name,
+                source_identity=source_identity,
+                build_inputs=build_inputs,
             )
             print(
                 json.dumps(
@@ -76,6 +110,21 @@ def main(argv: list[str] | None = None) -> int:
                         "ok": True,
                         "build_id": document["build_id"],
                         "manifest": str(output),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        if args.command == "source-identity":
+            identity = collect_source_identity(args.project_root)
+            atomic_write_json(args.output, identity)
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "dirty": identity["dirty"],
+                        "output": str(args.output.resolve()),
                     },
                     ensure_ascii=False,
                 )
@@ -114,6 +163,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"build manifest error: {exc}", file=sys.stderr)
         return 2
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BuildManifestError(f"JSON input is unreadable: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise BuildManifestError(f"JSON input must be an object: {path.name}")
+    return value
 
 
 if __name__ == "__main__":

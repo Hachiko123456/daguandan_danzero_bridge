@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+import subprocess
 
+import pytest
+
+import daguandan_bridge.release_lock as release_lock
 from daguandan_bridge.release_lock import verify_release_inputs
 
 
@@ -34,8 +39,6 @@ def test_release_lock_has_hash_for_every_wheel():
 
 def test_prepared_release_wheelhouse_matches_all_committed_locks():
     if not WHEELHOUSE.is_dir():
-        import pytest
-
         pytest.skip("external release wheelhouse has not been prepared")
 
     report = verify_release_inputs(
@@ -45,3 +48,81 @@ def test_prepared_release_wheelhouse_matches_all_committed_locks():
     )
 
     assert report["status"] == "PASS", report["errors"]
+
+
+def test_installed_inventory_gate_rejects_any_extra_distribution(monkeypatch):
+    if not WHEELHOUSE.is_dir():
+        pytest.skip("external release wheelhouse has not been prepared")
+    wheel_lock = json.loads((PROJECT_ROOT / "wheelhouse.lock.json").read_text(encoding="utf-8"))
+    toolchain = json.loads(
+        (PROJECT_ROOT / "release_toolchain.lock.json").read_text(encoding="utf-8")
+    )
+    expected = {
+        release_lock._canonical_name(record["distribution"]): record["version"]
+        for record in wheel_lock["files"]
+    }
+    expected["pip"] = toolchain["tools"]["pip"]
+    monkeypatch.setattr(
+        release_lock,
+        "collect_installed_distributions",
+        lambda: dict(expected),
+    )
+    passed = verify_release_inputs(
+        project_root=PROJECT_ROOT,
+        wheelhouse_root=WHEELHOUSE,
+        python_executable=PROJECT_ROOT / ".venv" / "Scripts" / "python.exe",
+        verify_installed=True,
+    )
+    assert passed["status"] == "PASS", passed["errors"]
+    assert passed["installed_distributions"] == expected
+
+    monkeypatch.setattr(
+        release_lock,
+        "collect_installed_distributions",
+        lambda: {**expected, "unlocked-package": "1.0"},
+    )
+    failed = verify_release_inputs(
+        project_root=PROJECT_ROOT,
+        wheelhouse_root=WHEELHOUSE,
+        python_executable=PROJECT_ROOT / ".venv" / "Scripts" / "python.exe",
+        verify_installed=True,
+    )
+    assert failed["status"] == "FAIL"
+    issue = next(
+        item for item in failed["errors"] if item["code"] == "LOCK-INSTALLED-DISTRIBUTIONS"
+    )
+    assert issue["evidence"]["unexpected"] == ["unlocked-package"]
+
+
+def test_fresh_venv_uses_the_hash_locked_python_launcher_and_pip(tmp_path):
+    bootstrap = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    build_env = tmp_path / "build-env"
+    created = subprocess.run(
+        [str(bootstrap), "-I", "-m", "venv", str(build_env)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    build_python = build_env / "Scripts" / "python.exe"
+    toolchain = json.loads(
+        (PROJECT_ROOT / "release_toolchain.lock.json").read_text(encoding="utf-8")
+    )
+    assert hashlib.sha256(build_python.read_bytes()).hexdigest() == (
+        toolchain["python_executable"]["sha256"]
+    )
+    queried = subprocess.run(
+        [
+            str(build_python),
+            "-I",
+            "-c",
+            "import importlib.metadata; print(importlib.metadata.version('pip'))",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert queried.returncode == 0, queried.stderr
+    assert queried.stdout.strip() == toolchain["tools"]["pip"]

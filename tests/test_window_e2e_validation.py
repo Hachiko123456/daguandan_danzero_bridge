@@ -241,33 +241,44 @@ def test_run_help_exposes_both_phase_three_routes():
     assert "--window-e2e-validation-config" in completed.stdout
 
 
-def test_package_script_keeps_default_and_accepts_explicit_release_root():
+def test_package_script_requires_unique_external_offline_roots_and_clean_build_env():
     script = (PROJECT_ROOT / "scripts" / "package_release.ps1").read_text(
         encoding="utf-8"
     )
 
     assert "[string] $ReleaseRoot" in script
+    assert "[string] $WheelhouseRoot" in script
+    assert script.count("[Parameter(Mandatory = $true)]") >= 2
     assert "[switch] $AllowDirtyDevelopmentBuild" in script
-    assert '$releaseRoot = Join-Path $projectRoot "artifacts\\release"' in script
+    assert "ReleaseRoot must be unique and must not already exist" in script
+    assert "Assert-DisjointRoots" in script
     assert 'Resolve-ManagedChildPath -Root $releaseRoot' in script
     assert ".daguandan-release-root" in script
-    assert "guandan.package-release-root/1" in script
-    assert "Existing non-empty ReleaseRoot is not owned" in script
+    assert "guandan.package-release-root/2" in script
     assert "Assert-NoReparsePathChain" in script
     assert "Assert-NoReparseTree" in script
     assert "--porcelain=v1 --untracked-files=all" in script
     assert "Source tree is dirty" in script
-    assert script.index("$sourceTreeDirty") < script.index(
-        "[System.IO.Directory]::CreateDirectory($releaseRoot)"
-    )
-    assert script.index("Assert-NoReparseTree -LiteralPath $path") < script.index(
-        "Remove-Item -LiteralPath $path -Recurse -Force"
-    )
+    assert "-m venv $buildEnvPath" in script
+    assert "--isolated" in script
+    assert "--no-index" in script
+    assert "--require-hashes" in script
+    assert "--ignore-requires-python" in script
+    assert "--find-links $wheelhouseRoot" in script
+    assert "pip install --upgrade" not in script
+    assert "Remove-Item -LiteralPath $path -Recurse" not in script
+    assert "PYTHONPATH" in script
+    assert "QT_PLUGIN_PATH" in script
+    assert "QML2_IMPORT_PATH" in script
+    assert "JAVA_HOME" in script
+    assert "CONDA_PREFIX" in script
+    assert "POPPLER_PATH" in script
     assert '"--collect-submodules", "rlcard"' in script
     assert '"--collect-data", "rlcard"' in script
     assert '"--noupx"' in script
-    assert '"_internal\\icuuc.dll"' in script
-    assert '"_internal\\icudt78.dll"' in script
+    assert "audit_frozen_bundle.py" in script
+    assert "native_dependency_audit.json" in script
+    assert "Remove-Item -LiteralPath $file" not in script
     assert "generate_build_manifest.py" in script
     assert "build_manifest.json" in script
     assert 'Resolve-ManagedChildPath -Root $releaseRoot -Child "$archivePath.sha256"' in script
@@ -275,8 +286,8 @@ def test_package_script_keeps_default_and_accepts_explicit_release_root():
     assert "Collect_Diagnostics.bat" in script
 
     launcher = (PROJECT_ROOT / "package_release.bat").read_text(encoding="utf-8")
-    assert "artifacts\\release\\dist\\DaguandanAssistant" in launcher
-    assert "artifacts\\release\\DaguandanAssistant.zip" in launcher
+    assert "Usage: package_release.bat RELEASE_ROOT WHEELHOUSE_ROOT" in launcher
+    assert '-ReleaseRoot "%~1" -WheelhouseRoot "%~2"' in launcher
 
     gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "/artifacts/" in gitignore

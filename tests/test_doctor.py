@@ -190,7 +190,7 @@ def test_frozen_doctor_fails_when_build_manifest_is_missing_or_invalid(tmp_path)
     assert invalid_check["evidence"]["checked_files"] == 0
 
 
-def test_build_integrity_classifies_mutable_model_and_immutable_executable_tampering(
+def test_build_integrity_rejects_model_and_executable_tampering(
     tmp_path,
 ):
     root = _portable_root(tmp_path)
@@ -222,13 +222,10 @@ def test_build_integrity_classifies_mutable_model_and_immutable_executable_tampe
     )
     assert tampered_check["status"] == "FAIL"
     assert any(
-        "immutable bundle resource changed" in error
+        "best.npz" in error
         for error in tampered_check["evidence"]["errors"]
     )
-    assert any(
-        "best.npz" in difference
-        for difference in tampered_check["evidence"]["mutable_differences"]
-    )
+    assert tampered_check["evidence"]["mutable_differences"] == []
 
     executable = root / "DaguandanAssistant.exe"
     original = executable.read_bytes()

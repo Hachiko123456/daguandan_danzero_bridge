@@ -10,11 +10,13 @@ import pytest
 
 import daguandan_bridge.build_manifest as build_manifest_module
 from daguandan_bridge.build_manifest import (
+    BUILD_INPUTS_SCHEMA,
     BUILD_MANIFEST_FILENAME,
     BuildManifestError,
     RELEASE_RECORD_SCHEMA,
     SCHEMA,
     compute_build_id,
+    collect_release_build_inputs,
     load_build_manifest,
     verify_build_manifest,
     write_build_manifest,
@@ -86,6 +88,7 @@ def test_manifest_is_deterministic_portable_and_does_not_hash_itself(tmp_path: P
     assert first["schema"] == SCHEMA
     assert first["build_id"] == compute_build_id(first)
     assert first["source"] == SOURCE
+    assert first["pyinstaller"]["version"] == "6.21.0"
     assert first["executable"]["path"] == "DaguandanAssistant.exe"
     assert first["dependencies"] == DEPENDENCIES
     assert first["bundle_tree"]["file_count"] == 8
@@ -102,19 +105,146 @@ def test_manifest_is_deterministic_portable_and_does_not_hash_itself(tmp_path: P
     ]["classification"] == "profile_config"
     assert entries[
         "data/profiles/tencent_daguandan/profile.json"
-    ]["mutability"] == "mutable"
+    ]["mutability"] == "immutable"
     assert entries[
         "data/profiles/tencent_daguandan/templates/rank/3.png"
-    ]["mutability"] == "mutable"
+    ]["mutability"] == "immutable"
     assert entries[
         "data/profiles/tencent_daguandan/models/best.npz"
-    ]["mutability"] == "mutable"
+    ]["mutability"] == "immutable"
+    assert first["build_inputs"] == {
+        "schema": BUILD_INPUTS_SCHEMA,
+        "status": "not_provided",
+    }
     paths = {entry["path"] for entry in first["bundle_tree"]["files"]}
     assert BUILD_MANIFEST_FILENAME not in paths
     serialized = json.dumps(first, ensure_ascii=False)
     assert str(tmp_path) not in serialized
     assert "source-machine-specific-name" not in serialized
     assert not list(bundle.glob(f".{BUILD_MANIFEST_FILENAME}.*.tmp"))
+
+
+def test_qualified_manifest_binds_locks_complete_inventory_and_native_audit(
+    tmp_path: Path,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    for name in (
+        "requirements-release.in",
+        "requirements-release.lock",
+        "release_toolchain.lock.json",
+        "wheelhouse.lock.json",
+    ):
+        (project / name).write_bytes((PROJECT_ROOT / name).read_bytes())
+    bundle = _bundle(tmp_path / "bundle")
+    input_audit = bundle / "release_input_audit.json"
+    input_audit.write_text(
+        json.dumps(
+            {
+                "schema": "guandan.release-input-audit/1",
+                "status": "PASS",
+                "installed_distributions": DEPENDENCIES,
+                "errors": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    native_audit = bundle / "native_dependency_audit.json"
+    native_audit.write_text(
+        json.dumps(
+            {
+                "schema": "guandan.native-dependency-audit/1",
+                "status": "PASS",
+                "summary": {"pe_file_count": 2, "error_count": 0},
+                "files": [],
+                "errors": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_inputs = collect_release_build_inputs(
+        project,
+        bundle,
+        release_input_audit=input_audit,
+        native_audit=native_audit,
+    )
+
+    manifest = write_build_manifest(
+        project,
+        bundle,
+        dependency_versions=DEPENDENCIES,
+        source_identity=SOURCE,
+        python_identity=PYTHON,
+        build_inputs=build_inputs,
+    )
+
+    assert manifest["build_inputs"]["status"] == "PASS"
+    assert set(manifest["build_inputs"]["locks"]) == {
+        "requirements_input",
+        "requirements_lock",
+        "toolchain_lock",
+        "wheelhouse_lock",
+    }
+    assert manifest["dependencies"] == DEPENDENCIES
+    assert manifest["build_inputs"]["native_dependency_audit"]["summary"] == {
+        "pe_file_count": 2,
+        "error_count": 0,
+    }
+    assert verify_build_manifest(
+        bundle,
+        bundle / BUILD_MANIFEST_FILENAME,
+        strict=True,
+    ).ok is True
+    serialized = json.dumps(manifest, ensure_ascii=False)
+    assert str(tmp_path) not in serialized
+
+    native_audit.write_text("{}", encoding="utf-8")
+    tampered = verify_build_manifest(bundle, bundle / BUILD_MANIFEST_FILENAME)
+    assert tampered.ok is False
+    assert any("native_dependency_audit.json" in error for error in tampered.errors)
+
+
+def test_release_build_inputs_reject_failed_native_audit(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    for name in (
+        "requirements-release.in",
+        "requirements-release.lock",
+        "release_toolchain.lock.json",
+        "wheelhouse.lock.json",
+    ):
+        (project / name).write_bytes((PROJECT_ROOT / name).read_bytes())
+    bundle = _bundle(tmp_path / "bundle")
+    input_audit = bundle / "release_input_audit.json"
+    input_audit.write_text(
+        json.dumps(
+            {
+                "schema": "guandan.release-input-audit/1",
+                "status": "PASS",
+                "installed_distributions": DEPENDENCIES,
+            }
+        ),
+        encoding="utf-8",
+    )
+    native = bundle / "native_dependency_audit.json"
+    native.write_text(
+        json.dumps(
+            {
+                "schema": "guandan.native-dependency-audit/1",
+                "status": "FAIL",
+                "summary": {"error_count": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BuildManifestError, match="native dependency audit did not pass"):
+        collect_release_build_inputs(
+            project,
+            bundle,
+            release_input_audit=input_audit,
+            native_audit=native,
+        )
 
 
 def test_integrity_verification_detects_mutation_and_optional_extra_files(tmp_path: Path):
@@ -133,20 +263,20 @@ def test_integrity_verification_detects_mutation_and_optional_extra_files(tmp_pa
     extra.write_text("runtime-only", encoding="utf-8")
     assert verify_build_manifest(bundle, manifest_path).ok is True
     strict = verify_build_manifest(bundle, manifest_path, strict=True)
-    assert strict.ok is True
-    assert strict.warnings == ()
+    assert strict.ok is False
+    assert "unexpected bundle file: logs/startup.log" in strict.errors
     assert strict.unexpected_files == ("logs/startup.log",)
 
     target = bundle / "data" / "profiles" / "tencent_daguandan" / "models" / "best.npz"
     target.write_bytes(b"changed-model")
     changed = verify_build_manifest(bundle, manifest_path)
-    assert changed.ok is True
-    assert changed.errors == ()
-    assert any("mismatch: data/profiles" in warning for warning in changed.warnings)
-    assert changed.mutable_differences == changed.warnings
+    assert changed.ok is False
+    assert any("mismatch: data/profiles" in error for error in changed.errors)
+    assert changed.warnings == ()
+    assert changed.mutable_differences == ()
 
 
-def test_immutable_mutation_is_an_error_but_missing_mutable_config_is_a_warning(
+def test_immutable_runtime_and_missing_seed_config_are_both_errors(
     tmp_path: Path,
 ):
     project = tmp_path / "project"
@@ -162,14 +292,14 @@ def test_immutable_mutation_is_an_error_but_missing_mutable_config_is_a_warning(
 
     (bundle / "_internal" / "runtime.dll").write_bytes(b"runtime")
     (bundle / "data" / "profiles" / "tencent_daguandan" / "profile.json").unlink()
-    mutable = verify_build_manifest(bundle, manifest_path)
-    assert mutable.ok is True
-    assert mutable.errors == ()
-    assert any("profile.json" in warning for warning in mutable.warnings)
-    assert mutable.mutable_differences == mutable.warnings
+    missing_seed = verify_build_manifest(bundle, manifest_path)
+    assert missing_seed.ok is False
+    assert any("profile.json" in error for error in missing_seed.errors)
+    assert missing_seed.warnings == ()
+    assert missing_seed.mutable_differences == ()
 
 
-def test_strict_unexpected_file_policy_allows_runtime_warns_profile_and_rejects_root(
+def test_strict_unexpected_file_policy_rejects_all_package_mutation(
     tmp_path: Path,
 ):
     project = tmp_path / "project"
@@ -185,10 +315,10 @@ def test_strict_unexpected_file_policy_allows_runtime_warns_profile_and_rejects_
     user_asset.parent.mkdir()
     user_asset.write_bytes(b"user")
     profile_only = verify_build_manifest(bundle, manifest_path, strict=True)
-    assert profile_only.ok is True
-    assert profile_only.warnings == (
-        "unexpected bundle file: data/profiles/tencent_daguandan/pics/sample.png",
-    )
+    assert profile_only.ok is False
+    assert profile_only.warnings == ()
+    assert "unexpected bundle file: data/profiles/tencent_daguandan/sessions/game/timeline.jsonl" in profile_only.errors
+    assert "unexpected bundle file: data/profiles/tencent_daguandan/pics/sample.png" in profile_only.errors
 
     (bundle / "rogue.dll").write_bytes(b"not shipped")
     root_extra = verify_build_manifest(bundle, manifest_path, strict=True)

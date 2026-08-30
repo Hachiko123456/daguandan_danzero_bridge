@@ -18,6 +18,8 @@ _PE_SUFFIXES = {".exe", ".dll", ".pyd"}
 _BANNED_SOURCE_TOKENS = ("java", "jdk", "anaconda", "miniconda", "poppler")
 _SYSTEM_DLLS = {
     "advapi32.dll",
+    "authz.dll",
+    "avicap32.dll",
     "bcrypt.dll",
     "bcryptprimitives.dll",
     "cfgmgr32.dll",
@@ -25,38 +27,56 @@ _SYSTEM_DLLS = {
     "comctl32.dll",
     "comdlg32.dll",
     "crypt32.dll",
+    "d2d1.dll",
     "d3d11.dll",
     "d3d12.dll",
+    "d3d9.dll",
+    "dbghelp.dll",
     "dcomp.dll",
     "dwmapi.dll",
+    "dwrite.dll",
+    "dnsapi.dll",
     "dxgi.dll",
     "gdi32.dll",
     "gdi32full.dll",
     "imm32.dll",
+    "icuuc.dll",
+    "imagehlp.dll",
     "iphlpapi.dll",
     "kernel32.dll",
     "kernelbase.dll",
     "mpr.dll",
+    "mf.dll",
+    "mfplat.dll",
+    "mfreadwrite.dll",
     "msvcp_win.dll",
     "msvcrt.dll",
+    "ncrypt.dll",
+    "netapi32.dll",
     "ntdll.dll",
     "ole32.dll",
     "oleaut32.dll",
     "powrprof.dll",
+    "propsys.dll",
     "psapi.dll",
     "rpcrt4.dll",
+    "secur32.dll",
     "sechost.dll",
     "setupapi.dll",
     "shell32.dll",
     "shlwapi.dll",
     "user32.dll",
     "userenv.dll",
+    "uiautomationcore.dll",
     "usp10.dll",
     "uxtheme.dll",
     "version.dll",
     "winhttp.dll",
     "winmm.dll",
+    "wintrust.dll",
     "winspool.drv",
+    "wsock32.dll",
+    "wtsapi32.dll",
     "wldap32.dll",
     "ws2_32.dll",
 }
@@ -90,16 +110,28 @@ def collect_pyinstaller_provenance(work_root: Path | str) -> dict[str, str]:
         except (OSError, UnicodeError, SyntaxError, ValueError):
             continue
         for destination, source in _toc_pairs(payload):
+            if Path(source).suffix.casefold() not in _PE_SUFFIXES:
+                continue
             try:
                 normalized = _portable_relative(destination)
             except FrozenBundleAuditError:
                 continue
-            existing = result.get(normalized.casefold())
-            if existing is not None and _path_identity(existing) != _path_identity(source):
-                raise FrozenBundleAuditError(
-                    f"conflicting PyInstaller provenance for {normalized}"
-                )
-            result[normalized.casefold()] = str(Path(source).resolve())
+            aliases = [normalized]
+            if not normalized.casefold().startswith("_internal/"):
+                # PyInstaller 6's onedir COLLECT TOC stores paths relative to
+                # the contents directory, while the final bundle places that
+                # directory at ``_internal``.
+                aliases.append(f"_internal/{normalized}")
+            for alias in aliases:
+                existing = result.get(alias.casefold())
+                if (
+                    existing is not None
+                    and _path_identity(existing) != _path_identity(source)
+                ):
+                    raise FrozenBundleAuditError(
+                        f"conflicting PyInstaller provenance for {alias}"
+                    )
+                result[alias.casefold()] = str(Path(source).resolve())
     return result
 
 

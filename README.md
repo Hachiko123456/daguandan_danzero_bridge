@@ -36,6 +36,32 @@ EXE 会把发布目录中的 `data/` 当作不可写的资源种子；首次启�
 自动校准缓存、诊断缓存和未知文件不会导入。迁移会创建新的数据 generation 与
 本地回执，不会覆盖当前 generation，因而可以保留旧版本作为快速回滚入口。
 
+### 离线、锁定的发布构建
+
+正式打包不复用开发虚拟环境中的包，也不会在构建时访问软件源。首先用唯一允许
+联网的准备脚本生成外部 wheelhouse；它必须与仓库中提交的依赖、wheelhouse 和
+CPython 工具链哈希完全一致：
+
+```powershell
+.\scripts\prepare_release_wheelhouse.ps1 `
+  -WheelhouseRoot "C:\DaguandanBuildInputs\wheelhouse-cp312-win_amd64"
+```
+
+随后指定一个尚不存在、位于仓库外部的唯一输出目录进行打包：
+
+```powershell
+.\scripts\package_release.ps1 `
+  -ReleaseRoot "C:\DaguandanBuilds\candidate-20260831-001" `
+  -WheelhouseRoot "C:\DaguandanBuildInputs\wheelhouse-cp312-win_amd64"
+```
+
+脚本会在 ReleaseRoot 内创建全新的 build venv，并只使用
+`--isolated --no-index --require-hashes` 安装锁定 wheel；构建环境会清除 Python、
+Qt/QML、Java、Conda 和 Poppler 等宿主变量。PyInstaller 完成后必须通过原生 PE
+来源审计；未知来源、冲突 ICU、Java/Anaconda/Poppler DLL、异常 Qt/CRT、UPX 或
+缺失导入都会令构建失败。`native_dependency_audit.json`、完整安装包清单和所有
+锁文件摘要均进入并受 `build_manifest.json` 哈希保护。
+
 ## 标记与模板
 
 页面会递归读取所选本地文件夹中的 PNG、JPG、JPEG 和 BMP 图片；图片两侧提供上一张/下一张箭头，并显示当前序号，方便连续检查样本。

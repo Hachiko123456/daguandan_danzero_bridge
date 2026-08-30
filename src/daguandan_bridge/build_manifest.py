@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import os
 import platform
@@ -14,29 +13,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 from uuid import uuid4
 
+from .release_lock import collect_installed_distributions
+
 
 SCHEMA = "guandan.build-manifest/1"
 RELEASE_RECORD_SCHEMA = "guandan.release-record/1"
 BUILD_MANIFEST_FILENAME = "build_manifest.json"
 DEFAULT_EXECUTABLE_NAME = "DaguandanAssistant.exe"
 DEFAULT_PROFILE_NAME = "tencent_daguandan"
+BUILD_INPUTS_SCHEMA = "guandan.release-build-inputs/1"
+NATIVE_AUDIT_SCHEMA = "guandan.native-dependency-audit/1"
+RELEASE_INPUT_AUDIT_SCHEMA = "guandan.release-input-audit/1"
 
-_KEY_DEPENDENCIES: tuple[str, ...] = (
-    "PyInstaller",
-    "pyinstaller-hooks-contrib",
-    "PySide6",
-    "PySide6_Essentials",
-    "PySide6_Addons",
-    "shiboken6",
-    "PySide6-Fluent-Widgets",
-    "PySideSix-Frameless-Window",
-    "opencv-python",
-    "numpy",
-    "torch",
-    "mss",
-    "pywin32",
-    "rlcard",
-)
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -104,13 +92,95 @@ def collect_python_identity() -> dict[str, str]:
 
 
 def collect_dependency_versions() -> dict[str, str | None]:
-    versions: dict[str, str | None] = {}
-    for distribution in _KEY_DEPENDENCIES:
-        try:
-            versions[distribution] = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            versions[distribution] = None
-    return versions
+    """Collect the complete isolated build-environment inventory."""
+
+    return collect_installed_distributions()
+
+
+def collect_release_build_inputs(
+    project_root: Path | str,
+    bundle_root: Path | str,
+    *,
+    release_input_audit: Path | str,
+    native_audit: Path | str,
+) -> dict[str, object]:
+    """Bind verified offline locks and native provenance to the frozen build."""
+
+    project = _safe_existing_directory(project_root, field="project root")
+    bundle = _safe_existing_directory(bundle_root, field="bundle root")
+    input_path = _safe_existing_file(
+        release_input_audit,
+        field="release input audit",
+    )
+    native_path = _safe_existing_file(native_audit, field="native dependency audit")
+    input_relative = _relative_bundle_file(bundle, input_path, field="release input audit")
+    native_relative = _relative_bundle_file(bundle, native_path, field="native dependency audit")
+    input_document = load_build_manifest(input_path)
+    native_document = load_build_manifest(native_path)
+    if (
+        input_document.get("schema") != RELEASE_INPUT_AUDIT_SCHEMA
+        or input_document.get("status") != "PASS"
+    ):
+        raise BuildManifestError("release input audit did not pass")
+    installed = input_document.get("installed_distributions")
+    if not isinstance(installed, dict) or not installed:
+        raise BuildManifestError(
+            "release input audit lacks the complete installed distribution inventory"
+        )
+    if (
+        native_document.get("schema") != NATIVE_AUDIT_SCHEMA
+        or native_document.get("status") != "PASS"
+    ):
+        raise BuildManifestError("native dependency audit did not pass")
+
+    lock_paths = {
+        "requirements_input": project / "requirements-release.in",
+        "requirements_lock": project / "requirements-release.lock",
+        "toolchain_lock": project / "release_toolchain.lock.json",
+        "wheelhouse_lock": project / "wheelhouse.lock.json",
+    }
+    locks: dict[str, dict[str, object]] = {}
+    for label, path in lock_paths.items():
+        file_path = _safe_existing_file(path, field=f"{label} file")
+        locks[label] = {
+            "path": file_path.name,
+            "bytes": file_path.stat().st_size,
+            "sha256": sha256_file(file_path),
+        }
+    lock_set_hash = hashlib.sha256(
+        _canonical_json_bytes(locks)
+    ).hexdigest()
+    summary = native_document.get("summary")
+    if not isinstance(summary, dict):
+        raise BuildManifestError("native dependency audit summary is missing")
+    return {
+        "schema": BUILD_INPUTS_SCHEMA,
+        "status": "PASS",
+        "locks": locks,
+        "lock_set_sha256": lock_set_hash,
+        "installed_distributions_sha256": hashlib.sha256(
+            _canonical_json_bytes(
+                _normalize_dependencies(
+                    {str(key): str(value) for key, value in installed.items()}
+                )
+            )
+        ).hexdigest(),
+        "release_input_audit": {
+            "path": input_relative,
+            "bytes": input_path.stat().st_size,
+            "sha256": sha256_file(input_path),
+            "schema": input_document["schema"],
+            "status": input_document["status"],
+        },
+        "native_dependency_audit": {
+            "path": native_relative,
+            "bytes": native_path.stat().st_size,
+            "sha256": sha256_file(native_path),
+            "schema": native_document["schema"],
+            "status": native_document["status"],
+            "summary": _json_roundtrip(summary, field="native audit summary"),
+        },
+    }
 
 
 def create_build_manifest(
@@ -122,6 +192,7 @@ def create_build_manifest(
     source_identity: Mapping[str, object] | None = None,
     python_identity: Mapping[str, str] | None = None,
     dependency_versions: Mapping[str, str | None] | None = None,
+    build_inputs: Mapping[str, object] | None = None,
     manifest_path: Path | str | None = None,
 ) -> dict[str, object]:
     root = _safe_existing_directory(bundle_root, field="bundle root")
@@ -167,8 +238,11 @@ def create_build_manifest(
         "schema": SCHEMA,
         "source": source,
         "python": python,
-        "pyinstaller": {"version": dependencies.get("PyInstaller")},
+        "pyinstaller": {
+            "version": _dependency_version(dependencies, "PyInstaller")
+        },
         "dependencies": dependencies,
+        "build_inputs": _normalize_build_inputs(build_inputs),
         "executable": _without_kind(executable),
         "bundle_tree": _tree_summary(files, include_files=True),
         "profile": {
@@ -200,6 +274,7 @@ def compute_build_id(manifest: Mapping[str, object]) -> str:
             "python",
             "pyinstaller",
             "dependencies",
+            "build_inputs",
             "executable",
             "bundle_tree",
             "profile",
@@ -390,6 +465,13 @@ def verify_build_manifest(
             )
             if resources.get(label) != expected:
                 errors.append(f"resources.{label} does not match bundle_tree.files")
+
+    _validate_build_inputs(
+        document.get("build_inputs"),
+        dependencies=document.get("dependencies"),
+        entries=normalized_entries,
+        errors=errors,
+    )
 
     if strict and root.is_dir():
         exclusions = {root / BUILD_MANIFEST_FILENAME}
@@ -599,6 +681,133 @@ def _resource_summary(entries: Any) -> dict[str, object]:
     return _tree_summary(normalized, include_files=True)
 
 
+def _normalize_build_inputs(
+    value: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if value is None:
+        return {"schema": BUILD_INPUTS_SCHEMA, "status": "not_provided"}
+    normalized = _json_roundtrip(value, field="build_inputs")
+    if normalized.get("schema") != BUILD_INPUTS_SCHEMA:
+        raise BuildManifestError("build_inputs schema is unsupported")
+    if normalized.get("status") != "PASS":
+        raise BuildManifestError("build_inputs must have PASS status")
+    return normalized
+
+
+def _validate_build_inputs(
+    value: object,
+    *,
+    dependencies: object,
+    entries: list[dict[str, object]],
+    errors: list[str],
+) -> None:
+    if not isinstance(value, dict) or value.get("schema") != BUILD_INPUTS_SCHEMA:
+        errors.append("manifest build_inputs entry is missing or unsupported")
+        return
+    status = value.get("status")
+    if status == "not_provided":
+        return
+    if status != "PASS":
+        errors.append("manifest build_inputs did not pass")
+        return
+    by_path = {str(entry["path"]): entry for entry in entries}
+    for label, expected_schema in (
+        ("release_input_audit", RELEASE_INPUT_AUDIT_SCHEMA),
+        ("native_dependency_audit", NATIVE_AUDIT_SCHEMA),
+    ):
+        raw = value.get(label)
+        if not isinstance(raw, dict):
+            errors.append(f"build_inputs.{label} is missing")
+            continue
+        try:
+            relative = _portable_relative_path(raw.get("path"))
+        except BuildManifestError as exc:
+            errors.append(str(exc))
+            continue
+        entry = by_path.get(relative)
+        if entry is None:
+            errors.append(f"build_inputs.{label} is not present in bundle_tree.files")
+            continue
+        if raw.get("schema") != expected_schema or raw.get("status") != "PASS":
+            errors.append(f"build_inputs.{label} did not pass")
+        if raw.get("bytes") != entry.get("bytes") or raw.get("sha256") != entry.get(
+            "sha256"
+        ):
+            errors.append(f"build_inputs.{label} does not match its bundle file")
+    locks = value.get("locks")
+    if not isinstance(locks, dict) or set(locks) != {
+        "requirements_input",
+        "requirements_lock",
+        "toolchain_lock",
+        "wheelhouse_lock",
+    }:
+        errors.append("build_inputs lock inventory is incomplete")
+    else:
+        for label, raw in locks.items():
+            if not isinstance(raw, dict):
+                errors.append(f"build_inputs lock entry is invalid: {label}")
+                continue
+            try:
+                _portable_segment(raw.get("path"), field=f"{label} lock path")
+            except BuildManifestError as exc:
+                errors.append(str(exc))
+            digest = raw.get("sha256")
+            size = raw.get("bytes")
+            if (
+                not isinstance(digest, str)
+                or _HEX_SHA256.fullmatch(digest) is None
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                errors.append(f"build_inputs lock metadata is invalid: {label}")
+        expected_lock_set = hashlib.sha256(_canonical_json_bytes(locks)).hexdigest()
+        if value.get("lock_set_sha256") != expected_lock_set:
+            errors.append("build_inputs lock_set_sha256 does not match lock inventory")
+    if isinstance(dependencies, dict):
+        try:
+            normalized_dependencies = _normalize_dependencies(dependencies)
+        except BuildManifestError as exc:
+            errors.append(str(exc))
+        else:
+            dependency_hash = hashlib.sha256(
+                _canonical_json_bytes(normalized_dependencies)
+            ).hexdigest()
+            if value.get("installed_distributions_sha256") != dependency_hash:
+                errors.append(
+                    "build_inputs installed distribution inventory does not match dependencies"
+                )
+    else:
+        errors.append("manifest dependencies entry is invalid")
+
+
+def _json_roundtrip(value: object, *, field: str) -> dict[str, object]:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BuildManifestError(f"{field} must contain canonical JSON values") from exc
+    if not isinstance(normalized, dict):
+        raise BuildManifestError(f"{field} must be a JSON object")
+    return normalized
+
+
+def _relative_bundle_file(root: Path, path: Path, *, field: str) -> str:
+    if _is_link_or_reparse(path):
+        raise BuildManifestError(f"{field} must not be a reparse point")
+    try:
+        relative = path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except ValueError as exc:
+        raise BuildManifestError(f"{field} must be inside the bundle") from exc
+    return _portable_relative_path(relative.as_posix())
+
+
 def _without_kind(entry: Mapping[str, object]) -> dict[str, object]:
     return {
         "path": entry["path"],
@@ -629,13 +838,13 @@ def _entry_policy(relative: str, *, executable: str | None) -> dict[str, str]:
             return {
                 "kind": "template",
                 "classification": "template",
-                "mutability": "mutable",
+                "mutability": "immutable",
             }
         if "models" in folded[3:]:
             return {
                 "kind": "model",
                 "classification": "model",
-                "mutability": "mutable",
+                "mutability": "immutable",
             }
         classification = (
             "profile_config"
@@ -647,7 +856,7 @@ def _entry_policy(relative: str, *, executable: str | None) -> dict[str, str]:
         return {
             "kind": "profile",
             "classification": classification,
-            "mutability": "mutable",
+            "mutability": "immutable",
         }
     return {
         "kind": "bundle",
@@ -672,26 +881,7 @@ def _record_file_difference(
 
 
 def _unexpected_file_disposition(relative: str) -> str:
-    parts = PurePosixPath(_portable_relative_path(relative)).parts
-    folded = tuple(part.casefold() for part in parts)
-    if folded and folded[0] in {"logs", "diagnostics"}:
-        return "allow"
-    if len(folded) >= 3 and folded[:2] == ("data", "profiles"):
-        remainder = folded[3:]
-        if remainder:
-            first = remainder[0]
-            if first in {
-                "screenshots",
-                "sessions",
-                "diagnostics",
-                "truth_log_batch_reports",
-            } or first.startswith("_quarantine"):
-                return "allow"
-            if remainder == ("hand_template_calibration.json",):
-                return "allow"
-            if len(remainder) >= 2 and remainder[:2] == ("models", "benchmarks"):
-                return "allow"
-        return "warning"
+    _portable_relative_path(relative)
     return "error"
 
 
@@ -924,6 +1114,17 @@ def _normalize_dependencies(
     return normalized
 
 
+def _dependency_version(
+    dependencies: Mapping[str, str | None],
+    distribution: str,
+) -> str | None:
+    expected = re.sub(r"[-_.]+", "-", distribution).casefold()
+    for name, version in dependencies.items():
+        if re.sub(r"[-_.]+", "-", name).casefold() == expected:
+            return version
+    return None
+
+
 def _git(root: Path, *arguments: str) -> str:
     return _git_bytes(root, *arguments).decode("utf-8", errors="strict").strip()
 
@@ -989,6 +1190,7 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 
 
 __all__ = [
+    "BUILD_INPUTS_SCHEMA",
     "BUILD_MANIFEST_FILENAME",
     "BuildManifestError",
     "IntegrityVerification",
@@ -996,6 +1198,7 @@ __all__ = [
     "SCHEMA",
     "collect_dependency_versions",
     "collect_python_identity",
+    "collect_release_build_inputs",
     "collect_source_identity",
     "compute_build_id",
     "create_build_manifest",

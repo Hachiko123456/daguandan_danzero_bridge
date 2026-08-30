@@ -3,6 +3,7 @@ from __future__ import annotations
 """Validation for the offline, hash-locked Windows release inputs."""
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -26,6 +27,7 @@ def verify_release_inputs(
     project_root: Path | str,
     wheelhouse_root: Path | str,
     python_executable: Path | str | None = None,
+    verify_installed: bool = False,
 ) -> dict[str, object]:
     project = Path(project_root).resolve()
     wheelhouse = Path(wheelhouse_root).resolve()
@@ -74,6 +76,7 @@ def verify_release_inputs(
     platform_lock = toolchain.get("platform")
     if isinstance(platform_lock, Mapping):
         checks = {
+            "system": platform.system(),
             "python_version": platform.python_version(),
             "architecture": platform.machine(),
             "python_cache_tag": sys.implementation.cache_tag,
@@ -137,6 +140,37 @@ def verify_release_inputs(
     if unexpected:
         errors.append(_error("LOCK-WHEEL-UNEXPECTED", {"filenames": unexpected}))
     _verify_requirements_hashes(requirements_lock, records, errors)
+    installed: dict[str, str] | None = None
+    if verify_installed:
+        installed = collect_installed_distributions()
+        expected = {
+            _canonical_name(str(item.get("distribution", ""))): str(
+                item.get("version", "")
+            )
+            for item in records
+            if isinstance(item, Mapping)
+        }
+        tools = toolchain.get("tools")
+        if isinstance(tools, Mapping):
+            expected["pip"] = str(tools.get("pip", ""))
+        missing = sorted(set(expected) - set(installed))
+        unexpected = sorted(set(installed) - set(expected))
+        mismatched = {
+            name: {"expected": expected[name], "actual": installed[name]}
+            for name in sorted(set(expected) & set(installed))
+            if expected[name] != installed[name]
+        }
+        if missing or unexpected or mismatched:
+            errors.append(
+                _error(
+                    "LOCK-INSTALLED-DISTRIBUTIONS",
+                    {
+                        "missing": missing,
+                        "unexpected": unexpected,
+                        "mismatched": mismatched,
+                    },
+                )
+            )
     return {
         "schema": RELEASE_INPUT_AUDIT_SCHEMA,
         "status": "PASS" if not errors else "FAIL",
@@ -151,8 +185,28 @@ def verify_release_inputs(
             "aggregate_sha256": wheel_lock.get("aggregate_sha256"),
             "files": verified,
         },
+        "installed_distributions": installed,
         "errors": errors,
     }
+
+
+def collect_installed_distributions() -> dict[str, str]:
+    """Return every distribution visible to the isolated build interpreter."""
+
+    inventory: dict[str, str] = {}
+    for distribution in importlib.metadata.distributions():
+        raw_name = distribution.metadata.get("Name")
+        if not raw_name:
+            continue
+        name = _canonical_name(str(raw_name))
+        version = str(distribution.version)
+        previous = inventory.get(name)
+        if previous is not None and previous != version:
+            raise ReleaseLockError(
+                f"multiple installed versions found for distribution: {name}"
+            )
+        inventory[name] = version
+    return dict(sorted(inventory.items()))
 
 
 def _verify_requirements_hashes(
@@ -198,6 +252,10 @@ def _json(path: Path) -> dict[str, object]:
     return value
 
 
+def _canonical_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
 def _is_link_or_reparse(path: Path) -> bool:
     try:
         if path.is_symlink():
@@ -228,5 +286,6 @@ def _error(code: str, evidence: Mapping[str, object]) -> dict[str, object]:
 __all__ = [
     "RELEASE_INPUT_AUDIT_SCHEMA",
     "ReleaseLockError",
+    "collect_installed_distributions",
     "verify_release_inputs",
 ]

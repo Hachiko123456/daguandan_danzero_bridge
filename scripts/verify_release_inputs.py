@@ -21,12 +21,18 @@ def main() -> int:
     parser.add_argument("--wheelhouse", type=Path, required=True)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--verify-installed",
+        action="store_true",
+        help="require the current interpreter's complete distribution inventory to match the lock",
+    )
     args = parser.parse_args()
     try:
         report = verify_release_inputs(
             project_root=args.project_root,
             wheelhouse_root=args.wheelhouse,
             python_executable=args.python,
+            verify_installed=args.verify_installed,
         )
     except (ReleaseLockError, OSError, ValueError) as exc:
         print(f"release input verification failed: {exc}", file=sys.stderr)
