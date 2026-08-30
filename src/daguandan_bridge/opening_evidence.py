@@ -225,16 +225,19 @@ class OpeningEvidenceMonitor:
         required_score: float,
     ) -> None:
         try:
+            now = self._clock_ms()
             with self._lock:
                 item = self._frame_by_identity.get(id(snapshot))
                 if item is not None:
                     item.anchor_score = float(score)
                 if float(score) >= float(required_score):
                     self._anchor_ready = True
+                    if self._armed_ms is None:
+                        self._armed_ms = now
                     self._field_blocked_since.pop("table_anchor", None)
                     self._clear_field_dedup_locked("table_anchor")
                 elif self._armed_ms is not None:
-                    self._field_blocked_since.setdefault("table_anchor", self._clock_ms())
+                    self._field_blocked_since.setdefault("table_anchor", now)
             self._emit_timeouts_if_due()
         except BaseException:
             return
@@ -281,6 +284,57 @@ class OpeningEvidenceMonitor:
                 hand_unstable = len(self._hands) >= 2 and len(set(self._hands)) > 1
                 if level in RANKS and len(hand) == 27 and opening_seed_valid is not None:
                     self._set_field_state_locked("lead_player", bool(opening_seed_valid), now)
+            trace_candidates = (
+                trace.get("candidates", ())
+                if isinstance(trace, Mapping)
+                else ()
+            )
+            level_candidates = [
+                item
+                for item in trace_candidates
+                if isinstance(item, Mapping)
+                and str(item.get("field", "")).casefold() in {"level_rank", "round_level"}
+            ]
+            if level not in RANKS and level_candidates:
+                best = max(level_candidates, key=lambda item: _number(item.get("score")))
+                threshold = _number(best.get("threshold"), default=1.0)
+                if _number(best.get("score")) < threshold:
+                    self.emit_incident(
+                        "OPENING-LEVEL-BELOW-THRESHOLD",
+                        field="round_level",
+                        reason="level candidates were present but none reached the production threshold",
+                        monotonic_ms=now,
+                        evidence={
+                            "best_candidate": _json_safe(dict(best)),
+                            "candidate_count": len(level_candidates),
+                        },
+                    )
+                labels = {
+                    str(item.get("label", ""))
+                    for item in level_candidates
+                    if _number(item.get("score")) >= threshold
+                }
+                if len(labels) > 1:
+                    self.emit_incident(
+                        "OPENING-LEVEL-CANDIDATE-CONFLICT",
+                        field="round_level",
+                        reason="multiple level candidates cleared the threshold",
+                        monotonic_ms=now,
+                        evidence={"labels": sorted(labels)},
+                    )
+            if hand:
+                try:
+                    from .danzero.state import GuanDanState
+
+                    GuanDanState().confirm_hand(hand)
+                except Exception as exc:
+                    self.emit_incident(
+                        "OPENING-HAND-INVALID",
+                        field="my_hand",
+                        reason="recognized hand failed canonical deck validation",
+                        monotonic_ms=now,
+                        evidence={"error_type": type(exc).__name__},
+                    )
             if level_conflict:
                 self.emit_incident(
                     OPENING_LEVEL_CONFLICT,
@@ -913,9 +967,11 @@ def classify_opening_failure(error: object) -> str:
     machine_code = str(getattr(error, "code", "")).strip().upper()
     typed = {
         "WINDOW-NOT-FOUND": OPENING_WINDOW_NOT_FOUND,
+        "WINDOW-AMBIGUOUS": OPENING_WINDOW_NOT_FOUND,
         "WINDOW-MINIMIZED": OPENING_WINDOW_MINIMIZED,
         "GEOMETRY-CHANGED": OPENING_GEOMETRY_CHANGED,
         "CAPTURE-BLACK-FRAME": OPENING_CAPTURE_BLACK_FRAME,
+        "CAPTURE-OCCLUDED": OPENING_CAPTURE_ERROR,
         "CAPTURE-BACKEND-FAILED": OPENING_CAPTURE_ERROR,
         "RESOURCE-MISMATCH": OPENING_RESOURCE_ERROR,
     }
