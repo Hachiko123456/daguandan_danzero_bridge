@@ -4,6 +4,22 @@ This document freezes the diagnostic contract introduced by phase 1A and the
 offline support-bundle schema API introduced alongside it.  Live evidence
 capture and a user-facing export command are not connected in phase 1A.
 
+## Storage roots
+
+Frozen builds expose two distinct roots and diagnostics must never conflate
+them:
+
+- `bundle_root` contains the EXE, `_internal`, build manifest, and immutable
+  seed resources. Support export only reads from this root.
+- `runtime_root` is `%LOCALAPPDATA%\DaguandanAssistant` or the absolute
+  `DAGUANDAN_DATA_ROOT` override. Versioned profiles, sessions, screenshots,
+  logs, diagnostics, preferences, cache, migration receipts, and exported
+  support files are written here.
+
+The active data generation identity is safe to include in a support manifest;
+absolute local paths are not. Source checkouts continue to use repository
+`data/` and are reported as `runtime_root_source=source_checkout`.
+
 ## Runtime identity
 
 Session manifests receive a `runtime_identity` object when they are first
@@ -107,14 +123,33 @@ other reparse points are rejected.  Callers cannot choose archive entry names.
 Core entries have fixed logical paths:
 
 - `startup/startup.log`
+- `startup/startup.jsonl`
+- `startup/exceptions.log`
+- `runtime/runtime.log`
 - `runtime/runtime_identity.json`
 - `doctor/doctor.json`
 - `build/build_manifest.json`
 - `incident/incident.json`
+- `evidence/opening_evidence.json`
+- `evidence/frame_index.jsonl`
+- `evidence/image_index.json`
+- `repro/repro.json`
+- `health/health_audit.json`
 - `trace/recognition_trace.jsonl`
-- `frames/frames_NNNN.png|jpg`
+- `frames/raw_client_NNNN.png|jpg`
+- `frames/standardized_NNNN.png|jpg`
+- `frames/frames_NNNN.png|jpg` (phase-1A compatibility callers)
 - `roi/roi_NNNN.png|jpg`
 - `support_manifest.json`
+
+The additional text entries are an additive extension of
+`guandan.support-bundle/1`.  Missing evidence remains explicit in the
+capability map; it is never fabricated merely to make a bundle look complete.
+The collection service can safely stage these fixed inputs from separate
+diagnostics-run, immutable-bundle, opening-incident, and sealed-session roots.
+When no opening incident is selected explicitly it chooses the incident with
+the newest recorded monotonic trigger, never a path supplied by an incident
+document.
 
 `.npz`, `.ckpt`, and explicitly named environment dumps are never accepted.
 Text is sanitized before it enters the ZIP: Windows/UNC paths, email addresses,
@@ -132,6 +167,16 @@ Frame and ROI bytes cannot be reliably anonymized.  They require explicit
 `sensitive-image` classification, and set
 `privacy.contains_sensitive_images=true`.  Recognition traces likewise require
 `include_recognition_trace=True` and are text-sanitized.
+
+Opted-in images are declared as structured sources.  A caller supplies only a
+root-relative file, frame sequence, monotonic timestamp, one of
+`raw_client|standardized|roi`, and an optional ROI field.  It cannot select the
+archive name.  The exporter validates and decodes each image within a pixel
+budget and generates `evidence/image_index.json` with schema
+`guandan.support-image-index/1`.  Every entry contains `archive_path`,
+`frame_seq`, `monotonic_ms`, `kind`, `field`, the included source-file SHA256,
+and the decoded-pixel SHA256.  The generated index is itself size/hash declared
+in `support_manifest.json`.
 
 `support_manifest.json` records every payload entry's size, SHA256,
 classification, capability, missing/disabled capabilities, and redaction

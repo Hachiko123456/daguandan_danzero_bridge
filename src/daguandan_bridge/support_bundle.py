@@ -7,16 +7,18 @@ import os
 import platform
 import re
 import stat
+import struct
 import time
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 
 SUPPORT_BUNDLE_SCHEMA = "guandan.support-bundle/1"
+SUPPORT_IMAGE_INDEX_SCHEMA = "guandan.support-image-index/1"
 
 __all__ = [
     "RedactionContext",
@@ -24,6 +26,8 @@ __all__ = [
     "SupportBundleError",
     "SupportBundleResult",
     "SupportBundleSources",
+    "SupportImageSource",
+    "SUPPORT_IMAGE_INDEX_SCHEMA",
     "UnsafeSupportSourceError",
     "export_support_bundle",
 ]
@@ -31,6 +35,9 @@ __all__ = [
 _MAX_TEXT_FILE_BYTES = 32 * 1024 * 1024
 _MAX_IMAGE_FILE_BYTES = 32 * 1024 * 1024
 _MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
+_MAX_IMAGE_PIXELS = 32_000_000
+_IMAGE_FIELD_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
+_IMAGE_KINDS = frozenset({"raw_client", "standardized", "roi"})
 _BANNED_SUFFIXES = {".ckpt", ".npz"}
 _ENVIRONMENT_DUMP_NAMES = {
     ".env",
@@ -99,8 +106,35 @@ class SupportBundleSources:
     build_manifest: Path | None = None
     incident: Path | None = None
     recognition_trace: Path | None = None
+    # Compatibility declarations retained in their original positional order
+    # for callers of the phase-1A API.
     frames: tuple[Path, ...] = ()
     roi: tuple[Path, ...] = ()
+    # Additive v1 evidence follows the frozen phase-1A fields above.
+    startup_events: Path | None = None
+    exceptions_log: Path | None = None
+    runtime_log: Path | None = None
+    opening_evidence: Path | None = None
+    repro_manifest: Path | None = None
+    frame_index: Path | None = None
+    health_audit: Path | None = None
+    images: tuple["SupportImageSource", ...] = ()
+
+
+@dataclass(frozen=True)
+class SupportImageSource:
+    """One explicitly classified image selected for a support bundle.
+
+    ``path`` remains root-relative and never controls its archive name.
+    ``frame_seq`` and ``monotonic_ms`` correlate the generated archive entry
+    with opening evidence without exposing a machine-local source filename.
+    """
+
+    path: Path
+    frame_seq: int
+    monotonic_ms: int
+    kind: str
+    field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +159,16 @@ class _Payload:
     classification: str
     content: bytes
     redactions: int = 0
+
+
+@dataclass(frozen=True)
+class _NormalizedImageSource:
+    path: Path
+    frame_seq: int
+    monotonic_ms: int
+    kind: str
+    field: str | None
+    archive_stem: str
 
 
 @dataclass
@@ -175,33 +219,63 @@ def export_support_bundle(
     # make the API's root-relative contract depend on an unrelated toggle.
     for declared in (
         sources.startup_log,
+        sources.startup_events,
+        sources.exceptions_log,
+        sources.runtime_log,
         sources.runtime_identity,
         sources.doctor,
         sources.build_manifest,
         sources.incident,
+        sources.opening_evidence,
+        sources.repro_manifest,
+        sources.frame_index,
+        sources.health_audit,
         sources.recognition_trace,
+        *(image.path for image in sources.images),
         *sources.frames,
         *sources.roi,
     ):
         if declared is not None:
             _resolve_source(source_root, declared)
+    image_sources = _normalized_image_sources(sources)
     context = _effective_redaction_context(redaction)
     payloads: list[_Payload] = []
     budget = _PayloadBudget(_MAX_PAYLOAD_BYTES)
     missing: list[dict[str, str]] = []
     capabilities: dict[str, bool] = {
         "startup_log": False,
+        "startup_events": False,
+        "exceptions_log": False,
+        "runtime_log": False,
         "runtime_identity": False,
         "doctor": False,
         "build_manifest": False,
         "incident": False,
+        "opening_evidence": False,
+        "repro_manifest": False,
+        "frame_index": False,
+        "health_audit": False,
         "frames": False,
         "roi": False,
+        "image_index": False,
         "recognition_trace": False,
     }
 
     fixed_text_sources = (
         ("startup_log", sources.startup_log, "startup/startup.log", "sanitized-log"),
+        (
+            "startup_events",
+            sources.startup_events,
+            "startup/startup.jsonl",
+            "sanitized-jsonl",
+        ),
+        (
+            "exceptions_log",
+            sources.exceptions_log,
+            "startup/exceptions.log",
+            "sanitized-log",
+        ),
+        ("runtime_log", sources.runtime_log, "runtime/runtime.log", "sanitized-log"),
         (
             "runtime_identity",
             sources.runtime_identity,
@@ -216,6 +290,30 @@ def export_support_bundle(
             "sanitized-json",
         ),
         ("incident", sources.incident, "incident/incident.json", "sanitized-json"),
+        (
+            "opening_evidence",
+            sources.opening_evidence,
+            "evidence/opening_evidence.json",
+            "sanitized-json",
+        ),
+        (
+            "repro_manifest",
+            sources.repro_manifest,
+            "repro/repro.json",
+            "sanitized-json",
+        ),
+        (
+            "frame_index",
+            sources.frame_index,
+            "evidence/frame_index.jsonl",
+            "sanitized-jsonl",
+        ),
+        (
+            "health_audit",
+            sources.health_audit,
+            "health/health_audit.json",
+            "sanitized-json",
+        ),
     )
     for capability, relative, archive_path, classification in fixed_text_sources:
         payload = _text_payload(
@@ -249,28 +347,41 @@ def export_support_bundle(
     else:
         missing.append({"capability": "recognition_trace", "reason": "disabled"})
 
-    _append_image_payloads(
+    image_index_entries = _append_structured_image_payloads(
         payloads,
         missing,
         capabilities,
         source_root=source_root,
-        relative_paths=sources.frames,
-        capability="frames",
-        archive_directory="frames",
-        enabled=include_frames,
+        images=image_sources,
+        include_frames=include_frames,
+        include_roi=include_roi,
         budget=budget,
     )
-    _append_image_payloads(
-        payloads,
-        missing,
-        capabilities,
-        source_root=source_root,
-        relative_paths=sources.roi,
-        capability="roi",
-        archive_directory="roi",
-        enabled=include_roi,
-        budget=budget,
-    )
+    if image_index_entries:
+        index_content = _json_bytes(
+            {
+                "schema": SUPPORT_IMAGE_INDEX_SCHEMA,
+                "entries": image_index_entries,
+            }
+        )
+        index_relative = Path("generated/image_index.json")
+        budget.add_payload(len(index_content), index_relative)
+        payloads.append(
+            _Payload(
+                capability="image_index",
+                archive_path="evidence/image_index.json",
+                classification="generated-json",
+                content=index_content,
+            )
+        )
+        capabilities["image_index"] = True
+    else:
+        image_reason = (
+            "disabled"
+            if not include_frames and not include_roi
+            else "not_provided"
+        )
+        missing.append({"capability": "image_index", "reason": image_reason})
 
     total_payload_bytes = sum(len(payload.content) for payload in payloads)
     if total_payload_bytes != budget.used:
@@ -490,29 +601,112 @@ def _text_payload(
     )
 
 
-def _append_image_payloads(
+def _normalized_image_sources(
+    sources: SupportBundleSources,
+) -> tuple[_NormalizedImageSource, ...]:
+    images: list[tuple[SupportImageSource, str | None]] = [
+        (image, None) for image in sources.images
+    ]
+    images.extend(
+        (
+            SupportImageSource(
+                path=relative,
+                frame_seq=index,
+                monotonic_ms=0,
+                kind="standardized",
+            ),
+            "frames",
+        )
+        for index, relative in enumerate(sources.frames, start=1)
+    )
+    images.extend(
+        (
+            SupportImageSource(
+                path=relative,
+                frame_seq=index,
+                monotonic_ms=0,
+                kind="roi",
+            ),
+            "roi",
+        )
+        for index, relative in enumerate(sources.roi, start=1)
+    )
+    seen: set[tuple[str, int, str | None]] = set()
+    normalized: list[_NormalizedImageSource] = []
+    for image, compatibility_stem in images:
+        if not isinstance(image, SupportImageSource):
+            raise SupportBundleError("structured support images must use SupportImageSource")
+        kind = str(image.kind).strip().lower()
+        if kind not in _IMAGE_KINDS:
+            raise SupportBundleError(
+                "support image kind must be raw_client, standardized, or roi"
+            )
+        if isinstance(image.frame_seq, bool) or int(image.frame_seq) < 0:
+            raise SupportBundleError("support image frame_seq must be a non-negative integer")
+        if isinstance(image.monotonic_ms, bool) or int(image.monotonic_ms) < 0:
+            raise SupportBundleError("support image monotonic_ms must be a non-negative integer")
+        field = None if image.field in {None, ""} else str(image.field).strip()
+        if field is not None and _IMAGE_FIELD_PATTERN.fullmatch(field) is None:
+            raise SupportBundleError("support image field is not a safe diagnostic identifier")
+        if kind != "roi" and field is not None:
+            raise SupportBundleError("only ROI support images may declare a field")
+        identity = (kind, int(image.frame_seq), field)
+        if identity in seen:
+            raise SupportBundleError(
+                "duplicate structured support image identity: "
+                f"kind={kind}, frame_seq={int(image.frame_seq)}, field={field!r}"
+            )
+        seen.add(identity)
+        normalized.append(
+            _NormalizedImageSource(
+                path=Path(image.path),
+                frame_seq=int(image.frame_seq),
+                monotonic_ms=int(image.monotonic_ms),
+                kind=kind,
+                field=field,
+                archive_stem=compatibility_stem or kind,
+            )
+        )
+    return tuple(normalized)
+
+
+def _append_structured_image_payloads(
     payloads: list[_Payload],
     missing: list[dict[str, str]],
     capabilities: dict[str, bool],
     *,
     source_root: Path,
-    relative_paths: Sequence[Path],
-    capability: str,
-    archive_directory: str,
-    enabled: bool,
+    images: tuple[_NormalizedImageSource, ...],
+    include_frames: bool,
+    include_roi: bool,
     budget: _PayloadBudget,
-) -> None:
-    if not enabled:
-        missing.append({"capability": capability, "reason": "disabled"})
-        return
-    if not relative_paths:
-        missing.append({"capability": capability, "reason": "not_provided"})
-        return
-    selected: list[_Payload] = []
-    for index, relative in enumerate(relative_paths, start=1):
+) -> list[dict[str, object]]:
+    frame_sources = tuple(image for image in images if image.kind != "roi")
+    roi_sources = tuple(image for image in images if image.kind == "roi")
+    for capability, enabled, declared in (
+        ("frames", include_frames, frame_sources),
+        ("roi", include_roi, roi_sources),
+    ):
+        if not enabled:
+            missing.append({"capability": capability, "reason": "disabled"})
+        elif not declared:
+            missing.append({"capability": capability, "reason": "not_provided"})
+
+    selected = tuple(
+        image
+        for image in images
+        if (image.kind == "roi" and include_roi)
+        or (image.kind != "roi" and include_frames)
+    )
+    counters: dict[str, int] = {}
+    index_entries: list[dict[str, object]] = []
+    for image in selected:
+        relative = image.path
         path = _resolve_source(source_root, relative)
         if path is None:
-            raise SupportBundleError(f"requested image support source was not found: {relative}")
+            raise SupportBundleError(
+                f"requested image support source was not found: {relative}"
+            )
         content = _read_limited(
             path,
             per_file_limit=_MAX_IMAGE_FILE_BYTES,
@@ -521,25 +715,143 @@ def _append_image_payloads(
             kind="image",
         )
         suffix = path.suffix.lower()
-        if suffix not in {".png", ".jpg", ".jpeg"}:
-            raise UnsafeSupportSourceError(f"unsupported support image type: {relative}")
-        if suffix == ".png" and not content.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise UnsafeSupportSourceError(f"invalid PNG support source: {relative}")
-        if suffix in {".jpg", ".jpeg"} and not content.startswith(b"\xff\xd8\xff"):
-            raise UnsafeSupportSourceError(f"invalid JPEG support source: {relative}")
         normalized_suffix = ".jpg" if suffix == ".jpeg" else suffix
-        archive_path = f"{archive_directory}/{archive_directory}_{index:04d}{normalized_suffix}"
+        width, height, channels, dtype, pixel_sha256 = _validated_image_info(
+            content,
+            suffix=suffix,
+            relative=relative,
+        )
+        counters[image.archive_stem] = counters.get(image.archive_stem, 0) + 1
+        if image.kind == "roi":
+            archive_path = (
+                f"roi/{image.archive_stem}_{counters[image.archive_stem]:04d}"
+                f"{normalized_suffix}"
+            )
+            capability = "roi"
+        else:
+            archive_path = (
+                f"frames/{image.archive_stem}_{counters[image.archive_stem]:04d}"
+                f"{normalized_suffix}"
+            )
+            capability = "frames"
+        archive_path = _validated_archive_path(archive_path)
+        source_sha256 = hashlib.sha256(content).hexdigest()
         budget.add_payload(len(content), relative)
-        selected.append(
+        payloads.append(
             _Payload(
                 capability=capability,
-                archive_path=_validated_archive_path(archive_path),
+                archive_path=archive_path,
                 classification="sensitive-image",
                 content=content,
             )
         )
-    payloads.extend(selected)
-    capabilities[capability] = bool(selected)
+        capabilities[capability] = True
+        index_entries.append(
+            {
+                "archive_path": archive_path,
+                "frame_seq": image.frame_seq,
+                "monotonic_ms": image.monotonic_ms,
+                "kind": image.kind,
+                "field": image.field,
+                "source_sha256": source_sha256,
+                "pixel_sha256": pixel_sha256,
+                "width": width,
+                "height": height,
+                "channels": channels,
+                "dtype": dtype,
+            }
+        )
+    return index_entries
+
+
+def _validated_image_info(
+    content: bytes,
+    *,
+    suffix: str,
+    relative: Path,
+) -> tuple[int, int, int, str, str]:
+    if suffix == ".png":
+        width, height = _png_dimensions(content, relative)
+    elif suffix in {".jpg", ".jpeg"}:
+        width, height = _jpeg_dimensions(content, relative)
+    else:
+        raise UnsafeSupportSourceError(f"unsupported support image type: {relative}")
+    if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+        raise UnsafeSupportSourceError(
+            f"support image dimensions exceed the safe pixel budget: {relative}"
+        )
+    try:
+        import cv2
+        import numpy as np
+
+        decoded = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    except Exception as exc:
+        raise UnsafeSupportSourceError(
+            f"support image could not be decoded safely: {relative}"
+        ) from exc
+    if decoded is None or decoded.size == 0:
+        raise UnsafeSupportSourceError(f"invalid support image content: {relative}")
+    decoded_height, decoded_width = decoded.shape[:2]
+    if (int(decoded_width), int(decoded_height)) != (width, height):
+        raise UnsafeSupportSourceError(
+            f"support image header and decoded dimensions disagree: {relative}"
+        )
+    channels = 1 if decoded.ndim == 2 else int(decoded.shape[2])
+    pixel_sha256 = hashlib.sha256(decoded.tobytes(order="C")).hexdigest()
+    return width, height, channels, str(decoded.dtype), pixel_sha256
+
+
+def _png_dimensions(content: bytes, relative: Path) -> tuple[int, int]:
+    if (
+        len(content) < 24
+        or not content.startswith(b"\x89PNG\r\n\x1a\n")
+        or content[12:16] != b"IHDR"
+    ):
+        raise UnsafeSupportSourceError(f"invalid PNG support source: {relative}")
+    return tuple(int(value) for value in struct.unpack(">II", content[16:24]))  # type: ignore[return-value]
+
+
+def _jpeg_dimensions(content: bytes, relative: Path) -> tuple[int, int]:
+    if len(content) < 4 or not content.startswith(b"\xff\xd8"):
+        raise UnsafeSupportSourceError(f"invalid JPEG support source: {relative}")
+    position = 2
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    while position < len(content):
+        while position < len(content) and content[position] != 0xFF:
+            position += 1
+        while position < len(content) and content[position] == 0xFF:
+            position += 1
+        if position >= len(content):
+            break
+        marker = content[position]
+        position += 1
+        if marker in {0x01, *range(0xD0, 0xDA)}:
+            continue
+        if position + 2 > len(content):
+            break
+        segment_length = int.from_bytes(content[position : position + 2], "big")
+        if segment_length < 2 or position + segment_length > len(content):
+            break
+        if marker in sof_markers and segment_length >= 7:
+            height = int.from_bytes(content[position + 3 : position + 5], "big")
+            width = int.from_bytes(content[position + 5 : position + 7], "big")
+            return width, height
+        position += segment_length
+    raise UnsafeSupportSourceError(f"invalid JPEG support source: {relative}")
 
 
 def _sanitize_document(

@@ -5,6 +5,8 @@ import json
 import zipfile
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from daguandan_bridge import support_bundle as support
@@ -12,6 +14,7 @@ from daguandan_bridge.support_bundle import (
     RedactionContext,
     SupportBundleError,
     SupportBundleSources,
+    SupportImageSource,
     UnsafeSupportSourceError,
     export_support_bundle,
 )
@@ -24,6 +27,13 @@ def _write_json(path: Path, value: object) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _png_bytes(value: int = 127) -> bytes:
+    image = np.full((3, 4, 3), value, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    return bytes(encoded)
 
 
 def _read_archive(path: Path) -> tuple[dict[str, bytes], dict[str, object]]:
@@ -91,9 +101,9 @@ def _sources(root: Path) -> SupportBundleSources:
         encoding="utf-8",
     )
     (root / "frames").mkdir()
-    (root / "frames" / "full.png").write_bytes(b"\x89PNG\r\n\x1a\nframe")
+    (root / "frames" / "full.png").write_bytes(_png_bytes(80))
     (root / "roi").mkdir()
-    (root / "roi" / "level.png").write_bytes(b"\x89PNG\r\n\x1a\nroi")
+    (root / "roi" / "level.png").write_bytes(_png_bytes(160))
     return SupportBundleSources(
         root=root,
         startup_log=Path("logs/startup.log"),
@@ -112,6 +122,26 @@ def _redaction() -> RedactionContext:
         usernames=("Alice",),
         computer_names=("DESKTOP-SECRET",),
     )
+
+
+def test_phase1a_support_sources_keep_their_positional_order(tmp_path: Path) -> None:
+    sources = SupportBundleSources(
+        tmp_path,
+        Path("startup.log"),
+        Path("runtime.json"),
+        Path("doctor.json"),
+        Path("build.json"),
+        Path("incident.json"),
+        Path("trace.jsonl"),
+        (Path("frame.png"),),
+        (Path("roi.png"),),
+    )
+
+    assert sources.runtime_identity == Path("runtime.json")
+    assert sources.recognition_trace == Path("trace.jsonl")
+    assert sources.frames == (Path("frame.png"),)
+    assert sources.roi == (Path("roi.png"),)
+    assert sources.opening_evidence is None
 
 
 def test_default_bundle_uses_fixed_allowlist_and_disables_sensitive_capabilities(
@@ -136,20 +166,36 @@ def test_default_bundle_uses_fixed_allowlist_and_disables_sensitive_capabilities
     }
     assert manifest["capabilities"] == {
         "startup_log": True,
+        "startup_events": False,
+        "exceptions_log": False,
+        "runtime_log": False,
         "runtime_identity": True,
         "doctor": True,
         "build_manifest": True,
         "incident": True,
+        "opening_evidence": False,
+        "repro_manifest": False,
+        "frame_index": False,
+        "health_audit": False,
         "frames": False,
         "roi": False,
+        "image_index": False,
         "recognition_trace": False,
     }
     assert {
         (item["capability"], item["reason"]) for item in manifest["missing"]
     } == {
+        ("exceptions_log", "not_provided"),
+        ("frame_index", "not_provided"),
         ("frames", "disabled"),
+        ("health_audit", "not_provided"),
+        ("image_index", "disabled"),
+        ("opening_evidence", "not_provided"),
+        ("repro_manifest", "not_provided"),
         ("roi", "disabled"),
         ("recognition_trace", "disabled"),
+        ("runtime_log", "not_provided"),
+        ("startup_events", "not_provided"),
     }
     assert manifest["privacy"]["contains_sensitive_images"] is False
 
@@ -195,16 +241,141 @@ def test_frames_roi_and_trace_require_opt_in_and_use_generated_names(tmp_path: P
 
     assert "frames/frames_0001.png" in entries
     assert "roi/roi_0001.png" in entries
+    assert "evidence/image_index.json" in entries
     assert "trace/recognition_trace.jsonl" in entries
     assert manifest["capabilities"]["frames"] is True
     assert manifest["capabilities"]["roi"] is True
+    assert manifest["capabilities"]["image_index"] is True
     assert manifest["capabilities"]["recognition_trace"] is True
     assert manifest["privacy"]["contains_sensitive_images"] is True
-    assert entries["frames/frames_0001.png"] == b"\x89PNG\r\n\x1a\nframe"
+    assert entries["frames/frames_0001.png"] == _png_bytes(80)
+    image_index = json.loads(entries["evidence/image_index.json"].decode("utf-8"))
+    assert image_index["schema"] == "guandan.support-image-index/1"
+    assert image_index["entries"][0]["archive_path"] == "frames/frames_0001.png"
+    assert image_index["entries"][0]["source_sha256"] == hashlib.sha256(
+        _png_bytes(80)
+    ).hexdigest()
+    assert len(image_index["entries"][0]["pixel_sha256"]) == 64
     trace = entries["trace/recognition_trace.jsonl"].decode("utf-8")
     assert "trace-secret" not in trace
     assert "Alice" not in trace
     assert "<PATH>" in trace
+
+
+def test_additive_v1_fixed_evidence_uses_stable_archive_paths(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "startup.jsonl").write_text(
+        json.dumps({"schema": "guandan.startup-event/1", "event": "ready"}) + "\n",
+        encoding="utf-8",
+    )
+    (root / "exceptions.log").write_text("worker failed safely\n", encoding="utf-8")
+    (root / "runtime.log").write_text("runtime ready\n", encoding="utf-8")
+    _write_json(root / "opening.json", {"schema": "guandan.opening-evidence/1"})
+    _write_json(root / "repro.json", {"schema": "guandan.repro-manifest/1"})
+    (root / "frame_index.jsonl").write_text(
+        json.dumps({"frame_seq": 4, "monotonic_ms": 900}) + "\n",
+        encoding="utf-8",
+    )
+    _write_json(root / "health.json", {"schema": "guandan.session-health/1", "status": "FAIL"})
+
+    export_support_bundle(
+        tmp_path / "support.zip",
+        SupportBundleSources(
+            root=root,
+            startup_events=Path("startup.jsonl"),
+            exceptions_log=Path("exceptions.log"),
+            runtime_log=Path("runtime.log"),
+            opening_evidence=Path("opening.json"),
+            repro_manifest=Path("repro.json"),
+            frame_index=Path("frame_index.jsonl"),
+            health_audit=Path("health.json"),
+        ),
+    )
+
+    entries, manifest = _read_archive(tmp_path / "support.zip")
+    assert {
+        "startup/startup.jsonl",
+        "startup/exceptions.log",
+        "runtime/runtime.log",
+        "evidence/opening_evidence.json",
+        "repro/repro.json",
+        "evidence/frame_index.jsonl",
+        "health/health_audit.json",
+    }.issubset(entries)
+    for capability in (
+        "startup_events",
+        "exceptions_log",
+        "runtime_log",
+        "opening_evidence",
+        "repro_manifest",
+        "frame_index",
+        "health_audit",
+    ):
+        assert manifest["capabilities"][capability] is True
+
+
+def test_structured_image_index_correlates_raw_standardized_and_roi(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    for name, value in (("raw.png", 10), ("standard.png", 20), ("level.png", 30)):
+        (root / name).write_bytes(_png_bytes(value))
+    sources = SupportBundleSources(
+        root=root,
+        images=(
+            SupportImageSource(Path("raw.png"), 42, 123_456, "raw_client"),
+            SupportImageSource(Path("standard.png"), 42, 123_456, "standardized"),
+            SupportImageSource(Path("level.png"), 42, 123_456, "roi", "level_rank"),
+        ),
+    )
+
+    export_support_bundle(
+        tmp_path / "support.zip",
+        sources,
+        include_frames=True,
+        include_roi=True,
+    )
+
+    entries, manifest = _read_archive(tmp_path / "support.zip")
+    index = json.loads(entries["evidence/image_index.json"].decode("utf-8"))
+    assert [item["kind"] for item in index["entries"]] == [
+        "raw_client",
+        "standardized",
+        "roi",
+    ]
+    assert {item["frame_seq"] for item in index["entries"]} == {42}
+    assert {item["monotonic_ms"] for item in index["entries"]} == {123_456}
+    assert index["entries"][2]["field"] == "level_rank"
+    assert all(len(item["source_sha256"]) == 64 for item in index["entries"])
+    assert all(len(item["pixel_sha256"]) == 64 for item in index["entries"])
+    records = {item["path"]: item for item in manifest["files"]}
+    for item in index["entries"]:
+        assert records[item["archive_path"]]["sha256"] == item["source_sha256"]
+
+
+def test_structured_image_metadata_is_validated_even_when_images_are_disabled(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "image.png").write_bytes(_png_bytes())
+
+    with pytest.raises(SupportBundleError, match="safe diagnostic identifier"):
+        export_support_bundle(
+            tmp_path / "support.zip",
+            SupportBundleSources(
+                root=root,
+                images=(
+                    SupportImageSource(
+                        Path("image.png"),
+                        1,
+                        1,
+                        "roi",
+                        "../level",
+                    ),
+                ),
+            ),
+        )
 
 
 def test_missing_inputs_are_reported_without_inventing_capabilities(tmp_path: Path) -> None:
@@ -226,10 +397,14 @@ def test_missing_inputs_are_reported_without_inventing_capabilities(tmp_path: Pa
         item["capability"]: item["reason"] for item in manifest["missing"]
     }
     assert reasons["startup_log"] == "not_found"
+    assert reasons["startup_events"] == "not_provided"
+    assert reasons["exceptions_log"] == "not_provided"
+    assert reasons["runtime_log"] == "not_provided"
     assert reasons["runtime_identity"] == "not_provided"
     assert reasons["doctor"] == "not_provided"
     assert reasons["build_manifest"] == "not_provided"
     assert reasons["frames"] == "disabled"
+    assert reasons["image_index"] == "disabled"
     assert reasons["roi"] == "disabled"
     assert reasons["recognition_trace"] == "disabled"
 
@@ -500,11 +675,13 @@ def test_cumulative_payload_limit_fails_before_publication_or_unbounded_read(
     root.mkdir()
     first = root / "first.png"
     second = root / "second.png"
-    first.write_bytes(b"\x89PNG\r\n\x1a\n")
-    second.write_bytes(b"\x89PNG\r\n\x1a\n")
+    first_payload = _png_bytes(10)
+    second_payload = _png_bytes(20)
+    first.write_bytes(first_payload)
+    second.write_bytes(second_payload)
     destination = tmp_path / "support.zip"
     destination.write_bytes(b"previous-good-bundle")
-    monkeypatch.setattr(support, "_MAX_PAYLOAD_BYTES", 12)
+    monkeypatch.setattr(support, "_MAX_PAYLOAD_BYTES", len(first_payload) + 1)
     monkeypatch.setattr(
         Path,
         "read_bytes",
