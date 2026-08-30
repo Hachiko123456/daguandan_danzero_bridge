@@ -16,6 +16,14 @@ from typing import Any, Iterable, Mapping, Sequence
 NATIVE_AUDIT_SCHEMA = "guandan.native-dependency-audit/1"
 _PE_SUFFIXES = {".exe", ".dll", ".pyd"}
 _BANNED_SOURCE_TOKENS = ("java", "jdk", "anaconda", "miniconda", "poppler")
+_PYINSTALLER_RUNTIME_SEARCH_DIRECTORIES = {
+    "numpy": ("_internal/numpy.libs",),
+    "pyside6": ("_internal/PySide6", "_internal/shiboken6"),
+    "pythonwin": ("_internal/pywin32_system32",),
+    "torch": ("_internal/torch/lib",),
+    "win32": ("_internal/pywin32_system32",),
+    "win32com": ("_internal/pywin32_system32",),
+}
 _SYSTEM_DLLS = {
     "advapi32.dll",
     "authz.dll",
@@ -160,22 +168,65 @@ def audit_frozen_bundle(
     pe_paths = [
         path for path in _walk_files(root) if path.suffix.casefold() in _PE_SUFFIXES
     ]
-    bundled_names = {path.name.casefold() for path in pe_paths}
+    bundled_paths = {
+        path.relative_to(root).as_posix().casefold()
+        for path in pe_paths
+    }
     executable_identity = executable_name.casefold()
     for path in pe_paths:
         relative = path.relative_to(root).as_posix()
         content_hash = _sha256_file(path)
         source = provenance_map.get(relative.casefold())
-        if source is None:
+        source_hash: str | None = None
+        if relative.casefold() == executable_identity:
+            source_class = "pyinstaller-output"
+            source_relative = path.name
+            if source is not None:
+                source_path = Path(source)
+                if source_path.is_file() and not _is_link_or_reparse(source_path):
+                    source_hash = _sha256_file(source_path)
+                    if source_hash != content_hash:
+                        errors.append(
+                            _error(
+                                "NATIVE-SOURCE-TARGET-MISMATCH",
+                                relative,
+                                {
+                                    "source_class": source_class,
+                                    "source_sha256": source_hash,
+                                    "target_sha256": content_hash,
+                                },
+                            )
+                        )
+        elif source is None:
             # PyInstaller's generated executable has no source TOC entry.
             source_class = "pyinstaller-output" if relative.casefold() == executable_identity else "unknown"
             source_relative = path.name if source_class == "pyinstaller-output" else None
         else:
-            source_class, source_relative = _classify_source(Path(source), allowed)
+            source_path = Path(source)
+            source_class, source_relative = _classify_source(source_path, allowed)
+            if _is_link_or_reparse(source_path) or not source_path.is_file():
+                errors.append(
+                    _error("NATIVE-SOURCE-UNAVAILABLE", relative, {"source_class": source_class})
+                )
+            else:
+                source_hash = _sha256_file(source_path)
+                if source_hash != content_hash:
+                    errors.append(
+                        _error(
+                            "NATIVE-SOURCE-TARGET-MISMATCH",
+                            relative,
+                            {
+                                "source_class": source_class,
+                                "source_sha256": source_hash,
+                                "target_sha256": content_hash,
+                            },
+                        )
+                    )
         record: dict[str, object] = {
             "path": relative,
             "bytes": path.stat().st_size,
             "sha256": content_hash,
+            "source_sha256": source_hash,
             "source_class": source_class,
             "source_relative": source_relative,
             "imports": [],
@@ -206,12 +257,17 @@ def audit_frozen_bundle(
             normalized = imported.casefold()
             if _is_windows_system_import(normalized):
                 continue
-            if normalized not in bundled_names:
+            resolved, searched = _resolve_bundled_import(
+                relative,
+                normalized,
+                bundled_paths,
+            )
+            if not resolved:
                 errors.append(
                     _error(
                         "NATIVE-MISSING-IMPORT",
                         relative,
-                        {"import": imported},
+                        {"import": imported, "searched": searched},
                     )
                 )
         if lower_name.startswith("qt6") and not (
@@ -337,6 +393,43 @@ def _is_windows_system_import(name: str) -> bool:
         or name.startswith("api-ms-win-")
         or name.startswith("ext-ms-win-")
     )
+
+
+def _resolve_bundled_import(
+    importer_relative: str,
+    imported_name: str,
+    bundle_paths: set[str],
+) -> tuple[bool, list[str]]:
+    """Resolve one PE import using only loader-searchable bundle locations.
+
+    A global basename set is unsafe: a DLL nested under an unrelated package
+    cannot satisfy the Windows loader for this importer.  PyInstaller onedir
+    binaries can resolve beside the importing PE, beside the executable, from
+    ``_internal``, and from their top-level package DLL directory (notably
+    PySide6's runtime hook).
+    """
+
+    imported = PurePosixPath(str(imported_name).replace("\\", "/")).name.casefold()
+    importer = PurePosixPath(importer_relative)
+    roots: list[PurePosixPath] = [importer.parent, PurePosixPath("."), PurePosixPath("_internal")]
+    parts = importer.parts
+    if len(parts) >= 3 and parts[0].casefold() == "_internal":
+        roots.append(PurePosixPath(parts[0], parts[1]))
+        package = parts[1].casefold()
+        roots.extend(
+            PurePosixPath(value)
+            for value in _PYINSTALLER_RUNTIME_SEARCH_DIRECTORIES.get(package, ())
+        )
+    searched: list[str] = []
+    for search_root in roots:
+        candidate = (
+            PurePosixPath(imported)
+            if str(search_root) == "."
+            else search_root / imported
+        ).as_posix().casefold()
+        if candidate not in searched:
+            searched.append(candidate)
+    return any(candidate in bundle_paths for candidate in searched), searched
 
 
 def _walk_files(root: Path) -> list[Path]:

@@ -111,3 +111,104 @@ def test_windows_media_and_system_icu_imports_are_not_reported_missing(
     ]
 
     assert missing == ["not_bundled.dll"]
+
+
+def test_native_audit_rejects_target_bytes_that_differ_from_provenance_source(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = tmp_path / "bundle"
+    target = bundle / "_internal" / "module.pyd"
+    source = tmp_path / "venv" / "Lib" / "site-packages" / "module.pyd"
+    _fake_pe(target)
+    _fake_pe(source)
+    target.write_bytes(target.read_bytes() + b"changed")
+    monkeypatch.setattr(
+        audit_module,
+        "_pe_metadata",
+        lambda _path: ([], [".text"], None),
+    )
+
+    result = audit_frozen_bundle(
+        bundle,
+        provenance={"_internal/module.pyd": str(source)},
+        allowed_venv_root=tmp_path / "venv",
+    )
+
+    assert "NATIVE-SOURCE-TARGET-MISMATCH" in result.document["summary"]["error_codes"]
+    record = result.document["files"][0]
+    assert record["source_sha256"] != record["sha256"]
+
+
+def test_import_resolution_does_not_accept_unsearchable_global_basename(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = tmp_path / "bundle"
+    importer = bundle / "_internal" / "package" / "module.pyd"
+    unrelated = bundle / "_internal" / "other" / "dependency.dll"
+    importer_source = tmp_path / "venv" / "package" / "module.pyd"
+    unrelated_source = tmp_path / "venv" / "other" / "dependency.dll"
+    for path in (importer, unrelated, importer_source, unrelated_source):
+        _fake_pe(path)
+
+    def metadata(path):
+        imports = ["dependency.dll"] if path.name == "module.pyd" else []
+        return imports, [".text"], None
+
+    monkeypatch.setattr(audit_module, "_pe_metadata", metadata)
+    result = audit_frozen_bundle(
+        bundle,
+        provenance={
+            "_internal/package/module.pyd": str(importer_source),
+            "_internal/other/dependency.dll": str(unrelated_source),
+        },
+        allowed_venv_root=tmp_path / "venv",
+    )
+
+    missing = [
+        item
+        for item in result.document["errors"]
+        if item["code"] == "NATIVE-MISSING-IMPORT"
+    ]
+    assert len(missing) == 1
+    assert missing[0]["path"] == "_internal/package/module.pyd"
+
+
+def test_import_resolution_accepts_importer_directory_and_internal_root(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = tmp_path / "bundle"
+    importer = bundle / "_internal" / "package" / "module.pyd"
+    sibling = bundle / "_internal" / "package" / "sibling.dll"
+    internal = bundle / "_internal" / "rootdep.dll"
+    sources = tmp_path / "venv"
+    for relative in (
+        "package/module.pyd",
+        "package/sibling.dll",
+        "rootdep.dll",
+    ):
+        _fake_pe(bundle / "_internal" / relative)
+        _fake_pe(sources / relative)
+
+    monkeypatch.setattr(
+        audit_module,
+        "_pe_metadata",
+        lambda path: (
+            ["sibling.dll", "rootdep.dll"] if path.name == "module.pyd" else [],
+            [".text"],
+            None,
+        ),
+    )
+    result = audit_frozen_bundle(
+        bundle,
+        provenance={
+            "_internal/package/module.pyd": str(sources / "package/module.pyd"),
+            "_internal/package/sibling.dll": str(sources / "package/sibling.dll"),
+            "_internal/rootdep.dll": str(sources / "rootdep.dll"),
+        },
+        allowed_venv_root=sources,
+    )
+
+    assert "NATIVE-MISSING-IMPORT" not in result.document["summary"]["error_codes"]
