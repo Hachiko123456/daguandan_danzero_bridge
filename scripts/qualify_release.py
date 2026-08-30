@@ -41,6 +41,7 @@ from daguandan_bridge.release_manager import (  # noqa: E402
     install_release,
     register_legacy_baseline,
     rollback_release,
+    verify_baseline_auth,
 )
 from daguandan_bridge.storage import atomic_write_json  # noqa: E402
 from daguandan_bridge.support_repro import verify_support_archive  # noqa: E402
@@ -172,6 +173,10 @@ class Qualification:
                 raise ValueError("baseline bundle must be a pre-stored external artifact")
             if _paths_overlap(Path(self.args.baseline_auth).resolve(), PROJECT_ROOT):
                 raise ValueError("baseline auth must be external to the source checkout")
+            baseline_auth = verify_baseline_auth(
+                baseline_bundle,
+                Path(self.args.baseline_auth),
+            )
             # From this point the destination is a new, disjoint file owned by
             # this qualification attempt, so later failures may be published
             # there without overwriting source/build inputs.
@@ -202,6 +207,11 @@ class Qualification:
                 "formal_inputs": {
                     label.replace(" ", "_"): sha256_file(path)
                     for label, path in required_files.items()
+                },
+                "baseline_artifact": {
+                    "tree_sha256": baseline_auth["artifact"]["tree_sha256"],
+                    "executable_sha256": baseline_auth["executable"]["sha256"],
+                    "build_identity_sha256": baseline_auth["build_identity_sha256"],
                 },
             }
         except Exception as exc:
@@ -456,14 +466,9 @@ class Qualification:
     def _install_rollback(self) -> Mapping[str, object]:
         assert self.archive is not None and self.release_record is not None and self.archive_checksum is not None
         runtime = self.work_root / "install-runtime"
-        # Existing repository release is an old portable build. Copy it as an
-        # explicitly non-reproducible legacy baseline; never modify release/.
-        legacy = PROJECT_ROOT / "release" / "dist" / "DaguandanAssistant"
-        if not (legacy / "DaguandanAssistant.exe").is_file():
-            raise _StageFailure("legacy baseline binary is unavailable for rollback exercise", 2, None, None, {"path": str(legacy)})
         baseline = register_legacy_baseline(
-            legacy,
-            executable_sha256=sha256_file(legacy / "DaguandanAssistant.exe"),
+            Path(self.args.baseline_bundle),
+            baseline_auth_path=Path(self.args.baseline_auth),
             runtime_root=runtime,
         )
         candidate = install_release(
@@ -472,16 +477,7 @@ class Qualification:
             checksum_path=self.archive_checksum,
             runtime_root=runtime,
         )
-        # The legacy binary predates the current doctor contract, so use a
-        # deliberately explicit transition runner that validates the pointer
-        # operation while recording that the physical legacy doctor is outside
-        # this local proof. Candidate activation is still run by the real EXE.
-        def legacy_doctor(_release, _runtime, output_path):
-            report = {"schema": "guandan.doctor/1", "checks": [], "legacy_baseline": True}
-            atomic_write_json(output_path, report)
-            return report
-
-        activate_release(baseline.release_id, runtime_root=runtime, doctor_runner=legacy_doctor)
+        activate_release(baseline.release_id, runtime_root=runtime)
         activate_release(candidate.release_id, runtime_root=runtime)
         rolled = rollback_release(runtime_root=runtime)
         if rolled.get("release_id") != baseline.release_id:

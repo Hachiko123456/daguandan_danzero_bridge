@@ -18,6 +18,7 @@ from daguandan_bridge.release_manager import (  # noqa: E402
     register_legacy_baseline,
     release_status,
     rollback_release,
+    write_baseline_auth,
 )
 
 
@@ -34,7 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     activate.add_argument("release_id")
     legacy = sub.add_parser("register-legacy-baseline")
     legacy.add_argument("directory", type=Path)
-    legacy.add_argument("--executable-sha256", required=True)
+    legacy.add_argument("--baseline-auth", type=Path, required=True)
+    auth = sub.add_parser("create-baseline-auth")
+    auth.add_argument("directory", type=Path)
+    auth.add_argument("--output", type=Path, required=True)
+    auth.add_argument("--approve-stable-baseline", action="store_true")
     sub.add_parser("rollback")
     sub.add_parser("status")
     args = parser.parse_args(argv)
@@ -52,9 +57,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "register-legacy-baseline":
             result = register_legacy_baseline(
                 args.directory,
-                executable_sha256=args.executable_sha256,
+                baseline_auth_path=args.baseline_auth,
                 runtime_root=args.runtime_root,
             ).to_dict()
+        elif args.command == "create-baseline-auth":
+            result = write_baseline_auth(
+                args.directory,
+                args.output,
+                approved=args.approve_stable_baseline,
+            )
         elif args.command == "rollback":
             result = rollback_release(runtime_root=args.runtime_root)
         else:

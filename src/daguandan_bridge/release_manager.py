@@ -23,12 +23,14 @@ from .build_manifest import (
     sha256_file,
     verify_build_manifest,
 )
+from .doctor import validate_frozen_doctor_report
 from .runtime_layout import (
     APP_DIRECTORY_NAME,
     RUNTIME_ROOT_MARKER,
     RUNTIME_ROOT_SCHEMA,
     assert_safe_tree,
     atomic_write_json,
+    safe_tree_files,
 )
 
 
@@ -36,6 +38,7 @@ INSTALL_ROOT_SCHEMA = "guandan.install-root/1"
 ACTIVE_RELEASE_SCHEMA = "guandan.active-release/1"
 ROLLBACK_RECEIPT_SCHEMA = "guandan.rollback-receipt/1"
 LEGACY_BASELINE_SCHEMA = "guandan.legacy-baseline/1"
+BASELINE_AUTH_SCHEMA = "guandan.baseline-auth/1"
 BASELINE_SOURCE_COMMIT = "2db427b0937dfa390eaad407a92a084556af1279"
 BASELINE_TAG = "baseline/local-stable-20260831"
 _INSTALL_MARKER = ".daguandan-install-root.json"
@@ -58,6 +61,9 @@ class InstalledRelease:
     executable: Path
     source_commit: str | None
     baseline: bool
+    receipt_schema: str
+    artifact_tree_sha256: str | None = None
+    baseline_auth_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -67,6 +73,9 @@ class InstalledRelease:
             "executable_relative": self.executable.relative_to(self.version_root).as_posix(),
             "source_commit": self.source_commit,
             "baseline": self.baseline,
+            "receipt_schema": self.receipt_schema,
+            "artifact_tree_sha256": self.artifact_tree_sha256,
+            "baseline_auth_sha256": self.baseline_auth_sha256,
         }
 
 
@@ -197,18 +206,16 @@ def install_release(
 def register_legacy_baseline(
     portable_directory: Path | str,
     *,
-    executable_sha256: str,
+    baseline_auth_path: Path | str,
     runtime_root: Path | str | None = None,
 ) -> InstalledRelease:
-    """Copy a known-good old portable directory without claiming reproducibility."""
+    """Copy an externally preapproved known-good portable baseline."""
 
     source = Path(portable_directory)
-    if not source.is_dir():
-        raise ReleaseManagerError("legacy baseline directory does not exist")
-    assert_safe_tree(source)
-    executable = source / "DaguandanAssistant.exe"
-    if not executable.is_file() or sha256_file(executable) != executable_sha256:
-        raise ReleaseManagerError("legacy baseline executable hash mismatch")
+    auth_path = Path(baseline_auth_path)
+    auth = verify_baseline_auth(source, auth_path)
+    executable = source / str(auth["executable"]["path"])
+    executable_sha256 = str(auth["executable"]["sha256"])
     release_id = f"legacy-baseline-{BASELINE_SOURCE_COMMIT[:12]}-{executable_sha256[:12]}"
     install = ensure_install_root(runtime_root)
     versions = install / "versions"
@@ -228,6 +235,11 @@ def register_legacy_baseline(
                     "source_commit": BASELINE_SOURCE_COMMIT,
                     "executable_relative": "DaguandanAssistant/DaguandanAssistant.exe",
                     "executable_sha256": executable_sha256,
+                    "artifact_tree_sha256": auth["artifact"]["tree_sha256"],
+                    "artifact_file_count": auth["artifact"]["file_count"],
+                    "artifact_bytes": auth["artifact"]["bytes"],
+                    "baseline_auth_sha256": sha256_file(auth_path),
+                    "build_identity_sha256": auth["build_identity_sha256"],
                     "baseline": True,
                     "reproducible": False,
                 },
@@ -241,6 +253,104 @@ def register_legacy_baseline(
     return installed
 
 
+def write_baseline_auth(
+    portable_directory: Path | str,
+    output_path: Path | str,
+    *,
+    approved: bool,
+) -> dict[str, object]:
+    """Create an explicit, one-time authorization for a stable old bundle.
+
+    Qualification never calls this function.  The resulting file must be
+    stored separately from both the source checkout and the approved bundle.
+    """
+
+    if approved is not True:
+        raise ReleaseManagerError("baseline authorization requires explicit approval")
+    source = Path(portable_directory).resolve()
+    output = Path(output_path).resolve()
+    if not source.is_dir():
+        raise ReleaseManagerError("legacy baseline directory does not exist")
+    if _paths_overlap(source, output):
+        raise ReleaseManagerError("baseline auth must be stored outside the baseline artifact")
+    if output.exists():
+        raise ReleaseManagerError("baseline auth output already exists")
+    artifact = _tree_identity(source)
+    executable = source / "DaguandanAssistant.exe"
+    if not executable.is_file() or _is_link_or_reparse(executable):
+        raise ReleaseManagerError("legacy baseline executable is unavailable")
+    executable_record = {
+        "path": "DaguandanAssistant.exe",
+        "bytes": executable.stat().st_size,
+        "sha256": sha256_file(executable),
+    }
+    source_identity = {
+        "tag": BASELINE_TAG,
+        "commit": BASELINE_SOURCE_COMMIT,
+    }
+    build_identity_sha256 = _canonical_sha256(source_identity)
+    approval_payload = {
+        "source_identity": source_identity,
+        "artifact": artifact,
+        "executable": executable_record,
+        "build_identity_sha256": build_identity_sha256,
+    }
+    document = {
+        "schema": BASELINE_AUTH_SCHEMA,
+        "approved": True,
+        **approval_payload,
+        "approval_sha256": _canonical_sha256(approval_payload),
+        "approved_at": datetime.now(UTC).isoformat(),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        raise ReleaseManagerError("baseline auth output already exists")
+    atomic_write_json(output, document)
+    return document
+
+
+def verify_baseline_auth(
+    portable_directory: Path | str,
+    baseline_auth_path: Path | str,
+) -> dict[str, object]:
+    source = Path(portable_directory).resolve()
+    auth_path = Path(baseline_auth_path).resolve()
+    if not source.is_dir():
+        raise ReleaseManagerError("legacy baseline directory does not exist")
+    if _paths_overlap(source, auth_path):
+        raise ReleaseManagerError("baseline auth must be external to the artifact")
+    document = _json_file(auth_path, "baseline auth")
+    if document.get("schema") != BASELINE_AUTH_SCHEMA or document.get("approved") is not True:
+        raise ReleaseManagerError("baseline auth is unsupported or not approved")
+    source_identity = document.get("source_identity")
+    expected_source = {"tag": BASELINE_TAG, "commit": BASELINE_SOURCE_COMMIT}
+    if source_identity != expected_source:
+        raise ReleaseManagerError("baseline auth source identity is invalid")
+    if document.get("build_identity_sha256") != _canonical_sha256(expected_source):
+        raise ReleaseManagerError("baseline auth build/source identity hash is invalid")
+    artifact = _tree_identity(source)
+    if document.get("artifact") != artifact:
+        raise ReleaseManagerError("baseline artifact tree does not match its preapproval")
+    executable = document.get("executable")
+    expected_executable_path = source / "DaguandanAssistant.exe"
+    expected_executable = {
+        "path": "DaguandanAssistant.exe",
+        "bytes": expected_executable_path.stat().st_size,
+        "sha256": sha256_file(expected_executable_path),
+    }
+    if executable != expected_executable:
+        raise ReleaseManagerError("baseline executable does not match its preapproval")
+    payload = {
+        "source_identity": expected_source,
+        "artifact": artifact,
+        "executable": expected_executable,
+        "build_identity_sha256": document.get("build_identity_sha256"),
+    }
+    if document.get("approval_sha256") != _canonical_sha256(payload):
+        raise ReleaseManagerError("baseline approval hash is invalid")
+    return document
+
+
 def activate_release(
     release_id: str,
     *,
@@ -251,15 +361,22 @@ def activate_release(
     selected = _installed_by_id(install, release_id)
     runtime = install.parent
     doctor_path = install / "rollback-receipts" / f"doctor-{selected.release_id}-{uuid4().hex[:8]}.json"
-    doctor = (
-        dict(doctor_runner(selected, runtime, doctor_path))
-        if doctor_runner is not None
-        else _run_frozen_doctor(selected, runtime, doctor_path)
-    )
-    checks = doctor.get("checks") if isinstance(doctor.get("checks"), list) else []
-    if doctor.get("schema") != "guandan.doctor/1" or any(
-        isinstance(item, Mapping) and item.get("status") == "FAIL" for item in checks
-    ):
+    if selected.receipt_schema == LEGACY_BASELINE_SCHEMA:
+        if doctor_runner is not None:
+            raise ReleaseManagerError("legacy baseline activation does not accept a custom doctor")
+        doctor = _run_preauthorized_legacy_doctor(selected, doctor_path)
+        doctor_validation = _validate_legacy_doctor(selected, doctor)
+    else:
+        doctor = (
+            dict(doctor_runner(selected, runtime, doctor_path))
+            if doctor_runner is not None
+            else _run_frozen_doctor(selected, runtime, doctor_path)
+        )
+        doctor_validation = validate_frozen_doctor_report(
+            doctor,
+            expected_build_id=selected.build_id,
+        )
+    if doctor_validation.get("status") != "PASS":
         raise ReleaseManagerError("candidate doctor did not pass; active release was not changed")
     current = _read_active(install)
     document = {
@@ -398,6 +515,14 @@ def _load_installed_receipt(version_root: Path) -> InstalledRelease:
         if not integrity.ok or integrity.build_id != installed.build_id:
             raise ReleaseManagerError("installed release no longer passes strict integrity")
         _verify_native_audit(bundle)
+    elif receipt.get("schema") == LEGACY_BASELINE_SCHEMA:
+        artifact = _tree_identity(installed.executable.parent)
+        if artifact.get("tree_sha256") != installed.artifact_tree_sha256:
+            raise ReleaseManagerError("installed legacy baseline artifact tree changed")
+        if not installed.baseline or not installed.baseline_auth_sha256:
+            raise ReleaseManagerError("installed legacy baseline preapproval is incomplete")
+    else:
+        raise ReleaseManagerError("installed release receipt schema is unsupported")
     return installed
 
 
@@ -421,6 +546,17 @@ def _installed_from_receipt(
         executable=executable,
         source_commit=str(receipt.get("source_commit") or "") or None,
         baseline=bool(receipt.get("baseline", False)),
+        receipt_schema=str(receipt.get("schema") or ""),
+        artifact_tree_sha256=(
+            str(receipt.get("artifact_tree_sha256"))
+            if receipt.get("artifact_tree_sha256")
+            else None
+        ),
+        baseline_auth_sha256=(
+            str(receipt.get("baseline_auth_sha256"))
+            if receipt.get("baseline_auth_sha256")
+            else None
+        ),
     )
 
 
@@ -502,6 +638,8 @@ def _record_baseline(
         "source_commit": BASELINE_SOURCE_COMMIT,
         "release": release.to_dict(),
         "archive_sha256": archive_hash,
+        "baseline_auth_sha256": release.baseline_auth_sha256,
+        "artifact_tree_sha256": release.artifact_tree_sha256,
     }
     path = install / _BASELINE_FILE
     if path.exists():
@@ -531,6 +669,71 @@ def _run_frozen_doctor(
     if completed.returncode != 0 or not output_path.is_file():
         raise ReleaseManagerError("frozen doctor failed before activation")
     return _json_file(output_path, "doctor report")
+
+
+def _run_preauthorized_legacy_doctor(
+    release: InstalledRelease,
+    output_path: Path,
+) -> dict[str, object]:
+    artifact = _tree_identity(release.executable.parent)
+    tree_matches = bool(
+        release.artifact_tree_sha256
+        and artifact.get("tree_sha256") == release.artifact_tree_sha256
+    )
+    auth_present = bool(release.baseline_auth_sha256)
+    report = {
+        "schema": "guandan.doctor/1",
+        "overall_status": "PASS" if tree_matches and auth_present else "FAIL",
+        "legacy_preauthorized": True,
+        "identity": {
+            "frozen": True,
+            "build_status": "legacy-preauthenticated",
+            "build_id": release.build_id,
+        },
+        "checks": [
+            {
+                "id": "LEGACY-BASELINE-PREAUTH",
+                "status": "PASS" if auth_present else "FAIL",
+                "summary": "External baseline authorization is bound to this install",
+                "evidence": {"baseline_auth_sha256": release.baseline_auth_sha256},
+            },
+            {
+                "id": "LEGACY-ARTIFACT-INTEGRITY",
+                "status": "PASS" if tree_matches else "FAIL",
+                "summary": "The complete legacy artifact still matches its authorization",
+                "evidence": {
+                    "expected_tree_sha256": release.artifact_tree_sha256,
+                    "actual_tree_sha256": artifact.get("tree_sha256"),
+                },
+            },
+        ],
+    }
+    atomic_write_json(output_path, report)
+    return report
+
+
+def _validate_legacy_doctor(
+    release: InstalledRelease,
+    report: Mapping[str, object],
+) -> dict[str, object]:
+    checks = report.get("checks") if isinstance(report.get("checks"), list) else []
+    ids = [item.get("id") for item in checks if isinstance(item, Mapping)]
+    expected = {"LEGACY-BASELINE-PREAUTH", "LEGACY-ARTIFACT-INTEGRITY"}
+    passed = bool(
+        release.receipt_schema == LEGACY_BASELINE_SCHEMA
+        and release.baseline
+        and release.baseline_auth_sha256
+        and report.get("schema") == "guandan.doctor/1"
+        and report.get("overall_status") == "PASS"
+        and report.get("legacy_preauthorized") is True
+        and len(ids) == len(set(ids)) == 2
+        and set(ids) == expected
+        and all(
+            isinstance(item, Mapping) and item.get("status") == "PASS"
+            for item in checks
+        )
+    )
+    return {"status": "PASS" if passed else "FAIL", "check_ids": ids}
 
 
 def _export_bad_release_support(
@@ -626,6 +829,50 @@ def _copy_safe_tree(source: Path, destination: Path) -> None:
         elif path.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
+
+
+def _tree_identity(root: Path) -> dict[str, object]:
+    assert_safe_tree(root)
+    records = [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in safe_tree_files(root)
+    ]
+    records.sort(key=lambda item: str(item["path"]).casefold())
+    return {
+        "file_count": len(records),
+        "bytes": sum(int(item["bytes"]) for item in records),
+        "tree_sha256": _canonical_sha256(records),
+    }
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    first = first.resolve(strict=False)
+    second = second.resolve(strict=False)
+    try:
+        first.relative_to(second)
+        return True
+    except ValueError:
+        pass
+    try:
+        second.relative_to(first)
+        return True
+    except ValueError:
+        return False
 
 
 def _remove_staging(path: Path, versions_root: Path) -> None:
@@ -742,6 +989,7 @@ def _is_link_or_reparse(path: Path) -> bool:
 
 __all__ = [
     "ACTIVE_RELEASE_SCHEMA",
+    "BASELINE_AUTH_SCHEMA",
     "BASELINE_SOURCE_COMMIT",
     "BASELINE_TAG",
     "InstalledRelease",
@@ -753,4 +1001,6 @@ __all__ = [
     "register_legacy_baseline",
     "release_status",
     "rollback_release",
+    "verify_baseline_auth",
+    "write_baseline_auth",
 ]

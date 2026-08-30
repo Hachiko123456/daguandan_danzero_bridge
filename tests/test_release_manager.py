@@ -10,15 +10,19 @@ import pytest
 
 from daguandan_bridge.build_manifest import write_build_manifest, write_release_record
 from daguandan_bridge.release_manager import (
+    BASELINE_AUTH_SCHEMA,
     BASELINE_SOURCE_COMMIT,
     BASELINE_TAG,
     ReleaseManagerError,
     activate_release,
     ensure_install_root,
     install_release,
+    register_legacy_baseline,
     release_status,
     rollback_release,
+    write_baseline_auth,
 )
+from daguandan_bridge.doctor import DOCTOR_REQUIRED_CHECK_IDS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -77,11 +81,40 @@ def _release(tmp_path: Path, name: str, *, commit: str):
     return archive, record, checksum, manifest, release_document
 
 
-def _doctor(_release, _runtime_root, output_path):
-    report = {"schema": "guandan.doctor/1", "checks": []}
+def _doctor(release, _runtime_root, output_path):
+    report = {
+        "schema": "guandan.doctor/1",
+        "overall_status": "PASS",
+        "identity": {
+            "schema": "guandan.runtime-identity/1",
+            "frozen": True,
+            "build_status": "identified",
+            "build_id": release.build_id,
+        },
+        "checks": [
+            {
+                "id": check_id,
+                "status": "PASS",
+                "summary": "ok",
+                "evidence": {},
+                "duration_ms": 0.0,
+            }
+            for check_id in DOCTOR_REQUIRED_CHECK_IDS
+        ],
+    }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report), encoding="utf-8")
     return report
+
+
+def _legacy_bundle(tmp_path: Path) -> tuple[Path, Path]:
+    bundle = tmp_path / "external" / "baseline"
+    bundle.mkdir(parents=True)
+    (bundle / "DaguandanAssistant.exe").write_bytes(b"known-stable-exe")
+    (bundle / "stable-resource.bin").write_bytes(b"known-stable-resource")
+    auth = tmp_path / "external" / "baseline-auth.json"
+    write_baseline_auth(bundle, auth, approved=True)
+    return bundle, auth
 
 
 def test_install_activate_candidate_and_rollback_preserves_bad_version(tmp_path):
@@ -259,3 +292,58 @@ def test_rollback_refuses_tampered_previous_version_and_keeps_candidate_active(t
 
     active = json.loads((runtime / "install" / "active.json").read_text(encoding="utf-8"))
     assert active["release_id"] == candidate.release_id
+
+
+def test_legacy_baseline_requires_external_full_tree_preapproval(tmp_path):
+    bundle, auth = _legacy_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+
+    installed = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+
+    auth_document = json.loads(auth.read_text(encoding="utf-8"))
+    assert auth_document["schema"] == BASELINE_AUTH_SCHEMA
+    assert auth_document["approved"] is True
+    assert installed.baseline is True
+    baseline_receipt = json.loads(
+        (runtime / "install" / "baseline.json").read_text(encoding="utf-8")
+    )
+    assert baseline_receipt["baseline_auth_sha256"] == hashlib.sha256(
+        auth.read_bytes()
+    ).hexdigest()
+
+
+def test_legacy_baseline_rejects_any_tree_change_after_preapproval(tmp_path):
+    bundle, auth = _legacy_bundle(tmp_path)
+    (bundle / "stable-resource.bin").write_bytes(b"changed-after-approval")
+
+    with pytest.raises(ReleaseManagerError, match="artifact tree"):
+        register_legacy_baseline(
+            bundle,
+            baseline_auth_path=auth,
+            runtime_root=tmp_path / "runtime",
+        )
+
+
+def test_preauthorized_legacy_activation_uses_nonempty_hash_bound_doctor(tmp_path):
+    bundle, auth = _legacy_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    baseline = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+
+    active = activate_release(baseline.release_id, runtime_root=runtime)
+
+    doctor_path = runtime / "install" / "rollback-receipts" / active["doctor_report"]
+    report = json.loads(doctor_path.read_text(encoding="utf-8"))
+    assert report["overall_status"] == "PASS"
+    assert report["legacy_preauthorized"] is True
+    assert {item["id"] for item in report["checks"]} == {
+        "LEGACY-BASELINE-PREAUTH",
+        "LEGACY-ARTIFACT-INTEGRITY",
+    }

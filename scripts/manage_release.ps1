@@ -1,7 +1,7 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("install", "activate", "rollback", "status", "register-legacy-baseline")]
+    [ValidateSet("install", "activate", "rollback", "status", "register-legacy-baseline", "create-baseline-auth")]
     [string] $Command,
 
     [Parameter()]
