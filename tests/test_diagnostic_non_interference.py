@@ -73,6 +73,19 @@ def test_trace_toggle_preserves_output_input_and_match_call_count(monkeypatch):
     assert trace["input_sha256"] == before_hash
     assert trace["threshold_policy"] == "production-unchanged"
     assert trace["candidates"]
+    assert all(
+        {
+            "peak_index",
+            "search_box",
+            "roi_box",
+            "peak_location",
+            "match_box",
+            "threshold",
+            "accepted",
+            "rejection_reason",
+        }.issubset(candidate)
+        for candidate in trace["candidates"]
+    )
 
 
 class _Capture:

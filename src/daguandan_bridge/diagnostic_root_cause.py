@@ -149,18 +149,26 @@ def diagnose_root_cause(
         )
         runner_up = other_scores[0] if other_scores else None
         margin = score - runner_up if runner_up is not None else None
-        if score < threshold:
+        accepted = best.get("accepted") is True
+        rejection_reason = best.get("rejection_reason")
+        if score < threshold or not accepted:
             layers["matcher_threshold_margin"] = _layer(
                 "matcher_threshold_margin",
                 status="FAIL",
                 confidence="HIGH_CONFIDENCE",
-                finding="truth candidate is consistently below the production threshold",
+                finding=(
+                    "truth candidate was rejected by the production matcher"
+                    if score >= threshold
+                    else "truth candidate is consistently below the production threshold"
+                ),
                 evidence={
                     "expected_level": expected_level,
                     "score": score,
                     "threshold": threshold,
                     "runner_up": runner_up,
                     "margin": margin,
+                    "accepted": accepted,
+                    "rejection_reason": rejection_reason,
                 },
             )
         else:
@@ -178,9 +186,32 @@ def diagnose_root_cause(
                 },
             )
 
+    consensus_failures = [
+        item.get("multi_frame_gate")
+        for item in outcomes
+        if isinstance(item.get("multi_frame_gate"), Mapping)
+        and str(item["multi_frame_gate"].get("status")) == "FAIL"
+    ]
     fingerprints = [str(item.get("output_fingerprint", "")) for item in outcomes]
     unique = sorted(set(value for value in fingerprints if value))
-    if len(unique) > 1:
+    if consensus_failures:
+        layers["multi_frame_stability"] = _layer(
+            "multi_frame_stability",
+            status="FAIL",
+            confidence="PROVEN",
+            finding="the production opening consensus detected an oscillating frame sequence",
+            evidence={
+                "failed_runs": len(consensus_failures),
+                "reasons": sorted(
+                    {
+                        str(item.get("reason") or "unknown")
+                        for item in consensus_failures
+                        if isinstance(item, Mapping)
+                    }
+                ),
+            },
+        )
+    elif len(unique) > 1:
         layers["multi_frame_stability"] = _layer(
             "multi_frame_stability",
             status="FAIL",

@@ -1682,29 +1682,43 @@ class ScreenshotRecognitionService:
                 gray_template,
                 cv2.TM_CCOEFF_NORMED,
             )
-            diagnostic_record: dict[str, object] | None = None
             for iteration in range(limit):
                 _, score, _, location = cv2.minMaxLoc(scores)
-                if iteration == 0:
-                    collector = getattr(self._diagnostic_local, "collector", None)
-                    if isinstance(collector, list) and len(collector) < 1024:
-                        diagnostic_record = {
-                            "field": str(getattr(region, "name", "unknown")),
-                            "label": str(raw.get("label", "")),
-                            "kind": str(raw.get("kind", "")),
-                            "source_role": str(raw.get("source_role", "")),
-                            "source": f"template:{raw.get('file', '')}",
-                            "score": float(score),
-                            "threshold": float(threshold),
-                            "accepted": bool(score >= threshold),
-                            "rejection_reason": (
-                                None if score >= threshold else "below_threshold"
-                            ),
-                        }
-                        collector.append(diagnostic_record)
-                if score < threshold:
-                    break
                 x, y = location
+                collector = getattr(self._diagnostic_local, "collector", None)
+                diagnostic_record: dict[str, object] | None = None
+                if isinstance(collector, list) and len(collector) < 4096:
+                    diagnostic_record = {
+                        "field": str(getattr(region, "name", "unknown")),
+                        "label": str(raw.get("label", "")),
+                        "kind": str(raw.get("kind", "")),
+                        "source_role": str(raw.get("source_role", "")),
+                        "source": f"template:{raw.get('file', '')}",
+                        "peak_index": int(iteration),
+                        "score": float(score),
+                        "threshold": float(threshold),
+                        "search_box": [
+                            int(left),
+                            int(top),
+                            int(right - left),
+                            int(bottom - top),
+                        ],
+                        "roi_box": [int(box.x), int(box.y), int(box.w), int(box.h)],
+                        "peak_location": [int(left + x), int(top + y)],
+                        "match_box": [
+                            int(left + x),
+                            int(top + y),
+                            int(template_width),
+                            int(template_height),
+                        ],
+                        "accepted": False,
+                        "rejection_reason": "pending_evaluation",
+                    }
+                    collector.append(diagnostic_record)
+                if score < threshold:
+                    if diagnostic_record is not None:
+                        diagnostic_record["rejection_reason"] = "below_threshold"
+                    break
                 candidate = search[y : y + template_height, x : x + template_width]
                 if (
                     use_color
@@ -1712,8 +1726,7 @@ class ScreenshotRecognitionService:
                     and str(raw.get("label", "")) in {"small_joker", "big_joker"}
                     and not self._joker_colors_compatible(template, candidate)
                 ):
-                    if diagnostic_record is not None and iteration == 0:
-                        diagnostic_record["accepted"] = False
+                    if diagnostic_record is not None:
                         diagnostic_record["rejection_reason"] = "joker_color_mismatch"
                     self._suppress_match_score(
                         scores,
@@ -1729,8 +1742,7 @@ class ScreenshotRecognitionService:
                     box.x - margin_x <= center_x <= box.x + box.w + margin_x
                     and box.y - margin_y <= center_y <= box.y + box.h + margin_y
                 ):
-                    if diagnostic_record is not None and iteration == 0:
-                        diagnostic_record["accepted"] = False
+                    if diagnostic_record is not None:
                         diagnostic_record["rejection_reason"] = "center_outside_roi"
                     self._suppress_match_score(
                         scores,
@@ -1753,7 +1765,7 @@ class ScreenshotRecognitionService:
                         h=template_height,
                     )
                 )
-                if diagnostic_record is not None and iteration == 0:
+                if diagnostic_record is not None:
                     diagnostic_record["accepted"] = True
                     diagnostic_record["rejection_reason"] = None
                 self._suppress_match_score(
