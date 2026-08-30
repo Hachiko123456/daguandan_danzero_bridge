@@ -181,6 +181,16 @@ class OpeningEvidenceMonitor:
             raw = getattr(captured, "raw_image", None)
             byte_size = _unique_array_bytes(raw, standard)
             metadata = _frame_metadata(snapshot)
+            if isinstance(standard, np.ndarray) and standard.size:
+                metadata.update(
+                    {
+                        "pixel_max": int(np.max(standard)),
+                        "pixel_mean": float(np.mean(standard)),
+                        "standardized_pixel_sha256": _array_sha256(standard),
+                    }
+                )
+            if isinstance(raw, np.ndarray) and raw.size:
+                metadata["raw_pixel_sha256"] = _array_sha256(raw)
             black = _is_black_frame(standard)
             with self._lock:
                 self._latest_seq += 1
