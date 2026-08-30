@@ -8,10 +8,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import stat
 import subprocess
 import sys
-import tempfile
 from typing import Callable, Mapping
 
 
@@ -25,7 +24,6 @@ from daguandan_bridge.storage import atomic_write_json  # noqa: E402
 
 
 MATRIX_SCHEMA = "guandan.portability-matrix/1"
-_DPI_CASES = (96, 120, 144)
 
 
 @dataclass(frozen=True)
@@ -33,7 +31,6 @@ class MatrixCase:
     case_id: str
     description: str
     data_root: Path
-    simulated_dpi: int
     read_only_bundle: bool
 
 
@@ -43,7 +40,7 @@ def run_matrix(
     bundle_root: Path,
     output_root: Path,
     data_root: Path | None = None,
-    doctor_runner: Callable[[Path, Path, Path, int], Mapping[str, object]] | None = None,
+    doctor_runner: Callable[[Path, Path, Path, bool], Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     executable = executable.resolve()
     bundle_root = bundle_root.resolve()
@@ -57,9 +54,8 @@ def run_matrix(
     base = (data_root or output_root / "matrix-data").resolve()
     base.mkdir(parents=True, exist_ok=True)
     cases = (
-        MatrixCase("unicode-space-path", "中文和空格数据路径", base / "中文 数据", 96, False),
-        MatrixCase("readonly-bundle", "资源包只读（模拟）", base / "readonly data", 96, True),
-        *(MatrixCase(f"dpi-{dpi}", f"模拟 {dpi}/96*100% DPI", base / f"dpi-{dpi}", dpi, False) for dpi in _DPI_CASES),
+        MatrixCase("unicode-space-path", "中文和空格数据路径", base / "中文 数据", False),
+        MatrixCase("readonly-bundle", "资源包文件只读", base / "readonly data", True),
     )
     results: list[dict[str, object]] = []
     for case in cases:
@@ -68,18 +64,18 @@ def run_matrix(
         if doctor_runner is None:
             environment = os.environ.copy()
             environment["DAGUANDAN_DATA_ROOT"] = str(case.data_root)
-            environment["DAGUANDAN_PORTABILITY_SIMULATED_DPI"] = str(case.simulated_dpi)
             environment.pop("PYTHONPATH", None)
             environment.pop("PYTHONHOME", None)
-            completed = subprocess.run(
-                [str(executable), "--doctor", "--doctor-output", str(report_path)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environment,
-                timeout=180,
-                check=False,
-            )
+            with _read_only_files(bundle_root, enabled=case.read_only_bundle):
+                completed = subprocess.run(
+                    [str(executable), "--doctor", "--doctor-output", str(report_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    timeout=180,
+                    check=False,
+                )
             report = _read_json(report_path)
             checks = report.get("checks") if isinstance(report.get("checks"), list) else []
             failed_checks = [
@@ -91,20 +87,15 @@ def run_matrix(
             result = {
                 "case_id": case.case_id,
                 "description": case.description,
-                "simulated": True,
-                "simulated_dpi": case.simulated_dpi,
                 "read_only_bundle": case.read_only_bundle,
                 "data_root_name": case.data_root.name,
                 "doctor_exit_code": int(completed.returncode),
                 "failed_checks": failed_checks,
                 "passed": bool(passed),
-                "physical_dpi_validated": False,
             }
         else:
-            result = dict(doctor_runner(executable, bundle_root, case.data_root, case.simulated_dpi))
+            result = dict(doctor_runner(executable, bundle_root, case.data_root, case.read_only_bundle))
             result.setdefault("case_id", case.case_id)
-            result.setdefault("simulated", True)
-            result.setdefault("physical_dpi_validated", False)
         results.append(result)
     after = _tree_hash(bundle_root)
     bundle_unchanged = before == after
@@ -120,8 +111,33 @@ def run_matrix(
         "bundle_after_sha256": after,
         "bundle_unchanged": bundle_unchanged,
         "physical_dpi_validation": "NOT_RUN",
+        "formal_acceptance_contribution": False,
+        "dpi_qualification_path": "source-frozen-window-e2e/dpi",
         "cases": results,
     }
+
+
+class _read_only_files:
+    def __init__(self, root: Path, *, enabled: bool) -> None:
+        self.root = root
+        self.enabled = enabled
+        self.modes: dict[Path, int] = {}
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
+            self.modes[path] = path.stat().st_mode
+            path.chmod(stat.S_IREAD)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        for path, mode in self.modes.items():
+            if path.exists():
+                path.chmod(mode)
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:

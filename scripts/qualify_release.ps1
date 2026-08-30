@@ -2,10 +2,15 @@
 param(
     [Parameter(Mandatory = $true)] [string] $ReleaseRoot,
     [Parameter(Mandatory = $true)] [string] $Wheelhouse,
-    [Parameter()] [string] $Output = "",
-    [Parameter()] [string] $WorkRoot = "",
-    [Parameter()] [string] $Session = "",
-    [Parameter()] [string] $BaselineSummary = ""
+    [Parameter(Mandatory = $true)] [string] $Output,
+    [Parameter(Mandatory = $true)] [string] $WorkRoot,
+    [Parameter(Mandatory = $true)] [string] $Session,
+    [Parameter(Mandatory = $true)] [string] $BaselineSummary,
+    [Parameter(Mandatory = $true)] [string] $ReproSupport,
+    [Parameter(Mandatory = $true)] [string] $ReproTruth,
+    [Parameter(Mandatory = $true)] [string] $ReferenceReproReport,
+    [Parameter(Mandatory = $true)] [string] $BaselineBundle,
+    [Parameter(Mandatory = $true)] [string] $BaselineAuth
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,11 +23,16 @@ if (-not [System.IO.File]::Exists($python)) {
 $arguments = @(
     (Join-Path $projectRoot "scripts\qualify_release.py"),
     "--release-root", $ReleaseRoot,
-    "--wheelhouse", $Wheelhouse
+    "--wheelhouse", $Wheelhouse,
+    "--output", $Output,
+    "--work-root", $WorkRoot,
+    "--session", $Session,
+    "--baseline-summary", $BaselineSummary,
+    "--repro-support", $ReproSupport,
+    "--repro-truth", $ReproTruth,
+    "--reference-repro-report", $ReferenceReproReport,
+    "--baseline-bundle", $BaselineBundle,
+    "--baseline-auth", $BaselineAuth
 )
-if (-not [string]::IsNullOrWhiteSpace($Output)) { $arguments += @("--output", $Output) }
-if (-not [string]::IsNullOrWhiteSpace($WorkRoot)) { $arguments += @("--work-root", $WorkRoot) }
-if (-not [string]::IsNullOrWhiteSpace($Session)) { $arguments += @("--session", $Session) }
-if (-not [string]::IsNullOrWhiteSpace($BaselineSummary)) { $arguments += @("--baseline-summary", $BaselineSummary) }
 & $python -I @arguments
 exit $LASTEXITCODE

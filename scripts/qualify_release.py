@@ -106,6 +106,8 @@ class Qualification:
         self.release_record: Path | None = None
         self.archive_checksum: Path | None = None
         self.bundle_hash_before: str | None = None
+        self.archive_hash_before: str | None = None
+        self._output_owned = False
 
     def run(self) -> int:
         self._preflight()
@@ -118,11 +120,8 @@ class Qualification:
         self._stage("manifest-native-audit", self._manifest_audit)
         self._stage("frozen-doctor", self._frozen_doctor)
         self._stage("support-export-verify", self._support_export)
-        self._stage("reproducer-fixtures", self._reproducer_fixtures)
-        if self.args.session is not None:
-            self._stage("source-frozen-window-e2e", self._window_e2e)
-        else:
-            self._add_skipped("source-frozen-window-e2e", "--session was not supplied")
+        self._stage("frozen-repro-gate", self._frozen_repro_gate)
+        self._stage("source-frozen-window-e2e", self._window_e2e)
         self._stage("portability-matrix", self._portability_matrix)
         self._stage("bundle-immutability", self._bundle_immutability)
         self._stage("install-activate-rollback", self._install_rollback)
@@ -138,8 +137,44 @@ class Qualification:
                 )
             if self.release_root == PROJECT_ROOT or _is_below(self.release_root, PROJECT_ROOT):
                 raise ValueError("release root must be external to the source checkout")
+            if self.work_root.exists():
+                raise ValueError(f"work root must be unique and absent: {self.work_root}")
+            if self.output_path.exists():
+                raise ValueError(f"qualification output must be new: {self.output_path}")
             if self.args.wheelhouse is None or not Path(self.args.wheelhouse).is_dir():
                 raise ValueError("an external prepared wheelhouse is required")
+            required_files = {
+                "baseline summary": Path(self.args.baseline_summary),
+                "repro support": Path(self.args.repro_support),
+                "repro truth": Path(self.args.repro_truth),
+                "reference repro report": Path(self.args.reference_repro_report),
+                "baseline auth": Path(self.args.baseline_auth),
+            }
+            missing = [label for label, path in required_files.items() if not path.is_file()]
+            if missing:
+                raise ValueError("required formal inputs are missing: " + ", ".join(missing))
+            if not Path(self.args.session).is_dir():
+                raise ValueError("formal window E2E session is unavailable")
+            if not Path(self.args.baseline_bundle).is_dir():
+                raise ValueError("external baseline bundle is unavailable")
+            overlaps = _root_overlap_failures(
+                project_root=PROJECT_ROOT,
+                release_root=self.release_root,
+                work_root=self.work_root,
+                wheelhouse_root=Path(self.args.wheelhouse),
+                output_path=self.output_path,
+            )
+            if overlaps:
+                raise ValueError("; ".join(overlaps))
+            baseline_bundle = Path(self.args.baseline_bundle).resolve()
+            if _paths_overlap(baseline_bundle, PROJECT_ROOT):
+                raise ValueError("baseline bundle must be a pre-stored external artifact")
+            if _paths_overlap(Path(self.args.baseline_auth).resolve(), PROJECT_ROOT):
+                raise ValueError("baseline auth must be external to the source checkout")
+            # From this point the destination is a new, disjoint file owned by
+            # this qualification attempt, so later failures may be published
+            # there without overwriting source/build inputs.
+            self._output_owned = True
             clean = subprocess.run(
                 ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain=v1", "--untracked-files=all"],
                 capture_output=True,
@@ -163,6 +198,10 @@ class Qualification:
                 "project_root": PROJECT_ROOT.name,
                 "release_root": self.release_root.name,
                 "wheelhouse_root": Path(self.args.wheelhouse).name,
+                "formal_inputs": {
+                    label.replace(" ", "_"): sha256_file(path)
+                    for label, path in required_files.items()
+                },
             }
         except Exception as exc:
             stage.status = "FAIL"
@@ -238,13 +277,14 @@ class Qualification:
         self.archive_checksum = self.release_root / "DaguandanAssistant.zip.sha256"
         if completed.returncode != 0 or not self.executable.is_file():
             raise _StageFailure("clean frozen package failed", completed.returncode, command, log, {"release_root": str(self.release_root)})
+        self.archive_hash_before = sha256_file(self.archive) if self.archive.is_file() else None
         return {
             "command": command,
             "log": str(log),
             "bundle_root": str(self.bundle_root),
             "executable": str(self.executable),
             "archive": str(self.archive),
-            "archive_sha256": sha256_file(self.archive) if self.archive.is_file() else None,
+            "archive_sha256": self.archive_hash_before,
         }
 
     def _manifest_audit(self) -> Mapping[str, object]:
@@ -269,9 +309,14 @@ class Qualification:
         report = _read_json(report_path)
         checks = report.get("checks") if isinstance(report.get("checks"), list) else []
         failed = [item.get("id") for item in checks if isinstance(item, Mapping) and item.get("status") == "FAIL"]
-        if completed.returncode != 0 or report.get("schema") != "guandan.doctor/1" or failed:
+        if (
+            completed.returncode != 0
+            or report.get("schema") != "guandan.doctor/1"
+            or report.get("overall_status") != "PASS"
+            or failed
+        ):
             raise _StageFailure("frozen doctor failed", completed.returncode, command, completed.log_path, {"report": str(report_path), "failed_checks": failed, "doctor": report})
-        return {"report": str(report_path), "failed_checks": [], "build_id": report.get("build_id")}
+        return {"report": str(report_path), "failed_checks": [], "build_id": _nested(report, "identity", "build_id")}
 
     def _support_export(self) -> Mapping[str, object]:
         assert self.executable is not None
@@ -284,34 +329,102 @@ class Qualification:
         verified = verify_support_archive(destination)
         return {"path": str(destination), "sha256": verified.sha256, "manifest": verified.manifest, "images_default": bool(verified.manifest.get("privacy", {}).get("contains_sensitive_images"))}
 
-    def _reproducer_fixtures(self) -> Mapping[str, object]:
-        command = [sys.executable, "-m", "pytest", "-q", "tests/test_support_repro.py", "tests/test_diagnostic_root_cause.py", "tests/test_diagnostic_non_interference.py"]
-        completed = self._run(command, self.work_root / "reproducer-fixtures.log")
-        if completed.returncode != 0:
-            raise _StageFailure("reproducer fixture tests failed", completed.returncode, command, completed.log_path, {})
-        return {"command": command, "log": str(completed.log_path), "default_repeats": 20, "truth_required_for_fix_gate": True}
+    def _frozen_repro_gate(self) -> Mapping[str, object]:
+        assert self.executable is not None and self.bundle_root is not None
+        support = Path(self.args.repro_support).resolve()
+        truth = Path(self.args.repro_truth).resolve()
+        reference_path = Path(self.args.reference_repro_report).resolve()
+        candidate_path = self.work_root / "candidate-repro.json"
+        gate_path = self.work_root / "repro-gate.json"
+        environment = _clean_runtime_environment(self.work_root / "repro-data")
+        candidate_command = [
+            str(self.executable),
+            "--repro-support",
+            str(support),
+            "--repro-truth",
+            str(truth),
+            "--repro-repeats",
+            "20",
+            "--repro-deterministic",
+            "--repro-output",
+            str(candidate_path),
+        ]
+        candidate_run = self._run(
+            candidate_command,
+            self.work_root / "candidate-repro.log",
+            env=environment,
+        )
+        if candidate_run.returncode != 0 or not candidate_path.is_file():
+            raise _StageFailure(
+                "candidate frozen reproducer failed",
+                candidate_run.returncode,
+                candidate_command,
+                candidate_run.log_path,
+                {},
+            )
+        gate_command = [
+            str(self.executable),
+            "--compare-repro",
+            str(reference_path),
+            str(candidate_path),
+            "--repro-gate-output",
+            str(gate_path),
+        ]
+        gate_run = self._run(
+            gate_command,
+            self.work_root / "repro-gate.log",
+            env=environment,
+        )
+        reference = _read_json(reference_path)
+        candidate = _read_json(candidate_path)
+        gate = _read_json(gate_path)
+        validation = _validate_frozen_repro_gate(
+            reference,
+            candidate,
+            gate,
+            expected_support_sha256=sha256_file(support),
+            expected_candidate_build_id=_build_id(self.bundle_root),
+        )
+        if gate_run.returncode != 0 or validation.get("status") != "PASS":
+            raise _StageFailure(
+                "reference/candidate frozen reproduction gate failed",
+                gate_run.returncode,
+                gate_command,
+                gate_run.log_path,
+                validation,
+            )
+        return {
+            **validation,
+            "reference_report": str(reference_path),
+            "candidate_report": str(candidate_path),
+            "gate_report": str(gate_path),
+            "candidate_command": candidate_command,
+        }
 
     def _window_e2e(self) -> Mapping[str, object]:
         assert self.bundle_root is not None and self.executable is not None
+        run_id = f"qualification-{uuid4().hex[:12]}"
+        output_root = self.work_root / "window-e2e"
         command = [
             sys.executable,
             str(PROJECT_ROOT / "scripts" / "run_window_e2e_validation.py"),
             "--session", str(Path(self.args.session).resolve()),
-            "--output", str(self.work_root / "window-e2e"),
+            "--output", str(output_root),
+            "--run-id", run_id,
             "--profile-source", str((PROJECT_ROOT / "data" / "profiles" / "tencent_daguandan").resolve()),
             "--bundle-root", str(self.bundle_root),
             "--executable", str(self.executable),
             "--frozen-data-root", str(self.work_root / "window-e2e-data"),
             "--scenarios", ",".join(FULL_SCENARIOS),
             "--time-scale", "1.0",
+            "--baseline-summary", str(Path(self.args.baseline_summary).resolve()),
         ]
-        if self.args.baseline_summary:
-            command.extend(["--baseline-summary", str(Path(self.args.baseline_summary).resolve())])
         completed = self._run(command, self.work_root / "window-e2e.log")
-        summary = _read_json(self.work_root / "window-e2e" / "runs")
-        if completed.returncode != 0:
-            raise _StageFailure("source/frozen window E2E failed", completed.returncode, command, completed.log_path, {"output_root": str(self.work_root / "window-e2e")})
-        return {"command": command, "log": str(completed.log_path), "output_root": str(self.work_root / "window-e2e"), "scenarios": list(FULL_SCENARIOS), "summary_probe": summary}
+        host_summary_path = output_root / "runs" / run_id / "host_summary.json"
+        validation = _validate_formal_window_e2e(host_summary_path)
+        if completed.returncode != 0 or validation.get("status") != "PASS":
+            raise _StageFailure("source/frozen window E2E failed", completed.returncode, command, completed.log_path, validation)
+        return {"command": command, "log": str(completed.log_path), "output_root": str(output_root), "host_summary": str(host_summary_path), **validation}
 
     def _portability_matrix(self) -> Mapping[str, object]:
         assert self.bundle_root is not None and self.executable is not None
@@ -326,9 +439,14 @@ class Qualification:
         ]
         completed = self._run(command, self.work_root / "portability-matrix.log")
         report = _read_json(output)
-        if completed.returncode != 0 or report.get("status") != "PASS":
+        if (
+            completed.returncode != 0
+            or report.get("status") != "PASS"
+            or report.get("physical_dpi_validation") != "NOT_RUN"
+            or report.get("formal_acceptance_contribution") is not False
+        ):
             raise _StageFailure("portability matrix failed", completed.returncode, command, completed.log_path, report)
-        return {"report": str(output), "physical_dpi_validation": report.get("physical_dpi_validation"), "cases": report.get("cases")}
+        return {"report": str(output), "physical_dpi_validation": report.get("physical_dpi_validation"), "formal_acceptance_contribution": False, "dpi_covered_by": "source-frozen-window-e2e/dpi", "cases": report.get("cases")}
 
     def _bundle_immutability(self) -> Mapping[str, object]:
         assert self.bundle_root is not None
@@ -378,7 +496,7 @@ class Qualification:
             "schema": QUALIFICATION_SCHEMA,
             "started_at": self.started_at,
             "finished_at": datetime.now(UTC).isoformat(),
-            "status": "PASS" if not self.errors and all(stage.status in {"PASS", "SKIPPED"} for stage in self.stages) else "FAIL",
+            "status": "PASS" if not self.errors and all(stage.status == "PASS" for stage in self.stages) else "FAIL",
             "branch": _git_value("branch --show-current"),
             "source_commit": _git_value("rev-parse HEAD"),
             "baseline": {"tag": "baseline/local-stable-20260831", "commit": BASELINE_SOURCE_COMMIT},
@@ -397,8 +515,20 @@ class Qualification:
                 "physical 125%/150% monitor transition not run; matrix is deterministic simulation",
             ],
         }
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.output_path, report)
+        if self._output_owned:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_new_json(self.output_path, report)
+            post_report = _post_report_artifact_hashes(
+                bundle_root=self.bundle_root,
+                archive=self.archive,
+                expected_bundle=self.bundle_hash_before,
+                expected_archive=self.archive_hash_before,
+            )
+            report["post_report_immutability"] = post_report
+            if post_report.get("status") != "PASS":
+                report["status"] = "FAIL"
+                report["errors"] = [*self.errors, "artifacts changed while publishing qualification report"]
+            atomic_write_json(self.output_path, report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["status"] == "PASS" else 2
 
@@ -508,14 +638,173 @@ def _is_below(path: Path, root: Path) -> bool:
         return False
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return _is_below(first, second) or _is_below(second, first)
+
+
+def _root_overlap_failures(
+    *,
+    project_root: Path,
+    release_root: Path,
+    work_root: Path,
+    wheelhouse_root: Path,
+    output_path: Path,
+) -> list[str]:
+    roots = {
+        "project_root": project_root.resolve(),
+        "release_root": release_root.resolve(),
+        "work_root": work_root.resolve(),
+        "wheelhouse_root": wheelhouse_root.resolve(),
+        "output_path": output_path.resolve(),
+    }
+    failures: list[str] = []
+    labels = list(roots)
+    for index, first in enumerate(labels):
+        for second in labels[index + 1 :]:
+            if _paths_overlap(roots[first], roots[second]):
+                failures.append(f"{first} overlaps {second}")
+    return failures
+
+
+def _validate_formal_window_e2e(host_summary_path: Path | str) -> dict[str, object]:
+    host_path = Path(host_summary_path).resolve()
+    host = _read_json(host_path)
+    failures: list[str] = []
+    if host.get("schema") != "guandan.window-e2e-host-summary/1":
+        failures.append("host_schema_invalid")
+    for field in ("execution_ok", "acceptance_eligible", "acceptance_passed"):
+        if host.get(field) is not True:
+            failures.append(f"host_{field}_not_true")
+
+    scenario_evidence: dict[str, list[str]] = {}
+    for label, expected_kind in (("source", "source"), ("frozen", "frozen_exe")):
+        raw_path = host.get(f"{label if label == 'source' else 'bundle'}_summary")
+        summary_path = Path(str(raw_path)).resolve() if raw_path else Path()
+        summary = _read_json(summary_path)
+        if summary.get("schema") != "guandan.window-e2e-summary/1":
+            failures.append(f"{label}_summary_schema_invalid")
+        if summary.get("run_kind") != expected_kind:
+            failures.append(f"{label}_run_kind_invalid")
+        for field in ("execution_ok", "acceptance_eligible", "acceptance_passed"):
+            if summary.get(field) is not True:
+                failures.append(f"{label}_{field}_not_true")
+        raw_scenarios = summary.get("scenarios")
+        scenarios = raw_scenarios if isinstance(raw_scenarios, Mapping) else {}
+        if set(scenarios) != set(FULL_SCENARIOS):
+            failures.append(f"{label}_scenario_set_invalid")
+        for name in FULL_SCENARIOS:
+            value = scenarios.get(name)
+            if not isinstance(value, Mapping) or value.get("passed") is not True:
+                failures.append(f"{label}_scenario_{name}_not_passed")
+        scenario_evidence[f"{label}_scenarios"] = [
+            name for name in FULL_SCENARIOS if isinstance(scenarios.get(name), Mapping)
+        ]
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "host_summary": str(host_path),
+        **scenario_evidence,
+        "failures": failures,
+    }
+
+
+def _validate_frozen_repro_gate(
+    reference: Mapping[str, object],
+    candidate: Mapping[str, object],
+    gate: Mapping[str, object],
+    *,
+    expected_support_sha256: str,
+    expected_candidate_build_id: str | None,
+) -> dict[str, object]:
+    failures: list[str] = []
+    for label, report in (("reference", reference), ("candidate", candidate)):
+        if report.get("schema") != "guandan.repro-report/1":
+            failures.append(f"{label}_schema_invalid")
+        if report.get("deterministic") is not True:
+            failures.append(f"{label}_not_deterministic")
+        if report.get("repeat_count") != 20 or _nested(report, "repeatability", "repeatable") is not True:
+            failures.append(f"{label}_not_repeatable_20_of_20")
+        if _nested(report, "support", "sha256") != expected_support_sha256:
+            failures.append(f"{label}_support_hash_mismatch")
+        if _nested(report, "truth", "eligible_for_fix_verification") is not True:
+            failures.append(f"{label}_truth_missing")
+    if _nested(reference, "truth", "correct_runs") != 0:
+        failures.append("reference_failure_not_reproduced_20_of_20")
+    if candidate.get("mode") != "frozen":
+        failures.append("candidate_not_frozen")
+    if _nested(candidate, "truth", "correct_runs") != 20:
+        failures.append("candidate_not_correct_20_of_20")
+    if _nested(candidate, "runner", "build_id") != expected_candidate_build_id:
+        failures.append("candidate_build_id_mismatch")
+    if gate.get("schema") != "guandan.repro-gate/1" or gate.get("status") != "PASS":
+        failures.append("repro_gate_not_passed")
+    if gate.get("failures") not in ([], ()):
+        failures.append("repro_gate_has_failures")
+    if gate.get("support_sha256") != expected_support_sha256:
+        failures.append("repro_gate_support_hash_mismatch")
+    return {"status": "PASS" if not failures else "FAIL", "failures": failures}
+
+
+def _nested(value: Mapping[str, object], *keys: str) -> object:
+    current: object = value
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _write_new_json(path: Path, value: Mapping[str, object]) -> None:
+    if path.exists():
+        raise FileExistsError(f"qualification output already exists: {path}")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(dict(value), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _post_report_artifact_hashes(
+    *,
+    bundle_root: Path | None,
+    archive: Path | None,
+    expected_bundle: str | None,
+    expected_archive: str | None,
+) -> dict[str, object]:
+    actual_bundle = _tree_hash(bundle_root) if bundle_root is not None and bundle_root.is_dir() else None
+    actual_archive = sha256_file(archive) if archive is not None and archive.is_file() else None
+    passed = bool(
+        expected_bundle is not None
+        and expected_archive is not None
+        and actual_bundle == expected_bundle
+        and actual_archive == expected_archive
+    )
+    return {
+        "status": "PASS" if passed else "FAIL",
+        "bundle_before": expected_bundle,
+        "bundle_after": actual_bundle,
+        "archive_before": expected_archive,
+        "archive_after": actual_archive,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-root", type=Path, required=True)
     parser.add_argument("--wheelhouse", type=Path, required=True)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--work-root", type=Path)
-    parser.add_argument("--session", type=Path)
-    parser.add_argument("--baseline-summary", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--work-root", type=Path, required=True)
+    parser.add_argument("--session", type=Path, required=True)
+    parser.add_argument("--baseline-summary", type=Path, required=True)
+    parser.add_argument("--repro-support", type=Path, required=True)
+    parser.add_argument("--repro-truth", type=Path, required=True)
+    parser.add_argument("--reference-repro-report", type=Path, required=True)
+    parser.add_argument("--baseline-bundle", type=Path, required=True)
+    parser.add_argument("--baseline-auth", type=Path, required=True)
     return parser
 
 

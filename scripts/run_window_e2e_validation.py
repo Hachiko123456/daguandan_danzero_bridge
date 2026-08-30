@@ -379,7 +379,10 @@ def main(argv: list[str] | None = None) -> int:
         _markdown(host_summary), encoding="utf-8"
     )
     print(run_directory / "host_summary.json")
-    return 0 if execution_ok else 1
+    # A full source+frozen run is a formal gate.  Returning success for an
+    # execution-only result lets callers accidentally publish an ineligible
+    # candidate, so only the explicit acceptance result is process success.
+    return 0 if acceptance_passed else 1
 
 
 def _run_logged(

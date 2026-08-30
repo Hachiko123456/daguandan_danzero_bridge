@@ -14,17 +14,17 @@ sys.modules["run_portability_matrix"] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 
-def _fake_runner(executable, bundle_root, data_root, dpi):
+def _fake_runner(executable, bundle_root, data_root, read_only_bundle):
     del executable, bundle_root
     return {
         "doctor_exit_code": 0,
         "failed_checks": [],
         "passed": data_root.name != "bad",
-        "simulated_dpi": dpi,
+        "read_only_bundle": read_only_bundle,
     }
 
 
-def test_matrix_covers_unicode_readonly_and_three_simulated_dpis(tmp_path):
+def test_matrix_covers_unicode_and_readonly_without_fake_dpi_cases(tmp_path):
     bundle = tmp_path / "中文 bundle"
     bundle.mkdir()
     (bundle / "DaguandanAssistant.exe").write_bytes(b"exe")
@@ -40,11 +40,9 @@ def test_matrix_covers_unicode_readonly_and_three_simulated_dpis(tmp_path):
     assert {item["case_id"] for item in report["cases"]} == {
         "unicode-space-path",
         "readonly-bundle",
-        "dpi-96",
-        "dpi-120",
-        "dpi-144",
     }
-    assert all(item["physical_dpi_validated"] is False for item in report["cases"])
+    assert report["physical_dpi_validation"] == "NOT_RUN"
+    assert report["formal_acceptance_contribution"] is False
 
 
 def test_matrix_fails_when_a_case_fails(tmp_path):
@@ -53,8 +51,11 @@ def test_matrix_fails_when_a_case_fails(tmp_path):
     exe = bundle / "DaguandanAssistant.exe"
     exe.write_bytes(b"exe")
 
-    def failing_runner(_exe, _bundle, data_root, dpi):
-        return {"passed": data_root.name != "readonly data", "simulated_dpi": dpi}
+    def failing_runner(_exe, _bundle, data_root, read_only_bundle):
+        return {
+            "passed": data_root.name != "readonly data",
+            "read_only_bundle": read_only_bundle,
+        }
 
     report = _MODULE.run_matrix(
         executable=exe,
