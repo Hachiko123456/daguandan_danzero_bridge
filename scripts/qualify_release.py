@@ -43,6 +43,7 @@ from daguandan_bridge.release_manager import (  # noqa: E402
     activate_release,
     install_release,
     register_legacy_baseline,
+    release_status,
     rollback_release,
     verify_baseline_auth,
 )
@@ -505,19 +506,148 @@ class Qualification:
             baseline_auth_path=Path(self.args.baseline_auth),
             runtime_root=runtime,
         )
+        activate_release(baseline.release_id, runtime_root=runtime)
+        verify_before_write = self._verify_active_launcher(
+            runtime,
+            label="baseline-before-write",
+        )
+        initial_legacy_probe = self._legacy_baseline_probe(
+            baseline,
+            require_runtime_write=True,
+            label="before-candidate",
+        )
+        # VerifyOnly: the immutable externally authorized source tree must
+        # still match after the separate mutable run copy wrote runtime data.
+        verify_baseline_auth(
+            Path(self.args.baseline_bundle),
+            Path(self.args.baseline_auth),
+        )
+        release_status(runtime)
+        verify_after_write = self._verify_active_launcher(
+            runtime,
+            label="baseline-after-write",
+        )
         candidate = install_release(
             self.archive,
             release_record_path=self.release_record,
             checksum_path=self.archive_checksum,
             runtime_root=runtime,
         )
-        activate_release(baseline.release_id, runtime_root=runtime)
         activate_release(candidate.release_id, runtime_root=runtime)
         rolled = rollback_release(runtime_root=runtime)
         if rolled.get("release_id") != baseline.release_id:
             raise _StageFailure("rollback did not restore the legacy baseline pointer", 2, None, None, {"rolled_back": rolled, "baseline": baseline.to_dict()})
         status = _read_json(runtime / "install" / "active.json")
-        return {"runtime_root": str(runtime), "baseline_release": baseline.to_dict(), "candidate_release": candidate.to_dict(), "active_after_rollback": status, "legacy_baseline_reproducible": False, "bad_candidate_preserved": candidate.version_root.is_dir()}
+        verify_after_rollback = self._verify_active_launcher(
+            runtime,
+            label="baseline-after-rollback",
+        )
+        rollback_legacy_probe = self._legacy_baseline_probe(
+            baseline,
+            require_runtime_write=False,
+            label="after-rollback",
+        )
+        verify_baseline_auth(
+            Path(self.args.baseline_bundle),
+            Path(self.args.baseline_auth),
+        )
+        release_status(runtime)
+        verify_after_relaunch = self._verify_active_launcher(
+            runtime,
+            label="baseline-after-relaunch",
+        )
+        return {
+            "runtime_root": str(runtime),
+            "baseline_release": baseline.to_dict(),
+            "candidate_release": candidate.to_dict(),
+            "active_after_rollback": status,
+            "legacy_baseline_reproducible": False,
+            "legacy_mutable_probe_before_candidate": initial_legacy_probe,
+            "legacy_probe_after_rollback": rollback_legacy_probe,
+            "launcher_verify_before_write": verify_before_write,
+            "launcher_verify_after_write": verify_after_write,
+            "launcher_verify_after_rollback": verify_after_rollback,
+            "launcher_verify_after_relaunch": verify_after_relaunch,
+            "immutable_baseline_reverified_after_each_probe": True,
+            "bad_candidate_preserved": candidate.version_root.is_dir(),
+        }
+
+    def _legacy_baseline_probe(
+        self,
+        release: object,
+        *,
+        require_runtime_write: bool,
+        label: str,
+    ) -> dict[str, object]:
+        executable = Path(getattr(release, "executable"))
+        run_root = executable.parent
+        before = _tree_hash(run_root)
+        command = [str(executable), "--fabledan-fixed-benchmark"]
+        completed = self._run(
+            command,
+            self.work_root / f"legacy-baseline-{label}.log",
+            timeout_seconds=300.0,
+        )
+        after = _tree_hash(run_root)
+        if completed.returncode != 0:
+            raise _StageFailure(
+                f"legacy baseline {label} launch failed",
+                completed.returncode,
+                command,
+                completed.log_path,
+                {"tree_before": before, "tree_after": after},
+            )
+        if require_runtime_write and before == after:
+            raise _StageFailure(
+                "legacy baseline mutable run copy produced no runtime write",
+                2,
+                command,
+                completed.log_path,
+                {"tree_before": before, "tree_after": after},
+            )
+        return {
+            "command": command,
+            "exit_code": completed.returncode,
+            "tree_before": before,
+            "tree_after": after,
+            "runtime_write_observed": before != after,
+        }
+
+    def _verify_active_launcher(
+        self,
+        runtime_root: Path,
+        *,
+        label: str,
+    ) -> dict[str, object]:
+        command = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(PROJECT_ROOT / "release_assets" / "Launch_DaguandanAssistant.ps1"),
+            "-RuntimeRoot",
+            str(runtime_root),
+            "-VerifyOnly",
+        ]
+        completed = self._run(
+            command,
+            self.work_root / f"launcher-{label}.log",
+            timeout_seconds=180.0,
+        )
+        if completed.returncode != 0:
+            raise _StageFailure(
+                f"launcher VerifyOnly failed: {label}",
+                completed.returncode,
+                command,
+                completed.log_path,
+                {},
+            )
+        return {
+            "command": command,
+            "exit_code": completed.returncode,
+            "log": str(completed.log_path),
+        }
 
     def _finish(self) -> int:
         if self.source_identity is not None:
@@ -591,6 +721,7 @@ class Qualification:
         log_path: Path,
         *,
         env: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> "_Completed":
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("wb") as handle:
@@ -600,6 +731,7 @@ class Qualification:
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 env=dict(env) if env is not None else None,
+                timeout=timeout_seconds,
                 check=False,
             )
         return _Completed(int(completed.returncode), log_path)

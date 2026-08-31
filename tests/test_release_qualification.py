@@ -97,6 +97,21 @@ def test_stage_failure_is_machine_readable():
     assert failure.evidence == {"foo": "bar"}
 
 
+def test_formal_rollback_stage_runs_real_legacy_write_and_relaunch_probes():
+    source = SCRIPT.read_text(encoding="utf-8")
+    method = source[source.index("def _install_rollback") : source.index("def _finish")]
+
+    assert 'label="before-candidate"' in method
+    assert "require_runtime_write=True" in method
+    assert 'label="after-rollback"' in method
+    assert "--fabledan-fixed-benchmark" in method
+    assert method.count("verify_baseline_auth(") >= 2
+    assert method.count("release_status(runtime)") >= 2
+    assert method.count("_verify_active_launcher(") >= 4
+    assert "-VerifyOnly" in method
+    assert "timeout_seconds=300.0" in method
+
+
 def test_host_summary_gate_requires_exact_formal_seven_scenario_pass(tmp_path):
     run = tmp_path / "runs" / "formal"
     source_path = run / "source" / "summary.json"
