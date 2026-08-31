@@ -334,6 +334,30 @@ def test_e002_typed_worker_error_and_correlated_incident_episode(tmp_path):
     monitor.close()
 
 
+def test_e002_slow_recognition_failure_recovers_its_exact_evicted_frame(tmp_path):
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path,
+        max_bytes=6 * 8 * 3 * 2 + 1,
+    )
+    monitor.begin()
+    failed_input = _snapshot(10)
+    monitor.observe_frame(failed_input)
+    monitor.observe_frame(_snapshot(20))
+    assert all(item.snapshot is not failed_input for item in monitor._ring)
+    monitor.observe_failure(
+        RuntimeError("recognition failed"),
+        stage="recognition",
+        snapshot=failed_input,
+    )
+    assert monitor.flush(5)
+    incidents = list((tmp_path / "opening" / "incidents").glob("*/incident.json"))
+    assert len(incidents) == 1
+    incident = json.loads(incidents[0].read_text(encoding="utf-8"))
+    assert incident["evidence"]["frame_id"] == failed_input.evidence_frame_id
+    assert incident["evidence"]["recovered_exact_failure_frame"] is True
+    monitor.close()
+
+
 def test_e003_pure_opening_gate_covers_anchor_settlement_lead_and_illegal_hand():
     assert evaluate_opening_gate(_result("7"), anchor_score=0.85).ready is True
     assert evaluate_opening_gate(_result("7"), anchor_score=0.849).reason == "table_anchor_unresolved"

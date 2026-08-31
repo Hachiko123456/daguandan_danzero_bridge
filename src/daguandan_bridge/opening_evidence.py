@@ -500,6 +500,19 @@ class OpeningEvidenceMonitor:
                     if snapshot is not None
                     else None
                 )
+            recovered = False
+            if correlated is None and snapshot is not None:
+                # A slow recognition can outlive the ordinary 8-second ring.
+                # Reinsert that exact id+pixel input as failure evidence; do
+                # not substitute the newest unrelated frame.
+                self.observe_frame(
+                    snapshot,
+                    monotonic_ms=self._clock_ms(),
+                )
+                with self._lock:
+                    correlated = self._correlated_frame_locked(snapshot)
+                recovered = correlated is not None
+            with self._lock:
                 if correlated is not None:
                     evidence.update(
                         {
@@ -508,6 +521,7 @@ class OpeningEvidenceMonitor:
                             "input_pixel_sha256": correlated.frame_metadata.get(
                                 "standardized_pixel_sha256"
                             ),
+                            "recovered_exact_failure_frame": recovered,
                         }
                     )
             self.emit_incident(
@@ -1352,6 +1366,9 @@ def _frame_metadata(snapshot: object) -> dict[str, object]:
         )
     return {
         "backend": str(getattr(captured, "backend", "unknown")),
+        "captured_monotonic_ms": int(
+            getattr(snapshot, "captured_monotonic_ms", 0) or 0
+        ),
         "dpi": int(getattr(captured, "dpi", 0) or 0),
         "window_title": str(getattr(captured, "window_title", ""))[:256],
         "client_rect": _box_like(rect, client=True),
