@@ -179,40 +179,54 @@ def test_host_summary_gate_requires_exact_formal_seven_scenario_pass(tmp_path):
     assert "source_summary_path_not_exact" in wrong_path["failures"]
 
 
-def test_repro_gate_rejects_non_frozen_or_missing_independent_truth():
+def test_release_repro_equivalence_requires_both_correct_and_distinct_builds():
     reference = {
         "schema": "guandan.repro-report/1",
-        "mode": "frozen",
+        "mode": "source",
         "deterministic": True,
+        "verification_role": "reference",
         "repeat_count": 20,
         "support": {"sha256": "a" * 64},
         "repeatability": {"repeatable": True},
-        "truth": {"eligible_for_fix_verification": True, "correct_runs": 0},
+        "truth": {"eligible_for_fix_verification": True, "correct_runs": 20},
+        "truth_identity": {"sha256": "b" * 64, "input_sequence_sha256": "c" * 64},
+        "runner": {"build_id": "source"},
+        "probes": {"fresh_child_deterministic": {"status": "PASS"}},
+        "outcomes": [{"output_fingerprint": "d" * 64} for _ in range(20)],
     }
     candidate = {
         **reference,
-        "mode": "source",
+        "mode": "frozen",
+        "verification_role": "candidate",
         "runner": {"build_id": "BUILD-candidate"},
-        "truth": {"eligible_for_fix_verification": False, "correct_runs": 20},
-    }
-    gate = {
-        "schema": "guandan.repro-gate/1",
-        "status": "PASS",
-        "failures": [],
-        "support_sha256": "a" * 64,
     }
 
-    result = MODULE._validate_frozen_repro_gate(
+    result = MODULE._validate_release_repro_equivalence(
         reference,
         candidate,
-        gate,
         expected_support_sha256="a" * 64,
         expected_candidate_build_id="BUILD-candidate",
     )
 
-    assert result["status"] == "FAIL"
-    assert "candidate_not_frozen" in result["failures"]
-    assert "candidate_truth_missing" in result["failures"]
+    assert result == {"status": "PASS", "failures": []}
+
+    candidate["truth_identity"] = {
+        "sha256": "e" * 64,
+        "input_sequence_sha256": "c" * 64,
+    }
+    candidate["outcomes"] = [
+        {"output_fingerprint": "f" * 64} for _ in range(20)
+    ]
+    failed = MODULE._validate_release_repro_equivalence(
+        reference,
+        candidate,
+        expected_support_sha256="a" * 64,
+        expected_candidate_build_id="BUILD-candidate",
+    )
+
+    assert failed["status"] == "FAIL"
+    assert "truth_hash_mismatch" in failed["failures"]
+    assert "normalized_outputs_not_equivalent" in failed["failures"]
 
 
 def test_managed_roots_must_be_pairwise_disjoint_and_output_new(tmp_path):

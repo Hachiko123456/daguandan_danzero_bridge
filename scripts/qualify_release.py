@@ -363,7 +363,6 @@ class Qualification:
         truth = Path(self.args.repro_truth).resolve()
         reference_path = Path(self.args.reference_repro_report).resolve()
         candidate_path = self.work_root / "candidate-repro.json"
-        gate_path = self.work_root / "repro-gate.json"
         environment = _clean_runtime_environment(self.work_root / "repro-data")
         candidate_command = [
             str(self.executable),
@@ -374,6 +373,8 @@ class Qualification:
             "--repro-repeats",
             "20",
             "--repro-deterministic",
+            "--repro-role",
+            "candidate",
             "--repro-output",
             str(candidate_path),
         ]
@@ -390,42 +391,26 @@ class Qualification:
                 candidate_run.log_path,
                 {},
             )
-        gate_command = [
-            str(self.executable),
-            "--compare-repro",
-            str(reference_path),
-            str(candidate_path),
-            "--repro-gate-output",
-            str(gate_path),
-        ]
-        gate_run = self._run(
-            gate_command,
-            self.work_root / "repro-gate.log",
-            env=environment,
-        )
         reference = _read_json(reference_path)
         candidate = _read_json(candidate_path)
-        gate = _read_json(gate_path)
-        validation = _validate_frozen_repro_gate(
+        validation = _validate_release_repro_equivalence(
             reference,
             candidate,
-            gate,
             expected_support_sha256=sha256_file(support),
             expected_candidate_build_id=_build_id(self.bundle_root),
         )
-        if gate_run.returncode != 0 or validation.get("status") != "PASS":
+        if validation.get("status") != "PASS":
             raise _StageFailure(
-                "reference/candidate frozen reproduction gate failed",
-                gate_run.returncode,
-                gate_command,
-                gate_run.log_path,
+                "source/candidate release reproduction equivalence failed",
+                2,
+                candidate_command,
+                candidate_run.log_path,
                 validation,
             )
         return {
             **validation,
             "reference_report": str(reference_path),
             "candidate_report": str(candidate_path),
-            "gate_report": str(gate_path),
             "candidate_command": candidate_command,
         }
 
@@ -734,10 +719,9 @@ def _validate_formal_window_e2e(host_summary_path: Path | str) -> dict[str, obje
     }
 
 
-def _validate_frozen_repro_gate(
+def _validate_release_repro_equivalence(
     reference: Mapping[str, object],
     candidate: Mapping[str, object],
-    gate: Mapping[str, object],
     *,
     expected_support_sha256: str,
     expected_candidate_build_id: str | None,
@@ -754,21 +738,46 @@ def _validate_frozen_repro_gate(
             failures.append(f"{label}_support_hash_mismatch")
         if _nested(report, "truth", "eligible_for_fix_verification") is not True:
             failures.append(f"{label}_truth_missing")
-    if _nested(reference, "truth", "correct_runs") != 0:
-        failures.append("reference_failure_not_reproduced_20_of_20")
+        if _nested(report, "truth", "correct_runs") != 20:
+            failures.append(f"{label}_not_correct_20_of_20")
+        if _nested(report, "probes", "fresh_child_deterministic", "status") != "PASS":
+            failures.append(f"{label}_fresh_child_not_passed")
+    if reference.get("mode") != "source":
+        failures.append("reference_not_source")
     if candidate.get("mode") != "frozen":
         failures.append("candidate_not_frozen")
-    if _nested(candidate, "truth", "correct_runs") != 20:
-        failures.append("candidate_not_correct_20_of_20")
     if _nested(candidate, "runner", "build_id") != expected_candidate_build_id:
         failures.append("candidate_build_id_mismatch")
-    if gate.get("schema") != "guandan.repro-gate/1" or gate.get("status") != "PASS":
-        failures.append("repro_gate_not_passed")
-    if gate.get("failures") not in ([], ()):
-        failures.append("repro_gate_has_failures")
-    if gate.get("support_sha256") != expected_support_sha256:
-        failures.append("repro_gate_support_hash_mismatch")
+    reference_build = _nested(reference, "runner", "build_id")
+    candidate_build = _nested(candidate, "runner", "build_id")
+    if reference_build == candidate_build:
+        failures.append("runner_builds_not_distinct")
+    if _nested(reference, "truth_identity", "sha256") != _nested(
+        candidate, "truth_identity", "sha256"
+    ):
+        failures.append("truth_hash_mismatch")
+    if _nested(reference, "truth_identity", "input_sequence_sha256") != _nested(
+        candidate, "truth_identity", "input_sequence_sha256"
+    ):
+        failures.append("input_sequence_hash_mismatch")
+    reference_outputs = _normalized_output_fingerprints(reference)
+    candidate_outputs = _normalized_output_fingerprints(candidate)
+    if len(reference_outputs) != 1 or reference_outputs != candidate_outputs:
+        failures.append("normalized_outputs_not_equivalent")
     return {"status": "PASS" if not failures else "FAIL", "failures": failures}
+
+
+def _normalized_output_fingerprints(
+    report: Mapping[str, object],
+) -> set[str]:
+    outcomes = report.get("outcomes")
+    if not isinstance(outcomes, list):
+        return set()
+    return {
+        str(item.get("output_fingerprint"))
+        for item in outcomes
+        if isinstance(item, Mapping) and item.get("output_fingerprint")
+    }
 
 
 def _validate_repro_inputs(
@@ -797,6 +806,16 @@ def _validate_repro_inputs(
         failures.append("reference_schema_invalid")
     if _nested(reference, "support", "sha256") != support.sha256:
         failures.append("reference_support_hash_mismatch")
+    if reference.get("mode") != "source":
+        failures.append("reference_not_source")
+    if reference.get("repeat_count") != 20 or _nested(
+        reference, "repeatability", "repeatable"
+    ) is not True:
+        failures.append("reference_not_repeatable_20_of_20")
+    if _nested(reference, "truth", "correct_runs") != 20:
+        failures.append("reference_not_correct_20_of_20")
+    if _nested(reference, "truth_identity", "sha256") != sha256_file(truth_path):
+        failures.append("reference_truth_hash_mismatch")
     return {
         "status": "PASS" if not failures else "FAIL",
         "support_sha256": support.sha256,
