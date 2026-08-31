@@ -250,12 +250,11 @@ class OpeningEvidenceMonitor:
                 self._levels.clear()
                 self._hands.clear()
                 self._anchor_ready = False
-                self._ring.clear()
+                self._clear_ring_locked()
                 self._frame_by_identity.clear()
                 self._frame_by_id.clear()
                 self._ambiguous_frame_ids.clear()
                 self._ring_record_ids.clear()
-                self._retained_bytes = 0
         except BaseException:
             return
 
@@ -545,6 +544,9 @@ class OpeningEvidenceMonitor:
         """Queue a deduplicated snapshot; return immediately if the queue is full."""
 
         slot_acquired = False
+        record_ids: tuple[int, ...] = ()
+        incident_id: str | None = None
+        key: tuple[str, str] | None = None
         try:
             now = int(monotonic_ms if monotonic_ms is not None else self._clock_ms())
             normalized_code = str(code).strip().upper()
@@ -561,7 +563,6 @@ class OpeningEvidenceMonitor:
                         )
                         self._incident_occurrences += 1
                     return False
-                records = tuple(self._ring)[-self.max_persisted_frames :]
             if not self._writer_slots.acquire(blocking=False):
                 with self._lock:
                     self._dropped_writer_queue += 1
@@ -576,6 +577,8 @@ class OpeningEvidenceMonitor:
                 self._active_incident_ids[key] = incident_id
                 self._occurrences_by_incident[incident_id] = 1
                 self._incident_occurrences += 1
+                records = tuple(self._ring)[-self.max_persisted_frames :]
+                record_ids = self._retain_pending_records_locked(records)
                 metrics = self._metrics_locked().to_dict()
             payload = {
                 "schema": OPENING_INCIDENT_SCHEMA,
@@ -594,7 +597,6 @@ class OpeningEvidenceMonitor:
                 if self._executor is None:
                     self._executor = _DaemonSingleWorker(name="opening-evidence")
                 self._incidents_queued += 1
-                record_ids = self._retain_pending_records_locked(records)
                 future = self._executor.submit(
                     self._write_incident,
                     incident_id,
@@ -608,6 +610,13 @@ class OpeningEvidenceMonitor:
                 future.add_done_callback(self._writer_finished)
             return True
         except BaseException:
+            with self._lock:
+                if record_ids:
+                    self._release_pending_records_locked(record_ids)
+                if key is not None:
+                    self._resolve_episode_locked(key)
+                if incident_id is not None:
+                    self._occurrences_by_incident.pop(incident_id, None)
             if slot_acquired:
                 try:
                     self._writer_slots.release()
@@ -625,6 +634,14 @@ class OpeningEvidenceMonitor:
                 if remaining <= 0:
                     return False
                 future.result(timeout=remaining)
+            while True:
+                with self._lock:
+                    callbacks_pending = bool(self._futures)
+                if not callbacks_pending:
+                    break
+                if monotonic_seconds() >= deadline:
+                    return False
+                sleep(0.001)
             self._sync_episode_occurrences()
             with self._lock:
                 return self._writer_failures == 0
@@ -690,6 +707,21 @@ class OpeningEvidenceMonitor:
             self._dropped_age += 1
         else:
             self._dropped_budget += 1
+
+    def _clear_ring_locked(self) -> None:
+        """Release a listener ring while preserving queued-writer accounting."""
+
+        while self._ring:
+            item = self._ring.popleft()
+            identity = id(item)
+            self._ring_record_ids.discard(identity)
+            if identity in self._pending_record_refs:
+                self._pending_record_bytes += item.byte_size
+            else:
+                self._retained_bytes = max(
+                    0,
+                    self._retained_bytes - item.byte_size,
+                )
 
     def _emit_timeouts_if_due(self, *, result: object | None = None) -> None:
         now = self._clock_ms()

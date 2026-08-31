@@ -27,6 +27,7 @@ from .support_bundle import (
     SupportBundleSources,
     SupportImageSource,
     UnsafeSupportSourceError,
+    _validated_image_info,
     export_support_bundle,
 )
 
@@ -550,15 +551,14 @@ def _verify_incident_artifact(
     if hashlib.sha256(content).hexdigest() != expected_file_sha:
         raise SupportBundleError(f"opening artifact file hash changed: {path.name}")
     try:
-        import cv2
-        import numpy as np
-
-        decoded = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        *_metadata, actual_pixel_sha = _validated_image_info(
+            content,
+            suffix=path.suffix.lower(),
+            relative=Path(path.name),
+        )
     except Exception as exc:
         raise SupportBundleError(f"opening artifact cannot be decoded: {path.name}") from exc
-    if decoded is None or decoded.size == 0:
-        raise SupportBundleError(f"opening artifact cannot be decoded: {path.name}")
-    if hashlib.sha256(decoded.tobytes(order="C")).hexdigest() != expected_pixel_sha:
+    if actual_pixel_sha != expected_pixel_sha:
         raise SupportBundleError(f"opening artifact pixel hash changed: {path.name}")
 
 

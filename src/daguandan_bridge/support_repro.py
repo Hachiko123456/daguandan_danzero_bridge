@@ -372,6 +372,7 @@ def run_child_probe(
     timeout_seconds: float = 180.0,
 ) -> dict[str, object]:
     output = Path(output_path)
+    output.unlink(missing_ok=True)
     command = _entrypoint_command()
     command.extend(
         [
@@ -387,15 +388,33 @@ def run_child_probe(
         command.extend(["--repro-truth", str(Path(truth_path))])
     if deterministic:
         command.append("--repro-deterministic")
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=max(1.0, float(timeout_seconds)),
-        check=False,
-        text=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(1.0, float(timeout_seconds)),
+            check=False,
+            text=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
+        return {
+            "schema": "guandan.repro-probe/1",
+            "status": "FAIL",
+            "reason": "timeout",
+            "exit_code": None,
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        }
+    except OSError as exc:
+        return {
+            "schema": "guandan.repro-probe/1",
+            "status": "FAIL",
+            "reason": "spawn_failed",
+            "error_type": type(exc).__name__,
+            "exit_code": None,
+        }
     if completed.returncode != 0 or not output.is_file():
         return {
             "schema": "guandan.repro-probe/1",
@@ -612,9 +631,12 @@ def _run_sequence(
                 "candidate_vector": list(trace.get("candidates", []))
                 if isinstance(trace, Mapping)
                 else [],
-                "input_sha256": trace.get("input_sha256")
-                if isinstance(trace, Mapping)
-                else frame["pixel_sha256"],
+                "input_sha256": frame["pixel_sha256"],
+                "trace_input_sha256": (
+                    trace.get("input_sha256")
+                    if isinstance(trace, Mapping)
+                    else None
+                ),
             }
         )
     if stable_seed is not None:
@@ -689,6 +711,7 @@ def _evaluate_truth(
         }
     expected_level = truth.get("expected_level")
     expected_hand = truth.get("expected_hand")
+    target_input = str(truth.get("input_pixel_sha256") or "")
     expected_hand_normalized = (
         sorted(str(card) for card in expected_hand)
         if isinstance(expected_hand, list)
@@ -696,11 +719,27 @@ def _evaluate_truth(
     )
     correct = 0
     for item in outcomes:
+        target_frames = [
+            frame
+            for frame in item.get("frame_results", [])
+            if isinstance(frame, Mapping)
+            and str(frame.get("input_sha256") or "") == target_input
+        ]
+        target = target_frames[-1] if target_frames else None
         # Correctness is a single-frame truth assertion.  Multi-frame
         # readiness is reported separately and must never erase a correct
         # one-frame observation.
-        level_ok = expected_level is None or item.get("single_frame_level") == expected_level
-        hand_ok = expected_hand_normalized is None or item.get("single_frame_hand") == expected_hand_normalized
+        level_ok = bool(
+            target is not None
+            and (expected_level is None or target.get("round_level") == expected_level)
+        )
+        hand_ok = bool(
+            target is not None
+            and (
+                expected_hand_normalized is None
+                or target.get("hand") == expected_hand_normalized
+            )
+        )
         if level_ok and hand_ok:
             correct += 1
     return {
@@ -708,6 +747,7 @@ def _evaluate_truth(
         "eligible_for_fix_verification": True,
         "expected_level": expected_level,
         "expected_hand": expected_hand_normalized,
+        "input_pixel_sha256": target_input,
         "correct_runs": correct,
         "total_runs": len(outcomes),
         "all_correct": correct == len(outcomes),
@@ -732,6 +772,10 @@ def _load_truth(
             raise SupportReproError("truth annotation is bound to a different support ZIP")
         if document.get("input_sequence_sha256") != sequence_sha256:
             raise SupportReproError("truth annotation is bound to a different input sequence")
+        input_hash = str(document.get("input_pixel_sha256") or "")
+        allowed_hashes = {str(item.get("pixel_sha256") or "") for item in frames}
+        if input_hash not in allowed_hashes:
+            raise SupportReproError("truth annotation is bound to a different input frame")
         normalized_level, normalized_hand = _validated_expected_truth(
             document.get("expected_level"),
             document.get("expected_hand") if isinstance(document.get("expected_hand"), list) else None,
@@ -752,6 +796,7 @@ def _load_truth(
         "schema": REPRO_TRUTH_SCHEMA,
         "support_sha256": support_sha256,
         "input_sequence_sha256": sequence_sha256,
+        "input_pixel_sha256": str(frames[-1].get("pixel_sha256") or ""),
         "expected_level": normalized_level,
         "expected_hand": list(normalized_hand) if normalized_hand is not None else None,
     }

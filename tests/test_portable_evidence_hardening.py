@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import subprocess
 from threading import Event
 import time
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from daguandan_bridge.support_repro import (
     compare_repro_reports,
     reproduce_support_bundle,
     reproduce_support_suite,
+    run_child_probe,
     verify_support_archive,
     write_truth_annotation,
 )
@@ -335,6 +337,7 @@ def test_e002_typed_worker_error_and_correlated_incident_episode(tmp_path):
 def test_e003_pure_opening_gate_covers_anchor_settlement_lead_and_illegal_hand():
     assert evaluate_opening_gate(_result("7"), anchor_score=0.85).ready is True
     assert evaluate_opening_gate(_result("7"), anchor_score=0.849).reason == "table_anchor_unresolved"
+    assert evaluate_opening_gate(_result("7"), anchor_score="corrupt").reason == "table_anchor_unresolved"
     assert evaluate_opening_gate(
         _result("7", buttons=("continue_game",)), anchor_score=1.0
     ).reason == "settlement_screen"
@@ -366,6 +369,17 @@ def test_e004_truth_is_legal_sequence_bound_and_hashed(tmp_path):
     with pytest.raises(SupportReproError, match="legal GuanDan rank"):
         write_truth_annotation(tmp_path / "bad.json", support, expected_level="ZZ")
     truth_path = tmp_path / "truth.json"
+    truth = write_truth_annotation(truth_path, support, expected_level="7")
+    missing_input = dict(truth)
+    missing_input.pop("input_pixel_sha256")
+    truth_path.write_text(json.dumps(missing_input), encoding="utf-8")
+    with pytest.raises(SupportReproError, match="different input frame"):
+        reproduce_support_bundle(
+            support,
+            truth_path=truth_path,
+            recognizer_factory=_FixedRecognizer,
+        )
+
     truth = write_truth_annotation(truth_path, support, expected_level="7")
     truth["input_sequence_sha256"] = "0" * 64
     truth_path.write_text(json.dumps(truth), encoding="utf-8")
@@ -517,6 +531,22 @@ def test_e006_suite_runs_ordinary_deterministic_and_child_and_wires_probe(monkey
     assert report["child_wired"]["status"] == "PASS"
 
 
+def test_e006_child_timeout_is_a_structured_probe_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "daguandan_bridge.support_repro.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 1))
+        ),
+    )
+    report = run_child_probe(
+        "support.zip",
+        tmp_path / "stale.json",
+        timeout_seconds=1,
+    )
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "timeout"
+
+
 def test_e007_frame_id_and_pixel_correlation_never_falls_back_to_latest(tmp_path):
     monitor = OpeningEvidenceMonitor(diagnostics_root=tmp_path)
     monitor.begin(monotonic_ms=0)
@@ -638,6 +668,10 @@ def test_e009_conflict_episode_recovers_and_pending_bytes_stay_hard_bounded(tmp_
 
     monkeypatch.setattr(blocked, "_write_incident", slow)
     assert blocked.emit_incident("OPENING-PENDING", field="test", reason="pending")
+    blocked.begin()
+    pending_after_begin = blocked.metrics()
+    assert pending_after_begin.pending_snapshot_bytes > 0
+    assert pending_after_begin.retained_bytes == pending_after_begin.pending_snapshot_bytes
     blocked.observe_frame(_snapshot(3), monotonic_ms=3)
     metrics = blocked.metrics()
     assert metrics.retained_bytes <= blocked.max_bytes

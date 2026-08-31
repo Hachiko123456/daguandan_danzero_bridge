@@ -49,7 +49,14 @@ def evaluate_opening_gate(
     buttons = {str(item) for item in tuple(getattr(result, "buttons", ()) or ())}
     if buttons & _SETTLEMENT_BUTTONS:
         return OpeningGateEvaluation(False, "settlement_screen", None, None)
-    if anchor_score is None or float(anchor_score) < float(anchor_required):
+    try:
+        anchor_ready = (
+            anchor_score is not None
+            and float(anchor_score) >= float(anchor_required)
+        )
+    except (TypeError, ValueError, OverflowError):
+        anchor_ready = False
+    if not anchor_ready:
         return OpeningGateEvaluation(False, "table_anchor_unresolved", None, None)
     level = str(getattr(result, "round_level", "") or "")
     if level not in RANKS:
@@ -98,6 +105,10 @@ def build_opening_seed(
         or current_player != next_active_seat(actor, frozenset())
     ):
         return None
+    try:
+        confidence = float(getattr(event, "confidence", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return None
     return OpeningSessionSeed(
         round_level,
         hand,
@@ -106,7 +117,7 @@ def build_opening_seed(
             actor=actor,
             cards=cards,
             next_player=current_player,
-            confidence=float(getattr(event, "confidence", 0.0)),
+            confidence=confidence,
             source=str(getattr(event, "source", "visual_opening_anchor")),
         ),
     )
