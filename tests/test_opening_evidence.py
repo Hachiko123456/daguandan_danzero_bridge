@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 import json
 import hashlib
 import time
@@ -254,6 +255,97 @@ def test_e006_slow_successful_unresolved_recognition_keeps_exact_trace(tmp_path)
     )
     trace_files = [path.with_name("recognition_trace.jsonl") for path in evidence_files]
     assert any(trace_hash in path.read_text(encoding="utf-8") for path in trace_files)
+    monitor.close()
+
+
+def test_e006_atomic_slow_frame_restore_is_trace_bound_before_any_writer(
+    tmp_path,
+    monkeypatch,
+):
+    class SynchronousExecutor:
+        def submit(self, operation, *args):
+            future = Future()
+            try:
+                operation(*args)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(None)
+            return future
+
+        def shutdown(self, **_kwargs):
+            return None
+
+    now = [0]
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path,
+        max_bytes=128 * 72 * 3 * 2 + 1,
+        field_timeout_seconds=1,
+        delivery_settle_seconds=0,
+        clock_ms=lambda: now[0],
+    )
+    monitor.begin(monotonic_ms=0)
+    slow = _snapshot(103)
+    monitor.observe_frame(slow, monotonic_ms=1)
+    monitor.observe_analysis_submitted(slow)
+    monitor.observe_analysis_started(slow)
+    monitor.observe_frame(_snapshot(104), monotonic_ms=2)
+    assert all(item.snapshot is not slow for item in monitor._ring)
+    monitor._executor = SynchronousExecutor()
+    original_append = monitor._append_frame_locked
+
+    def append_and_publish(*args, **kwargs):
+        restored = original_append(*args, **kwargs)
+        assert restored.recognition is not None
+        assert restored.recognition_trace is not None
+        assert restored.analysis["status"] == "completed"
+        assert restored.analysis["submitted_ms"] is not None
+        assert restored.analysis["started_ms"] is not None
+        assert restored.analysis["delivered_ms"] is None
+        assert restored.analysis["gate_delivered"] is False
+        monitor.emit_incident(
+            "OPENING-ATOMIC-RESTORE-RACE",
+            field="round_level",
+            reason="force a synchronous writer before restore returns",
+        )
+        return restored
+
+    monkeypatch.setattr(monitor, "_append_frame_locked", append_and_publish)
+    now[0] = 2_000
+    trace_hash = hashlib.sha256(
+        memoryview(np.ascontiguousarray(slow.image))
+    ).hexdigest()
+
+    monitor.observe_recognition(
+        slow,
+        _result(level=None, hand=()),
+        {
+            "schema": "guandan.recognition-trace/1",
+            "input_sha256": trace_hash,
+            "candidates": [],
+        },
+    )
+    assert monitor.flush(5)
+
+    evidence_files = list(
+        (tmp_path / "opening" / "incidents").glob("*/opening_evidence.json")
+    )
+    assert len(evidence_files) >= 2
+    for evidence_path in evidence_files:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        correlated = [
+            frame
+            for frame in evidence["frames"]
+            if frame["frame_id"] == slow.evidence_frame_id
+        ]
+        assert correlated
+        assert all(frame["recognition"] is not None for frame in correlated)
+        assert all(frame["analysis"]["completed_ms"] == now[0] for frame in correlated)
+        assert all(frame["analysis"]["submitted_ms"] is not None for frame in correlated)
+        assert all(frame["analysis"]["started_ms"] is not None for frame in correlated)
+        assert all(frame["analysis"]["gate_delivered"] is False for frame in correlated)
+        trace_path = evidence_path.with_name("recognition_trace.jsonl")
+        assert trace_hash in trace_path.read_text(encoding="utf-8")
     monitor.close()
 
 

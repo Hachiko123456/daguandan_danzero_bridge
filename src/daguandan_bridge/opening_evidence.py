@@ -207,7 +207,7 @@ class OpeningEvidenceMonitor:
         self._frame_by_id: dict[str, _OpeningFrame] = {}
         self._ambiguous_frame_ids: set[str] = set()
         self._known_frame_inputs: dict[
-            int, tuple[object, str, str]
+            int, tuple[object, str, str, dict[str, object]]
         ] = {}
         self._ring_record_ids: set[int] = set()
         self._retained_bytes = 0
@@ -270,81 +270,21 @@ class OpeningEvidenceMonitor:
 
         try:
             now = int(monotonic_ms if monotonic_ms is not None else self._clock_ms())
-            standard = getattr(snapshot, "image", None)
-            captured = getattr(snapshot, "frame", None)
-            raw = getattr(captured, "raw_image", None)
-            byte_size = _unique_array_bytes(raw, standard)
-            metadata = _frame_metadata(snapshot)
-            if isinstance(standard, np.ndarray) and standard.size:
-                metadata.update(
-                    {
-                        "pixel_max": int(np.max(standard)),
-                        "pixel_mean": float(np.mean(standard)),
-                        "standardized_pixel_sha256": _array_sha256(standard),
-                    }
-                )
-            if isinstance(raw, np.ndarray) and raw.size:
-                metadata["raw_pixel_sha256"] = _array_sha256(raw)
-            black = _is_black_frame(standard)
+            byte_size, metadata, black = _frame_capture_details(snapshot)
             with self._lock:
                 if self._closed:
                     return
-                self._latest_seq += 1
-                requested_frame_id = str(
-                    getattr(snapshot, "evidence_frame_id", "") or uuid4().hex
-                )
-                frame_id = requested_frame_id
-                if frame_id in self._frame_by_id or frame_id in self._ambiguous_frame_ids:
-                    self._ambiguous_frame_ids.add(requested_frame_id)
-                    self._frame_by_id.pop(requested_frame_id, None)
-                    frame_id = uuid4().hex
-                    metadata["duplicate_source_frame_id"] = requested_frame_id
-                metadata["frame_id"] = frame_id
-                pixel_hash = str(metadata.get("standardized_pixel_sha256") or "")
-                try:
-                    snapshot_ref: object = weakref_ref(snapshot)
-                except TypeError:
-                    snapshot_ref = lambda: None
-                self._known_frame_inputs[id(snapshot)] = (
-                    snapshot_ref,
-                    requested_frame_id,
-                    pixel_hash,
-                )
-                for identity, known in tuple(self._known_frame_inputs.items()):
-                    dereference = known[0]
-                    if callable(dereference) and dereference() is None:
-                        self._known_frame_inputs.pop(identity, None)
-                item = _OpeningFrame(
-                    frame_id=frame_id,
-                    seq=self._latest_seq,
-                    monotonic_ms=now,
-                    wall_time=_wall_time(snapshot),
-                    snapshot=snapshot,
+                self._append_frame_locked(
+                    snapshot,
+                    now=now,
                     byte_size=byte_size,
-                    frame_metadata=metadata,
-                    analysis={
-                        "status": "captured",
-                        "captured_observer_ms": now,
-                        "submitted_ms": None,
-                        "started_ms": None,
-                        "completed_ms": None,
-                        "delivered_ms": None,
-                        "dropped_ms": None,
-                        "drop_reason": None,
-                        "gate_delivered": False,
-                    },
+                    metadata=metadata,
+                    analysis=_initial_analysis(now),
                 )
-                self._ring.append(item)
-                self._frame_by_identity[id(snapshot)] = item
-                if requested_frame_id not in self._ambiguous_frame_ids:
-                    self._frame_by_id[requested_frame_id] = item
-                self._frame_by_id[frame_id] = item
-                self._ring_record_ids.add(id(item))
-                self._retained_bytes += byte_size
-                self._trim_locked(now)
                 if not black:
                     self._clear_error_stage_locked("capture")
             if black:
+                standard = getattr(snapshot, "image", None)
                 self.emit_incident(
                     OPENING_CAPTURE_BLACK_FRAME,
                     field="capture",
@@ -355,6 +295,116 @@ class OpeningEvidenceMonitor:
             self._emit_timeouts_if_due()
         except BaseException:
             return
+
+    def _append_frame_locked(
+        self,
+        snapshot: object,
+        *,
+        now: int,
+        byte_size: int,
+        metadata: Mapping[str, object],
+        analysis: Mapping[str, object],
+        recognition: Mapping[str, object] | None = None,
+        trace: Mapping[str, object] | None = None,
+    ) -> _OpeningFrame:
+        """Publish a fully initialized frame while the evidence lock is held."""
+
+        self._latest_seq += 1
+        frame_metadata = dict(metadata)
+        requested_frame_id = str(
+            getattr(snapshot, "evidence_frame_id", "") or uuid4().hex
+        )
+        frame_id = requested_frame_id
+        if frame_id in self._frame_by_id or frame_id in self._ambiguous_frame_ids:
+            self._ambiguous_frame_ids.add(requested_frame_id)
+            self._frame_by_id.pop(requested_frame_id, None)
+            frame_id = uuid4().hex
+            frame_metadata["duplicate_source_frame_id"] = requested_frame_id
+        frame_metadata["frame_id"] = frame_id
+        pixel_hash = str(frame_metadata.get("standardized_pixel_sha256") or "")
+        try:
+            snapshot_ref: object = weakref_ref(snapshot)
+        except TypeError:
+            snapshot_ref = lambda: None
+        analysis_document = dict(analysis)
+        self._known_frame_inputs[id(snapshot)] = (
+            snapshot_ref,
+            requested_frame_id,
+            pixel_hash,
+            analysis_document,
+        )
+        for identity, known in tuple(self._known_frame_inputs.items()):
+            dereference = known[0]
+            if callable(dereference) and dereference() is None:
+                self._known_frame_inputs.pop(identity, None)
+        item = _OpeningFrame(
+            frame_id=frame_id,
+            seq=self._latest_seq,
+            monotonic_ms=now,
+            wall_time=_wall_time(snapshot),
+            snapshot=snapshot,
+            byte_size=byte_size,
+            frame_metadata=frame_metadata,
+            recognition=dict(recognition) if isinstance(recognition, Mapping) else None,
+            recognition_trace=dict(trace) if isinstance(trace, Mapping) else None,
+            analysis=analysis_document,
+        )
+        self._ring.append(item)
+        self._frame_by_identity[id(snapshot)] = item
+        if requested_frame_id not in self._ambiguous_frame_ids:
+            self._frame_by_id[requested_frame_id] = item
+        self._frame_by_id[frame_id] = item
+        self._ring_record_ids.add(id(item))
+        self._retained_bytes += byte_size
+        self._trim_locked(now)
+        return item
+
+    def _restore_and_bind_recognition_locked(
+        self,
+        snapshot: object,
+        document: Mapping[str, object],
+        trace: Mapping[str, object] | None,
+        *,
+        now: int,
+    ) -> tuple[_OpeningFrame | None, bool]:
+        """Atomically restore an exact evicted input already bound to its result."""
+
+        item = self._correlated_frame_locked(snapshot, trace=trace)
+        recovered = False
+        if item is None:
+            if not self._can_recover_exact_locked(snapshot, trace=trace):
+                return None, False
+            known = self._known_frame_inputs.get(id(snapshot))
+            if known is None:
+                return None, False
+            analysis = dict(known[3])
+            analysis["completed_ms"] = now
+            analysis["recovered_exact_analysis_frame"] = True
+            if analysis.get("status") != "dropped":
+                analysis["status"] = "completed"
+            byte_size, metadata, _black = _frame_capture_details(snapshot)
+            item = self._append_frame_locked(
+                snapshot,
+                now=now,
+                byte_size=byte_size,
+                metadata=metadata,
+                analysis=analysis,
+                recognition=document,
+                trace=trace,
+            )
+            recovered = id(item) in self._ring_record_ids
+            if not recovered:
+                return None, False
+        else:
+            item.recognition = dict(document)
+            item.recognition_trace = (
+                dict(trace) if isinstance(trace, Mapping) else None
+            )
+            item.analysis["completed_ms"] = now
+            item.analysis["recovered_exact_analysis_frame"] = False
+            if item.analysis.get("status") != "dropped":
+                item.analysis["status"] = "completed"
+        return item, recovered
 
     def observe_analysis_submitted(self, snapshot: object) -> None:
         self._mark_analysis(snapshot, "submitted")
@@ -458,27 +508,14 @@ class OpeningEvidenceMonitor:
             level = str(document.get("round_level") or "")
             hand = tuple(str(card) for card in document.get("my_hand", []))
             now = self._clock_ms()
-            recovered = False
             with self._lock:
-                item = self._correlated_frame_locked(snapshot, trace=trace)
-                recoverable = self._can_recover_exact_locked(snapshot, trace=trace)
-            if item is None and recoverable:
-                # Slow successful recognition must retain the exact analyzed
-                # input and trace, just like the exception path.  Never attach
-                # it to an unrelated newest frame.
-                self.observe_frame(snapshot, monotonic_ms=now)
-                with self._lock:
-                    item = self._correlated_frame_locked(snapshot, trace=trace)
-                recovered = item is not None
-            with self._lock:
-                if item is not None:
-                    item.recognition = document
-                    item.recognition_trace = dict(trace) if isinstance(trace, Mapping) else None
-                    item.analysis["completed_ms"] = now
-                    item.analysis["recovered_exact_analysis_frame"] = recovered
-                    if item.analysis.get("status") != "dropped":
-                        item.analysis["status"] = "completed"
-                else:
+                item, _recovered = self._restore_and_bind_recognition_locked(
+                    snapshot,
+                    document,
+                    trace,
+                    now=now,
+                )
+                if item is None:
                     self._orphan_recognitions += 1
                 self._clear_error_stage_locked("recognition")
                 if level in RANKS:
@@ -983,7 +1020,7 @@ class OpeningEvidenceMonitor:
         known = self._known_frame_inputs.get(id(snapshot))
         if known is None:
             return False
-        dereference, frame_id, pixel_hash = known
+        dereference, frame_id, pixel_hash, _analysis = known
         if not callable(dereference) or dereference() is not snapshot:
             return False
         if str(getattr(snapshot, "evidence_frame_id", "") or "") != frame_id:
@@ -1529,6 +1566,41 @@ def classify_opening_failure(error: object) -> str:
     if any(token in text for token in ("timeout", "超时")):
         return OPENING_TIMEOUT
     return OPENING_CAPTURE_ERROR
+
+
+def _initial_analysis(now: int) -> dict[str, object]:
+    return {
+        "status": "captured",
+        "captured_observer_ms": now,
+        "submitted_ms": None,
+        "started_ms": None,
+        "completed_ms": None,
+        "delivered_ms": None,
+        "dropped_ms": None,
+        "drop_reason": None,
+        "gate_delivered": False,
+    }
+
+
+def _frame_capture_details(
+    snapshot: object,
+) -> tuple[int, dict[str, object], bool]:
+    standard = getattr(snapshot, "image", None)
+    captured = getattr(snapshot, "frame", None)
+    raw = getattr(captured, "raw_image", None)
+    byte_size = _unique_array_bytes(raw, standard)
+    metadata = _frame_metadata(snapshot)
+    if isinstance(standard, np.ndarray) and standard.size:
+        metadata.update(
+            {
+                "pixel_max": int(np.max(standard)),
+                "pixel_mean": float(np.mean(standard)),
+                "standardized_pixel_sha256": _array_sha256(standard),
+            }
+        )
+    if isinstance(raw, np.ndarray) and raw.size:
+        metadata["raw_pixel_sha256"] = _array_sha256(raw)
+    return byte_size, metadata, _is_black_frame(standard)
 
 
 def _frame_metadata(snapshot: object) -> dict[str, object]:
