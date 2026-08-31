@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     install.add_argument("--release-record", type=Path, required=True)
     install.add_argument("--checksum", type=Path, required=True)
     install.add_argument("--baseline", action="store_true")
+    install.add_argument("--baseline-auth", type=Path)
     activate = sub.add_parser("activate")
     activate.add_argument("release_id")
     legacy = sub.add_parser("register-legacy-baseline")
@@ -45,12 +46,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "install":
+            if args.baseline and args.baseline_auth is None:
+                parser.error("--baseline requires --baseline-auth")
+            if not args.baseline and args.baseline_auth is not None:
+                parser.error("--baseline-auth requires --baseline")
             result = install_release(
                 args.archive,
                 release_record_path=args.release_record,
                 checksum_path=args.checksum,
                 runtime_root=args.runtime_root,
                 baseline=args.baseline,
+                baseline_auth_path=args.baseline_auth,
             ).to_dict()
         elif args.command == "activate":
             result = activate_release(args.release_id, runtime_root=args.runtime_root)

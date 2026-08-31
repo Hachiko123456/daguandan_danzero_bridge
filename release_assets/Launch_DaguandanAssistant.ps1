@@ -241,12 +241,14 @@ elseif ($receipt.schema -eq "guandan.legacy-baseline/1") {
     if ($receipt.baseline -ne $true -or [string]::IsNullOrWhiteSpace([string] $receipt.baseline_auth_sha256)) {
         throw "The legacy baseline is not externally preauthorized."
     }
+    $approvedRoot = Resolve-SafeRelative -Root $versionRoot -Relative ([string] $receipt.approved_artifact_relative) -Field "approved_artifact_relative"
+    Assert-NoReparseTree -LiteralPath $approvedRoot
     $declared = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($record in $receipt.artifact_files) {
-        Assert-ManifestFile -Root $bundleRoot -Record $record -Declared $declared
+        Assert-ManifestFile -Root $approvedRoot -Record $record -Declared $declared
     }
-    foreach ($file in [System.IO.Directory]::EnumerateFiles($bundleRoot, '*', [System.IO.SearchOption]::AllDirectories)) {
-        $relative = Get-RelativePortablePath -Root $bundleRoot -Path $file
+    foreach ($file in [System.IO.Directory]::EnumerateFiles($approvedRoot, '*', [System.IO.SearchOption]::AllDirectories)) {
+        $relative = Get-RelativePortablePath -Root $approvedRoot -Path $file
         if (-not $declared.Contains($relative)) { throw "The legacy baseline contains an undeclared file: $relative" }
     }
 }

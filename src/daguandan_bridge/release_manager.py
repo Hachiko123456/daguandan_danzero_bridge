@@ -47,6 +47,7 @@ ROLLBACK_RECEIPT_SCHEMA = "guandan.rollback-receipt/1"
 LEGACY_BASELINE_SCHEMA = "guandan.legacy-baseline/1"
 BASELINE_AUTH_SCHEMA = "guandan.baseline-auth/1"
 BASELINE_SOURCE_COMMIT = "2db427b0937dfa390eaad407a92a084556af1279"
+BASELINE_SOURCE_TREE = "c4c6ec70a4c4677d5d5520038d35cb16dc7aa437"
 BASELINE_TAG = "baseline/local-stable-20260831"
 _INSTALL_MARKER = ".daguandan-install-root.json"
 _ACTIVE_FILE = "active.json"
@@ -71,6 +72,7 @@ class InstalledRelease:
     receipt_schema: str
     artifact_tree_sha256: str | None = None
     baseline_auth_sha256: str | None = None
+    approved_artifact_root: Path | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -83,6 +85,11 @@ class InstalledRelease:
             "receipt_schema": self.receipt_schema,
             "artifact_tree_sha256": self.artifact_tree_sha256,
             "baseline_auth_sha256": self.baseline_auth_sha256,
+            "approved_artifact_relative": (
+                self.approved_artifact_root.relative_to(self.version_root).as_posix()
+                if self.approved_artifact_root is not None
+                else None
+            ),
         }
 
 
@@ -142,7 +149,16 @@ def install_release(
     checksum_path: Path | str,
     runtime_root: Path | str | None = None,
     baseline: bool = False,
+    baseline_auth_path: Path | str | None = None,
 ) -> InstalledRelease:
+    if baseline and baseline_auth_path is None:
+        raise ReleaseManagerError(
+            "baseline install requires exact external baseline authorization"
+        )
+    if not baseline and baseline_auth_path is not None:
+        raise ReleaseManagerError(
+            "external baseline authorization is valid only for a baseline install"
+        )
     archive = Path(archive_path)
     release_record = _json_file(Path(release_record_path), "release record")
     if release_record.get("schema") != RELEASE_RECORD_SCHEMA:
@@ -163,6 +179,12 @@ def install_release(
     _assert_below(destination, versions, "release destination")
     if destination.exists():
         installed = _verify_installed_release(destination, release_record, baseline=baseline)
+        if baseline:
+            auth = verify_baseline_auth(installed.executable.parent, Path(baseline_auth_path))
+            if installed.baseline_auth_sha256 != sha256_file(Path(baseline_auth_path)):
+                raise ReleaseManagerError("installed baseline authorization does not match")
+            if installed.artifact_tree_sha256 != auth["artifact"]["tree_sha256"]:
+                raise ReleaseManagerError("installed baseline artifact authorization does not match")
         _record_baseline(install, installed, archive_hash=actual_archive_hash)
         return installed
     staging = versions / f".{release_id}.install-{uuid4().hex}.tmp"
@@ -178,8 +200,13 @@ def install_release(
         _verify_native_audit(bundle)
         source = manifest.get("source") if isinstance(manifest.get("source"), Mapping) else {}
         source_commit = str(source.get("commit") or "") or None
-        if baseline and source_commit != BASELINE_SOURCE_COMMIT:
-            raise ReleaseManagerError("baseline release does not point to the frozen source commit")
+        baseline_auth: Mapping[str, object] | None = None
+        if baseline:
+            if not _is_exact_clean_baseline_source(source):
+                raise ReleaseManagerError(
+                    "baseline release is not the exact clean frozen source"
+                )
+            baseline_auth = verify_baseline_auth(bundle, Path(baseline_auth_path))
         executable_info = manifest.get("executable")
         if not isinstance(executable_info, Mapping):
             raise ReleaseManagerError("build manifest executable entry is missing")
@@ -201,6 +228,14 @@ def install_release(
             "executable_relative": executable.relative_to(staging).as_posix(),
             "executable_sha256": sha256_file(executable),
             "baseline": bool(baseline),
+            "baseline_auth_sha256": (
+                sha256_file(Path(baseline_auth_path)) if baseline else None
+            ),
+            "artifact_tree_sha256": (
+                baseline_auth["artifact"]["tree_sha256"]
+                if baseline_auth is not None
+                else None
+            ),
             "installed_at": datetime.now(UTC).isoformat(),
         }
         atomic_write_json(staging / "install_receipt.json", install_receipt)
@@ -234,8 +269,12 @@ def register_legacy_baseline(
         staging = versions / f".{release_id}.install-{uuid4().hex}.tmp"
         try:
             staging.mkdir()
-            target = staging / "DaguandanAssistant"
-            _copy_safe_tree(source, target)
+            approved_target = staging / "approved" / "DaguandanAssistant"
+            run_target = staging / "run" / "DaguandanAssistant"
+            approved_target.parent.mkdir()
+            run_target.parent.mkdir()
+            _copy_safe_tree(source, approved_target)
+            _copy_safe_tree(source, run_target)
             atomic_write_json(
                 staging / "install_receipt.json",
                 {
@@ -243,8 +282,9 @@ def register_legacy_baseline(
                     "release_id": release_id,
                     "build_id": "legacy-unidentified",
                     "source_commit": BASELINE_SOURCE_COMMIT,
-                    "executable_relative": "DaguandanAssistant/DaguandanAssistant.exe",
+                    "executable_relative": "run/DaguandanAssistant/DaguandanAssistant.exe",
                     "executable_sha256": executable_sha256,
+                    "approved_artifact_relative": "approved/DaguandanAssistant",
                     "artifact_tree_sha256": auth["artifact"]["tree_sha256"],
                     "artifact_file_count": auth["artifact"]["file_count"],
                     "artifact_bytes": auth["artifact"]["bytes"],
@@ -360,6 +400,15 @@ def verify_baseline_auth(
     if document.get("approval_sha256") != _canonical_sha256(payload):
         raise ReleaseManagerError("baseline approval hash is invalid")
     return document
+
+
+def _is_exact_clean_baseline_source(source: Mapping[str, object]) -> bool:
+    return bool(
+        source.get("commit") == BASELINE_SOURCE_COMMIT
+        and source.get("tree") == BASELINE_SOURCE_TREE
+        and source.get("dirty") is False
+        and source.get("status_sha256") in {None, hashlib.sha256(b"").hexdigest()}
+    )
 
 
 def activate_release(
@@ -570,8 +619,14 @@ def _verify_installed_release(
     if not integrity.ok or integrity.build_id != installed.build_id:
         raise ReleaseManagerError("installed release failed strict integrity verification")
     _verify_native_audit(bundle)
-    if baseline and installed.source_commit != BASELINE_SOURCE_COMMIT:
-        raise ReleaseManagerError("installed baseline source identity is invalid")
+    if installed.baseline != bool(baseline):
+        raise ReleaseManagerError("installed release baseline identity is different")
+    if baseline and (
+        installed.source_commit != BASELINE_SOURCE_COMMIT
+        or not installed.baseline_auth_sha256
+        or not installed.artifact_tree_sha256
+    ):
+        raise ReleaseManagerError("installed baseline source authorization is invalid")
     return installed
 
 
@@ -587,7 +642,9 @@ def _load_installed_receipt(version_root: Path) -> InstalledRelease:
             raise ReleaseManagerError("installed release no longer passes strict integrity")
         _verify_native_audit(bundle)
     elif receipt.get("schema") == LEGACY_BASELINE_SCHEMA:
-        artifact = _tree_identity(installed.executable.parent)
+        if installed.approved_artifact_root is None:
+            raise ReleaseManagerError("installed legacy baseline approved artifact is missing")
+        artifact = _tree_identity(installed.approved_artifact_root)
         if (
             artifact.get("tree_sha256") != installed.artifact_tree_sha256
             or receipt.get("artifact_files") != artifact.get("files")
@@ -613,6 +670,19 @@ def _installed_from_receipt(
     expected_hash = str(receipt.get("executable_sha256") or "")
     if expected_hash and sha256_file(executable) != expected_hash:
         raise ReleaseManagerError("installed executable hash mismatch")
+    approved_artifact_root: Path | None = None
+    if receipt.get("approved_artifact_relative"):
+        approved_relative = _safe_relative(
+            str(receipt.get("approved_artifact_relative") or "")
+        )
+        approved_artifact_root = version_root.joinpath(
+            *PurePosixPath(approved_relative).parts
+        )
+        _assert_below(approved_artifact_root, version_root, "approved baseline artifact")
+        if not approved_artifact_root.is_dir() or _is_link_or_reparse(
+            approved_artifact_root
+        ):
+            raise ReleaseManagerError("installed legacy approved artifact is unavailable")
     return InstalledRelease(
         release_id=release_id,
         build_id=str(receipt.get("build_id") or "legacy-unidentified"),
@@ -631,6 +701,7 @@ def _installed_from_receipt(
             if receipt.get("baseline_auth_sha256")
             else None
         ),
+        approved_artifact_root=approved_artifact_root,
     )
 
 
@@ -725,6 +796,10 @@ def _record_baseline(
 ) -> None:
     if not release.baseline:
         return
+    if not release.baseline_auth_sha256 or not release.artifact_tree_sha256:
+        raise ReleaseManagerError(
+            "baseline receipt requires verified external authorization"
+        )
     document = {
         "schema": "guandan.baseline-receipt/1",
         "tag": BASELINE_TAG,
@@ -768,7 +843,9 @@ def _run_preauthorized_legacy_doctor(
     release: InstalledRelease,
     output_path: Path,
 ) -> dict[str, object]:
-    artifact = _tree_identity(release.executable.parent)
+    if release.approved_artifact_root is None:
+        raise ReleaseManagerError("legacy approved artifact is unavailable")
+    artifact = _tree_identity(release.approved_artifact_root)
     tree_matches = bool(
         release.artifact_tree_sha256
         and artifact.get("tree_sha256") == release.artifact_tree_sha256

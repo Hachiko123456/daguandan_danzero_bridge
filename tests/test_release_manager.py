@@ -13,6 +13,7 @@ from daguandan_bridge.build_manifest import write_build_manifest, write_release_
 from daguandan_bridge.release_manager import (
     BASELINE_AUTH_SCHEMA,
     BASELINE_SOURCE_COMMIT,
+    BASELINE_SOURCE_TREE,
     BASELINE_TAG,
     ReleaseManagerError,
     activate_release,
@@ -39,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def _source(commit: str) -> dict[str, object]:
     return {
         "commit": commit,
-        "tree": "b" * 40,
+        "tree": BASELINE_SOURCE_TREE if commit == BASELINE_SOURCE_COMMIT else "b" * 40,
         "branch": "test",
         "dirty": False,
         "status_sha256": None,
@@ -134,6 +135,13 @@ def _legacy_bundle(tmp_path: Path) -> tuple[Path, Path]:
     return bundle, auth
 
 
+def _modern_baseline_auth(tmp_path: Path, release_files) -> Path:
+    bundle = release_files[0].parent / "DaguandanAssistant"
+    auth = tmp_path / "external" / f"{release_files[0].parent.name}-baseline-auth.json"
+    write_baseline_auth(bundle, auth, approved=True)
+    return auth
+
+
 def test_install_activate_candidate_and_rollback_preserves_bad_version(tmp_path):
     baseline_files = _release(tmp_path, "baseline", commit=BASELINE_SOURCE_COMMIT)
     candidate_files = _release(tmp_path, "candidate", commit="a" * 40)
@@ -144,6 +152,7 @@ def test_install_activate_candidate_and_rollback_preserves_bad_version(tmp_path)
         checksum_path=baseline_files[2],
         runtime_root=runtime,
         baseline=True,
+        baseline_auth_path=_modern_baseline_auth(tmp_path, baseline_files),
     )
     candidate = install_release(
         candidate_files[0],
@@ -181,6 +190,7 @@ def test_candidate_cannot_overwrite_immutable_baseline_receipt(tmp_path):
         checksum_path=baseline_files[2],
         runtime_root=runtime,
         baseline=True,
+        baseline_auth_path=_modern_baseline_auth(tmp_path, baseline_files),
     )
     baseline_path = runtime / "install" / "baseline.json"
     before = baseline_path.read_bytes()
@@ -261,6 +271,7 @@ def test_failed_candidate_doctor_never_changes_active_pointer(tmp_path):
         checksum_path=baseline_files[2],
         runtime_root=runtime,
         baseline=True,
+        baseline_auth_path=_modern_baseline_auth(tmp_path, baseline_files),
     )
     candidate = install_release(
         candidate_files[0],
@@ -302,6 +313,7 @@ def test_rollback_refuses_tampered_previous_version_and_keeps_candidate_active(t
         checksum_path=baseline_files[2],
         runtime_root=runtime,
         baseline=True,
+        baseline_auth_path=_modern_baseline_auth(tmp_path, baseline_files),
     )
     candidate = install_release(
         candidate_files[0],
@@ -354,6 +366,100 @@ def test_legacy_baseline_rejects_any_tree_change_after_preapproval(tmp_path):
         )
 
 
+def test_modern_install_cannot_claim_baseline_without_external_authorization(tmp_path):
+    release_files = _release(tmp_path, "synthetic-baseline", commit=BASELINE_SOURCE_COMMIT)
+    runtime = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseManagerError, match="external baseline authorization"):
+        install_release(
+            release_files[0],
+            release_record_path=release_files[1],
+            checksum_path=release_files[2],
+            runtime_root=runtime,
+            baseline=True,
+        )
+
+    assert not (runtime / "install" / "baseline.json").exists()
+
+
+def test_dirty_modern_install_cannot_claim_baseline_even_with_tree_preapproval(tmp_path):
+    release_files = _release(tmp_path, "dirty-baseline", commit=BASELINE_SOURCE_COMMIT)
+    archive, record, checksum, _manifest, _release_document = release_files
+    bundle = archive.parent / "DaguandanAssistant"
+    manifest_path = bundle / "build_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source"]["dirty"] = True
+    # The test intentionally presents an internally consistent but dirty build.
+    from daguandan_bridge.build_manifest import compute_build_id
+
+    manifest["build_id"] = compute_build_id(manifest)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+        for path in sorted(bundle.rglob("*")):
+            if path.is_file():
+                handle.write(path, path.relative_to(archive.parent).as_posix())
+    write_release_record(manifest_path, archive, record, checksum)
+    auth = tmp_path / "external" / "dirty-auth.json"
+    write_baseline_auth(bundle, auth, approved=True)
+
+    with pytest.raises(ReleaseManagerError, match="clean frozen source"):
+        install_release(
+            archive,
+            release_record_path=record,
+            checksum_path=checksum,
+            runtime_root=tmp_path / "runtime",
+            baseline=True,
+            baseline_auth_path=auth,
+        )
+
+
+def test_legacy_baseline_uses_mutable_run_copy_without_mutating_approved_artifact(
+    tmp_path,
+):
+    bundle, auth = _legacy_bundle(tmp_path)
+    approved_before = _snapshot_tree(bundle)
+    runtime = tmp_path / "runtime"
+    baseline = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+
+    runtime_file = (
+        baseline.executable.parent
+        / "data"
+        / "profiles"
+        / "tencent_daguandan"
+        / "sessions"
+        / "game-written-after-registration"
+        / "timeline.jsonl"
+    )
+    runtime_file.parent.mkdir(parents=True)
+    runtime_file.write_text('{"event":"runtime-write"}\n', encoding="utf-8")
+
+    status = release_status(runtime)
+    reloaded = next(
+        item for item in status["versions"] if item["release_id"] == baseline.release_id
+    )
+    receipt = json.loads(
+        (baseline.version_root / "install_receipt.json").read_text(encoding="utf-8")
+    )
+    approved_root = baseline.version_root / receipt["approved_artifact_relative"]
+    assert runtime_file.is_file()
+    assert approved_root != baseline.executable.parent
+    assert _snapshot_tree(bundle) == approved_before
+    assert _snapshot_tree(approved_root) == approved_before
+    assert reloaded["baseline"] is True
+
+
+def _snapshot_tree(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def test_preauthorized_legacy_activation_uses_nonempty_hash_bound_doctor(tmp_path):
     bundle, auth = _legacy_bundle(tmp_path)
     runtime = tmp_path / "runtime"
@@ -387,6 +493,7 @@ def test_activation_preserves_real_migrated_generation_and_rollback_restores_mar
         checksum_path=baseline_files[2],
         runtime_root=runtime,
         baseline=True,
+        baseline_auth_path=_modern_baseline_auth(tmp_path, baseline_files),
     )
     candidate = install_release(
         candidate_files[0],
@@ -452,6 +559,7 @@ def test_pointer_transaction_restores_both_files_when_release_publish_fails(
         checksum_path=baseline_files[2],
         runtime_root=runtime,
         baseline=True,
+        baseline_auth_path=_modern_baseline_auth(tmp_path, baseline_files),
     )
     candidate = install_release(
         candidate_files[0],
