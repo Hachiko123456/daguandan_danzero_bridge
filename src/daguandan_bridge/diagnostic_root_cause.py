@@ -242,6 +242,19 @@ def diagnose_root_cause(
             finding="fresh deterministic child disagrees with the same-process probe",
             evidence={"support_build_id": support_build_id, "runner_build_id": runner_build_id},
         )
+    elif child_status == "FAIL":
+        layers["runtime_native_build"] = _layer(
+            "runtime_native_build",
+            status="UNKNOWN",
+            confidence="SUSPECTED",
+            finding="fresh deterministic child probe could not complete",
+            evidence={
+                "reason": child_probe.get("reason") if child_probe else None,
+                "exit_code": child_probe.get("exit_code") if child_probe else None,
+                "support_build_id": support_build_id,
+                "runner_build_id": runner_build_id,
+            },
+        )
     elif build_differs:
         layers["runtime_native_build"] = _layer(
             "runtime_native_build",

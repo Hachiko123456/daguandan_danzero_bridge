@@ -545,6 +545,19 @@ def test_e006_child_timeout_is_a_structured_probe_failure(monkeypatch, tmp_path)
     )
     assert report["status"] == "FAIL"
     assert report["reason"] == "timeout"
+    root = diagnose_root_cause(
+        support_verified=True,
+        opening_evidence={"frames": []},
+        outcomes=[],
+        truth=None,
+        local_resource_identity=None,
+        support_build_id="BUILD-remote",
+        runner_build_id="BUILD-local",
+        child_probe=report,
+    )
+    runtime = {item["layer"]: item for item in root["layers"]}["runtime_native_build"]
+    assert runtime["confidence"] == "SUSPECTED"
+    assert runtime["evidence"]["reason"] == "timeout"
 
 
 def test_e007_frame_id_and_pixel_correlation_never_falls_back_to_latest(tmp_path):
