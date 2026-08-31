@@ -273,3 +273,25 @@ def test_qualification_output_is_exclusive_and_post_publish_hash_gate_detects_ch
 
     assert result["status"] == "FAIL"
     assert result["bundle_before"] != result["bundle_after"]
+
+
+def test_formal_manifest_source_must_equal_clean_preflight_head():
+    expected = {
+        "commit": "1" * 40,
+        "tree": "2" * 40,
+        "branch": "fix_dif_computer",
+        "dirty": False,
+        "status_sha256": None,
+    }
+    manifest = {"source": dict(expected)}
+
+    assert MODULE._validate_formal_manifest_source(manifest, expected)["status"] == "PASS"
+
+    manifest["source"]["tree"] = "3" * 40
+    manifest["source"]["dirty"] = True
+    manifest["source"]["status_sha256"] = "4" * 64
+    failed = MODULE._validate_formal_manifest_source(manifest, expected)
+
+    assert failed["status"] == "FAIL"
+    assert "manifest_source_tree_mismatch" in failed["failures"]
+    assert "manifest_source_not_clean" in failed["failures"]

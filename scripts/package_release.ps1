@@ -331,6 +331,11 @@ Invoke-PythonCommand $bootstrapPython `
     source-identity `
     --project-root $projectRoot `
     --output $sourceIdentityPath
+Invoke-PythonCommand $bootstrapPython `
+    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
+    verify-source-identity `
+    --project-root $projectRoot `
+    --expected $sourceIdentityPath
 
 $script:pythonBaseRoot = (& $bootstrapPython -I -c "import sys; print(sys.base_prefix)").Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($script:pythonBaseRoot)) {
@@ -426,6 +431,14 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     --project-root $projectRoot `
     --output $nativeAuditPath
 
+# PyInstaller imports the source tree for an extended period.  Re-prove the
+# tracked commit/tree/status before signing those bytes into the manifest.
+Invoke-PythonCommand $bootstrapPython `
+    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
+    verify-source-identity `
+    --project-root $projectRoot `
+    --expected $sourceIdentityPath
+
 Write-Host "[6/7] Creating and strictly verifying the build manifest..." -ForegroundColor Cyan
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
@@ -474,6 +487,14 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     --archive $archivePath `
     --record $releaseRecordPath `
     --checksum $archiveChecksumPath
+
+# A build hook or concurrent editor must not be able to modify tracked source
+# after manifest creation and still publish a formally qualified archive.
+Invoke-PythonCommand $bootstrapPython `
+    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
+    verify-source-identity `
+    --project-root $projectRoot `
+    --expected $sourceIdentityPath
 
 $size = (Get-ChildItem -LiteralPath $bundlePath -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
 Write-Host ("Complete bundle: {0}" -f $bundlePath) -ForegroundColor Green

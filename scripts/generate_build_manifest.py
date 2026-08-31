@@ -18,6 +18,7 @@ from daguandan_bridge.build_manifest import (  # noqa: E402
     BuildManifestError,
     collect_release_build_inputs,
     collect_source_identity,
+    verify_source_identity,
     verify_build_manifest,
     write_build_manifest,
     write_release_record,
@@ -45,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     source.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     source.add_argument("--output", type=Path, required=True)
+
+    verify_source = subparsers.add_parser(
+        "verify-source-identity",
+        help="fail if Git commit/tree/status changed after source capture",
+    )
+    verify_source.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
+    verify_source.add_argument("--expected", type=Path, required=True)
 
     verify = subparsers.add_parser("verify", help="verify files against a manifest")
     verify.add_argument("--bundle-root", type=Path, required=True)
@@ -125,6 +133,26 @@ def main(argv: list[str] | None = None) -> int:
                         "ok": True,
                         "dirty": identity["dirty"],
                         "output": str(args.output.resolve()),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        if args.command == "verify-source-identity":
+            expected = _read_json_object(args.expected)
+            identity = verify_source_identity(
+                args.project_root,
+                expected,
+                require_clean=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "commit": identity["commit"],
+                        "tree": identity["tree"],
+                        "dirty": identity["dirty"],
                     },
                     ensure_ascii=False,
                 )

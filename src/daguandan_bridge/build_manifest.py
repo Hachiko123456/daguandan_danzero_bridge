@@ -83,6 +83,29 @@ def collect_source_identity(project_root: Path | str) -> dict[str, object]:
     }
 
 
+def verify_source_identity(
+    project_root: Path | str,
+    expected: Mapping[str, object],
+    *,
+    require_clean: bool = True,
+) -> dict[str, object]:
+    """Prove the Git source still matches a previously captured identity."""
+
+    normalized_expected = _normalize_source_identity(expected)
+    current = collect_source_identity(project_root)
+    normalized_current = _normalize_source_identity(current)
+    if require_clean and normalized_expected["dirty"] is not False:
+        raise BuildManifestError("expected release source identity is dirty")
+    if require_clean and normalized_current["dirty"] is not False:
+        raise BuildManifestError("release source changed or became dirty during build")
+    for field in ("commit", "tree", "dirty", "status_sha256"):
+        if normalized_current[field] != normalized_expected[field]:
+            raise BuildManifestError(
+                f"release source identity changed during build: {field}"
+            )
+    return normalized_current
+
+
 def collect_python_identity() -> dict[str, str]:
     return {
         "version": platform.python_version(),
@@ -347,6 +370,15 @@ def verify_build_manifest(
     schema = document.get("schema")
     if schema != SCHEMA:
         errors.append(f"unsupported manifest schema: {schema!r}")
+    try:
+        source_identity = _normalize_source_identity(
+            document.get("source") if isinstance(document.get("source"), Mapping) else {}
+        )
+    except BuildManifestError as exc:
+        errors.append(str(exc))
+        source_identity = None
+    if strict and source_identity is not None and source_identity.get("dirty") is not False:
+        errors.append("strict release manifest source identity must be clean")
     build_id = document.get("build_id")
     if not isinstance(build_id, str) or not build_id:
         errors.append("manifest build_id is missing")
@@ -1066,9 +1098,9 @@ def _normalize_source_identity(source: Mapping[str, object]) -> dict[str, object
     branch = source.get("branch")
     dirty = source.get("dirty")
     status_sha256 = source.get("status_sha256")
-    if not isinstance(commit, str) or not commit:
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit) is None:
         raise BuildManifestError("source commit is missing")
-    if not isinstance(tree, str) or not tree:
+    if not isinstance(tree, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", tree) is None:
         raise BuildManifestError("source tree is missing")
     if branch is not None and not isinstance(branch, str):
         raise BuildManifestError("source branch must be a string or null")

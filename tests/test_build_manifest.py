@@ -19,6 +19,7 @@ from daguandan_bridge.build_manifest import (
     collect_release_build_inputs,
     load_build_manifest,
     verify_build_manifest,
+    verify_source_identity,
     write_build_manifest,
     write_release_record,
 )
@@ -276,6 +277,46 @@ def test_integrity_verification_detects_mutation_and_optional_extra_files(tmp_pa
     assert changed.mutable_differences == ()
 
 
+def test_strict_manifest_rejects_dirty_source_identity(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    bundle = _bundle(tmp_path / "bundle")
+    manifest = _write(project, bundle)
+    manifest["source"]["dirty"] = True
+    manifest["source"]["status_sha256"] = "f" * 64
+    manifest["build_id"] = compute_build_id(manifest)
+
+    result = verify_build_manifest(bundle, manifest, strict=True)
+
+    assert result.ok is False
+    assert "strict release manifest source identity must be clean" in result.errors
+
+
+def test_source_identity_gate_detects_tracked_mutation_during_build(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run(
+        ["git", "-C", str(project), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project), "config", "user.name", "Release Test"],
+        check=True,
+    )
+    tracked = project / "tracked.py"
+    tracked.write_text("before = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "tracked.py"], check=True)
+    subprocess.run(["git", "-C", str(project), "commit", "-qm", "initial"], check=True)
+    expected = build_manifest_module.collect_source_identity(project)
+    assert verify_source_identity(project, expected)["dirty"] is False
+
+    tracked.write_text("after = 2\n", encoding="utf-8")
+
+    with pytest.raises(BuildManifestError, match="changed or became dirty"):
+        verify_source_identity(project, expected)
+
+
 def test_immutable_runtime_and_missing_seed_config_are_both_errors(
     tmp_path: Path,
 ):
@@ -427,6 +468,8 @@ def test_manifest_cli_creates_and_strictly_verifies_a_temporary_bundle(tmp_path:
     bundle = _bundle(tmp_path / "bundle")
     script = PROJECT_ROOT / "scripts" / "generate_build_manifest.py"
     manifest = bundle / BUILD_MANIFEST_FILENAME
+    source_identity = tmp_path / "source_identity.json"
+    source_identity.write_text(json.dumps(SOURCE), encoding="utf-8")
 
     created = subprocess.run(
         [
@@ -439,6 +482,8 @@ def test_manifest_cli_creates_and_strictly_verifies_a_temporary_bundle(tmp_path:
             str(bundle),
             "--output",
             str(manifest),
+            "--source-identity",
+            str(source_identity),
         ],
         cwd=PROJECT_ROOT,
         capture_output=True,

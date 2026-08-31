@@ -29,8 +29,11 @@ if str(SRC_ROOT) not in sys.path:
 
 from daguandan_bridge.build_manifest import (  # noqa: E402
     BUILD_MANIFEST_FILENAME,
+    collect_source_identity,
+    load_build_manifest,
     sha256_file,
     verify_build_manifest,
+    verify_source_identity,
 )
 from daguandan_bridge.release_lock import verify_release_inputs  # noqa: E402
 from daguandan_bridge.doctor import validate_frozen_doctor_report  # noqa: E402
@@ -110,6 +113,7 @@ class Qualification:
         self.bundle_hash_before: str | None = None
         self.archive_hash_before: str | None = None
         self._output_owned = False
+        self.source_identity: dict[str, object] | None = None
 
     def run(self) -> int:
         self._preflight()
@@ -119,6 +123,7 @@ class Qualification:
         self._stage("source-tests", self._source_tests)
         self._stage("release-input-lock", self._release_input_lock)
         self._stage("clean-frozen-build", self._build)
+        self._stage("source-identity-immutability", self._source_immutability)
         self._stage("manifest-native-audit", self._manifest_audit)
         self._stage("frozen-doctor", self._frozen_doctor)
         self._stage("support-export-verify", self._support_export)
@@ -200,14 +205,10 @@ class Qualification:
             # this qualification attempt, so later failures may be published
             # there without overwriting source/build inputs.
             self._output_owned = True
-            clean = subprocess.run(
-                ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain=v1", "--untracked-files=all"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if clean.returncode != 0 or clean.stdout.strip():
+            source_identity = collect_source_identity(PROJECT_ROOT)
+            if source_identity.get("dirty") is not False:
                 raise ValueError("source tree must be clean before qualification")
+            self.source_identity = source_identity
             baseline = subprocess.run(
                 ["git", "-C", str(PROJECT_ROOT), "rev-parse", "baseline/local-stable-20260831^{}"],
                 capture_output=True,
@@ -220,6 +221,7 @@ class Qualification:
             stage.evidence = {
                 "baseline_tag": "baseline/local-stable-20260831",
                 "baseline_commit": baseline.stdout.strip(),
+                "source_identity": source_identity,
                 "project_root": PROJECT_ROOT.name,
                 "release_root": self.release_root.name,
                 "wheelhouse_root": Path(self.args.wheelhouse).name,
@@ -318,6 +320,21 @@ class Qualification:
             "archive_sha256": self.archive_hash_before,
         }
 
+    def _source_immutability(self) -> Mapping[str, object]:
+        if self.source_identity is None:
+            raise ValueError("preflight source identity is unavailable")
+        current = verify_source_identity(
+            PROJECT_ROOT,
+            self.source_identity,
+            require_clean=True,
+        )
+        return {
+            "status": "PASS",
+            "commit": current["commit"],
+            "tree": current["tree"],
+            "dirty": current["dirty"],
+        }
+
     def _manifest_audit(self) -> Mapping[str, object]:
         assert self.bundle_root is not None and self.executable is not None
         manifest_path = self.bundle_root / BUILD_MANIFEST_FILENAME
@@ -327,8 +344,20 @@ class Qualification:
         native = _read_json(self.bundle_root / "native_dependency_audit.json")
         if native.get("status") != "PASS":
             raise _StageFailure("native dependency audit did not pass", 2, None, None, native)
+        source_validation = _validate_formal_manifest_source(
+            load_build_manifest(manifest_path),
+            self.source_identity,
+        )
+        if source_validation.get("status") != "PASS":
+            raise _StageFailure(
+                "build manifest source identity is not the expected clean HEAD",
+                2,
+                None,
+                None,
+                source_validation,
+            )
         self.bundle_hash_before = _tree_hash(self.bundle_root)
-        return {"build_id": manifest.build_id, "checked_files": manifest.checked_files, "native_audit": native.get("summary"), "bundle_tree_sha256": self.bundle_hash_before}
+        return {"build_id": manifest.build_id, "checked_files": manifest.checked_files, "native_audit": native.get("summary"), "bundle_tree_sha256": self.bundle_hash_before, "source_identity": source_validation}
 
     def _frozen_doctor(self) -> Mapping[str, object]:
         assert self.executable is not None
@@ -491,6 +520,30 @@ class Qualification:
         return {"runtime_root": str(runtime), "baseline_release": baseline.to_dict(), "candidate_release": candidate.to_dict(), "active_after_rollback": status, "legacy_baseline_reproducible": False, "bad_candidate_preserved": candidate.version_root.is_dir()}
 
     def _finish(self) -> int:
+        if self.source_identity is not None:
+            try:
+                final_source = verify_source_identity(
+                    PROJECT_ROOT,
+                    self.source_identity,
+                    require_clean=True,
+                )
+            except Exception as exc:
+                self.errors.append(f"final-source-immutability: {exc}")
+                self.stages.append(
+                    Stage(
+                        "final-source-immutability",
+                        status="FAIL",
+                        evidence={"error_type": type(exc).__name__, "message": str(exc)},
+                    )
+                )
+            else:
+                self.stages.append(
+                    Stage(
+                        "final-source-immutability",
+                        status="PASS",
+                        evidence=final_source,
+                    )
+                )
         report = {
             "schema": QUALIFICATION_SCHEMA,
             "started_at": self.started_at,
@@ -498,6 +551,7 @@ class Qualification:
             "status": "PASS" if not self.errors and all(stage.status == "PASS" for stage in self.stages) else "FAIL",
             "branch": _git_value("branch --show-current"),
             "source_commit": _git_value("rev-parse HEAD"),
+            "source_identity": self.source_identity,
             "baseline": {"tag": "baseline/local-stable-20260831", "commit": BASELINE_SOURCE_COMMIT},
             "release_root": self.release_root.name,
             "candidate": {
@@ -765,6 +819,32 @@ def _validate_release_repro_equivalence(
     if len(reference_outputs) != 1 or reference_outputs != candidate_outputs:
         failures.append("normalized_outputs_not_equivalent")
     return {"status": "PASS" if not failures else "FAIL", "failures": failures}
+
+
+def _validate_formal_manifest_source(
+    manifest: Mapping[str, object],
+    expected: Mapping[str, object] | None,
+) -> dict[str, object]:
+    failures: list[str] = []
+    source = manifest.get("source")
+    if not isinstance(source, Mapping):
+        failures.append("manifest_source_missing")
+        source = {}
+    if not isinstance(expected, Mapping):
+        failures.append("expected_source_missing")
+        expected = {}
+    for field in ("commit", "tree", "dirty", "status_sha256"):
+        if source.get(field) != expected.get(field):
+            failures.append(f"manifest_source_{field}_mismatch")
+    if source.get("dirty") is not False:
+        failures.append("manifest_source_not_clean")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failures": failures,
+        "commit": source.get("commit"),
+        "tree": source.get("tree"),
+        "dirty": source.get("dirty"),
+    }
 
 
 def _normalized_output_fingerprints(
