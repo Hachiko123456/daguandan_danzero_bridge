@@ -34,7 +34,18 @@ EXE 会把发布目录中的 `data/` 当作不可写的资源种子；首次启�
 
 迁移只复制白名单内的 profile、模板、模型、sessions 和截图，旧目录保持原样；
 自动校准缓存、诊断缓存和未知文件不会导入。迁移会创建新的数据 generation 与
-本地回执，不会覆盖当前 generation，因而可以保留旧版本作为快速回滚入口。
+本地回执，不会修改或删除旧 generation。命令成功后会立即原子切换 active
+pointer，因此下一次启动直接使用迁移后的数据；命令输出中的绝对 `receipt_path`
+是恢复凭据。若要恢复迁移前的 pointer，执行：
+
+```powershell
+.\DaguandanAssistant.exe --restore-portable-migration `
+  "%LOCALAPPDATA%\DaguandanAssistant\migration_backups\pm-....json"
+```
+
+恢复采用 compare-and-swap：只有当前 pointer 仍是该回执记录的迁移目标时才会
+恢复；若之后已有新迁移、升级或手动 generation 切换，它会拒绝覆盖。恢复操作
+写回同一回执并可安全重复执行，迁移生成的数据目录和旧便携目录都不会被删除。
 
 ### 离线、锁定的发布构建
 

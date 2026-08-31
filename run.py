@@ -71,6 +71,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--restore-portable-migration",
+        type=Path,
+        help="按迁移回执恢复迁移前的数据 generation；若当前 pointer 已更新则拒绝覆盖。",
+    )
+    parser.add_argument(
         "--_doctor-import-probe",
         help=argparse.SUPPRESS,
     )
@@ -164,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             args.window_e2e_validation_config is not None,
             bool(args.doctor),
             args.migrate_portable_data is not None,
+            args.restore_portable_migration is not None,
             args._doctor_import_probe is not None,
             args.export_support is not None,
             args.repro_support is not None,
@@ -330,6 +336,14 @@ def main(argv: list[str] | None = None) -> int:
         from daguandan_bridge.portable_data_migration import migrate_portable_data
 
         result = migrate_portable_data(args.migrate_portable_data)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if args.restore_portable_migration is not None:
+        from daguandan_bridge.portable_data_migration import (
+            restore_portable_migration,
+        )
+
+        result = restore_portable_migration(args.restore_portable_migration)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0
 

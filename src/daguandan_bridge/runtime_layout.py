@@ -504,8 +504,69 @@ def activate_generation(layout: RuntimeLayout, generation_id: str) -> RuntimeLay
     ):
         selected = layout_for_generation(layout, generation_id)
         _validate_generation(selected.generation_root, selected)
-        _write_active_generation(selected, selected.generation_id)
+        current = _read_active_generation_document(selected.active_generation_path)
+        desired = _active_generation_document(
+            selected,
+            selected.generation_id,
+            transaction_id=f"data-activate-{uuid4().hex}",
+        )
+        _compare_and_swap_active_generation_locked(
+            selected,
+            expected=current,
+            desired=desired,
+        )
         return selected
+
+
+def active_generation_pointer(layout: RuntimeLayout) -> dict[str, object] | None:
+    """Read the exact active generation pointer under the storage lock."""
+
+    if not layout.frozen or layout.active_generation_path is None:
+        return None
+    with runtime_storage_lock(
+        layout.runtime_root,
+        operation="read-active-data-generation",
+        timeout_seconds=30.0,
+    ):
+        return _read_active_generation_document(layout.active_generation_path)
+
+
+def compare_and_swap_active_generation(
+    layout: RuntimeLayout,
+    *,
+    expected: Mapping[str, object] | None,
+    desired: Mapping[str, object] | None,
+    operation: str,
+) -> dict[str, object] | None:
+    """Publish/restore a generation pointer without overwriting a newer value."""
+
+    if not layout.frozen:
+        raise RuntimeLayoutError("source checkouts do not use data generation pointers")
+    with runtime_storage_lock(
+        layout.runtime_root,
+        operation=operation,
+        timeout_seconds=120.0,
+    ):
+        return _compare_and_swap_active_generation_locked(
+            layout,
+            expected=dict(expected) if expected is not None else None,
+            desired=dict(desired) if desired is not None else None,
+        )
+
+
+def make_active_generation_pointer(
+    layout: RuntimeLayout,
+    generation_id: str,
+    *,
+    transaction_id: str,
+) -> dict[str, object]:
+    selected = layout_for_generation(layout, generation_id)
+    _validate_generation(selected.generation_root, selected)
+    return _active_generation_document(
+        selected,
+        selected.generation_id,
+        transaction_id=transaction_id,
+    )
 
 
 def seed_entries(layout: RuntimeLayout) -> tuple[dict[str, object], ...]:
@@ -769,24 +830,93 @@ def _validate_generation(root: Path, layout: RuntimeLayout) -> None:
         raise RuntimeLayoutError("data generation has no profiles directory")
 
 
-def _write_active_generation(layout: RuntimeLayout, generation_id: str) -> None:
+def _write_active_generation(
+    layout: RuntimeLayout,
+    generation_id: str,
+) -> dict[str, object] | None:
     path = layout.active_generation_path
     if path is None:
-        return
+        return None
     _ensure_safe_directory(path.parent)
-    _atomic_write_json(
-        path,
-        {
-            "schema": ACTIVE_GENERATION_SCHEMA,
-            "data_schema": layout.data_schema,
-            "build_id": layout.build_id,
-            "generation_id": _safe_segment(generation_id, field="generation id"),
-        },
+    desired = _active_generation_document(layout, generation_id)
+    current = _read_active_generation_document(path)
+    if current is not None and all(
+        current.get(field) == desired.get(field)
+        for field in ("schema", "data_schema", "build_id", "generation_id")
+    ):
+        return current
+    _atomic_write_json(path, desired)
+    return desired
+
+
+def _active_generation_document(
+    layout: RuntimeLayout,
+    generation_id: str,
+    *,
+    transaction_id: str | None = None,
+) -> dict[str, object]:
+    document: dict[str, object] = {
+        "schema": ACTIVE_GENERATION_SCHEMA,
+        "data_schema": layout.data_schema,
+        "build_id": layout.build_id,
+        "generation_id": _safe_segment(generation_id, field="generation id"),
+    }
+    if transaction_id is not None:
+        document["transaction_id"] = _safe_segment(
+            transaction_id,
+            field="data transaction id",
+        )
+    return document
+
+
+def _compare_and_swap_active_generation_locked(
+    layout: RuntimeLayout,
+    *,
+    expected: Mapping[str, object] | None,
+    desired: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    path = layout.active_generation_path
+    if path is None:
+        raise RuntimeLayoutError("active generation pointer is unavailable")
+    _ensure_safe_directory(path.parent)
+    current = _read_active_generation_document(path)
+    expected_document = dict(expected) if expected is not None else None
+    if current != expected_document:
+        raise RuntimeLayoutError(
+            "active data generation changed; refusing to overwrite a newer selection"
+        )
+    desired_document = dict(desired) if desired is not None else None
+    if desired_document is None:
+        if path.exists():
+            if _path_is_reparse(path) or not path.is_file():
+                raise RuntimeLayoutError("active data pointer is unsafe")
+            path.unlink()
+        return None
+    if (
+        desired_document.get("schema") != ACTIVE_GENERATION_SCHEMA
+        or desired_document.get("data_schema") != layout.data_schema
+        or desired_document.get("build_id") != layout.build_id
+    ):
+        raise RuntimeLayoutError("desired active data pointer is invalid")
+    generation_id = _safe_segment(
+        desired_document.get("generation_id"), field="generation id"
     )
+    transaction_id = desired_document.get("transaction_id")
+    if transaction_id is not None:
+        _safe_segment(transaction_id, field="data transaction id")
+    selected = layout_for_generation(layout, generation_id)
+    _validate_generation(selected.generation_root, selected)
+    _atomic_write_json(path, desired_document)
+    published = _read_active_generation_document(path)
+    if published != desired_document:
+        raise RuntimeLayoutError("active data generation did not publish exactly")
+    return published
 
 
-def _read_active_generation_if_present(path: Path, *, build_id: str) -> str | None:
-    if not path.exists():
+def _read_active_generation_document(
+    path: Path | None,
+) -> dict[str, object] | None:
+    if path is None or not path.exists():
         return None
     if _path_is_reparse(path) or not path.is_file():
         raise RuntimeLayoutError("active data pointer is not a regular file")
@@ -799,9 +929,6 @@ def _read_active_generation_if_present(path: Path, *, build_id: str) -> str | No
             except (FileNotFoundError, PermissionError):
                 if attempt == 19:
                     raise
-                # A concurrent atomic ReplaceFile may make the destination
-                # briefly unavailable on Windows; retry without accepting a
-                # partial or malformed document.
                 time.sleep(0.01)
         value = json.loads(payload or "")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -810,6 +937,17 @@ def _read_active_generation_if_present(path: Path, *, build_id: str) -> str | No
         raise RuntimeLayoutError("active data pointer schema is unsupported")
     if value.get("data_schema") != DATA_SCHEMA_VERSION:
         raise RuntimeLayoutError("active data pointer version is unsupported")
+    _safe_segment(value.get("build_id"), field="build id")
+    _safe_segment(value.get("generation_id"), field="generation id")
+    if value.get("transaction_id") is not None:
+        _safe_segment(value.get("transaction_id"), field="data transaction id")
+    return value
+
+
+def _read_active_generation_if_present(path: Path, *, build_id: str) -> str | None:
+    value = _read_active_generation_document(path)
+    if value is None:
+        return None
     if value.get("build_id") != build_id:
         return None
     return _safe_segment(value.get("generation_id"), field="generation id")
@@ -1120,15 +1258,21 @@ __all__ = [
     "RUNTIME_ROOT_MARKER",
     "RuntimeLayout",
     "RuntimeLayoutError",
+    "active_generation_pointer",
     "activate_generation",
     "assert_safe_tree",
     "atomic_write_json",
     "copy_seed_resources",
+    "compare_and_swap_active_generation",
     "ensure_runtime_layout",
     "generation_marker",
     "layout_for_generation",
+    "make_active_generation_pointer",
     "prepare_runtime_layout",
     "resolve_runtime_layout",
+    "runtime_storage_lock",
+    "runtime_storage_lock_owner_path",
+    "runtime_storage_lock_path",
     "safe_tree_files",
     "seed_entries",
     "sha256_file",

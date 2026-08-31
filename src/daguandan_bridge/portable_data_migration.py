@@ -22,13 +22,16 @@ from uuid import uuid4
 from .runtime_layout import (
     RuntimeLayout,
     RuntimeLayoutError,
-    activate_generation,
+    active_generation_pointer,
     assert_safe_tree,
     atomic_write_json,
+    compare_and_swap_active_generation,
     copy_seed_resources,
     ensure_runtime_layout,
     generation_marker,
     layout_for_generation,
+    make_active_generation_pointer,
+    prepare_runtime_layout,
     resolve_runtime_layout,
     runtime_storage_lock,
     safe_tree_files,
@@ -65,6 +68,8 @@ class PortableMigrationResult:
     excluded_files: int
     receipt_path: Path
     source_preserved: bool
+    activated: bool
+    previous_generation_id: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -75,7 +80,30 @@ class PortableMigrationResult:
             "copied_bytes": self.copied_bytes,
             "excluded_files": self.excluded_files,
             "receipt_file": self.receipt_path.name,
+            "receipt_path": str(self.receipt_path.resolve()),
             "source_preserved": self.source_preserved,
+            "activated": self.activated,
+            "activation": "immediate_next_start",
+            "previous_generation_id": self.previous_generation_id,
+        }
+
+
+@dataclass(frozen=True)
+class PortableMigrationRestoreResult:
+    migration_id: str
+    receipt_path: Path
+    restored_generation_id: str | None
+    restored: bool
+    already_restored: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": "guandan.portable-data-migration-restore/1",
+            "migration_id": self.migration_id,
+            "receipt_path": str(self.receipt_path.resolve()),
+            "restored_generation_id": self.restored_generation_id,
+            "restored": self.restored,
+            "already_restored": self.already_restored,
         }
 
 
@@ -122,6 +150,7 @@ def _migrate_portable_data_locked(
     target_layout = layout_for_generation(selected, generation_id)
     receipt_directory = selected.runtime_root / "migration_backups"
     receipt_path = receipt_directory / f"{migration_id}.json"
+    previous_pointer = active_generation_pointer(selected)
 
     if target_layout.generation_root.exists():
         marker = generation_marker(target_layout.generation_root)
@@ -173,9 +202,59 @@ def _migrate_portable_data_locked(
             "excluded_count": len(excluded),
             "excluded_paths": list(excluded),
         },
+        "activation": {
+            "mode": "immediate_next_start",
+            "state": "PREPARED",
+            "previous_pointer": previous_pointer,
+            "previous_pointer_sha256": _pointer_sha256(previous_pointer),
+            "migrated_pointer": make_active_generation_pointer(
+                target_layout,
+                generation_id,
+                transaction_id=f"migration-{migration_id}",
+            ),
+        },
+    }
+    receipt["activation"]["migrated_pointer_sha256"] = _pointer_sha256(
+        receipt["activation"]["migrated_pointer"]
+    )
+    if receipt_path.exists():
+        existing_receipt = _read_receipt(receipt_path)
+        existing_activation = existing_receipt.get("activation")
+        if not isinstance(existing_activation, Mapping):
+            raise RuntimeLayoutError("existing migration receipt is not recoverable")
+        if existing_receipt.get("migration_id") != migration_id:
+            raise RuntimeLayoutError("existing migration receipt identity differs")
+        if isinstance(existing_receipt.get("restoration"), Mapping):
+            raise RuntimeLayoutError(
+                "this migration was restored; refusing to silently reactivate it"
+            )
+        receipt = existing_receipt
+    else:
+        atomic_write_json(receipt_path, receipt)
+    activation = receipt.get("activation")
+    if not isinstance(activation, Mapping):
+        raise RuntimeLayoutError("migration receipt activation is invalid")
+    expected_pointer = _optional_pointer(activation.get("previous_pointer"))
+    migrated_pointer = _optional_pointer(activation.get("migrated_pointer"))
+    if migrated_pointer is None:
+        raise RuntimeLayoutError("migration receipt target pointer is missing")
+    current_pointer = active_generation_pointer(selected)
+    if current_pointer != migrated_pointer:
+        compare_and_swap_active_generation(
+            selected,
+            expected=expected_pointer,
+            desired=migrated_pointer,
+            operation="activate-portable-migration",
+        )
+    receipt = dict(receipt)
+    receipt["activation"] = {
+        **dict(activation),
+        "state": "ACTIVE",
+        "activated_at_utc": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ),
     }
     atomic_write_json(receipt_path, receipt)
-    activate_generation(target_layout, generation_id)
     return PortableMigrationResult(
         migration_id=migration_id,
         generation_id=generation_id,
@@ -184,7 +263,93 @@ def _migrate_portable_data_locked(
         excluded_files=len(excluded),
         receipt_path=receipt_path,
         source_preserved=True,
+        activated=True,
+        previous_generation_id=(
+            str(expected_pointer.get("generation_id"))
+            if expected_pointer is not None
+            else None
+        ),
     )
+
+
+def restore_portable_migration(
+    receipt_path: Path | str,
+    *,
+    layout: RuntimeLayout | None = None,
+) -> PortableMigrationRestoreResult:
+    """Restore the exact pre-migration pointer without clobbering newer data."""
+
+    selected = layout or resolve_runtime_layout()
+    with runtime_storage_lock(
+        selected.runtime_root,
+        operation="restore-portable-migration",
+        timeout_seconds=120.0,
+    ):
+        selected = prepare_runtime_layout(selected)
+        path = _absolute_without_resolving(Path(receipt_path).expanduser())
+        receipts_root = selected.runtime_root / "migration_backups"
+        _assert_below(path, receipts_root)
+        if path.parent != receipts_root or path.suffix.casefold() != ".json":
+            raise RuntimeLayoutError("migration receipt must be a direct JSON receipt")
+        receipt = _read_receipt(path)
+        if (
+            receipt.get("schema") != MIGRATION_RECEIPT_SCHEMA
+            or receipt.get("build_id") != selected.build_id
+            or receipt.get("data_schema") != selected.data_schema
+        ):
+            raise RuntimeLayoutError("migration receipt does not belong to this build")
+        activation = receipt.get("activation")
+        if not isinstance(activation, Mapping):
+            raise RuntimeLayoutError("migration receipt has no reversible activation")
+        previous = _optional_pointer(activation.get("previous_pointer"))
+        migrated = _optional_pointer(activation.get("migrated_pointer"))
+        if migrated is None:
+            raise RuntimeLayoutError("migration receipt target pointer is missing")
+        if _pointer_sha256(previous) != activation.get("previous_pointer_sha256"):
+            raise RuntimeLayoutError("migration previous pointer hash is invalid")
+        if _pointer_sha256(migrated) != activation.get("migrated_pointer_sha256"):
+            raise RuntimeLayoutError("migration target pointer hash is invalid")
+        current = active_generation_pointer(selected)
+        restoration = receipt.get("restoration")
+        if isinstance(restoration, Mapping):
+            if current != previous:
+                raise RuntimeLayoutError(
+                    "migration was restored but active data has since changed"
+                )
+            return PortableMigrationRestoreResult(
+                migration_id=str(receipt.get("migration_id")),
+                receipt_path=path,
+                restored_generation_id=(
+                    str(previous.get("generation_id")) if previous else None
+                ),
+                restored=True,
+                already_restored=True,
+            )
+        compare_and_swap_active_generation(
+            selected,
+            expected=migrated,
+            desired=previous,
+            operation="restore-portable-migration-pointer",
+        )
+        receipt["restoration"] = {
+            "schema": "guandan.portable-data-migration-restoration/1",
+            "status": "RESTORED",
+            "restored_at_utc": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ),
+            "restored_pointer": previous,
+            "restored_pointer_sha256": _pointer_sha256(previous),
+        }
+        atomic_write_json(path, receipt)
+        return PortableMigrationRestoreResult(
+            migration_id=str(receipt.get("migration_id")),
+            receipt_path=path,
+            restored_generation_id=(
+                str(previous.get("generation_id")) if previous else None
+            ),
+            restored=True,
+            already_restored=False,
+        )
 
 
 def _create_migrated_generation(
@@ -367,6 +532,45 @@ def _portable_relative(path: Path) -> str:
     return pure.as_posix()
 
 
+def _read_receipt(path: Path) -> dict[str, object]:
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeLayoutError("migration receipt is unavailable or unsafe")
+    assert_safe_tree(path.parent)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeLayoutError("migration receipt is unreadable or invalid") from exc
+    if not isinstance(value, dict):
+        raise RuntimeLayoutError("migration receipt must be a JSON object")
+    return value
+
+
+def _optional_pointer(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise RuntimeLayoutError("migration generation pointer is invalid")
+    pointer = dict(value)
+    if (
+        pointer.get("schema") != "guandan.active-data-generation/1"
+        or not isinstance(pointer.get("build_id"), str)
+        or not isinstance(pointer.get("generation_id"), str)
+    ):
+        raise RuntimeLayoutError("migration generation pointer is invalid")
+    return pointer
+
+
+def _pointer_sha256(value: Mapping[str, object] | None) -> str:
+    payload = json.dumps(
+        dict(value) if value is not None else None,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _assert_below(path: Path, root: Path) -> None:
     try:
         path.resolve(strict=False).relative_to(root.resolve(strict=False))
@@ -390,5 +594,7 @@ __all__ = [
     "MIGRATION_RECEIPT_SCHEMA",
     "MIGRATION_SCHEMA",
     "PortableMigrationResult",
+    "PortableMigrationRestoreResult",
     "migrate_portable_data",
+    "restore_portable_migration",
 ]

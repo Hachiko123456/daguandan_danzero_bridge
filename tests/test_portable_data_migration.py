@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -10,12 +12,20 @@ from daguandan_bridge.build_manifest import write_build_manifest
 from daguandan_bridge.portable_data_migration import (
     MIGRATION_RECEIPT_SCHEMA,
     migrate_portable_data,
+    restore_portable_migration,
 )
 from daguandan_bridge.runtime_layout import (
     RuntimeLayoutError,
+    activate_generation,
+    copy_seed_resources,
     ensure_runtime_layout,
+    layout_for_generation,
     resolve_runtime_layout,
+    write_generation_marker,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _candidate_bundle(tmp_path: Path) -> Path:
@@ -116,6 +126,12 @@ def test_explicit_migration_creates_new_generation_and_preserves_old_portable(tm
     assert receipt["schema"] == MIGRATION_RECEIPT_SCHEMA
     assert receipt["source"]["preserved_in_place"] is True
     assert receipt["copy"]["excluded_count"] == 2
+    assert receipt["activation"]["mode"] == "immediate_next_start"
+    assert receipt["activation"]["state"] == "ACTIVE"
+    assert receipt["activation"]["previous_pointer"]["generation_id"] == (
+        result.previous_generation_id
+    )
+    assert result.to_dict()["receipt_path"] == str(result.receipt_path.resolve())
     assert str(legacy) not in result.receipt_path.read_text(encoding="utf-8")
 
 
@@ -154,3 +170,95 @@ def test_migration_rejects_source_overlap_unknown_layout_and_source_mode(tmp_pat
     )
     with pytest.raises(RuntimeLayoutError, match="only from the frozen"):
         migrate_portable_data(_legacy_portable(tmp_path / "second"), layout=source_layout)
+
+
+def test_migration_restore_reinstates_exact_previous_pointer_and_is_idempotent(
+    tmp_path,
+):
+    bundle = _candidate_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    legacy = _legacy_portable(tmp_path)
+    before = ensure_runtime_layout(_layout(bundle, runtime))
+    before_pointer = json.loads(
+        (runtime / "data" / "v1" / "active.json").read_text(encoding="utf-8")
+    )
+    migrated = migrate_portable_data(legacy, layout=before)
+
+    restored = restore_portable_migration(
+        migrated.receipt_path,
+        layout=_layout(bundle, runtime),
+    )
+
+    active = json.loads(
+        (runtime / "data" / "v1" / "active.json").read_text(encoding="utf-8")
+    )
+    assert active == before_pointer
+    assert restored.restored is True
+    assert restored.already_restored is False
+    assert restored.restored_generation_id == before.generation_id
+    receipt = json.loads(migrated.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["restoration"]["status"] == "RESTORED"
+    again = restore_portable_migration(
+        migrated.receipt_path,
+        layout=_layout(bundle, runtime),
+    )
+    assert again.already_restored is True
+
+
+def test_migration_restore_refuses_to_overwrite_newer_generation(tmp_path):
+    bundle = _candidate_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    migrated = migrate_portable_data(
+        _legacy_portable(tmp_path),
+        layout=_layout(bundle, runtime),
+    )
+    current = _layout(bundle, runtime)
+    newer = layout_for_generation(current, f"{current.build_id}-newer")
+    seed = copy_seed_resources(newer, newer.generation_root)
+    write_generation_marker(newer.generation_root, newer, seed_summary=seed)
+    activate_generation(newer, newer.generation_id)
+
+    with pytest.raises(RuntimeLayoutError, match="newer selection"):
+        restore_portable_migration(
+            migrated.receipt_path,
+            layout=_layout(bundle, runtime),
+        )
+
+    assert _layout(bundle, runtime).generation_id == newer.generation_id
+    receipt = json.loads(migrated.receipt_path.read_text(encoding="utf-8"))
+    assert "restoration" not in receipt
+
+
+def test_data_migration_cli_reports_receipt_and_restores_it(tmp_path):
+    bundle = _candidate_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    legacy = _legacy_portable(tmp_path)
+    script = PROJECT_ROOT / "scripts" / "manage_data_migration.py"
+    common = [
+        sys.executable,
+        str(script),
+        "--bundle-root",
+        str(bundle),
+        "--runtime-root",
+        str(runtime),
+    ]
+    migrated = subprocess.run(
+        [*common, "migrate", str(legacy)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+    migration = json.loads(migrated.stdout)
+    assert migration["activated"] is True
+    receipt = Path(migration["receipt_path"])
+    restored = subprocess.run(
+        [*common, "restore", str(receipt)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert json.loads(restored.stdout)["restored"] is True

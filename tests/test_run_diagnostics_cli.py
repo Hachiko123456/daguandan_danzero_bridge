@@ -27,6 +27,7 @@ def test_run_help_exposes_support_and_repro_routes():
         "--truth-input-sha256",
         "--truth-frame-seq",
         "--benchmark-output",
+        "--restore-portable-migration",
     ):
         assert option in completed.stdout
 
