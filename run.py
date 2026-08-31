@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
         help="运行固定的 FableDan 无进贡基准评测，然后写入模型目录。",
     )
     parser.add_argument(
+        "--benchmark-output",
+        type=Path,
+        help="固定基准结果的精确 JSON 输出路径；只可与 --fabledan-fixed-benchmark 一起使用。",
+    )
+    parser.add_argument(
         "--simulated-game-window-config",
         type=Path,
         help="使用 JSON 配置启动第三阶段可见模拟游戏窗口。",
@@ -175,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         args.doctor or args._doctor_import_probe is not None
     ):
         parser.error("--doctor-output 只能与 --doctor 一起使用")
+    if args.benchmark_output is not None and not args.fabledan_fixed_benchmark:
+        parser.error("--benchmark-output 只能与 --fabledan-fixed-benchmark 一起使用")
     if (
         args.truth_input_sha256 is not None or args.truth_frame_seq is not None
     ) and not (
@@ -334,9 +341,10 @@ def main(argv: list[str] | None = None) -> int:
             FableDanBenchmarkService,
         )
 
-        result = FableDanBenchmarkService().run_fixed()
-        print(json.dumps(result.payload, ensure_ascii=False, indent=2))
-        print(f"结果文件：{result.output_path}")
+        result = FableDanBenchmarkService().run_fixed(
+            output_path=args.benchmark_output,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0
     from daguandan_bridge.dpi import enable_windows_dpi_awareness
 

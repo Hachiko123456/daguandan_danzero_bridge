@@ -77,6 +77,25 @@ CPython 本身也不是只锁一个 `python.exe`：`python_runtime.lock.json` �
 生成后必须审查工具链来源、完整文件差异，并重新运行发布锁测试；不能为绕过某台
 机器的校验失败而直接修改清单。
 
+### 发布版固定 FableDan 基准
+
+发布目录内双击 `Run_FableDan_Fixed_Benchmark.bat`。启动器会为本次运行分配唯一
+结果文件，把它通过 `--benchmark-output` 明确传给 EXE，并在退出码为 0 后用
+`-LiteralPath` 读取和校验该精确文件；不再从 EXE 目录猜测“最新结果”。默认结果
+位于 `%LOCALAPPDATA%\DaguandanAssistant\benchmarks\`（设置
+`DAGUANDAN_DATA_ROOT` 时位于该根目录的 `benchmarks\`），不会写入只读发布包。
+
+自动化调用可自行指定一个尚不存在的绝对路径：
+
+```powershell
+.\DaguandanAssistant.exe --fabledan-fixed-benchmark `
+  --benchmark-output "D:\Benchmark Results\candidate.json"
+```
+
+标准输出是 `guandan.fabledan-benchmark-cli/1` JSON，其中 `output_path` 是实际写入
+的绝对路径，`output_sha256` 可用于后续审计。输出已存在、JSON 不合法或 EXE 返回
+非零码时，启动器会原样失败，绝不回退到旧结果。
+
 ## 标记与模板
 
 页面会递归读取所选本地文件夹中的 PNG、JPG、JPEG 和 BMP 图片；图片两侧提供上一张/下一张箭头，并显示当前序号，方便连续检查样本。

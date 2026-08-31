@@ -28,6 +28,15 @@ class FableDanBenchmarkResult:
     output_path: Path
     payload: dict[str, object]
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": "guandan.fabledan-benchmark-cli/1",
+            "status": "PASS",
+            "output_path": str(self.output_path.resolve()),
+            "output_sha256": sha256(self.output_path.read_bytes()).hexdigest(),
+            "benchmark": self.payload,
+        }
+
 
 class FableDanBenchmarkService:
     """Run only the published fixed benchmark; no runtime knobs are exposed."""
@@ -35,7 +44,12 @@ class FableDanBenchmarkService:
     def __init__(self, profiles_root: Path = PROFILES_ROOT) -> None:
         self.profiles_root = Path(profiles_root)
 
-    def run_fixed(self, profile_name: str = "tencent_daguandan") -> FableDanBenchmarkResult:
+    def run_fixed(
+        self,
+        profile_name: str = "tencent_daguandan",
+        *,
+        output_path: Path | str | None = None,
+    ) -> FableDanBenchmarkResult:
         profile = normalize_profile_name(profile_name)
         model_path = self.profiles_root / profile / "models" / "best.npz"
         if not model_path.is_file():
@@ -107,12 +121,20 @@ class FableDanBenchmarkService:
             ),
         }
         output = (
-            self.profiles_root
-            / profile
-            / "models"
-            / "benchmarks"
-            / f"{FIXED_BENCHMARK_ID}-{model_hash[:16]}.json"
+            Path(output_path).expanduser().resolve()
+            if output_path is not None
+            else (
+                self.profiles_root
+                / profile
+                / "models"
+                / "benchmarks"
+                / f"{FIXED_BENCHMARK_ID}-{model_hash[:16]}.json"
+            ).resolve()
         )
+        if output_path is not None and output.exists():
+            raise FileExistsError(f"基准输出文件已存在：{output.name}")
+        if output.exists() and not output.is_file():
+            raise OSError(f"基准输出路径不是普通文件：{output.name}")
         atomic_write_json(output, payload)
         return FableDanBenchmarkResult(output_path=output, payload=payload)
 
