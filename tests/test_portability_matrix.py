@@ -65,3 +65,24 @@ def test_matrix_fails_when_a_case_fails(tmp_path):
     )
 
     assert report["status"] == "FAIL"
+
+
+def test_matrix_fails_if_doctor_writes_any_bundle_file(tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    exe = bundle / "DaguandanAssistant.exe"
+    exe.write_bytes(b"exe")
+
+    def writing_runner(_exe, selected_bundle, _data_root, _read_only):
+        (selected_bundle / "unexpected.log").write_text("write", encoding="utf-8")
+        return {"passed": True}
+
+    report = _MODULE.run_matrix(
+        executable=exe,
+        bundle_root=bundle,
+        output_root=tmp_path / "out",
+        doctor_runner=writing_runner,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["bundle_unchanged"] is False

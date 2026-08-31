@@ -20,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from daguandan_bridge.build_manifest import sha256_file  # noqa: E402
+from daguandan_bridge.doctor import validate_frozen_doctor_report  # noqa: E402
 from daguandan_bridge.storage import atomic_write_json  # noqa: E402
 
 
@@ -51,6 +52,12 @@ def run_matrix(
     if not bundle_root.is_dir():
         raise ValueError(f"frozen bundle is missing: {bundle_root}")
     before = _tree_hash(bundle_root)
+    expected_build_id: str | None = None
+    if doctor_runner is None:
+        build_manifest = _read_json(bundle_root / "build_manifest.json")
+        expected_build_id = str(build_manifest.get("build_id") or "") or None
+        if expected_build_id is None:
+            raise ValueError("frozen bundle build identity is unavailable")
     base = (data_root or output_root / "matrix-data").resolve()
     base.mkdir(parents=True, exist_ok=True)
     cases = (
@@ -83,7 +90,11 @@ def run_matrix(
                 for item in checks
                 if isinstance(item, Mapping) and item.get("status") == "FAIL"
             ]
-            passed = completed.returncode == 0 and not failed_checks and report.get("schema") == "guandan.doctor/1"
+            doctor_validation = validate_frozen_doctor_report(
+                report,
+                expected_build_id=str(expected_build_id),
+            )
+            passed = completed.returncode == 0 and doctor_validation.get("status") == "PASS"
             result = {
                 "case_id": case.case_id,
                 "description": case.description,
@@ -91,6 +102,7 @@ def run_matrix(
                 "data_root_name": case.data_root.name,
                 "doctor_exit_code": int(completed.returncode),
                 "failed_checks": failed_checks,
+                "doctor_validation": doctor_validation,
                 "passed": bool(passed),
             }
         else:

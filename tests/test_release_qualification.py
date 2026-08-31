@@ -141,6 +141,14 @@ def test_host_summary_gate_requires_exact_formal_seven_scenario_pass(tmp_path):
                 "execution_ok": True,
                 "acceptance_eligible": True,
                 "acceptance_passed": True,
+                "complete_source_and_bundle_matrix": True,
+                "source_only_debug_run": False,
+                "source_exit_code": 0,
+                "package_exit_code": 0,
+                "bundle_exit_code": 0,
+                "same_hwnd": True,
+                "integrity_unchanged": True,
+                "forced_simulator_termination": False,
                 "source_summary": str(source_path),
                 "bundle_summary": str(bundle_path),
             }
@@ -160,6 +168,15 @@ def test_host_summary_gate_requires_exact_formal_seven_scenario_pass(tmp_path):
     failed = MODULE._validate_formal_window_e2e(host_path)
     assert failed["status"] == "FAIL"
     assert "source_scenario_dpi_not_passed" in failed["failures"]
+
+    source["scenarios"]["dpi"]["passed"] = True
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    host = json.loads(host_path.read_text(encoding="utf-8"))
+    host["source_summary"] = str(tmp_path / "unrelated-passing-summary.json")
+    host_path.write_text(json.dumps(host), encoding="utf-8")
+    wrong_path = MODULE._validate_formal_window_e2e(host_path)
+    assert wrong_path["status"] == "FAIL"
+    assert "source_summary_path_not_exact" in wrong_path["failures"]
 
 
 def test_repro_gate_rejects_non_frozen_or_missing_independent_truth():
@@ -214,3 +231,31 @@ def test_managed_roots_must_be_pairwise_disjoint_and_output_new(tmp_path):
     )
 
     assert "release_root overlaps work_root" in failures
+
+
+def test_qualification_output_is_exclusive_and_post_publish_hash_gate_detects_change(
+    tmp_path,
+):
+    output = tmp_path / "qualification.json"
+    MODULE._write_new_json(output, {"status": "PASS"})
+    with pytest.raises(FileExistsError):
+        MODULE._write_new_json(output, {"status": "FAIL"})
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "app.bin").write_bytes(b"before")
+    archive = tmp_path / "release.zip"
+    archive.write_bytes(b"archive")
+    expected_bundle = MODULE._tree_hash(bundle)
+    expected_archive = MODULE.sha256_file(archive)
+    (bundle / "app.bin").write_bytes(b"after!")
+
+    result = MODULE._post_report_artifact_hashes(
+        bundle_root=bundle,
+        archive=archive,
+        expected_bundle=expected_bundle,
+        expected_archive=expected_archive,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["bundle_before"] != result["bundle_after"]

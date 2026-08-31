@@ -171,12 +171,31 @@ class Qualification:
             baseline_bundle = Path(self.args.baseline_bundle).resolve()
             if _paths_overlap(baseline_bundle, PROJECT_ROOT):
                 raise ValueError("baseline bundle must be a pre-stored external artifact")
-            if _paths_overlap(Path(self.args.baseline_auth).resolve(), PROJECT_ROOT):
+            baseline_auth_path = Path(self.args.baseline_auth).resolve()
+            if _paths_overlap(baseline_auth_path, PROJECT_ROOT):
                 raise ValueError("baseline auth must be external to the source checkout")
+            for label, managed in (
+                ("release root", self.release_root),
+                ("work root", self.work_root),
+                ("wheelhouse", Path(self.args.wheelhouse).resolve()),
+                ("qualification output", self.output_path),
+            ):
+                if _paths_overlap(baseline_bundle, managed) or _paths_overlap(baseline_auth_path, managed):
+                    raise ValueError(f"baseline artifact/auth must be disjoint from {label}")
             baseline_auth = verify_baseline_auth(
                 baseline_bundle,
                 Path(self.args.baseline_auth),
             )
+            repro_inputs = _validate_repro_inputs(
+                Path(self.args.repro_support),
+                Path(self.args.repro_truth),
+                Path(self.args.reference_repro_report),
+            )
+            if repro_inputs.get("status") != "PASS":
+                raise ValueError(
+                    "formal repro inputs are invalid: "
+                    + ", ".join(str(item) for item in repro_inputs.get("failures", []))
+                )
             # From this point the destination is a new, disjoint file owned by
             # this qualification attempt, so later failures may be published
             # there without overwriting source/build inputs.
@@ -213,6 +232,7 @@ class Qualification:
                     "executable_sha256": baseline_auth["executable"]["sha256"],
                     "build_identity_sha256": baseline_auth["build_identity_sha256"],
                 },
+                "repro_inputs": repro_inputs,
             }
         except Exception as exc:
             stage.status = "FAIL"
@@ -519,7 +539,7 @@ class Qualification:
                 expected_archive=self.archive_hash_before,
             )
             report["post_report_immutability"] = post_report
-            if post_report.get("status") != "PASS":
+            if post_report.get("status") == "FAIL":
                 report["status"] = "FAIL"
                 report["errors"] = [*self.errors, "artifacts changed while publishing qualification report"]
             atomic_write_json(self.output_path, report)
@@ -669,11 +689,24 @@ def _validate_formal_window_e2e(host_summary_path: Path | str) -> dict[str, obje
     for field in ("execution_ok", "acceptance_eligible", "acceptance_passed"):
         if host.get(field) is not True:
             failures.append(f"host_{field}_not_true")
+    for field in ("complete_source_and_bundle_matrix", "same_hwnd", "integrity_unchanged"):
+        if host.get(field) is not True:
+            failures.append(f"host_{field}_not_true")
+    if host.get("source_only_debug_run") is not False:
+        failures.append("host_source_only_debug_run_not_false")
+    if host.get("forced_simulator_termination") is not False:
+        failures.append("host_forced_simulator_termination_not_false")
+    for field in ("source_exit_code", "package_exit_code", "bundle_exit_code"):
+        if host.get(field) != 0:
+            failures.append(f"host_{field}_not_zero")
 
     scenario_evidence: dict[str, list[str]] = {}
     for label, expected_kind in (("source", "source"), ("frozen", "frozen_exe")):
         raw_path = host.get(f"{label if label == 'source' else 'bundle'}_summary")
         summary_path = Path(str(raw_path)).resolve() if raw_path else Path()
+        expected_path = host_path.parent / ("source" if label == "source" else "bundle") / "summary.json"
+        if summary_path != expected_path.resolve():
+            failures.append(f"{label}_summary_path_not_exact")
         summary = _read_json(summary_path)
         if summary.get("schema") != "guandan.window-e2e-summary/1":
             failures.append(f"{label}_summary_schema_invalid")
@@ -738,6 +771,41 @@ def _validate_frozen_repro_gate(
     return {"status": "PASS" if not failures else "FAIL", "failures": failures}
 
 
+def _validate_repro_inputs(
+    support_path: Path,
+    truth_path: Path,
+    reference_path: Path,
+) -> dict[str, object]:
+    failures: list[str] = []
+    try:
+        support = verify_support_archive(support_path)
+    except Exception as exc:
+        return {
+            "status": "FAIL",
+            "failures": ["support_invalid"],
+            "error_type": type(exc).__name__,
+        }
+    truth = _read_json(truth_path)
+    reference = _read_json(reference_path)
+    if truth.get("schema") != "guandan.repro-truth/1":
+        failures.append("truth_schema_invalid")
+    if truth.get("support_sha256") != support.sha256:
+        failures.append("truth_support_hash_mismatch")
+    if not truth.get("expected_level") and not truth.get("expected_hand"):
+        failures.append("truth_has_no_independent_expectation")
+    if reference.get("schema") != "guandan.repro-report/1":
+        failures.append("reference_schema_invalid")
+    if _nested(reference, "support", "sha256") != support.sha256:
+        failures.append("reference_support_hash_mismatch")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "support_sha256": support.sha256,
+        "truth_sha256": sha256_file(truth_path),
+        "reference_sha256": sha256_file(reference_path),
+        "failures": failures,
+    }
+
+
 def _nested(value: Mapping[str, object], *keys: str) -> object:
     current: object = value
     for key in keys:
@@ -769,6 +837,15 @@ def _post_report_artifact_hashes(
     expected_bundle: str | None,
     expected_archive: str | None,
 ) -> dict[str, object]:
+    if expected_bundle is None and expected_archive is None:
+        return {
+            "status": "NOT_RUN",
+            "reason": "candidate artifacts were not produced",
+            "bundle_before": None,
+            "bundle_after": None,
+            "archive_before": None,
+            "archive_after": None,
+        }
     actual_bundle = _tree_hash(bundle_root) if bundle_root is not None and bundle_root.is_dir() else None
     actual_archive = sha256_file(archive) if archive is not None and archive.is_file() else None
     passed = bool(
