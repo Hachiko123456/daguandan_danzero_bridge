@@ -54,6 +54,15 @@ def _release(tmp_path: Path, name: str, *, commit: str):
     (bundle / "DaguandanAssistant.exe").write_bytes(b"MZ" + name.encode())
     for filename in ("profile.json", "regions_config.json", "templates_config.json"):
         (profile / filename).write_text("{}\n", encoding="utf-8")
+    template = profile / "templates" / "rank" / "7_level.png"
+    template.parent.mkdir(parents=True)
+    template.write_bytes(b"template")
+    fabledan = profile / "models" / "best.npz"
+    danzero = profile / "models" / "danzero" / "q_network.ckpt"
+    fabledan.parent.mkdir(parents=True)
+    danzero.parent.mkdir(parents=True)
+    fabledan.write_bytes(b"model")
+    danzero.write_bytes(b"checkpoint")
     (bundle / "native_dependency_audit.json").write_text(
         json.dumps(
             {
@@ -478,3 +487,72 @@ def test_pointer_transaction_restores_both_files_when_release_publish_fails(
         for path in (runtime / "install" / "transactions").glob("activate-*.json")
     ]
     assert any(item["phase"] == "ROLLED_BACK" for item in transactions)
+
+
+def _run_launcher(runtime: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(PROJECT_ROOT / "release_assets" / "Launch_DaguandanAssistant.ps1"),
+            "-RuntimeRoot",
+            str(runtime),
+            "-VerifyOnly",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_launcher_verifies_full_modern_manifest_native_audit_and_data_pointer(tmp_path):
+    release_files = _release(tmp_path, "candidate", commit="7" * 40)
+    runtime = tmp_path / "runtime"
+    installed = install_release(
+        release_files[0],
+        release_record_path=release_files[1],
+        checksum_path=release_files[2],
+        runtime_root=runtime,
+    )
+    activate_release(installed.release_id, runtime_root=runtime, doctor_runner=_doctor)
+
+    passed = _run_launcher(runtime)
+
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    resource = (
+        installed.executable.parent
+        / "data"
+        / "profiles"
+        / "tencent_daguandan"
+        / "regions_config.json"
+    )
+    resource.write_text('{"tampered":true}\n', encoding="utf-8")
+    failed = _run_launcher(runtime)
+    assert failed.returncode != 0
+    assert "changed" in (failed.stdout + failed.stderr)
+
+
+def test_launcher_rejects_unsafe_version_segment_before_path_resolution(tmp_path):
+    bundle, auth = _legacy_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    baseline = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+    activate_release(baseline.release_id, runtime_root=runtime)
+    passed = _run_launcher(runtime)
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    active_path = runtime / "install" / "active.json"
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    active["version_directory"] = "../escape"
+    active_path.write_text(json.dumps(active), encoding="utf-8")
+
+    failed = _run_launcher(runtime)
+
+    assert failed.returncode != 0
+    assert "safe single path segment" in (failed.stdout + failed.stderr)

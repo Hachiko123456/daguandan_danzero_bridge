@@ -195,6 +195,9 @@ def install_release(
             "archive_sha256": actual_archive_hash,
             "release_record_sha256": sha256_file(Path(release_record_path)),
             "manifest_sha256": sha256_file(manifest_path),
+            "manifest_relative": manifest_path.relative_to(staging).as_posix(),
+            "native_audit_relative": (bundle / "native_dependency_audit.json").relative_to(staging).as_posix(),
+            "native_audit_sha256": sha256_file(bundle / "native_dependency_audit.json"),
             "executable_relative": executable.relative_to(staging).as_posix(),
             "executable_sha256": sha256_file(executable),
             "baseline": bool(baseline),
@@ -245,6 +248,7 @@ def register_legacy_baseline(
                     "artifact_tree_sha256": auth["artifact"]["tree_sha256"],
                     "artifact_file_count": auth["artifact"]["file_count"],
                     "artifact_bytes": auth["artifact"]["bytes"],
+                    "artifact_files": auth["artifact"]["files"],
                     "baseline_auth_sha256": sha256_file(auth_path),
                     "build_identity_sha256": auth["build_identity_sha256"],
                     "baseline": True,
@@ -557,6 +561,7 @@ def _verify_installed_release(
     if receipt.get("release_id") != release_record.get("release_id"):
         raise ReleaseManagerError("existing installed release has a different identity")
     installed = _installed_from_receipt(version_root, receipt)
+    _verify_install_receipt_artifacts(version_root, receipt)
     bundle = installed.executable.parent
     manifest_path = bundle / BUILD_MANIFEST_FILENAME
     integrity = verify_build_manifest(bundle, manifest_path, strict=True)
@@ -572,6 +577,7 @@ def _load_installed_receipt(version_root: Path) -> InstalledRelease:
     receipt = _json_file(version_root / "install_receipt.json", "install receipt")
     installed = _installed_from_receipt(version_root, receipt)
     if receipt.get("schema") == "guandan.installed-release/1":
+        _verify_install_receipt_artifacts(version_root, receipt)
         bundle = installed.executable.parent
         manifest_path = bundle / BUILD_MANIFEST_FILENAME
         integrity = verify_build_manifest(bundle, manifest_path, strict=True)
@@ -580,7 +586,10 @@ def _load_installed_receipt(version_root: Path) -> InstalledRelease:
         _verify_native_audit(bundle)
     elif receipt.get("schema") == LEGACY_BASELINE_SCHEMA:
         artifact = _tree_identity(installed.executable.parent)
-        if artifact.get("tree_sha256") != installed.artifact_tree_sha256:
+        if (
+            artifact.get("tree_sha256") != installed.artifact_tree_sha256
+            or receipt.get("artifact_files") != artifact.get("files")
+        ):
             raise ReleaseManagerError("installed legacy baseline artifact tree changed")
         if not installed.baseline or not installed.baseline_auth_sha256:
             raise ReleaseManagerError("installed legacy baseline preapproval is incomplete")
@@ -621,6 +630,25 @@ def _installed_from_receipt(
             else None
         ),
     )
+
+
+def _verify_install_receipt_artifacts(
+    version_root: Path,
+    receipt: Mapping[str, object],
+) -> None:
+    if receipt.get("schema") != "guandan.installed-release/1":
+        return
+    for relative_field, hash_field, label in (
+        ("manifest_relative", "manifest_sha256", "build manifest"),
+        ("native_audit_relative", "native_audit_sha256", "native audit"),
+    ):
+        relative = _safe_relative(str(receipt.get(relative_field) or ""))
+        path = version_root.joinpath(*PurePosixPath(relative).parts)
+        _assert_below(path, version_root, label)
+        if _is_link_or_reparse(path) or not path.is_file():
+            raise ReleaseManagerError(f"installed {label} is unavailable")
+        if sha256_file(path) != receipt.get(hash_field):
+            raise ReleaseManagerError(f"installed {label} hash mismatch")
 
 
 def _installed_by_id(install: Path, release_id: str) -> InstalledRelease:
@@ -1134,6 +1162,7 @@ def _tree_identity(root: Path) -> dict[str, object]:
         "file_count": len(records),
         "bytes": sum(int(item["bytes"]) for item in records),
         "tree_sha256": _canonical_sha256(records),
+        "files": records,
     }
 
 
