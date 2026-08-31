@@ -53,3 +53,14 @@ def test_run_can_annotate_truth_without_mutating_support_zip(tmp_path):
     assert completed.returncode != 0
     assert not truth.exists()
     assert support.read_bytes() == b"not a zip"
+
+
+def test_frozen_repro_branch_seeds_runtime_before_constructing_recognizer():
+    source = (PROJECT_ROOT / "run.py").read_text(encoding="utf-8")
+    branch = source[source.index("if args.repro_support is not None") :]
+
+    assert branch.index("ensure_runtime_layout()") < branch.index(
+        "reproduce_support_bundle"
+    )
+    assert 'args.repro_role == "candidate"' in branch
+    assert 'truth.get("all_correct") is not True' in branch

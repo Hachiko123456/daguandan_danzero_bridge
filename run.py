@@ -194,6 +194,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(truth, ensure_ascii=False, indent=2))
         return 0
     if args.repro_support is not None or args._repro_probe is not None:
+        # A frozen repro run may use a brand-new isolated data root.  Seed its
+        # immutable profile resources before constructing the production
+        # recognizer, exactly as the GUI path does.
+        from daguandan_bridge.runtime_layout import ensure_runtime_layout
+
+        ensure_runtime_layout()
         from daguandan_bridge.support_repro import (
             reproduce_support_bundle,
             reproduce_support_suite,
@@ -224,6 +230,15 @@ def main(argv: list[str] | None = None) -> int:
                 role=args.repro_role,
             )
         print(json.dumps(report, ensure_ascii=False, indent=2))
+        if args.repro_role == "candidate":
+            truth = report.get("truth")
+            if not isinstance(truth, dict) or truth.get("all_correct") is not True:
+                return 2
+            probes = report.get("probes")
+            if isinstance(probes, dict):
+                child = probes.get("fresh_child_deterministic")
+                if isinstance(child, dict) and child.get("status") != "PASS":
+                    return 2
         return 0
     if args.export_support is not None:
         from daguandan_bridge.support_export import (
