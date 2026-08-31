@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from types import SimpleNamespace
 
@@ -163,4 +164,113 @@ def test_diagnostic_writer_failure_never_raises_or_blocks_observer(tmp_path, mon
     assert monitor.emit_incident("OPENING-TEST-FAILURE", field="test", reason="boom")
     assert monitor.flush(5) is False
     assert monitor.metrics().writer_failures == 1
+    monitor.close()
+
+
+def test_e003_persists_only_explicit_analysis_delivery_and_drop_timing(tmp_path):
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path,
+        delivery_settle_seconds=0,
+    )
+    monitor.begin()
+    delivered = _snapshot(80)
+    dropped = _snapshot(90)
+    for snapshot in (delivered, dropped):
+        monitor.observe_frame(snapshot)
+        monitor.observe_analysis_submitted(snapshot)
+    monitor.observe_analysis_started(delivered)
+    trace_hash = hashlib.sha256(memoryview(np.ascontiguousarray(delivered.image))).hexdigest()
+    monitor.observe_recognition(
+        delivered,
+        _result(level=None, hand=()),
+        {"input_sha256": trace_hash, "candidates": []},
+    )
+    monitor.observe_delivery(delivered, gate_eligible=True)
+    monitor.observe_analysis_dropped(dropped, reason="latest_replaced")
+    assert monitor.emit_incident("OPENING-DELIVERY-AUDIT", field="test", reason="audit")
+    assert monitor.flush(5)
+
+    evidence_path = next(
+        (tmp_path / "opening" / "incidents").glob("*/opening_evidence.json")
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    frames = {item["frame_id"]: item for item in evidence["frames"]}
+    delivered_analysis = frames[delivered.evidence_frame_id]["analysis"]
+    dropped_analysis = frames[dropped.evidence_frame_id]["analysis"]
+    assert delivered_analysis["gate_delivered"] is True
+    assert delivered_analysis["submitted_ms"] <= delivered_analysis["started_ms"]
+    assert delivered_analysis["completed_ms"] <= delivered_analysis["delivered_ms"]
+    assert dropped_analysis["status"] == "dropped"
+    assert dropped_analysis["drop_reason"] == "latest_replaced"
+    assert dropped_analysis["gate_delivered"] is False
+    monitor.close()
+
+
+def test_e006_slow_successful_unresolved_recognition_keeps_exact_trace(tmp_path):
+    now = [0]
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path,
+        max_bytes=128 * 72 * 3 * 2 + 1,
+        field_timeout_seconds=1,
+        clock_ms=lambda: now[0],
+    )
+    monitor.begin(monotonic_ms=0)
+    slow = _snapshot(101)
+    monitor.observe_frame(slow, monotonic_ms=1)
+    monitor.observe_analysis_submitted(slow)
+    monitor.observe_analysis_started(slow)
+    monitor.observe_frame(_snapshot(102), monotonic_ms=2)
+    now[0] = 2_000
+    trace_hash = hashlib.sha256(memoryview(np.ascontiguousarray(slow.image))).hexdigest()
+    monitor.observe_recognition(
+        slow,
+        _result(level=None, hand=()),
+        {
+            "schema": "guandan.recognition-trace/1",
+            "input_sha256": trace_hash,
+            "candidates": [],
+        },
+    )
+    monitor.observe_delivery(slow, gate_eligible=True)
+    assert monitor.flush(5)
+
+    evidence_files = list(
+        (tmp_path / "opening" / "incidents").glob("*/opening_evidence.json")
+    )
+    assert evidence_files
+    documents = [json.loads(path.read_text(encoding="utf-8")) for path in evidence_files]
+    correlated = [
+        frame
+        for document in documents
+        for frame in document["frames"]
+        if frame["frame_id"] == slow.evidence_frame_id
+        and frame.get("recognition") is not None
+    ]
+    assert correlated
+    assert all(frame["analysis"]["gate_delivered"] is True for frame in correlated)
+    assert all(
+        frame["analysis"]["recovered_exact_analysis_frame"] is True
+        for frame in correlated
+    )
+    trace_files = [path.with_name("recognition_trace.jsonl") for path in evidence_files]
+    assert any(trace_hash in path.read_text(encoding="utf-8") for path in trace_files)
+    monitor.close()
+
+
+def test_e007_png_actual_bytes_never_exceed_budget_or_leave_partial_files(tmp_path):
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path,
+        max_persisted_image_bytes=8,
+        delivery_settle_seconds=0,
+    )
+    monitor.begin()
+    monitor.observe_frame(_snapshot(77))
+    assert monitor.emit_incident("OPENING-PNG-BUDGET", field="test", reason="budget")
+    assert monitor.flush(5)
+    incident = next((tmp_path / "opening" / "incidents").iterdir())
+    evidence = json.loads((incident / "opening_evidence.json").read_text(encoding="utf-8"))
+    assert evidence["privacy"]["contains_sensitive_images"] is False
+    assert all(not frame["artifacts"] for frame in evidence["frames"])
+    assert not list(incident.rglob("*.png"))
+    assert not any(path.name.endswith(".tmp") for path in incident.rglob("*"))
     monitor.close()

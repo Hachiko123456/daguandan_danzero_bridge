@@ -23,13 +23,13 @@ from time import monotonic as monotonic_seconds
 from time import sleep
 from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
+from weakref import ref as weakref_ref
 from queue import Empty, Full, Queue
 
 import cv2
 import numpy as np
 
 from .danzero.state import RANKS
-from .image_io import save_image_unicode
 from .runtime_identity import get_runtime_identity
 from .resource_fingerprint import recognition_resource_identity
 from .startup_diagnostics import current_startup_diagnostics
@@ -67,6 +67,7 @@ class _OpeningFrame:
     recognition: dict[str, object] | None = None
     recognition_trace: dict[str, object] | None = None
     anchor_score: float | None = None
+    analysis: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,7 @@ class OpeningEvidenceMonitor:
         writer_queue_size: int = 16,
         max_persisted_frames: int = 40,
         max_persisted_image_bytes: int = 256 * 1024 * 1024,
+        delivery_settle_seconds: float = 0.5,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
         if max_age_seconds <= 0 or field_timeout_seconds <= 0:
@@ -198,11 +200,15 @@ class OpeningEvidenceMonitor:
         self.field_timeout_ms = max(1, int(field_timeout_seconds * 1000))
         self.max_persisted_frames = max(1, int(max_persisted_frames))
         self.max_persisted_image_bytes = max(1, int(max_persisted_image_bytes))
+        self.delivery_settle_seconds = max(0.0, float(delivery_settle_seconds))
         self._clock_ms = clock_ms or (lambda: monotonic_ns() // 1_000_000)
         self._ring: deque[_OpeningFrame] = deque()
         self._frame_by_identity: dict[int, _OpeningFrame] = {}
         self._frame_by_id: dict[str, _OpeningFrame] = {}
         self._ambiguous_frame_ids: set[str] = set()
+        self._known_frame_inputs: dict[
+            int, tuple[object, str, str]
+        ] = {}
         self._ring_record_ids: set[int] = set()
         self._retained_bytes = 0
         self._latest_seq = 0
@@ -254,6 +260,7 @@ class OpeningEvidenceMonitor:
                 self._frame_by_identity.clear()
                 self._frame_by_id.clear()
                 self._ambiguous_frame_ids.clear()
+                self._known_frame_inputs.clear()
                 self._ring_record_ids.clear()
         except BaseException:
             return
@@ -293,6 +300,20 @@ class OpeningEvidenceMonitor:
                     frame_id = uuid4().hex
                     metadata["duplicate_source_frame_id"] = requested_frame_id
                 metadata["frame_id"] = frame_id
+                pixel_hash = str(metadata.get("standardized_pixel_sha256") or "")
+                try:
+                    snapshot_ref: object = weakref_ref(snapshot)
+                except TypeError:
+                    snapshot_ref = lambda: None
+                self._known_frame_inputs[id(snapshot)] = (
+                    snapshot_ref,
+                    requested_frame_id,
+                    pixel_hash,
+                )
+                for identity, known in tuple(self._known_frame_inputs.items()):
+                    dereference = known[0]
+                    if callable(dereference) and dereference() is None:
+                        self._known_frame_inputs.pop(identity, None)
                 item = _OpeningFrame(
                     frame_id=frame_id,
                     seq=self._latest_seq,
@@ -301,6 +322,17 @@ class OpeningEvidenceMonitor:
                     snapshot=snapshot,
                     byte_size=byte_size,
                     frame_metadata=metadata,
+                    analysis={
+                        "status": "captured",
+                        "captured_observer_ms": now,
+                        "submitted_ms": None,
+                        "started_ms": None,
+                        "completed_ms": None,
+                        "delivered_ms": None,
+                        "dropped_ms": None,
+                        "drop_reason": None,
+                        "gate_delivered": False,
+                    },
                 )
                 self._ring.append(item)
                 self._frame_by_identity[id(snapshot)] = item
@@ -321,6 +353,70 @@ class OpeningEvidenceMonitor:
                     evidence={"pixel_max": int(np.max(standard)) if isinstance(standard, np.ndarray) and standard.size else 0},
                 )
             self._emit_timeouts_if_due()
+        except BaseException:
+            return
+
+    def observe_analysis_submitted(self, snapshot: object) -> None:
+        self._mark_analysis(snapshot, "submitted")
+
+    def observe_analysis_started(self, snapshot: object) -> None:
+        self._mark_analysis(snapshot, "started")
+
+    def observe_analysis_dropped(self, snapshot: object, *, reason: str) -> None:
+        try:
+            now = self._clock_ms()
+            with self._lock:
+                item = self._correlated_frame_locked(snapshot)
+                if item is None:
+                    return
+                item.analysis.update(
+                    {
+                        "status": "dropped",
+                        "dropped_ms": now,
+                        "drop_reason": str(reason)[:128],
+                        "gate_delivered": False,
+                    }
+                )
+        except BaseException:
+            return
+
+    def observe_delivery(
+        self,
+        snapshot: object,
+        *,
+        gate_eligible: bool,
+    ) -> None:
+        try:
+            now = self._clock_ms()
+            with self._lock:
+                item = self._correlated_frame_locked(snapshot)
+                if item is None:
+                    return
+                item.analysis.update(
+                    {
+                        "status": "delivered" if gate_eligible else "delivered_ineligible",
+                        "delivered_ms": now,
+                        "gate_delivered": bool(gate_eligible),
+                    }
+                )
+        except BaseException:
+            return
+
+    def _mark_analysis(self, snapshot: object, state: str) -> None:
+        try:
+            now = self._clock_ms()
+            with self._lock:
+                item = self._correlated_frame_locked(snapshot)
+                if item is None:
+                    return
+                order = {"captured": 0, "submitted": 1, "started": 2}
+                current = str(item.analysis.get("status") or "captured")
+                if current in {"completed", "dropped", "delivered", "delivered_ineligible"}:
+                    return
+                if order.get(state, 0) < order.get(current, 0):
+                    return
+                item.analysis["status"] = state
+                item.analysis[f"{state}_ms"] = now
         except BaseException:
             return
 
@@ -362,11 +458,26 @@ class OpeningEvidenceMonitor:
             level = str(document.get("round_level") or "")
             hand = tuple(str(card) for card in document.get("my_hand", []))
             now = self._clock_ms()
+            recovered = False
             with self._lock:
                 item = self._correlated_frame_locked(snapshot, trace=trace)
+                recoverable = self._can_recover_exact_locked(snapshot, trace=trace)
+            if item is None and recoverable:
+                # Slow successful recognition must retain the exact analyzed
+                # input and trace, just like the exception path.  Never attach
+                # it to an unrelated newest frame.
+                self.observe_frame(snapshot, monotonic_ms=now)
+                with self._lock:
+                    item = self._correlated_frame_locked(snapshot, trace=trace)
+                recovered = item is not None
+            with self._lock:
                 if item is not None:
                     item.recognition = document
                     item.recognition_trace = dict(trace) if isinstance(trace, Mapping) else None
+                    item.analysis["completed_ms"] = now
+                    item.analysis["recovered_exact_analysis_frame"] = recovered
+                    if item.analysis.get("status") != "dropped":
+                        item.analysis["status"] = "completed"
                 else:
                     self._orphan_recognitions += 1
                 self._clear_error_stage_locked("recognition")
@@ -500,8 +611,13 @@ class OpeningEvidenceMonitor:
                     if snapshot is not None
                     else None
                 )
+                recoverable = (
+                    self._can_recover_exact_locked(snapshot)
+                    if snapshot is not None
+                    else False
+                )
             recovered = False
-            if correlated is None and snapshot is not None:
+            if correlated is None and snapshot is not None and recoverable:
                 # A slow recognition can outlive the ordinary 8-second ring.
                 # Reinsert that exact id+pixel input as failure evidence; do
                 # not substitute the newest unrelated frame.
@@ -858,6 +974,32 @@ class OpeningEvidenceMonitor:
             return None
         return candidate
 
+    def _can_recover_exact_locked(
+        self,
+        snapshot: object,
+        *,
+        trace: Mapping[str, object] | None = None,
+    ) -> bool:
+        known = self._known_frame_inputs.get(id(snapshot))
+        if known is None:
+            return False
+        dereference, frame_id, pixel_hash = known
+        if not callable(dereference) or dereference() is not snapshot:
+            return False
+        if str(getattr(snapshot, "evidence_frame_id", "") or "") != frame_id:
+            return False
+        image = getattr(snapshot, "image", None)
+        if not isinstance(image, np.ndarray) or not image.size:
+            return False
+        if pixel_hash and _array_sha256(image) != pixel_hash:
+            return False
+        trace_hash = (
+            str(trace.get("input_sha256") or "")
+            if isinstance(trace, Mapping)
+            else ""
+        )
+        return not trace_hash or trace_hash == pixel_hash
+
     def _retain_pending_records_locked(
         self,
         records: tuple[_OpeningFrame, ...],
@@ -941,6 +1083,7 @@ class OpeningEvidenceMonitor:
         records: tuple[_OpeningFrame, ...],
         metrics: dict[str, int],
     ) -> None:
+        self._settle_analysis_delivery(records)
         self.root.mkdir(parents=True, exist_ok=True)
         incidents_root = self.root / "incidents"
         incidents_root.mkdir(exist_ok=True)
@@ -959,6 +1102,7 @@ class OpeningEvidenceMonitor:
                     "monotonic_ms": record.monotonic_ms,
                     "wall_time": record.wall_time,
                     "capture": record.frame_metadata,
+                    "analysis": _json_safe(record.analysis),
                     "anchor_score": record.anchor_score,
                     "recognition": record.recognition,
                 }
@@ -1047,6 +1191,22 @@ class OpeningEvidenceMonitor:
             _remove_tree_best_effort(staging)
             raise
 
+    def _settle_analysis_delivery(
+        self,
+        records: tuple[_OpeningFrame, ...],
+    ) -> None:
+        deadline = monotonic_seconds() + self.delivery_settle_seconds
+        while monotonic_seconds() < deadline:
+            with self._lock:
+                pending = any(
+                    record.analysis.get("status")
+                    in {"submitted", "started", "completed"}
+                    for record in records
+                )
+            if not pending:
+                return
+            sleep(0.005)
+
     def _write_record_images(
         self,
         staging: Path,
@@ -1068,12 +1228,14 @@ class OpeningEvidenceMonitor:
         for kind, relative, image in images:
             if not isinstance(image, np.ndarray) or image.size == 0:
                 continue
-            estimated = int(image.nbytes)
-            if estimated + written > remaining:
+            saved = _write_png_bounded(
+                staging / relative,
+                image,
+                remaining=max(0, remaining - written),
+            )
+            if saved is None:
                 continue
-            save_image_unicode(staging / relative, image)
-            path = staging / relative
-            size = path.stat().st_size
+            size, file_sha256 = saved
             written += size
             artifacts.append(
                 {
@@ -1083,19 +1245,21 @@ class OpeningEvidenceMonitor:
                     "field": None,
                     "path": relative.replace("\\", "/"),
                     "bytes": size,
-                    "sha256": _sha256_file(path),
+                    "sha256": file_sha256,
                     "pixel_sha256": _array_sha256(image),
                 }
             )
         if isinstance(standard, np.ndarray) and standard.size:
             for name, box, crop in self._opening_rois(standard):
                 relative = Path("roi") / f"{name}_{record.seq:06d}.png"
-                estimated = int(crop.nbytes)
-                if estimated + written > remaining:
-                    break
-                save_image_unicode(staging / relative, crop)
-                path = staging / relative
-                size = path.stat().st_size
+                saved = _write_png_bounded(
+                    staging / relative,
+                    crop,
+                    remaining=max(0, remaining - written),
+                )
+                if saved is None:
+                    continue
+                size, file_sha256 = saved
                 written += size
                 artifacts.append(
                     {
@@ -1105,7 +1269,7 @@ class OpeningEvidenceMonitor:
                         "field": name,
                         "path": relative.as_posix(),
                         "bytes": size,
-                        "sha256": _sha256_file(path),
+                        "sha256": file_sha256,
                         "pixel_sha256": _array_sha256(crop),
                         "box": list(box),
                     }
@@ -1183,6 +1347,26 @@ class NonBlockingOpeningEvidenceSink:
 
     def observe_frame(self, snapshot: object, **kwargs: object) -> None:
         self._submit("observe_frame", (snapshot,), kwargs)
+
+    def observe_analysis_submitted(self, snapshot: object) -> None:
+        self._submit("observe_analysis_submitted", (snapshot,), {})
+
+    def observe_analysis_started(self, snapshot: object) -> None:
+        self._submit("observe_analysis_started", (snapshot,), {})
+
+    def observe_analysis_dropped(self, snapshot: object, *, reason: str) -> None:
+        self._submit(
+            "observe_analysis_dropped",
+            (snapshot,),
+            {"reason": str(reason)},
+        )
+
+    def observe_delivery(self, snapshot: object, *, gate_eligible: bool) -> None:
+        self._submit(
+            "observe_delivery",
+            (snapshot,),
+            {"gate_eligible": bool(gate_eligible)},
+        )
 
     def observe_anchor(self, snapshot: object, score: float, **kwargs: object) -> None:
         self._submit("observe_anchor", (snapshot, score), kwargs)
@@ -1444,12 +1628,31 @@ def _array_sha256(image: np.ndarray) -> str:
     return hashlib.sha256(memoryview(np.ascontiguousarray(image))).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _write_png_bounded(
+    path: Path,
+    image: np.ndarray,
+    *,
+    remaining: int,
+) -> tuple[int, str] | None:
+    """Encode first, then enforce the hard on-disk byte budget before publish."""
+
+    if remaining <= 0:
+        return None
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise RuntimeError(f"diagnostic PNG encoding failed: {path.name}")
+    content = bytes(encoded)
+    if len(content) > int(remaining):
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return len(content), hashlib.sha256(content).hexdigest()
 
 
 def _wall_time(snapshot: object) -> str:

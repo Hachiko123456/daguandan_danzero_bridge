@@ -623,6 +623,7 @@ def _write_generated_frame_index(path: Path, evidence: Mapping[str, object]) -> 
                 "monotonic_ms": raw.get("monotonic_ms"),
                 "wall_time": raw.get("wall_time"),
                 "capture": raw.get("capture"),
+                "analysis": raw.get("analysis"),
             }
             handle.write(
                 json.dumps(

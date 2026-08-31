@@ -340,6 +340,10 @@ class LiveAssistantController(QObject):
             self._recognize_waiting_frame,
             on_result=lambda value: self._waiting_recognized.emit(value[0], value[1]),
             on_error=self._accept_waiting_recognition_error,
+            on_discard=lambda value, reason: self.opening_evidence.observe_analysis_dropped(
+                value,
+                reason=reason,
+            ),
         )
         self._waiting_analysis_worker = analysis
         analysis.start()
@@ -358,7 +362,15 @@ class LiveAssistantController(QObject):
             # selected full recording for this listening pass.
             active_analysis = self._waiting_analysis_worker
             if active_analysis is not None:
-                active_analysis.submit(snapshot)
+                self.opening_evidence.observe_analysis_submitted(snapshot)
+                try:
+                    active_analysis.submit(snapshot)
+                except Exception:
+                    self.opening_evidence.observe_analysis_dropped(
+                        snapshot,
+                        reason="submit_failed",
+                    )
+                    raise
             return snapshot
 
         worker = WorkerHandle(operation, 0.2)
@@ -372,6 +384,7 @@ class LiveAssistantController(QObject):
         self,
         snapshot: FrameSnapshot,
     ) -> tuple[object, FrameSnapshot]:
+        self.opening_evidence.observe_analysis_started(snapshot)
         try:
             result = self._recognize_initial_image(snapshot.image)
         except Exception as exc:
@@ -452,8 +465,15 @@ class LiveAssistantController(QObject):
                 record_recognition(result)
             except Exception as exc:
                 self.error.emit(f"监听录像写入识别记录失败：{exc}")
+        gate_eligible = bool(
+            self._listening_enabled and self.orchestrator is None
+        )
+        self.opening_evidence.observe_delivery(
+            snapshot,
+            gate_eligible=gate_eligible,
+        )
         self.initial_recognized.emit(result, snapshot)
-        if not self._listening_enabled or self.orchestrator is not None:
+        if not gate_eligible:
             return
         buttons = set(getattr(result, "buttons", ()) or ())
         if buttons & {"change_table", "continue_game"}:
