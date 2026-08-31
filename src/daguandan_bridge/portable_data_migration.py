@@ -30,6 +30,7 @@ from .runtime_layout import (
     generation_marker,
     layout_for_generation,
     resolve_runtime_layout,
+    runtime_storage_lock,
     safe_tree_files,
     sha256_file,
     write_generation_marker,
@@ -85,7 +86,21 @@ def migrate_portable_data(
 ) -> PortableMigrationResult:
     """Copy allowlisted legacy data into a new generation and activate it."""
 
-    selected = ensure_runtime_layout(layout or resolve_runtime_layout())
+    selected = layout or resolve_runtime_layout()
+    with runtime_storage_lock(
+        selected.runtime_root,
+        operation="migrate-portable-data",
+        timeout_seconds=300.0,
+    ):
+        return _migrate_portable_data_locked(portable_root, layout=selected)
+
+
+def _migrate_portable_data_locked(
+    portable_root: Path | str,
+    *,
+    layout: RuntimeLayout,
+) -> PortableMigrationResult:
+    selected = ensure_runtime_layout(layout)
     if not selected.frozen:
         raise RuntimeLayoutError(
             "portable migration is available only from the frozen application"

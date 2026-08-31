@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import zipfile
 
 import pytest
@@ -536,7 +537,10 @@ def test_activation_preserves_real_migrated_generation_and_rollback_restores_mar
         (runtime / "data" / "v1" / "active.json").read_text(encoding="utf-8")
     )
     assert rolled["release_id"] == baseline.release_id
-    assert restored_pointer == baseline_pointer
+    assert {
+        key: value for key, value in restored_pointer.items() if key != "transaction_id"
+    } == {key: value for key, value in baseline_pointer.items() if key != "transaction_id"}
+    assert restored_pointer["transaction_id"] == rolled["transaction_id"]
     assert rolled["data_marker_sha256"] == baseline_marker_hash
     receipt_path = next(
         (runtime / "install" / "rollback-receipts").glob("rollback-*/receipt.json")
@@ -595,6 +599,60 @@ def test_pointer_transaction_restores_both_files_when_release_publish_fails(
         for path in (runtime / "install" / "transactions").glob("activate-*.json")
     ]
     assert any(item["phase"] == "ROLLED_BACK" for item in transactions)
+
+
+def test_two_processes_install_same_release_without_partial_staging(tmp_path):
+    release_files = _release(tmp_path, "concurrent-candidate", commit="6" * 40)
+    runtime = tmp_path / "concurrent-runtime"
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "manage_release.py"),
+        "--runtime-root",
+        str(runtime),
+        "install",
+        str(release_files[0]),
+        "--release-record",
+        str(release_files[1]),
+        "--checksum",
+        str(release_files[2]),
+    ]
+    processes = [
+        subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    completed = [process.communicate(timeout=30) for process in processes]
+
+    for process, (stdout, stderr) in zip(processes, completed, strict=True):
+        assert process.returncode == 0, stdout + stderr
+    status = release_status(runtime)
+    assert len(status["versions"]) == 1
+    assert not list((runtime / "install" / "versions").glob(".*.tmp"))
+
+
+def test_manage_release_cli_rejects_baseline_flag_without_external_auth(tmp_path):
+    release_files = _release(tmp_path, "cli-baseline", commit=BASELINE_SOURCE_COMMIT)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "manage_release.py"),
+            "--runtime-root",
+            str(tmp_path / "runtime"),
+            "install",
+            str(release_files[0]),
+            "--release-record",
+            str(release_files[1]),
+            "--checksum",
+            str(release_files[2]),
+            "--baseline",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert "--baseline requires --baseline-auth" in completed.stderr
 
 
 def _run_launcher(runtime: Path) -> subprocess.CompletedProcess[str]:

@@ -20,6 +20,7 @@ from daguandan_bridge.release_manager import (  # noqa: E402
     rollback_release,
     write_baseline_auth,
 )
+from daguandan_bridge.runtime_layout import RuntimeLayoutError  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             result = rollback_release(runtime_root=args.runtime_root)
         else:
             result = release_status(runtime_root=args.runtime_root)
-    except (ReleaseManagerError, OSError, ValueError) as exc:
+    except (ReleaseManagerError, RuntimeLayoutError, OSError, ValueError) as exc:
         print(f"release manager error: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))

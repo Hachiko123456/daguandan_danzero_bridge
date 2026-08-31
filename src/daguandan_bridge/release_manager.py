@@ -38,6 +38,7 @@ from .runtime_layout import (
     prepare_runtime_layout,
     resolve_runtime_layout,
     safe_tree_files,
+    runtime_storage_lock,
 )
 
 
@@ -110,6 +111,13 @@ def default_runtime_root(environ: Mapping[str, str] | None = None) -> Path:
 
 def ensure_install_root(runtime_root: Path | str | None = None) -> Path:
     runtime = Path(runtime_root or default_runtime_root())
+    with runtime_storage_lock(
+        runtime, operation="ensure-install-root", timeout_seconds=30.0
+    ):
+        return _ensure_install_root_locked(runtime)
+
+
+def _ensure_install_root_locked(runtime: Path) -> Path:
     _reject_filesystem_root(runtime, "runtime root")
     _assert_no_reparse_chain(runtime)
     runtime.mkdir(parents=True, exist_ok=True)
@@ -139,6 +147,7 @@ def ensure_install_root(runtime_root: Path | str | None = None) -> Path:
         path = install / name
         _assert_no_reparse_chain(path)
         path.mkdir(exist_ok=True)
+    _recover_pointer_transactions(install)
     return install
 
 
@@ -150,6 +159,29 @@ def install_release(
     runtime_root: Path | str | None = None,
     baseline: bool = False,
     baseline_auth_path: Path | str | None = None,
+) -> InstalledRelease:
+    runtime = Path(runtime_root or default_runtime_root())
+    with runtime_storage_lock(
+        runtime, operation="install-release", timeout_seconds=300.0
+    ):
+        return _install_release_locked(
+            archive_path,
+            release_record_path=release_record_path,
+            checksum_path=checksum_path,
+            runtime_root=runtime,
+            baseline=baseline,
+            baseline_auth_path=baseline_auth_path,
+        )
+
+
+def _install_release_locked(
+    archive_path: Path | str,
+    *,
+    release_record_path: Path | str,
+    checksum_path: Path | str,
+    runtime_root: Path,
+    baseline: bool,
+    baseline_auth_path: Path | str | None,
 ) -> InstalledRelease:
     if baseline and baseline_auth_path is None:
         raise ReleaseManagerError(
@@ -255,6 +287,25 @@ def register_legacy_baseline(
     runtime_root: Path | str | None = None,
 ) -> InstalledRelease:
     """Copy an externally preapproved known-good portable baseline."""
+
+    runtime = Path(runtime_root or default_runtime_root())
+    with runtime_storage_lock(
+        runtime, operation="register-legacy-baseline", timeout_seconds=300.0
+    ):
+        return _register_legacy_baseline_locked(
+            portable_directory,
+            baseline_auth_path=baseline_auth_path,
+            runtime_root=runtime,
+        )
+
+
+def _register_legacy_baseline_locked(
+    portable_directory: Path | str,
+    *,
+    baseline_auth_path: Path | str,
+    runtime_root: Path,
+) -> InstalledRelease:
+    """Locked implementation for legacy baseline registration."""
 
     source = Path(portable_directory)
     auth_path = Path(baseline_auth_path)
@@ -417,6 +468,23 @@ def activate_release(
     runtime_root: Path | str | None = None,
     doctor_runner: Callable[[InstalledRelease, Path, Path], Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
+    runtime = Path(runtime_root or default_runtime_root())
+    with runtime_storage_lock(
+        runtime, operation="activate-release", timeout_seconds=300.0
+    ):
+        return _activate_release_locked(
+            release_id,
+            runtime_root=runtime,
+            doctor_runner=doctor_runner,
+        )
+
+
+def _activate_release_locked(
+    release_id: str,
+    *,
+    runtime_root: Path,
+    doctor_runner: Callable[[InstalledRelease, Path, Path], Mapping[str, object]] | None,
+) -> dict[str, object]:
     install = ensure_install_root(runtime_root)
     selected = _installed_by_id(install, release_id)
     runtime = install.parent
@@ -465,21 +533,36 @@ def activate_release(
         "previous": previous,
         "doctor_report": doctor_path.name,
     }
-    _transactional_pointer_switch(
+    committed = _transactional_pointer_switch(
         install,
         transition_id=transition_id,
         release_document=document,
         data_document=desired_data,
         expected_marker_sha256=data_marker_sha256,
     )
-    _append_history(install, {**document, "operation": "activate"})
-    return document
+    _append_history(install, {**committed, "operation": "activate"})
+    return committed
 
 
 def rollback_release(
     *,
     runtime_root: Path | str | None = None,
     support_exporter: Callable[[InstalledRelease, Path], Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    runtime = Path(runtime_root or default_runtime_root())
+    with runtime_storage_lock(
+        runtime, operation="rollback-release", timeout_seconds=300.0
+    ):
+        return _rollback_release_locked(
+            runtime_root=runtime,
+            support_exporter=support_exporter,
+        )
+
+
+def _rollback_release_locked(
+    *,
+    runtime_root: Path,
+    support_exporter: Callable[[InstalledRelease, Path], Mapping[str, object]] | None,
 ) -> dict[str, object]:
     install = ensure_install_root(runtime_root)
     current = _read_active(install)
@@ -559,7 +642,7 @@ def rollback_release(
         "data_snapshot": data_snapshot,
     }
     atomic_write_json(receipt_root / "receipt.json", receipt)
-    _transactional_pointer_switch(
+    committed = _transactional_pointer_switch(
         install,
         transition_id=transition_id,
         release_document=target_document,
@@ -573,17 +656,25 @@ def rollback_release(
     )
     receipt["restored_data_snapshot"] = restored
     receipt["restored_pointer_verified"] = bool(
-        restored.get("active_pointer") == target_data_document
+        restored.get("active_pointer") == committed.get("data_pointer")
         and restored.get("generation_marker_sha256") == expected_target_marker
     )
     if not receipt["restored_pointer_verified"]:
         raise ReleaseManagerError("rollback data pointer/marker verification failed")
     atomic_write_json(receipt_root / "receipt.json", receipt)
-    _append_history(install, {**target_document, "operation": "rollback"})
-    return target_document
+    _append_history(install, {**committed, "operation": "rollback"})
+    return committed
 
 
 def release_status(runtime_root: Path | str | None = None) -> dict[str, object]:
+    runtime = Path(runtime_root or default_runtime_root())
+    with runtime_storage_lock(
+        runtime, operation="release-status", timeout_seconds=30.0
+    ):
+        return _release_status_locked(runtime)
+
+
+def _release_status_locked(runtime_root: Path) -> dict[str, object]:
     install = ensure_install_root(runtime_root)
     versions = []
     for path in sorted((install / "versions").iterdir(), key=lambda item: item.name.casefold()):
@@ -984,24 +1075,40 @@ def _transactional_pointer_switch(
     release_document: Mapping[str, object],
     data_document: Mapping[str, object] | None,
     expected_marker_sha256: str | None,
-) -> None:
+) -> dict[str, object]:
     transaction_path = install / "transactions" / f"{_safe_segment(transition_id, 'transition id')}.json"
     active_release_path = install / _ACTIVE_FILE
     active_data_path = _data_pointer_path(install.parent)
     release_before = _read_file_bytes(active_release_path)
     data_before = _read_file_bytes(active_data_path)
+    release_before_document = _json_from_bytes(release_before, "active release snapshot")
+    data_before_document = _json_from_bytes(data_before, "active data snapshot")
+    desired_data = dict(data_document) if data_document is not None else None
+    if desired_data is not None:
+        desired_data["transaction_id"] = transition_id
+    desired_release = dict(release_document)
+    desired_release["transaction_id"] = transition_id
+    if isinstance(desired_release.get("data_pointer"), Mapping):
+        desired_release["data_pointer"] = desired_data
+        desired_release["data_pointer_sha256"] = (
+            _json_document_sha256(desired_data) if desired_data is not None else None
+        )
     transaction = {
-        "schema": "guandan.pointer-transaction/1",
+        "schema": "guandan.pointer-transaction/2",
         "transition_id": transition_id,
         "phase": "PREPARED",
         "release_before_sha256": _bytes_sha256(release_before),
         "data_before_sha256": _bytes_sha256(data_before),
-        "release_id": release_document.get("release_id"),
+        "release_before": release_before_document,
+        "data_before": data_before_document,
+        "release_after": desired_release,
+        "data_after": desired_data,
+        "release_id": desired_release.get("release_id"),
         "data_generation": (
-            data_document.get("generation_id") if data_document is not None else None
+            desired_data.get("generation_id") if desired_data is not None else None
         ),
         "expected_data_pointer_sha256": (
-            _json_document_sha256(data_document) if data_document is not None else None
+            _json_document_sha256(desired_data) if desired_data is not None else None
         ),
         "expected_marker_sha256": expected_marker_sha256,
     }
@@ -1009,37 +1116,149 @@ def _transactional_pointer_switch(
     try:
         _verify_data_pointer_target(
             install.parent,
-            dict(data_document) if data_document is not None else None,
+            desired_data,
             expected_marker_sha256=expected_marker_sha256,
         )
-        _publish_optional_json(active_data_path, data_document)
+        if (
+            _read_file_bytes(active_release_path) != release_before
+            or _read_file_bytes(active_data_path) != data_before
+        ):
+            raise ReleaseManagerError("pointer transaction compare-and-swap precondition failed")
+        _publish_optional_json(active_data_path, desired_data)
         transaction["phase"] = "DATA_PUBLISHED"
         atomic_write_json(transaction_path, transaction)
-        atomic_write_json(active_release_path, release_document)
-        transaction["phase"] = "COMMITTED"
+        if _read_file_bytes(active_release_path) != release_before:
+            raise ReleaseManagerError("active release changed during pointer transaction")
+        atomic_write_json(active_release_path, desired_release)
         if _read_optional_json(active_data_path) != (
-            dict(data_document) if data_document is not None else None
+            desired_data
         ):
             raise ReleaseManagerError("active data pointer did not publish exactly")
-        if _read_optional_json(active_release_path) != dict(release_document):
+        if _read_optional_json(active_release_path) != desired_release:
             raise ReleaseManagerError("active release pointer did not publish exactly")
-        if data_document is not None and sha256_file(active_data_path) != _json_document_sha256(data_document):
+        if desired_data is not None and sha256_file(active_data_path) != _json_document_sha256(desired_data):
             raise ReleaseManagerError("active data pointer hash changed during publication")
         _verify_data_pointer_target(
             install.parent,
-            dict(data_document) if data_document is not None else None,
+            desired_data,
             expected_marker_sha256=expected_marker_sha256,
         )
+        transaction["phase"] = "COMMITTED"
         atomic_write_json(transaction_path, transaction)
+        return desired_release
     except BaseException as exc:
-        _restore_file(active_data_path, data_before)
-        _restore_file(active_release_path, release_before)
-        transaction["phase"] = "ROLLED_BACK"
+        data_restored = _cas_restore_pointer(
+            active_data_path,
+            expected=desired_data,
+            previous=data_before_document,
+            other_path=active_release_path,
+            other_expected=desired_release,
+            other_previous=release_before_document,
+        )
+        release_restored = _cas_restore_pointer(
+            active_release_path,
+            expected=desired_release,
+            previous=release_before_document,
+        )
+        fully_before = bool(
+            _read_optional_json(active_data_path) == data_before_document
+            and _read_optional_json(active_release_path) == release_before_document
+        )
+        transaction["phase"] = "ROLLED_BACK" if fully_before else "CONFLICTED"
+        transaction["data_restored"] = data_restored
+        transaction["release_restored"] = release_restored
         transaction["error_type"] = type(exc).__name__
         atomic_write_json(transaction_path, transaction)
-        if _read_file_bytes(active_data_path) != data_before or _read_file_bytes(active_release_path) != release_before:
-            raise ReleaseManagerError("pointer transaction failed and could not restore its snapshots") from exc
         raise
+
+
+def _recover_pointer_transactions(install: Path) -> None:
+    transactions = install / "transactions"
+    if not transactions.is_dir():
+        return
+    terminal = {"COMMITTED", "ROLLED_BACK", "RECOVERED", "CONFLICTED"}
+    for path in sorted(transactions.glob("*.json"), key=lambda item: item.name.casefold()):
+        transaction = _json_file(path, "pointer transaction")
+        phase = str(transaction.get("phase") or "")
+        if phase in terminal:
+            continue
+        if transaction.get("schema") != "guandan.pointer-transaction/2":
+            raise ReleaseManagerError(
+                "an incomplete legacy pointer transaction requires manual recovery"
+            )
+        release_before = _optional_document(transaction.get("release_before"))
+        data_before = _optional_document(transaction.get("data_before"))
+        release_after = _optional_document(transaction.get("release_after"))
+        data_after = _optional_document(transaction.get("data_after"))
+        release_path = install / _ACTIVE_FILE
+        data_path = _data_pointer_path(install.parent)
+        current_release = _read_optional_json(release_path)
+        current_data = _read_optional_json(data_path)
+        if current_release == release_after and current_data == data_after:
+            transaction["phase"] = "COMMITTED"
+        elif current_release == release_before and current_data == data_after:
+            _cas_restore_pointer(
+                data_path,
+                expected=data_after,
+                previous=data_before,
+                other_path=release_path,
+                other_expected=release_after,
+                other_previous=release_before,
+            )
+            transaction["phase"] = (
+                "RECOVERED"
+                if _read_optional_json(release_path) == release_before
+                and _read_optional_json(data_path) == data_before
+                else "CONFLICTED"
+            )
+        elif current_release == release_before and current_data == data_before:
+            transaction["phase"] = "RECOVERED"
+        else:
+            transaction["phase"] = "CONFLICTED"
+        transaction["recovered_at"] = datetime.now(UTC).isoformat()
+        atomic_write_json(path, transaction)
+
+
+def _cas_restore_pointer(
+    path: Path,
+    *,
+    expected: Mapping[str, object] | None,
+    previous: Mapping[str, object] | None,
+    other_path: Path | None = None,
+    other_expected: Mapping[str, object] | None = None,
+    other_previous: Mapping[str, object] | None = None,
+) -> bool:
+    current = _read_optional_json(path)
+    if current == previous:
+        return True
+    if current != expected:
+        return False
+    if other_path is not None:
+        other = _read_optional_json(other_path)
+        if other not in (other_expected, other_previous):
+            return False
+    _publish_optional_json(path, previous)
+    return _read_optional_json(path) == previous
+
+
+def _optional_document(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ReleaseManagerError("pointer transaction snapshot is invalid")
+    return dict(value)
+
+
+def _json_from_bytes(value: bytes | None, label: str) -> dict[str, object] | None:
+    if value is None:
+        return None
+    try:
+        document = json.loads(value.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseManagerError(f"{label} is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise ReleaseManagerError(f"{label} must be a JSON object")
+    return document
 
 
 def _verify_data_pointer_target(
@@ -1193,6 +1412,29 @@ def _read_active(install: Path) -> dict[str, object] | None:
     if value.get("schema") != ACTIVE_RELEASE_SCHEMA:
         raise ReleaseManagerError("active release pointer schema is invalid")
     _installed_by_id(install, str(value.get("release_id")))
+    embedded_data = value.get("data_pointer")
+    if embedded_data is not None and not isinstance(embedded_data, Mapping):
+        raise ReleaseManagerError("active release embeds an invalid data pointer")
+    actual_data = _read_optional_json(_data_pointer_path(install.parent))
+    expected_data = dict(embedded_data) if isinstance(embedded_data, Mapping) else None
+    # A separately prepared migration may publish the next generation before
+    # the matching release activation. Pointer transactions themselves remain
+    # strict CAS operations; this read preserves that intentional hand-off.
+    pointers_match = actual_data == expected_data
+    transaction_id = value.get("transaction_id")
+    data_transaction_id = (
+        expected_data.get("transaction_id") if expected_data is not None else None
+    )
+    if pointers_match and (transaction_id is not None or data_transaction_id is not None):
+        if (
+            not isinstance(transaction_id, str)
+            or not transaction_id
+            or (
+                expected_data is not None
+                and data_transaction_id != transaction_id
+            )
+        ):
+            raise ReleaseManagerError("active release/data transaction identity differs")
     return value
 
 

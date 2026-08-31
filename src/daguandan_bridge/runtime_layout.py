@@ -11,6 +11,7 @@ libraries are imported.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -19,10 +20,12 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import socket
 import stat
 import sys
+import threading
 import time
-from typing import Iterable, Mapping
+from typing import BinaryIO, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 
@@ -55,6 +58,203 @@ _WINDOWS_RESERVED_NAMES = {
 
 class RuntimeLayoutError(RuntimeError):
     """The runtime storage layout cannot be trusted or initialized safely."""
+
+
+@dataclass
+class _LocalStorageLock:
+    mutex: threading.RLock
+    depth: int = 0
+    owner_thread: int | None = None
+    handle: BinaryIO | None = None
+    owner: dict[str, object] | None = None
+
+
+_STORAGE_LOCKS_GUARD = threading.Lock()
+_STORAGE_LOCKS: dict[str, _LocalStorageLock] = {}
+
+
+def runtime_storage_lock_path(runtime_root: Path | str) -> Path:
+    """Return the sibling OS-lock file for one absolute runtime root.
+
+    Keeping the lock beside (not inside) the runtime root lets first-time
+    ownership checks remain strict while still serializing root creation.
+    """
+
+    root = _absolute_path_without_resolving(Path(runtime_root).expanduser())
+    if not root.is_absolute():
+        raise RuntimeLayoutError("runtime lock root must be absolute")
+    identity = hashlib.sha256(_path_identity(root).encode("utf-8")).hexdigest()[:24]
+    return root.parent / f".daguandan-{identity}.storage.lock"
+
+
+def runtime_storage_lock_owner_path(runtime_root: Path | str) -> Path:
+    lock = runtime_storage_lock_path(runtime_root)
+    return lock.with_suffix(lock.suffix + ".owner.json")
+
+
+@contextmanager
+def runtime_storage_lock(
+    runtime_root: Path | str,
+    *,
+    operation: str,
+    timeout_seconds: float = 30.0,
+) -> Iterator[dict[str, object]]:
+    """Serialize storage/release transactions across threads and processes."""
+
+    if not isinstance(operation, str) or not operation.strip():
+        raise RuntimeLayoutError("runtime lock operation is required")
+    if timeout_seconds <= 0:
+        raise RuntimeLayoutError("runtime lock timeout must be positive")
+    lock_path = runtime_storage_lock_path(runtime_root)
+    owner_path = runtime_storage_lock_owner_path(runtime_root)
+    key = _path_identity(lock_path)
+    with _STORAGE_LOCKS_GUARD:
+        state = _STORAGE_LOCKS.setdefault(
+            key, _LocalStorageLock(mutex=threading.RLock())
+        )
+    deadline = time.monotonic() + float(timeout_seconds)
+    if not state.mutex.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        owner = _read_storage_lock_owner(owner_path)
+        raise RuntimeLayoutError(_lock_timeout_message(operation, owner))
+    current_thread = threading.get_ident()
+    outermost = state.depth == 0
+    try:
+        if not outermost:
+            if state.owner_thread != current_thread or state.owner is None:
+                raise RuntimeLayoutError("runtime lock reentrancy state is invalid")
+            state.depth += 1
+            try:
+                yield dict(state.owner)
+            finally:
+                state.depth -= 1
+            return
+
+        handle = _open_storage_lock(lock_path)
+        while True:
+            try:
+                _try_lock_file(handle)
+                break
+            except (OSError, BlockingIOError):
+                if time.monotonic() >= deadline:
+                    owner = _read_storage_lock_owner(owner_path)
+                    handle.close()
+                    raise RuntimeLayoutError(_lock_timeout_message(operation, owner))
+                time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+        owner = {
+            "schema": "guandan.runtime-storage-lock/1",
+            "state": "held",
+            "operation": operation.strip(),
+            "pid": os.getpid(),
+            "thread_id": current_thread,
+            "host": socket.gethostname(),
+            "token": uuid4().hex,
+            "acquired_at_utc": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ),
+        }
+        _write_storage_lock_owner(owner_path, owner)
+        state.depth = 1
+        state.owner_thread = current_thread
+        state.handle = handle
+        state.owner = owner
+        try:
+            yield dict(owner)
+        finally:
+            released = {
+                **owner,
+                "state": "released",
+                "released_at_utc": datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                ),
+            }
+            try:
+                _write_storage_lock_owner(owner_path, released)
+            finally:
+                _unlock_file(handle)
+                handle.close()
+                state.depth = 0
+                state.owner_thread = None
+                state.handle = None
+                state.owner = None
+    finally:
+        state.mutex.release()
+
+
+def _open_storage_lock(path: Path) -> BinaryIO:
+    _assert_no_reparse_chain(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_no_reparse_chain(path.parent)
+    try:
+        with path.open("xb") as created:
+            created.write(b"0")
+            created.flush()
+            os.fsync(created.fileno())
+    except FileExistsError:
+        pass
+    if _path_is_reparse(path) or not path.is_file():
+        raise RuntimeLayoutError("runtime lock path is unsafe")
+    return path.open("r+b", buffering=0)
+
+
+def _try_lock_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_storage_lock_owner(path: Path, owner: Mapping[str, object]) -> None:
+    payload = (
+        json.dumps(dict(owner), ensure_ascii=False, sort_keys=True, allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_storage_lock_owner(path: Path) -> dict[str, object] | None:
+    try:
+        with path.open("rb") as handle:
+            value = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _lock_timeout_message(
+    operation: str, owner: Mapping[str, object] | None
+) -> str:
+    if not owner:
+        return f"runtime storage lock timed out for {operation}; owner unavailable"
+    return (
+        f"runtime storage lock timed out for {operation}; "
+        f"owner operation={owner.get('operation')!s} pid={owner.get('pid')!s} "
+        f"host={owner.get('host')!s} acquired={owner.get('acquired_at_utc')!s}"
+    )
 
 
 @dataclass(frozen=True)
@@ -220,10 +420,19 @@ def resolve_runtime_layout(
 def ensure_runtime_layout(layout: RuntimeLayout | None = None) -> RuntimeLayout:
     """Atomically seed and validate the writable generation for a frozen app."""
 
-    selected = prepare_runtime_layout(layout)
-    if selected.frozen:
+    selected = layout or resolve_runtime_layout()
+    if not selected.frozen:
+        return selected
+    with runtime_storage_lock(
+        selected.runtime_root,
+        operation="ensure-runtime-layout",
+        timeout_seconds=120.0,
+    ):
+        if layout is None:
+            selected = resolve_runtime_layout()
+        selected = _prepare_runtime_layout_locked(selected)
         _write_active_generation(selected, selected.generation_id)
-    return selected
+        return selected
 
 
 def prepare_runtime_layout(layout: RuntimeLayout | None = None) -> RuntimeLayout:
@@ -232,6 +441,17 @@ def prepare_runtime_layout(layout: RuntimeLayout | None = None) -> RuntimeLayout
     selected = layout or resolve_runtime_layout()
     if not selected.frozen:
         return selected
+    with runtime_storage_lock(
+        selected.runtime_root,
+        operation="prepare-runtime-layout",
+        timeout_seconds=120.0,
+    ):
+        if layout is None:
+            selected = resolve_runtime_layout()
+        return _prepare_runtime_layout_locked(selected)
+
+
+def _prepare_runtime_layout_locked(selected: RuntimeLayout) -> RuntimeLayout:
     if selected.manifest_status != "identified":
         detail = selected.manifest_error or "build manifest is unavailable"
         raise RuntimeLayoutError(f"cannot seed user data: {detail}")
@@ -277,10 +497,15 @@ def layout_for_generation(layout: RuntimeLayout, generation_id: str) -> RuntimeL
 def activate_generation(layout: RuntimeLayout, generation_id: str) -> RuntimeLayout:
     """Validate and atomically select an already-created generation."""
 
-    selected = layout_for_generation(layout, generation_id)
-    _validate_generation(selected.generation_root, selected)
-    _write_active_generation(selected, selected.generation_id)
-    return selected
+    with runtime_storage_lock(
+        layout.runtime_root,
+        operation="activate-data-generation",
+        timeout_seconds=120.0,
+    ):
+        selected = layout_for_generation(layout, generation_id)
+        _validate_generation(selected.generation_root, selected)
+        _write_active_generation(selected, selected.generation_id)
+        return selected
 
 
 def seed_entries(layout: RuntimeLayout) -> tuple[dict[str, object], ...]:
