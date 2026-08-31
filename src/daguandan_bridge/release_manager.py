@@ -33,6 +33,7 @@ from .runtime_layout import (
     GENERATION_SCHEMA,
     RUNTIME_ROOT_MARKER,
     RUNTIME_ROOT_SCHEMA,
+    RuntimeLayoutError,
     assert_safe_tree,
     atomic_write_json,
     prepare_runtime_layout,
@@ -56,6 +57,16 @@ _HISTORY_FILE = "history.jsonl"
 _BASELINE_FILE = "baseline.json"
 _MAX_ARCHIVE_FILES = 100_000
 _MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
+LEGACY_MUTABLE_PREFIXES = (
+    "logs/**",
+    "reports/**",
+    "diagnostics/**",
+    "data/profiles/*/sessions/**",
+    "data/profiles/*/screenshots/**",
+    "data/profiles/*/diagnostics/**",
+    "data/profiles/*/truth_log_batch_reports/**",
+    "data/profiles/*/models/benchmarks/**",
+)
 
 
 class ReleaseManagerError(RuntimeError):
@@ -340,6 +351,7 @@ def _register_legacy_baseline_locked(
                     "artifact_file_count": auth["artifact"]["file_count"],
                     "artifact_bytes": auth["artifact"]["bytes"],
                     "artifact_files": auth["artifact"]["files"],
+                    "legacy_mutable_prefixes": list(LEGACY_MUTABLE_PREFIXES),
                     "baseline_auth_sha256": sha256_file(auth_path),
                     "build_identity_sha256": auth["build_identity_sha256"],
                     "baseline": True,
@@ -743,6 +755,7 @@ def _load_installed_receipt(version_root: Path) -> InstalledRelease:
             raise ReleaseManagerError("installed legacy baseline artifact tree changed")
         if not installed.baseline or not installed.baseline_auth_sha256:
             raise ReleaseManagerError("installed legacy baseline preapproval is incomplete")
+        _verify_legacy_run_copy(installed, receipt)
     else:
         raise ReleaseManagerError("installed release receipt schema is unsupported")
     return installed
@@ -813,6 +826,90 @@ def _verify_install_receipt_artifacts(
             raise ReleaseManagerError(f"installed {label} is unavailable")
         if sha256_file(path) != receipt.get(hash_field):
             raise ReleaseManagerError(f"installed {label} hash mismatch")
+
+
+def _verify_legacy_run_copy(
+    release: InstalledRelease,
+    receipt: Mapping[str, object],
+) -> dict[str, object]:
+    """Verify immutable legacy run files while permitting narrow runtime output roots."""
+
+    configured_prefixes = receipt.get("legacy_mutable_prefixes")
+    if configured_prefixes != list(LEGACY_MUTABLE_PREFIXES):
+        raise ReleaseManagerError("legacy mutable path policy is missing or changed")
+    records = receipt.get("artifact_files")
+    if not isinstance(records, list):
+        raise ReleaseManagerError("legacy artifact file inventory is invalid")
+
+    declared: dict[str, tuple[str, int, str]] = {}
+    for raw_record in records:
+        if not isinstance(raw_record, Mapping):
+            raise ReleaseManagerError("legacy artifact file inventory is invalid")
+        relative = _safe_relative(str(raw_record.get("path") or ""))
+        size = raw_record.get("bytes")
+        digest = str(raw_record.get("sha256") or "").lower()
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ReleaseManagerError("legacy artifact file inventory is invalid")
+        key = relative.casefold()
+        if key in declared:
+            raise ReleaseManagerError("legacy artifact file inventory contains a duplicate path")
+        declared[key] = (relative, size, digest)
+
+    run_root = release.executable.parent
+    _assert_below(run_root, release.version_root, "legacy run copy")
+    try:
+        actual_files = safe_tree_files(run_root)
+    except (OSError, RuntimeLayoutError) as exc:
+        raise ReleaseManagerError("legacy run copy cannot be enumerated safely") from exc
+
+    checked = 0
+    for relative, expected_size, expected_digest in declared.values():
+        if _is_legacy_mutable_path(relative):
+            continue
+        target = run_root.joinpath(*PurePosixPath(relative).parts)
+        _assert_below(target, run_root, "legacy run file")
+        if not target.is_file() or _is_link_or_reparse(target):
+            raise ReleaseManagerError(f"legacy run copy file is missing: {relative}")
+        if target.stat().st_size != expected_size:
+            raise ReleaseManagerError(f"legacy run copy file size changed: {relative}")
+        if sha256_file(target) != expected_digest:
+            raise ReleaseManagerError(f"legacy run copy file hash changed: {relative}")
+        checked += 1
+
+    for path in actual_files:
+        relative = path.relative_to(run_root).as_posix()
+        if _is_legacy_mutable_path(relative):
+            continue
+        if relative.casefold() not in declared:
+            raise ReleaseManagerError(
+                f"legacy run copy contains an undeclared immutable file: {relative}"
+            )
+    return {
+        "checked_immutable_files": checked,
+        "mutable_prefixes": list(LEGACY_MUTABLE_PREFIXES),
+    }
+
+
+def _is_legacy_mutable_path(relative: str) -> bool:
+    parts = tuple(part.casefold() for part in PurePosixPath(relative).parts)
+    if len(parts) >= 2 and parts[0] in {"logs", "reports", "diagnostics"}:
+        return True
+    if len(parts) < 5 or parts[:2] != ("data", "profiles"):
+        return False
+    if parts[3] in {
+        "sessions",
+        "screenshots",
+        "diagnostics",
+        "truth_log_batch_reports",
+    }:
+        return True
+    return len(parts) >= 6 and parts[3:5] == ("models", "benchmarks")
 
 
 def _installed_by_id(install: Path, release_id: str) -> InstalledRelease:
@@ -942,6 +1039,10 @@ def _run_preauthorized_legacy_doctor(
         and artifact.get("tree_sha256") == release.artifact_tree_sha256
     )
     auth_present = bool(release.baseline_auth_sha256)
+    run_copy = _verify_legacy_run_copy(
+        release,
+        _json_file(release.version_root / "install_receipt.json", "install receipt"),
+    )
     report = {
         "schema": "guandan.doctor/1",
         "overall_status": "PASS" if tree_matches and auth_present else "FAIL",
@@ -967,6 +1068,12 @@ def _run_preauthorized_legacy_doctor(
                     "actual_tree_sha256": artifact.get("tree_sha256"),
                 },
             },
+            {
+                "id": "LEGACY-RUN-COPY-INTEGRITY",
+                "status": "PASS",
+                "summary": "Immutable files in the mutable legacy run copy are intact",
+                "evidence": run_copy,
+            },
         ],
     }
     atomic_write_json(output_path, report)
@@ -979,7 +1086,11 @@ def _validate_legacy_doctor(
 ) -> dict[str, object]:
     checks = report.get("checks") if isinstance(report.get("checks"), list) else []
     ids = [item.get("id") for item in checks if isinstance(item, Mapping)]
-    expected = {"LEGACY-BASELINE-PREAUTH", "LEGACY-ARTIFACT-INTEGRITY"}
+    expected = {
+        "LEGACY-BASELINE-PREAUTH",
+        "LEGACY-ARTIFACT-INTEGRITY",
+        "LEGACY-RUN-COPY-INTEGRITY",
+    }
     passed = bool(
         release.receipt_schema == LEGACY_BASELINE_SCHEMA
         and release.baseline
@@ -987,7 +1098,7 @@ def _validate_legacy_doctor(
         and report.get("schema") == "guandan.doctor/1"
         and report.get("overall_status") == "PASS"
         and report.get("legacy_preauthorized") is True
-        and len(ids) == len(set(ids)) == 2
+        and len(ids) == len(set(ids)) == 3
         and set(ids) == expected
         and all(
             isinstance(item, Mapping) and item.get("status") == "PASS"

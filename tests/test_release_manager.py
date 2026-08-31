@@ -131,6 +131,9 @@ def _legacy_bundle(tmp_path: Path) -> tuple[Path, Path]:
     bundle.mkdir(parents=True)
     (bundle / "DaguandanAssistant.exe").write_bytes(b"known-stable-exe")
     (bundle / "stable-resource.bin").write_bytes(b"known-stable-resource")
+    internal = bundle / "_internal"
+    internal.mkdir()
+    (internal / "runtime.dll").write_bytes(b"known-stable-runtime")
     auth = tmp_path / "external" / "baseline-auth.json"
     write_baseline_auth(bundle, auth, approved=True)
     return bundle, auth
@@ -451,6 +454,71 @@ def test_legacy_baseline_uses_mutable_run_copy_without_mutating_approved_artifac
     assert _snapshot_tree(bundle) == approved_before
     assert _snapshot_tree(approved_root) == approved_before
     assert reloaded["baseline"] is True
+    assert receipt["legacy_mutable_prefixes"] == list(
+        release_manager_module.LEGACY_MUTABLE_PREFIXES
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative", "action"),
+    [
+        ("stable-resource.bin", "change"),
+        ("_internal/runtime.dll", "change"),
+        ("_internal/runtime.dll", "missing"),
+        ("injected-resource.bin", "extra"),
+    ],
+)
+def test_legacy_run_copy_integrity_blocks_status_and_activation(
+    tmp_path: Path,
+    relative: str,
+    action: str,
+):
+    bundle, auth = _legacy_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    baseline = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+    target = baseline.executable.parent / Path(relative)
+    if action == "change":
+        target.write_bytes(b"x" * target.stat().st_size)
+    elif action == "missing":
+        target.unlink()
+    else:
+        target.write_bytes(b"injected")
+
+    status = release_status(runtime)
+    version = next(item for item in status["versions"] if item["release_id"] == baseline.release_id)
+    assert version["status"] == "INVALID"
+    with pytest.raises(ReleaseManagerError, match="legacy run copy"):
+        activate_release(baseline.release_id, runtime_root=runtime)
+
+
+def test_rollback_rejects_tampered_legacy_run_copy_and_keeps_candidate_active(tmp_path):
+    bundle, auth = _legacy_bundle(tmp_path)
+    candidate_files = _release(tmp_path, "candidate", commit="8" * 40)
+    runtime = tmp_path / "runtime"
+    baseline = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+    candidate = install_release(
+        candidate_files[0],
+        release_record_path=candidate_files[1],
+        checksum_path=candidate_files[2],
+        runtime_root=runtime,
+    )
+    activate_release(baseline.release_id, runtime_root=runtime)
+    activate_release(candidate.release_id, runtime_root=runtime, doctor_runner=_doctor)
+    (baseline.executable.parent / "stable-resource.bin").write_bytes(b"tampered")
+
+    with pytest.raises(ReleaseManagerError, match="legacy run copy"):
+        rollback_release(runtime_root=runtime)
+
+    active = json.loads((runtime / "install" / "active.json").read_text(encoding="utf-8"))
+    assert active["release_id"] == candidate.release_id
 
 
 def _snapshot_tree(root: Path) -> dict[str, str]:
@@ -479,6 +547,7 @@ def test_preauthorized_legacy_activation_uses_nonempty_hash_bound_doctor(tmp_pat
     assert {item["id"] for item in report["checks"]} == {
         "LEGACY-BASELINE-PREAUTH",
         "LEGACY-ARTIFACT-INTEGRITY",
+        "LEGACY-RUN-COPY-INTEGRITY",
     }
 
 
@@ -700,6 +769,57 @@ def test_launcher_verifies_full_modern_manifest_native_audit_and_data_pointer(tm
     failed = _run_launcher(runtime)
     assert failed.returncode != 0
     assert "changed" in (failed.stdout + failed.stderr)
+
+
+@pytest.mark.parametrize(
+    ("relative", "action"),
+    [
+        ("stable-resource.bin", "change"),
+        ("_internal/runtime.dll", "change"),
+        ("_internal/runtime.dll", "missing"),
+        ("injected-resource.bin", "extra"),
+    ],
+)
+def test_launcher_allows_legacy_session_output_but_rejects_immutable_run_tamper(
+    tmp_path: Path,
+    relative: str,
+    action: str,
+):
+    bundle, auth = _legacy_bundle(tmp_path)
+    runtime = tmp_path / "runtime"
+    baseline = register_legacy_baseline(
+        bundle,
+        baseline_auth_path=auth,
+        runtime_root=runtime,
+    )
+    activate_release(baseline.release_id, runtime_root=runtime)
+    session = (
+        baseline.executable.parent
+        / "data"
+        / "profiles"
+        / "tencent_daguandan"
+        / "sessions"
+        / "game-test"
+        / "manifest.json"
+    )
+    session.parent.mkdir(parents=True)
+    session.write_text('{"schema":"test"}\n', encoding="utf-8")
+
+    passed = _run_launcher(runtime)
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+
+    target = baseline.executable.parent / Path(relative)
+    if action == "change":
+        target.write_bytes(b"x" * target.stat().st_size)
+    elif action == "missing":
+        target.unlink()
+    else:
+        target.write_bytes(b"injected")
+    failed = _run_launcher(runtime)
+
+    assert failed.returncode != 0
+    output = (failed.stdout + failed.stderr).lower()
+    assert any(token in output for token in ("changed", "missing", "undeclared"))
 
 
 def test_launcher_rejects_unsafe_version_segment_before_path_resolution(tmp_path):

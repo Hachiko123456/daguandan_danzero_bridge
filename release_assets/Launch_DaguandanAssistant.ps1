@@ -9,6 +9,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$legacyMutablePrefixes = @(
+    "logs/**",
+    "reports/**",
+    "diagnostics/**",
+    "data/profiles/*/sessions/**",
+    "data/profiles/*/screenshots/**",
+    "data/profiles/*/diagnostics/**",
+    "data/profiles/*/truth_log_batch_reports/**",
+    "data/profiles/*/models/benchmarks/**"
+)
 
 function Get-ExistingPathAttributes {
     param([Parameter(Mandatory = $true)][string] $LiteralPath)
@@ -124,6 +134,17 @@ function Get-RelativePortablePath {
     $rootUri = [System.Uri]::new($rootFull)
     $pathUri = [System.Uri]::new($pathFull)
     return [System.Uri]::UnescapeDataString($rootUri.MakeRelativeUri($pathUri).ToString()).Replace('\', '/')
+}
+
+function Test-LegacyMutablePath {
+    param([Parameter(Mandatory = $true)][string] $Relative)
+    $portable = $Relative.Replace('\', '/')
+    if ($portable -match '^(?i:logs|reports|diagnostics)/.+') { return $true }
+    if ($portable -match '^(?i:data/profiles/[^/]+/(sessions|screenshots|diagnostics|truth_log_batch_reports))/.+') {
+        return $true
+    }
+    if ($portable -match '^(?i:data/profiles/[^/]+/models/benchmarks)/.+') { return $true }
+    return $false
 }
 
 function Assert-ManifestFile {
@@ -250,6 +271,32 @@ elseif ($receipt.schema -eq "guandan.legacy-baseline/1") {
     foreach ($file in [System.IO.Directory]::EnumerateFiles($approvedRoot, '*', [System.IO.SearchOption]::AllDirectories)) {
         $relative = Get-RelativePortablePath -Root $approvedRoot -Path $file
         if (-not $declared.Contains($relative)) { throw "The legacy baseline contains an undeclared file: $relative" }
+    }
+    $mutableProperty = $receipt.PSObject.Properties['legacy_mutable_prefixes']
+    if ($null -eq $mutableProperty) { throw "The legacy mutable path policy is missing." }
+    $receiptMutablePrefixes = @($mutableProperty.Value | ForEach-Object { [string] $_ })
+    if ($receiptMutablePrefixes.Count -ne $legacyMutablePrefixes.Count) {
+        throw "The legacy mutable path policy changed."
+    }
+    for ($index = 0; $index -lt $legacyMutablePrefixes.Count; $index++) {
+        if (-not [string]::Equals(
+            $receiptMutablePrefixes[$index],
+            $legacyMutablePrefixes[$index],
+            [System.StringComparison]::Ordinal
+        )) { throw "The legacy mutable path policy changed." }
+    }
+    $runDeclared = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($record in $receipt.artifact_files) {
+        $relative = [string] $record.path
+        if (Test-LegacyMutablePath -Relative $relative) { continue }
+        Assert-ManifestFile -Root $bundleRoot -Record $record -Declared $runDeclared
+    }
+    foreach ($file in [System.IO.Directory]::EnumerateFiles($bundleRoot, '*', [System.IO.SearchOption]::AllDirectories)) {
+        $relative = Get-RelativePortablePath -Root $bundleRoot -Path $file
+        if (Test-LegacyMutablePath -Relative $relative) { continue }
+        if (-not $runDeclared.Contains($relative)) {
+            throw "The legacy run copy contains an undeclared immutable file: $relative"
+        }
     }
 }
 else { throw "The installed release receipt schema is unsupported." }
