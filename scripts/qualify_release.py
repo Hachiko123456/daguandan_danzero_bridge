@@ -500,7 +500,14 @@ class Qualification:
 
     def _install_rollback(self) -> Mapping[str, object]:
         assert self.archive is not None and self.release_record is not None and self.archive_checksum is not None
-        runtime = self.work_root / "install-runtime"
+        # Keep the formal install root as a short unique sibling.  Nesting it
+        # below the already descriptive work-root plus versions/approved/run
+        # can exceed legacy Win32 MAX_PATH while copying the preauthorized
+        # baseline's Qt tree; the product's default LocalAppData root is also
+        # a short sibling-style layout.
+        runtime = self.work_root.parent / f"qi-{uuid4().hex[:10]}"
+        if runtime.exists():
+            raise FileExistsError(f"qualification install root exists: {runtime}")
         baseline = register_legacy_baseline(
             Path(self.args.baseline_bundle),
             baseline_auth_path=Path(self.args.baseline_auth),
@@ -558,6 +565,7 @@ class Qualification:
         )
         return {
             "runtime_root": str(runtime),
+            "runtime_root_is_short_unique_sibling": True,
             "baseline_release": baseline.to_dict(),
             "candidate_release": candidate.to_dict(),
             "active_after_rollback": status,

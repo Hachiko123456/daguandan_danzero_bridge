@@ -110,6 +110,9 @@ def test_formal_rollback_stage_runs_real_legacy_write_and_relaunch_probes():
     assert method.count("_verify_active_launcher(") >= 4
     assert "-VerifyOnly" in method
     assert "timeout_seconds=300.0" in method
+    assert "self.work_root.parent" in method
+    assert "runtime_root_is_short_unique_sibling" in method
+    assert 'self.work_root / "install-runtime"' not in method
 
 
 def test_host_summary_gate_requires_exact_formal_seven_scenario_pass(tmp_path):
