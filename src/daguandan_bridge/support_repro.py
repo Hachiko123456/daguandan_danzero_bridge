@@ -171,6 +171,7 @@ def write_truth_annotation(
     support_zip: Path | str,
     *,
     input_pixel_sha256: str | None = None,
+    input_frame_seq: int | None = None,
     expected_level: str | None = None,
     expected_hand: Sequence[str] | None = None,
 ) -> dict[str, object]:
@@ -187,22 +188,23 @@ def write_truth_annotation(
     frames = _standardized_frames(verified, indexed)
     if not frames:
         raise SupportReproError("truth annotation needs at least one standardized input")
-    if input_pixel_sha256 is None:
-        hashes = sorted({str(item["pixel_sha256"]) for item in frames})
-        if len(hashes) != 1:
-            raise SupportReproError(
-                "truth annotation needs input_pixel_sha256 when support contains multiple distinct inputs"
-            )
-        input_pixel_sha256 = hashes[0]
-    elif input_pixel_sha256 not in {
-        str(item["pixel_sha256"]) for item in frames
-    }:
-        raise SupportReproError("truth input_pixel_sha256 is not in the support sequence")
+    selected = _select_truth_frame(
+        frames,
+        input_pixel_sha256=input_pixel_sha256,
+        input_frame_seq=input_frame_seq,
+        require_selector=True,
+    )
+    binding = _truth_incident_binding(selected)
     sequence_sha256 = _input_sequence_sha256(frames)
     document: dict[str, object] = {
         "schema": REPRO_TRUTH_SCHEMA,
         "support_sha256": verified.sha256,
-        "input_pixel_sha256": input_pixel_sha256,
+        "input_pixel_sha256": selected["pixel_sha256"],
+        "input_frame_seq": selected["frame_seq"],
+        "input_frame_id": binding["frame_id"],
+        "incident_id": binding["incident_id"],
+        "incident_artifact_path": binding["artifact_path"],
+        "incident_artifact_sha256": binding["artifact_sha256"],
         "input_sequence_sha256": sequence_sha256,
         "expected_level": normalized_level,
         "expected_hand": list(normalized_hand) if normalized_hand is not None else None,
@@ -219,6 +221,8 @@ def reproduce_support_bundle(
     truth_path: Path | str | None = None,
     expected_level: str | None = None,
     expected_hand: Sequence[str] | None = None,
+    truth_input_pixel_sha256: str | None = None,
+    truth_input_frame_seq: int | None = None,
     repeats: int = 20,
     recognizer_factory: Callable[[], object] | None = None,
     deterministic: bool = True,
@@ -238,10 +242,11 @@ def reproduce_support_bundle(
         ("repro/repro.json", "repro.json", "evidence/repro.json"),
     )
     image_index = _image_index(verified.payloads, opening)
+    delivery_summary = _delivery_summary(opening)
     frames = _standardized_frames(verified, image_index)
     if not frames:
         raise SupportReproError(
-            "support bundle has no standardized frames; export again with explicit image opt-in"
+            "support bundle has no gate-delivered standardized frames; export again with image and delivery audit opt-in"
         )
     truth = _load_truth(
         truth_path,
@@ -249,6 +254,8 @@ def reproduce_support_bundle(
         frames=frames,
         expected_level=expected_level,
         expected_hand=expected_hand,
+        input_pixel_sha256=truth_input_pixel_sha256,
+        input_frame_seq=truth_input_frame_seq,
     )
     if truth is not None and truth.get("input_pixel_sha256"):
         allowed_hashes = {str(item["pixel_sha256"]) for item in frames}
@@ -311,9 +318,11 @@ def reproduce_support_bundle(
                 "file_sha256": frame["file_sha256"],
                 "pixel_sha256": frame["pixel_sha256"],
                 "shape": list(frame["image"].shape),
+                "analysis": frame.get("analysis"),
             }
             for frame in frames
         ],
+        "frame_delivery": delivery_summary,
         "repeat_count": int(repeats),
         "repeatability": {
             "repeatable": repeatable,
@@ -327,6 +336,13 @@ def reproduce_support_bundle(
                 "sha256": truth.get("_truth_sha256"),
                 "support_sha256": truth.get("support_sha256"),
                 "input_sequence_sha256": truth.get("input_sequence_sha256"),
+                "input_pixel_sha256": truth.get("input_pixel_sha256"),
+                "input_frame_seq": truth.get("input_frame_seq"),
+                "input_frame_id": truth.get("input_frame_id"),
+                "incident_id": truth.get("incident_id"),
+                "incident_artifact_sha256": truth.get(
+                    "incident_artifact_sha256"
+                ),
             }
             if truth is not None
             else None
@@ -367,6 +383,10 @@ def run_child_probe(
     output_path: Path | str,
     *,
     truth_path: Path | str | None = None,
+    expected_level: str | None = None,
+    expected_hand: Sequence[str] | None = None,
+    truth_input_pixel_sha256: str | None = None,
+    truth_input_frame_seq: int | None = None,
     repeats: int = 20,
     deterministic: bool = True,
     timeout_seconds: float = 180.0,
@@ -386,6 +406,14 @@ def run_child_probe(
     )
     if truth_path is not None:
         command.extend(["--repro-truth", str(Path(truth_path))])
+    if expected_level is not None:
+        command.extend(["--expected-level", str(expected_level)])
+    if expected_hand is not None:
+        command.extend(["--expected-hand", ",".join(str(card) for card in expected_hand)])
+    if truth_input_pixel_sha256 is not None:
+        command.extend(["--truth-input-sha256", str(truth_input_pixel_sha256)])
+    if truth_input_frame_seq is not None:
+        command.extend(["--truth-frame-seq", str(int(truth_input_frame_seq))])
     if deterministic:
         command.append("--repro-deterministic")
     try:
@@ -438,6 +466,8 @@ def reproduce_support_suite(
     truth_path: Path | str | None = None,
     expected_level: str | None = None,
     expected_hand: Sequence[str] | None = None,
+    truth_input_pixel_sha256: str | None = None,
+    truth_input_frame_seq: int | None = None,
     repeats: int = 20,
     role: str = "unspecified",
 ) -> dict[str, object]:
@@ -448,6 +478,8 @@ def reproduce_support_suite(
         truth_path=truth_path,
         expected_level=expected_level,
         expected_hand=expected_hand,
+        truth_input_pixel_sha256=truth_input_pixel_sha256,
+        truth_input_frame_seq=truth_input_frame_seq,
         repeats=repeats,
         deterministic=False,
         role=role,
@@ -457,6 +489,8 @@ def reproduce_support_suite(
         truth_path=truth_path,
         expected_level=expected_level,
         expected_hand=expected_hand,
+        truth_input_pixel_sha256=truth_input_pixel_sha256,
+        truth_input_frame_seq=truth_input_frame_seq,
         repeats=repeats,
         deterministic=True,
         role=role,
@@ -466,6 +500,10 @@ def reproduce_support_suite(
             support_zip,
             Path(temporary) / "child-report.json",
             truth_path=truth_path,
+            expected_level=expected_level,
+            expected_hand=expected_hand,
+            truth_input_pixel_sha256=truth_input_pixel_sha256,
+            truth_input_frame_seq=truth_input_frame_seq,
             repeats=repeats,
             deterministic=True,
         )
@@ -487,6 +525,8 @@ def reproduce_support_suite(
         truth_path=truth_path,
         expected_level=expected_level,
         expected_hand=expected_hand,
+        truth_input_pixel_sha256=truth_input_pixel_sha256,
+        truth_input_frame_seq=truth_input_frame_seq,
         repeats=repeats,
         deterministic=True,
         child_probe=child_summary,
@@ -501,6 +541,38 @@ def reproduce_support_suite(
             "matches_ordinary": ordinary_matches,
         },
         "fresh_child_deterministic": child_summary,
+    }
+    failures: list[str] = []
+    if not ordinary_matches:
+        failures.append("ordinary_deterministic_disagree")
+    if str(child_summary.get("status")) != "PASS":
+        failures.append("fresh_child_probe_failed")
+    elif not child_matches:
+        failures.append("fresh_child_deterministic_disagree")
+    normalized_role = str(role)
+    if normalized_role in {"reference", "candidate"} and int(repeats) != 20:
+        failures.append(f"{normalized_role}_repeat_count_not_20")
+    if normalized_role == "candidate" and _nested(
+        final_report, "truth", "correct_runs"
+    ) != 20:
+        failures.append("candidate_not_correct_20_of_20")
+    if normalized_role == "candidate" and _nested(
+        child_report if isinstance(child_report, Mapping) else {},
+        "truth",
+        "correct_runs",
+    ) != 20:
+        failures.append("candidate_child_not_correct_20_of_20")
+    if normalized_role == "reference" and not _nested(
+        final_report, "comparison", "reference_failure_20_of_20"
+    ):
+        failures.append("reference_not_failure_20_of_20")
+    final_report["suite_gate"] = {
+        "status": "PASS" if not failures else "FAIL",
+        "failures": failures,
+        "role": normalized_role,
+        "repeat_count": int(repeats),
+        "ordinary_deterministic_agree": ordinary_matches,
+        "fresh_child_deterministic_agree": child_matches,
     }
     if output_path is not None:
         atomic_write_json(Path(output_path), final_report)
@@ -528,6 +600,16 @@ def _normalized_probe_signature(report: Mapping[str, object]) -> str:
             for item in report.get("outcomes", [])
             if isinstance(item, Mapping)
         ],
+        "repeat_count": report.get("repeat_count"),
+        "repeatability": report.get("repeatability"),
+        "truth": {
+            "correct_runs": _nested(report, "truth", "correct_runs"),
+            "all_correct": _nested(report, "truth", "all_correct"),
+            "input_pixel_sha256": _nested(
+                report, "truth", "input_pixel_sha256"
+            ),
+            "input_frame_seq": _nested(report, "truth", "input_frame_seq"),
+        },
     }
     return hashlib.sha256(_canonical_json(normalized)).hexdigest()
 
@@ -547,6 +629,10 @@ def compare_repro_reports(
     new_inputs = [item.get("pixel_sha256") for item in new.get("inputs", []) if isinstance(item, Mapping)]
     if old_inputs != new_inputs:
         failures.append("input_pixel_hash_mismatch")
+    if _nested(old, "suite_gate", "status") != "PASS":
+        failures.append("reference_suite_not_passed")
+    if _nested(new, "suite_gate", "status") != "PASS":
+        failures.append("candidate_suite_not_passed")
     if old.get("verification_role") != "reference":
         failures.append("reference_role_invalid")
     if new.get("verification_role") != "candidate":
@@ -597,6 +683,8 @@ def _run_sequence(
     stable_seed: object | None = None
     previous_seed: object | None = None
     observed_seed_fingerprints: set[str] = set()
+    oscillated = False
+    anchor_latched = False
     for frame in frames:
         operation = getattr(recognizer, "recognize", None)
         if not callable(operation):
@@ -606,13 +694,31 @@ def _run_sequence(
         trace = trace_reader() if callable(trace_reader) else None
         level = str(getattr(result, "round_level", "") or "")
         hand = tuple(sorted(str(card) for card in getattr(result, "my_hand", ()) or ()))
+        buttons = tuple(str(item) for item in tuple(getattr(result, "buttons", ()) or ()))
+        events = _production_events(result)
         opening_frame = frame.get("opening_frame")
-        anchor_score = (
+        observed_anchor_score = (
             _number(opening_frame.get("anchor_score"), default=-1.0)
             if isinstance(opening_frame, Mapping)
             else None
         )
-        gate = evaluate_opening_gate(result, anchor_score=anchor_score)
+        settlement = bool(set(buttons) & {"change_table", "continue_game"})
+        if settlement:
+            anchor_latched = False
+            previous_seed = None
+            stable_seed = None
+            observed_seed_fingerprints.clear()
+            oscillated = False
+        elif (
+            not anchor_latched
+            and observed_anchor_score is not None
+            and observed_anchor_score >= 0.85
+        ):
+            anchor_latched = True
+        gate = evaluate_opening_gate(
+            result,
+            anchor_score=0.85 if anchor_latched else observed_anchor_score,
+        )
         seed = gate.seed
         if seed is not None and seed == previous_seed:
             stable_seed = seed
@@ -620,18 +726,42 @@ def _run_sequence(
             observed_seed_fingerprints.add(
                 hashlib.sha256(_canonical_json(_opening_seed_document(seed))).hexdigest()
             )
-        previous_seed = seed
+            if len(observed_seed_fingerprints) > 1:
+                oscillated = True
+            previous_seed = seed
+        else:
+            previous_seed = None
+        raw_candidates = (
+            list(trace.get("candidates", []))
+            if isinstance(trace, Mapping)
+            else []
+        )
+        bound_candidates = [
+            {
+                **dict(candidate),
+                "frame_seq": frame["frame_seq"],
+                "input_sha256": frame["pixel_sha256"],
+            }
+            for candidate in raw_candidates
+            if isinstance(candidate, Mapping)
+        ]
+        seed_document = _opening_seed_document(seed) if seed is not None else None
         frame_results.append(
             {
                 "frame_seq": frame["frame_seq"],
+                "input_sha256": frame["pixel_sha256"],
                 "round_level": level or None,
                 "hand": list(hand),
                 "hand_count": len(hand),
+                "lead_player": getattr(result, "lead_player", None),
+                "current_player": getattr(result, "current_player", None),
+                "buttons": list(buttons),
+                "events": events,
+                "anchor_score_observed": observed_anchor_score,
+                "anchor_latched": anchor_latched,
                 "production_gate": "ready" if gate.ready else gate.reason,
-                "candidate_vector": list(trace.get("candidates", []))
-                if isinstance(trace, Mapping)
-                else [],
-                "input_sha256": frame["pixel_sha256"],
+                "production_seed": seed_document,
+                "candidate_vector": bound_candidates,
                 "trace_input_sha256": (
                     trace.get("input_sha256")
                     if isinstance(trace, Mapping)
@@ -641,33 +771,59 @@ def _run_sequence(
         )
     if stable_seed is not None:
         consensus = {"status": "READY", "reason": "two_frame_consensus"}
-    elif len(observed_seed_fingerprints) > 1:
+    elif oscillated:
         consensus = {"status": "FAIL", "reason": "opening_seed_oscillation"}
     else:
         consensus = {"status": "PENDING", "reason": "opening_stability_pending"}
     normalized = {
-        "stable_level": getattr(stable_seed, "round_level", None),
-        "stable_hand": list(getattr(stable_seed, "hand", ())) if stable_seed else None,
+        "stable_seed": (
+            _opening_seed_document(stable_seed) if stable_seed is not None else None
+        ),
         "multi_frame_gate": consensus,
         "frames": [
             {
-                "frame_seq": item["frame_seq"],
-                "round_level": item["round_level"],
-                "hand": item["hand"],
-                "production_gate": item["production_gate"],
+                key: item[key]
+                for key in (
+                    "frame_seq",
+                    "input_sha256",
+                    "round_level",
+                    "hand",
+                    "lead_player",
+                    "current_player",
+                    "buttons",
+                    "events",
+                    "anchor_score_observed",
+                    "anchor_latched",
+                    "production_gate",
+                    "production_seed",
+                )
             }
             for item in frame_results
         ],
     }
     fingerprint = hashlib.sha256(_canonical_json(normalized)).hexdigest()
     final = frame_results[-1]
+    stable_document = normalized["stable_seed"]
     return {
         "repeat_index": repeat_index,
         "output_fingerprint": fingerprint,
-        "stable_level": normalized["stable_level"],
-        "stable_hand": normalized["stable_hand"],
+        "stable_seed": stable_document,
+        "stable_level": (
+            stable_document.get("round_level")
+            if isinstance(stable_document, Mapping)
+            else None
+        ),
+        "stable_hand": (
+            stable_document.get("hand")
+            if isinstance(stable_document, Mapping)
+            else None
+        ),
         "final_level": final["round_level"],
         "final_hand": final["hand"],
+        "final_lead_player": final["lead_player"],
+        "final_current_player": final["current_player"],
+        "final_buttons": final["buttons"],
+        "final_events": final["events"],
         "single_frame_level": final["round_level"],
         "single_frame_hand": final["hand"],
         "single_frame_gate": final["production_gate"],
@@ -691,11 +847,28 @@ def _opening_seed_document(seed: object) -> dict[str, object]:
                 "actor": getattr(opening_action, "actor", None),
                 "cards": list(getattr(opening_action, "cards", ())),
                 "next_player": getattr(opening_action, "next_player", None),
+                "confidence": _number(getattr(opening_action, "confidence", 0.0)),
+                "source": str(getattr(opening_action, "source", "")),
             }
             if opening_action is not None
             else None
         ),
     }
+
+
+def _production_events(result: object) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for event in tuple(getattr(result, "events", ()) or ()):
+        events.append(
+            {
+                "player": getattr(event, "player", None),
+                "cards": [str(card) for card in tuple(getattr(event, "cards", ()) or ())],
+                "is_pass": bool(getattr(event, "is_pass", False)),
+                "confidence": _number(getattr(event, "confidence", 0.0)),
+                "source": str(getattr(event, "source", "")),
+            }
+        )
+    return events
 
 
 def _evaluate_truth(
@@ -712,6 +885,7 @@ def _evaluate_truth(
     expected_level = truth.get("expected_level")
     expected_hand = truth.get("expected_hand")
     target_input = str(truth.get("input_pixel_sha256") or "")
+    target_frame_seq = _safe_int(truth.get("input_frame_seq"))
     expected_hand_normalized = (
         sorted(str(card) for card in expected_hand)
         if isinstance(expected_hand, list)
@@ -724,6 +898,10 @@ def _evaluate_truth(
             for frame in item.get("frame_results", [])
             if isinstance(frame, Mapping)
             and str(frame.get("input_sha256") or "") == target_input
+            and (
+                target_frame_seq is None
+                or _safe_int(frame.get("frame_seq")) == target_frame_seq
+            )
         ]
         target = target_frames[-1] if target_frames else None
         # Correctness is a single-frame truth assertion.  Multi-frame
@@ -748,6 +926,7 @@ def _evaluate_truth(
         "expected_level": expected_level,
         "expected_hand": expected_hand_normalized,
         "input_pixel_sha256": target_input,
+        "input_frame_seq": target_frame_seq,
         "correct_runs": correct,
         "total_runs": len(outcomes),
         "all_correct": correct == len(outcomes),
@@ -761,9 +940,15 @@ def _load_truth(
     frames: Sequence[Mapping[str, object]],
     expected_level: str | None,
     expected_hand: Sequence[str] | None,
+    input_pixel_sha256: str | None,
+    input_frame_seq: int | None,
 ) -> dict[str, object] | None:
     sequence_sha256 = _input_sequence_sha256(frames)
     if path is not None:
+        if input_pixel_sha256 is not None or input_frame_seq is not None:
+            raise SupportReproError(
+                "truth input selectors cannot override an external truth annotation"
+            )
         raw = Path(path).read_bytes()
         document = _json_object(raw, "truth annotation")
         if document.get("schema") != REPRO_TRUTH_SCHEMA:
@@ -773,9 +958,28 @@ def _load_truth(
         if document.get("input_sequence_sha256") != sequence_sha256:
             raise SupportReproError("truth annotation is bound to a different input sequence")
         input_hash = str(document.get("input_pixel_sha256") or "")
-        allowed_hashes = {str(item.get("pixel_sha256") or "") for item in frames}
-        if input_hash not in allowed_hashes:
+        bound_frame_seq = _safe_int(document.get("input_frame_seq"))
+        if bound_frame_seq is None:
+            raise SupportReproError("truth annotation input_frame_seq is missing")
+        selected = _select_truth_frame(
+            frames,
+            input_pixel_sha256=None,
+            input_frame_seq=bound_frame_seq,
+            require_selector=True,
+        )
+        if str(selected.get("pixel_sha256") or "") != input_hash:
             raise SupportReproError("truth annotation is bound to a different input frame")
+        binding = _truth_incident_binding(selected)
+        expected_binding = {
+            "incident_id": document.get("incident_id"),
+            "frame_id": document.get("input_frame_id"),
+            "artifact_path": document.get("incident_artifact_path"),
+            "artifact_sha256": document.get("incident_artifact_sha256"),
+        }
+        if binding != expected_binding:
+            raise SupportReproError(
+                "truth annotation is bound to a different incident artifact"
+            )
         normalized_level, normalized_hand = _validated_expected_truth(
             document.get("expected_level"),
             document.get("expected_hand") if isinstance(document.get("expected_hand"), list) else None,
@@ -792,11 +996,23 @@ def _load_truth(
         expected_level,
         expected_hand,
     )
+    selected = _select_truth_frame(
+        frames,
+        input_pixel_sha256=input_pixel_sha256,
+        input_frame_seq=input_frame_seq,
+        require_selector=False,
+    )
+    binding = _truth_incident_binding(selected)
     document = {
         "schema": REPRO_TRUTH_SCHEMA,
         "support_sha256": support_sha256,
         "input_sequence_sha256": sequence_sha256,
-        "input_pixel_sha256": str(frames[-1].get("pixel_sha256") or ""),
+        "input_pixel_sha256": str(selected.get("pixel_sha256") or ""),
+        "input_frame_seq": selected.get("frame_seq"),
+        "input_frame_id": binding["frame_id"],
+        "incident_id": binding["incident_id"],
+        "incident_artifact_path": binding["artifact_path"],
+        "incident_artifact_sha256": binding["artifact_sha256"],
         "expected_level": normalized_level,
         "expected_hand": list(normalized_hand) if normalized_hand is not None else None,
     }
@@ -829,6 +1045,90 @@ def _validated_expected_truth(
     return level, normalized_hand
 
 
+def _select_truth_frame(
+    frames: Sequence[Mapping[str, object]],
+    *,
+    input_pixel_sha256: str | None,
+    input_frame_seq: int | None,
+    require_selector: bool,
+) -> Mapping[str, object]:
+    if input_pixel_sha256 is not None and input_frame_seq is not None:
+        raise SupportReproError(
+            "truth input selector must use either pixel SHA256 or frame sequence, not both"
+        )
+    if require_selector and input_pixel_sha256 is None and input_frame_seq is None:
+        raise SupportReproError(
+            "truth annotation requires input_pixel_sha256 or input_frame_seq"
+        )
+    if input_frame_seq is not None:
+        if isinstance(input_frame_seq, bool) or int(input_frame_seq) < 0:
+            raise SupportReproError("truth input_frame_seq is invalid")
+        matches = [
+            item
+            for item in frames
+            if int(item.get("frame_seq", -1)) == int(input_frame_seq)
+        ]
+    elif input_pixel_sha256 is not None:
+        digest = str(input_pixel_sha256).lower()
+        if not re_full_sha256(digest):
+            raise SupportReproError("truth input_pixel_sha256 is invalid")
+        matches = [
+            item
+            for item in frames
+            if str(item.get("pixel_sha256") or "") == digest
+        ]
+    else:
+        matches = [frames[-1]] if frames else []
+    if not matches:
+        raise SupportReproError("truth input selector is not in the delivered support sequence")
+    if len(matches) != 1:
+        raise SupportReproError(
+            "truth input selector is ambiguous; use input_frame_seq"
+        )
+    return matches[0]
+
+
+def _truth_incident_binding(frame: Mapping[str, object]) -> dict[str, object]:
+    opening_frame = frame.get("opening_frame")
+    index = frame.get("image_index_entry")
+    incident_id = str(frame.get("incident_id") or "")
+    if not isinstance(opening_frame, Mapping) or not isinstance(index, Mapping):
+        raise SupportReproError("truth input lacks incident frame binding")
+    analysis = opening_frame.get("analysis")
+    if not isinstance(analysis, Mapping) or analysis.get("gate_delivered") is not True:
+        raise SupportReproError("truth input was not delivered to the production opening gate")
+    frame_id = str(opening_frame.get("frame_id") or "")
+    if not incident_id or not frame_id:
+        raise SupportReproError("truth input incident/frame identity is missing")
+    artifacts = opening_frame.get("artifacts")
+    standardized = [
+        item
+        for item in (artifacts if isinstance(artifacts, list) else [])
+        if isinstance(item, Mapping)
+        and str(item.get("kind") or "").casefold() == "standardized"
+    ]
+    if len(standardized) != 1:
+        raise SupportReproError("truth input needs exactly one standardized incident artifact")
+    artifact = standardized[0]
+    artifact_path = str(artifact.get("path") or "")
+    artifact_sha = str(artifact.get("sha256") or "")
+    if (
+        str(artifact.get("frame_id") or "") != frame_id
+        or _safe_int(artifact.get("frame_seq")) != _safe_int(frame.get("frame_seq"))
+        or str(artifact.get("pixel_sha256") or "") != str(frame.get("pixel_sha256") or "")
+        or str(index.get("incident_path") or "") != artifact_path
+        or str(index.get("incident_sha256") or "") != artifact_sha
+        or str(index.get("frame_id") or "") != frame_id
+    ):
+        raise SupportReproError("truth input disagrees with its incident artifact binding")
+    return {
+        "incident_id": incident_id,
+        "frame_id": frame_id,
+        "artifact_path": artifact_path,
+        "artifact_sha256": artifact_sha,
+    }
+
+
 def _input_sequence_sha256(frames: Sequence[Mapping[str, object]]) -> str:
     sequence = [
         {
@@ -852,6 +1152,33 @@ def _image_index(
         if isinstance(entries, list):
             return [dict(item) for item in entries if isinstance(item, Mapping)]
     return []
+
+
+def _delivery_summary(
+    opening: Mapping[str, object] | None,
+) -> dict[str, object]:
+    frames = opening.get("frames") if isinstance(opening, Mapping) else None
+    statuses: Counter[str] = Counter()
+    audited = 0
+    delivered = 0
+    for frame in frames if isinstance(frames, list) else []:
+        if not isinstance(frame, Mapping):
+            continue
+        analysis = frame.get("analysis")
+        if not isinstance(analysis, Mapping):
+            continue
+        audited += 1
+        status = str(analysis.get("status") or "unknown")
+        statuses[status] += 1
+        if analysis.get("gate_delivered") is True:
+            delivered += 1
+    return {
+        "policy": "gate_delivered_only" if audited else "legacy_unverified_all_frames",
+        "audited_frames": audited,
+        "gate_delivered_frames": delivered,
+        "excluded_frames": max(0, audited - delivered),
+        "status_counts": dict(sorted(statuses.items())),
+    }
 
 
 def _standardized_frames(
@@ -908,9 +1235,33 @@ def _standardized_frames(
                 "pixel_sha256": pixel_hash,
                 "image": image,
                 "opening_frame": opening_by_seq.get(int(raw.get("frame_seq", -1))),
+                "analysis": (
+                    dict(opening_by_seq[int(raw.get("frame_seq", -1))].get("analysis"))
+                    if int(raw.get("frame_seq", -1)) in opening_by_seq
+                    and isinstance(
+                        opening_by_seq[int(raw.get("frame_seq", -1))].get("analysis"),
+                        Mapping,
+                    )
+                    else None
+                ),
+                "image_index_entry": dict(raw),
+                "incident_id": (
+                    opening.get("incident_id")
+                    if isinstance(opening, Mapping)
+                    else None
+                ),
             }
         )
-    return sorted(frames, key=lambda item: int(item["frame_seq"]))
+    ordered = sorted(frames, key=lambda item: int(item["frame_seq"]))
+    has_delivery_audit = any(isinstance(item.get("analysis"), Mapping) for item in ordered)
+    if has_delivery_audit:
+        ordered = [
+            item
+            for item in ordered
+            if isinstance(item.get("analysis"), Mapping)
+            and item["analysis"].get("gate_delivered") is True
+        ]
+    return ordered
 
 
 def _decode_image(content: bytes, name: str) -> np.ndarray:

@@ -141,6 +141,16 @@ def main(argv: list[str] | None = None) -> int:
         help="为支持包创建外部真值 annotation。",
     )
     parser.add_argument("--truth-output", type=Path, metavar="JSON")
+    parser.add_argument(
+        "--truth-input-sha256",
+        type=str,
+        help="把独立真值绑定到唯一的标准化输入像素 SHA256。",
+    )
+    parser.add_argument(
+        "--truth-frame-seq",
+        type=int,
+        help="把独立真值绑定到 incident 中实际送达 opening gate 的帧序号。",
+    )
     args = parser.parse_args(argv)
     selected_modes = sum(
         (
@@ -165,6 +175,18 @@ def main(argv: list[str] | None = None) -> int:
         args.doctor or args._doctor_import_probe is not None
     ):
         parser.error("--doctor-output 只能与 --doctor 一起使用")
+    if (
+        args.truth_input_sha256 is not None or args.truth_frame_seq is not None
+    ) and not (
+        args.annotate_repro_truth is not None
+        or args.repro_support is not None
+        or args._repro_probe is not None
+    ):
+        parser.error("真值输入选择器只能用于真值标注或支持包复现")
+    if args.repro_truth is not None and (
+        args.truth_input_sha256 is not None or args.truth_frame_seq is not None
+    ):
+        parser.error("外部 --repro-truth 已包含输入绑定，不能被命令行选择器覆盖")
     if args._doctor_import_probe is not None:
         from daguandan_bridge.doctor import run_import_probe
 
@@ -182,12 +204,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.annotate_repro_truth is not None:
         if args.truth_output is None:
             parser.error("--annotate-repro-truth 必须同时指定 --truth-output")
+        if (args.truth_input_sha256 is None) == (args.truth_frame_seq is None):
+            parser.error(
+                "真值必须且只能指定 --truth-input-sha256 或 --truth-frame-seq 之一"
+            )
         from daguandan_bridge.support_repro import write_truth_annotation
 
         expected_hand = _parse_expected_hand(args.expected_hand)
         truth = write_truth_annotation(
             args.truth_output,
             args.annotate_repro_truth,
+            input_pixel_sha256=args.truth_input_sha256,
+            input_frame_seq=args.truth_frame_seq,
             expected_level=args.expected_level,
             expected_hand=expected_hand,
         )
@@ -208,6 +236,16 @@ def main(argv: list[str] | None = None) -> int:
         support_path = args.repro_support or args._repro_probe
         output_path = args.repro_output
         expected_hand = _parse_expected_hand(args.expected_hand)
+        inline_truth = bool(args.expected_level is not None or expected_hand is not None)
+        if (
+            args._repro_probe is None
+            and args.repro_truth is None
+            and inline_truth
+            and (args.truth_input_sha256 is None) == (args.truth_frame_seq is None)
+        ):
+            parser.error(
+                "命令行独立真值必须且只能指定 --truth-input-sha256 或 --truth-frame-seq 之一"
+            )
         if args._repro_probe is not None:
             report = reproduce_support_bundle(
                 support_path,
@@ -215,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
                 truth_path=args.repro_truth,
                 expected_level=args.expected_level,
                 expected_hand=expected_hand,
+                truth_input_pixel_sha256=args.truth_input_sha256,
+                truth_input_frame_seq=args.truth_frame_seq,
                 repeats=args.repro_repeats,
                 deterministic=True,
                 role=args.repro_role,
@@ -226,19 +266,22 @@ def main(argv: list[str] | None = None) -> int:
                 truth_path=args.repro_truth,
                 expected_level=args.expected_level,
                 expected_hand=expected_hand,
+                truth_input_pixel_sha256=args.truth_input_sha256,
+                truth_input_frame_seq=args.truth_frame_seq,
                 repeats=args.repro_repeats,
                 role=args.repro_role,
             )
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        if args.repro_role == "candidate":
-            truth = report.get("truth")
-            if not isinstance(truth, dict) or truth.get("all_correct") is not True:
-                return 2
-            probes = report.get("probes")
-            if isinstance(probes, dict):
-                child = probes.get("fresh_child_deterministic")
-                if isinstance(child, dict) and child.get("status") != "PASS":
+        if args._repro_probe is None:
+            suite_gate = report.get("suite_gate")
+            if args.repro_role == "candidate":
+                truth = report.get("truth")
+                if not isinstance(truth, dict) or truth.get("all_correct") is not True:
                     return 2
+                if not isinstance(suite_gate, dict) or suite_gate.get("status") != "PASS":
+                    return 2
+            if not isinstance(suite_gate, dict) or suite_gate.get("status") != "PASS":
+                return 2
         return 0
     if args.export_support is not None:
         from daguandan_bridge.support_export import (

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import struct
 import subprocess
+import sys
 from threading import Event
 import time
 from types import SimpleNamespace
@@ -133,6 +134,8 @@ def _evidence_support(
     roi_box: list[int] | None = None,
     standard_images: list[np.ndarray] | None = None,
     roi_saved_box: list[int] | None = None,
+    anchor_scores: list[float | None] | None = None,
+    gate_delivered: list[bool] | None = None,
 ) -> Path:
     payloads: dict[str, bytes] = {}
     frames: list[dict[str, object]] = []
@@ -237,7 +240,34 @@ def _evidence_support(
                 "frame_id": frame_id,
                 "seq": seq,
                 "monotonic_ms": seq * 100,
-                "anchor_score": 0.90,
+                "anchor_score": (
+                    anchor_scores[seq - 1]
+                    if anchor_scores is not None
+                    else 0.90
+                ),
+                "analysis": {
+                    "status": (
+                        "delivered"
+                        if gate_delivered is None or gate_delivered[seq - 1]
+                        else "dropped"
+                    ),
+                    "gate_delivered": (
+                        True if gate_delivered is None else gate_delivered[seq - 1]
+                    ),
+                    "submitted_ms": seq * 100 - 3,
+                    "started_ms": seq * 100 - 2,
+                    "completed_ms": seq * 100 - 1,
+                    "delivered_ms": (
+                        seq * 100
+                        if gate_delivered is None or gate_delivered[seq - 1]
+                        else None
+                    ),
+                    "drop_reason": (
+                        None
+                        if gate_delivered is None or gate_delivered[seq - 1]
+                        else "latest_replaced"
+                    ),
+                },
                 "capture": {
                     "backend": "test",
                     "pixel_max": int(raw.max()),
@@ -248,6 +278,7 @@ def _evidence_support(
         )
     opening = {
         "schema": "guandan.opening-evidence/1",
+        "incident_id": "OPEN-hardening",
         "resource_identity": {"status": "identified", "sha256": "remote"},
         "frames": frames,
     }
@@ -288,6 +319,53 @@ class _PixelRecognizer(_FixedRecognizer):
     def recognize(self, image, *, allow_unknown_suit=False):
         self.level = "7" if int(image[0, 0, 0]) >= 50 else "2"
         return super().recognize(image, allow_unknown_suit=allow_unknown_suit)
+
+
+class _AnchorResetRecognizer(_FixedRecognizer):
+    def recognize(self, image, *, allow_unknown_suit=False):
+        if int(image[0, 0, 0]) == 10:
+            return _result(None, hand=(), buttons=("continue_game",))
+        return super().recognize(image, allow_unknown_suit=allow_unknown_suit)
+
+
+class _LeadRecognizer(_FixedRecognizer):
+    def __init__(self, lead: str, *, action_source: str = "visual") -> None:
+        super().__init__("7")
+        self.lead = lead
+        self.action_source = action_source
+
+    def recognize(self, image, *, allow_unknown_suit=False):
+        del image
+        assert allow_unknown_suit is True
+        return _result(
+            "7",
+            lead_player=self.lead,
+            current_player=self.lead,
+            events=(),
+        )
+
+
+class _ActionRecognizer(_FixedRecognizer):
+    def __init__(self, source: str) -> None:
+        super().__init__("7")
+        self.source = source
+
+    def recognize(self, image, *, allow_unknown_suit=False):
+        del image
+        assert allow_unknown_suit is True
+        event = SimpleNamespace(
+            player="right",
+            cards=("2S",),
+            is_pass=False,
+            confidence=0.91,
+            source=self.source,
+        )
+        return _result(
+            "7",
+            lead_player="right",
+            current_player="opposite",
+            events=(event,),
+        )
 
 
 def test_e001_canonical_resource_fingerprint_is_root_and_order_independent(tmp_path):
@@ -386,6 +464,100 @@ def test_e003_single_frame_truth_is_independent_of_multiframe_gate(tmp_path):
     assert report["outcomes"][0]["multi_frame_gate"]["status"] == "PENDING"
 
 
+def test_review_e002_replay_latches_anchor_and_resets_it_on_settlement(tmp_path):
+    images = [np.full((6, 8, 3), 70, np.uint8) for _ in range(2)]
+    latched = reproduce_support_bundle(
+        _evidence_support(tmp_path, images, anchor_scores=[0.9, 0.1]),
+        repeats=1,
+        recognizer_factory=_FixedRecognizer,
+    )
+    frames = latched["outcomes"][0]["frame_results"]
+    assert frames[0]["anchor_latched"] is True
+    assert frames[1]["anchor_latched"] is True
+    assert frames[1]["production_gate"] == "ready"
+    assert latched["outcomes"][0]["multi_frame_gate"]["status"] == "READY"
+
+    reset_images = [
+        np.full((6, 8, 3), value, np.uint8)
+        for value in (70, 10, 70, 70)
+    ]
+    reset = reproduce_support_bundle(
+        _evidence_support(
+            tmp_path,
+            reset_images,
+            anchor_scores=[0.9, None, 0.1, 0.1],
+        ),
+        repeats=1,
+        recognizer_factory=_AnchorResetRecognizer,
+    )
+    frames = reset["outcomes"][0]["frame_results"]
+    assert frames[1]["production_gate"] == "settlement_screen"
+    assert frames[2]["anchor_latched"] is False
+    assert frames[3]["production_gate"] == "table_anchor_unresolved"
+    assert reset["outcomes"][0]["multi_frame_gate"]["status"] == "PENDING"
+
+
+def test_review_e002_replay_anchor_state_matches_live_gate_sequence(tmp_path):
+    images = [
+        np.full((6, 8, 3), value, np.uint8)
+        for value in (70, 70, 10, 70, 70)
+    ]
+    scores = [0.9, 0.1, None, 0.1, 0.9]
+    support = _evidence_support(tmp_path, images, anchor_scores=scores)
+    outcome = reproduce_support_bundle(
+        support,
+        repeats=1,
+        recognizer_factory=_AnchorResetRecognizer,
+    )["outcomes"][0]
+    replay_gates = [item["production_gate"] for item in outcome["frame_results"]]
+
+    live_gates = []
+    latched = False
+    for image, score in zip(images, scores):
+        result = _AnchorResetRecognizer().recognize(image, allow_unknown_suit=True)
+        if set(getattr(result, "buttons", ())) & {"change_table", "continue_game"}:
+            latched = False
+        elif not latched and score is not None and score >= 0.85:
+            latched = True
+        evaluation = evaluate_opening_gate(
+            result,
+            anchor_score=0.85 if latched else score,
+        )
+        live_gates.append("ready" if evaluation.ready else evaluation.reason)
+    assert replay_gates == live_gates
+
+
+def test_review_e003_replay_excludes_dropped_and_ineligible_frames(tmp_path):
+    images = [
+        np.full((6, 8, 3), value, np.uint8)
+        for value in (70, 20, 70)
+    ]
+    report = reproduce_support_bundle(
+        _evidence_support(
+            tmp_path,
+            images,
+            gate_delivered=[True, False, True],
+        ),
+        repeats=1,
+        recognizer_factory=_PixelRecognizer,
+    )
+    assert [item["frame_seq"] for item in report["inputs"]] == [1, 3]
+    assert report["frame_delivery"]["policy"] == "gate_delivered_only"
+    assert report["frame_delivery"]["excluded_frames"] == 1
+    assert report["outcomes"][0]["multi_frame_gate"]["status"] == "READY"
+
+    with pytest.raises(SupportReproError, match="no gate-delivered"):
+        reproduce_support_bundle(
+            _evidence_support(
+                tmp_path,
+                images[:2],
+                gate_delivered=[False, False],
+            ),
+            repeats=1,
+            recognizer_factory=_PixelRecognizer,
+        )
+
+
 def test_e004_truth_is_legal_sequence_bound_and_hashed(tmp_path):
     support = _evidence_support(tmp_path, [np.full((6, 8, 3), 70, np.uint8)])
     with pytest.raises(SupportReproError, match="non-empty"):
@@ -393,7 +565,12 @@ def test_e004_truth_is_legal_sequence_bound_and_hashed(tmp_path):
     with pytest.raises(SupportReproError, match="legal GuanDan rank"):
         write_truth_annotation(tmp_path / "bad.json", support, expected_level="ZZ")
     truth_path = tmp_path / "truth.json"
-    truth = write_truth_annotation(truth_path, support, expected_level="7")
+    truth = write_truth_annotation(
+        truth_path,
+        support,
+        input_frame_seq=1,
+        expected_level="7",
+    )
     missing_input = dict(truth)
     missing_input.pop("input_pixel_sha256")
     truth_path.write_text(json.dumps(missing_input), encoding="utf-8")
@@ -404,13 +581,23 @@ def test_e004_truth_is_legal_sequence_bound_and_hashed(tmp_path):
             recognizer_factory=_FixedRecognizer,
         )
 
-    truth = write_truth_annotation(truth_path, support, expected_level="7")
+    truth = write_truth_annotation(
+        truth_path,
+        support,
+        input_frame_seq=1,
+        expected_level="7",
+    )
     truth["input_sequence_sha256"] = "0" * 64
     truth_path.write_text(json.dumps(truth), encoding="utf-8")
     with pytest.raises(SupportReproError, match="different input sequence"):
         reproduce_support_bundle(support, truth_path=truth_path, recognizer_factory=_FixedRecognizer)
 
-    truth = write_truth_annotation(truth_path, support, expected_level="7")
+    truth = write_truth_annotation(
+        truth_path,
+        support,
+        input_frame_seq=1,
+        expected_level="7",
+    )
     report = reproduce_support_bundle(
         support,
         truth_path=truth_path,
@@ -419,6 +606,94 @@ def test_e004_truth_is_legal_sequence_bound_and_hashed(tmp_path):
     )
     assert report["truth_identity"]["sha256"] == hashlib.sha256(truth_path.read_bytes()).hexdigest()
     assert report["truth_identity"]["input_sequence_sha256"] == truth["input_sequence_sha256"]
+
+
+def test_review_e008_truth_selector_and_incident_binding_are_mandatory(tmp_path):
+    support = _evidence_support(
+        tmp_path,
+        [np.full((6, 8, 3), 70, np.uint8)] * 2,
+    )
+    with pytest.raises(SupportReproError, match="requires input_pixel_sha256 or input_frame_seq"):
+        write_truth_annotation(
+            tmp_path / "missing-selector.json",
+            support,
+            expected_level="7",
+        )
+    verified = verify_support_archive(support)
+    index = json.loads(verified.payloads["evidence/image_index.json"])
+    standard_hash = next(
+        item["pixel_sha256"]
+        for item in index["entries"]
+        if item["kind"] == "standardized"
+    )
+    with pytest.raises(SupportReproError, match="ambiguous"):
+        write_truth_annotation(
+            tmp_path / "ambiguous.json",
+            support,
+            input_pixel_sha256=standard_hash,
+            expected_level="7",
+        )
+
+    truth_path = tmp_path / "truth-bound.json"
+    write_truth_annotation(
+        truth_path,
+        support,
+        input_frame_seq=1,
+        expected_level="7",
+    )
+    truth = json.loads(truth_path.read_text(encoding="utf-8"))
+    truth["input_frame_id"] = "forged-frame"
+    truth_path.write_text(json.dumps(truth), encoding="utf-8")
+    with pytest.raises(SupportReproError, match="different incident artifact"):
+        reproduce_support_bundle(
+            support,
+            truth_path=truth_path,
+            repeats=1,
+            recognizer_factory=_FixedRecognizer,
+        )
+
+    dropped = _evidence_support(
+        tmp_path,
+        [np.full((6, 8, 3), 70, np.uint8)] * 2,
+        gate_delivered=[True, False],
+    )
+    with pytest.raises(SupportReproError, match="not in the delivered"):
+        write_truth_annotation(
+            tmp_path / "dropped.json",
+            dropped,
+            input_frame_seq=2,
+            expected_level="7",
+        )
+
+
+def test_review_e008_truth_cli_requires_explicit_frame_selector(tmp_path):
+    support = _evidence_support(
+        tmp_path,
+        [np.full((6, 8, 3), 70, np.uint8)],
+    )
+    project_root = Path(__file__).resolve().parents[1]
+    base = [
+        sys.executable,
+        str(project_root / "run.py"),
+        "--annotate-repro-truth",
+        str(support),
+        "--truth-output",
+        str(tmp_path / "truth-cli.json"),
+        "--expected-level",
+        "7",
+    ]
+    missing = subprocess.run(base, cwd=project_root, capture_output=True, check=False)
+    assert missing.returncode == 2
+    selected = subprocess.run(
+        [*base, "--truth-frame-seq", "1"],
+        cwd=project_root,
+        capture_output=True,
+        check=False,
+    )
+    assert selected.returncode == 0, selected.stderr.decode(errors="replace")
+    truth = json.loads((tmp_path / "truth-cli.json").read_text(encoding="utf-8"))
+    assert truth["input_frame_seq"] == 1
+    assert truth["incident_id"] == "OPEN-hardening"
 
 
 def test_e004_fix_gate_requires_roles_same_truth_and_distinct_builds(tmp_path):
@@ -439,12 +714,51 @@ def test_e004_fix_gate_requires_roles_same_truth_and_distinct_builds(tmp_path):
     )
     reference["runner"]["build_id"] = "BUILD-old"
     candidate["runner"]["build_id"] = "BUILD-new"
+    reference["suite_gate"] = {"status": "PASS"}
+    candidate["suite_gate"] = {"status": "PASS"}
     assert compare_repro_reports(reference, candidate)["status"] == "PASS"
     candidate["verification_role"] = "reference"
     candidate["runner"]["build_id"] = "BUILD-old"
     candidate["truth_identity"]["sha256"] = "f" * 64
     failures = compare_repro_reports(reference, candidate)["failures"]
     assert {"candidate_role_invalid", "truth_sha256_mismatch", "reference_candidate_build_not_distinct"}.issubset(failures)
+
+
+def test_review_e004_fingerprint_includes_full_seed_and_production_lead(tmp_path):
+    support = _evidence_support(
+        tmp_path,
+        [np.full((6, 8, 3), 70, np.uint8)] * 2,
+    )
+    right = reproduce_support_bundle(
+        support,
+        repeats=1,
+        recognizer_factory=lambda: _LeadRecognizer("right"),
+    )
+    left = reproduce_support_bundle(
+        support,
+        repeats=1,
+        recognizer_factory=lambda: _LeadRecognizer("left"),
+    )
+    right_outcome = right["outcomes"][0]
+    left_outcome = left["outcomes"][0]
+    assert right_outcome["stable_seed"]["lead_player"] == "right"
+    assert left_outcome["stable_seed"]["lead_player"] == "left"
+    assert right_outcome["final_lead_player"] == "right"
+    assert right_outcome["output_fingerprint"] != left_outcome["output_fingerprint"]
+
+    visual = reproduce_support_bundle(
+        support,
+        repeats=1,
+        recognizer_factory=lambda: _ActionRecognizer("visual"),
+    )["outcomes"][0]
+    replayed = reproduce_support_bundle(
+        support,
+        repeats=1,
+        recognizer_factory=lambda: _ActionRecognizer("replayed"),
+    )["outcomes"][0]
+    assert visual["stable_seed"]["opening_action"]["source"] == "visual"
+    assert visual["final_events"][0]["cards"] == ["2S"]
+    assert visual["output_fingerprint"] != replayed["output_fingerprint"]
 
 
 def test_e005_raw_standard_and_roi_pixels_reproduce_exactly_and_tamper_fails(tmp_path):
@@ -555,6 +869,70 @@ def test_e006_suite_runs_ordinary_deterministic_and_child_and_wires_probe(monkey
     assert report["child_wired"]["status"] == "PASS"
 
 
+def test_review_e005_candidate_suite_fails_any_probe_disagreement_or_non20(
+    monkeypatch,
+):
+    def report(fingerprint: str, repeats: int, *, child_probe=None):
+        return {
+            "schema": "guandan.repro-report/1",
+            "support": {"sha256": "support"},
+            "inputs": [{"frame_seq": 1, "pixel_sha256": "pixel"}],
+            "outcomes": [
+                {
+                    "output_fingerprint": fingerprint,
+                    "opening_gate": "ready",
+                    "single_frame_level": "7",
+                    "single_frame_hand": list(HAND),
+                }
+            ],
+            "truth": {
+                "correct_runs": repeats,
+                "all_correct": True,
+            },
+            "comparison": {
+                "reference_failure_20_of_20": False,
+            },
+            "child_probe": child_probe,
+        }
+
+    calls = []
+
+    def disagreeing(_support, **kwargs):
+        calls.append(kwargs)
+        fingerprint = "ordinary" if kwargs.get("deterministic") is False else "deterministic"
+        return report(fingerprint, int(kwargs["repeats"]), child_probe=kwargs.get("child_probe"))
+
+    monkeypatch.setattr(
+        "daguandan_bridge.support_repro.reproduce_support_bundle",
+        disagreeing,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.support_repro.run_child_probe",
+        lambda *_args, **kwargs: {
+            "status": "PASS",
+            "report": report("deterministic", int(kwargs["repeats"])),
+        },
+    )
+    failed = reproduce_support_suite(
+        "support.zip",
+        expected_level="7",
+        repeats=20,
+        role="candidate",
+    )
+    assert failed["suite_gate"]["status"] == "FAIL"
+    assert "ordinary_deterministic_disagree" in failed["suite_gate"]["failures"]
+
+    non20 = reproduce_support_suite(
+        "support.zip",
+        expected_level="7",
+        repeats=19,
+        role="candidate",
+    )
+    assert non20["suite_gate"]["status"] == "FAIL"
+    assert "candidate_repeat_count_not_20" in non20["suite_gate"]["failures"]
+    assert "candidate_not_correct_20_of_20" in non20["suite_gate"]["failures"]
+
+
 def test_e006_child_timeout_is_a_structured_probe_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "daguandan_bridge.support_repro.subprocess.run",
@@ -613,8 +991,9 @@ def test_e007_frame_id_and_pixel_correlation_never_falls_back_to_latest(tmp_path
         _result("2"),
         {"input_sha256": _pixel_sha(old.image)},
     )
-    assert pressured.metrics().orphan_recognitions == 1
-    assert pressured._ring[-1].recognition is None
+    assert pressured.metrics().orphan_recognitions == 0
+    assert pressured._ring[-1].snapshot is old
+    assert pressured._ring[-1].recognition["round_level"] == "2"
     pressured.close()
 
 

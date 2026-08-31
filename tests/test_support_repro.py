@@ -39,9 +39,32 @@ def _support_zip(tmp_path: Path, *, undeclared: bool = False) -> Path:
         "evidence/opening_evidence.json": json.dumps(
             {
                 "schema": "guandan.opening-evidence/1",
+                "incident_id": "OPEN-test",
                 "resource_identity": {"status": "identified", "sha256": "remote"},
                 "frames": [
-                    {"seq": index, "anchor_score": 0.90, "capture": {}}
+                    {
+                        "frame_id": f"frame-{index}",
+                        "seq": index,
+                        "anchor_score": 0.90,
+                        "capture": {},
+                        "analysis": {
+                            "status": "delivered",
+                            "gate_delivered": True,
+                            "delivered_ms": index * 100,
+                        },
+                        "artifacts": [
+                            {
+                                "frame_id": f"frame-{index}",
+                                "frame_seq": index,
+                                "kind": "standardized",
+                                "field": None,
+                                "path": f"frames/standardized_{index:06d}.png",
+                                "bytes": len(image),
+                                "sha256": hashlib.sha256(image).hexdigest(),
+                                "pixel_sha256": pixel_hash,
+                            }
+                        ],
+                    }
                     for index in (1, 2)
                 ],
             }
@@ -63,6 +86,9 @@ def _support_zip(tmp_path: Path, *, undeclared: bool = False) -> Path:
                 "field": None,
                 "source_sha256": hashlib.sha256(image).hexdigest(),
                 "pixel_sha256": pixel_hash,
+                "incident_path": f"frames/standardized_{index:06d}.png",
+                "incident_sha256": hashlib.sha256(image).hexdigest(),
+                "frame_id": f"frame-{index}",
             }
             for index in (1, 2)
         ],
@@ -164,7 +190,12 @@ def test_truth_annotation_is_external_and_bound_to_zip_hash(tmp_path):
     truth_path = tmp_path / "truth.json"
     before = hashlib.sha256(support.read_bytes()).hexdigest()
 
-    truth = write_truth_annotation(truth_path, support, expected_level="7")
+    truth = write_truth_annotation(
+        truth_path,
+        support,
+        input_frame_seq=2,
+        expected_level="7",
+    )
     report = reproduce_support_bundle(
         support,
         truth_path=truth_path,
@@ -195,6 +226,8 @@ def test_old_new_gate_requires_same_support_failure_then_correct_20_of_20(tmp_pa
     )
     reference["runner"]["build_id"] = "BUILD-reference"
     candidate["runner"]["build_id"] = "BUILD-candidate"
+    reference["suite_gate"] = {"status": "PASS"}
+    candidate["suite_gate"] = {"status": "PASS"}
 
     gate = compare_repro_reports(reference, candidate)
 

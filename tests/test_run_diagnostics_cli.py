@@ -24,6 +24,8 @@ def test_run_help_exposes_support_and_repro_routes():
         "--repro-support",
         "--annotate-repro-truth",
         "--compare-repro",
+        "--truth-input-sha256",
+        "--truth-frame-seq",
     ):
         assert option in completed.stdout
 
@@ -44,6 +46,8 @@ def test_run_can_annotate_truth_without_mutating_support_zip(tmp_path):
             str(truth),
             "--expected-level",
             "7",
+            "--truth-frame-seq",
+            "1",
         ],
         cwd=PROJECT_ROOT,
         capture_output=True,
