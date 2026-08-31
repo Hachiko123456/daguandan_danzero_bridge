@@ -373,7 +373,7 @@ def activate_release(
     runtime = install.parent
     doctor_path = install / "rollback-receipts" / f"doctor-{selected.release_id}-{uuid4().hex[:8]}.json"
     data_path = _data_pointer_path(runtime)
-    data_before_doctor = _file_snapshot(data_path)
+    data_before_doctor = _read_file_bytes(data_path)
     if selected.receipt_schema == LEGACY_BASELINE_SCHEMA:
         if doctor_runner is not None:
             raise ReleaseManagerError("legacy baseline activation does not accept a custom doctor")
@@ -387,14 +387,16 @@ def activate_release(
             if doctor_runner is not None
             else _run_frozen_doctor(selected, probe_root, doctor_path)
         )
+        atomic_write_json(doctor_path, doctor)
         doctor_validation = validate_frozen_doctor_report(
             doctor,
             expected_build_id=selected.build_id,
         )
+    if _read_file_bytes(data_path) != data_before_doctor:
+        _restore_file(data_path, data_before_doctor)
+        raise ReleaseManagerError("candidate doctor modified the real active data pointer")
     if doctor_validation.get("status") != "PASS":
         raise ReleaseManagerError("candidate doctor did not pass; active release was not changed")
-    if _file_snapshot(data_path) != data_before_doctor:
-        raise ReleaseManagerError("candidate doctor modified the real active data pointer")
     desired_data, data_marker_sha256 = _prepare_release_data(selected, runtime)
     current = _read_active(install)
     previous = _previous_release_document(current)
@@ -1042,13 +1044,6 @@ def _read_file_bytes(path: Path) -> bytes | None:
     if _is_link_or_reparse(path) or not path.is_file():
         raise ReleaseManagerError(f"managed pointer is unsafe: {path.name}")
     return path.read_bytes()
-
-
-def _file_snapshot(path: Path) -> dict[str, object] | None:
-    payload = _read_file_bytes(path)
-    if payload is None:
-        return None
-    return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
 
 
 def _bytes_sha256(value: bytes | None) -> str | None:

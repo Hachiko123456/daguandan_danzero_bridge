@@ -565,8 +565,20 @@ def _read_active_generation_if_present(path: Path, *, build_id: str) -> str | No
         return None
     if _path_is_reparse(path) or not path.is_file():
         raise RuntimeLayoutError("active data pointer is not a regular file")
+    payload: str | None = None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        for attempt in range(20):
+            try:
+                payload = path.read_text(encoding="utf-8")
+                break
+            except (FileNotFoundError, PermissionError):
+                if attempt == 19:
+                    raise
+                # A concurrent atomic ReplaceFile may make the destination
+                # briefly unavailable on Windows; retry without accepting a
+                # partial or malformed document.
+                time.sleep(0.01)
+        value = json.loads(payload or "")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeLayoutError("active data pointer is unreadable or invalid") from exc
     if not isinstance(value, dict) or value.get("schema") != ACTIVE_GENERATION_SCHEMA:
