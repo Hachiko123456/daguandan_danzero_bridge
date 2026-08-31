@@ -125,7 +125,7 @@ function Invoke-PythonCommand {
         [Parameter(Mandatory = $true)][string] $Python,
         [Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments
     )
-    & $Python -I @Arguments
+    & $Python -I -S @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Python command failed (exit code $LASTEXITCODE): $($Arguments -join ' ')"
     }
@@ -135,6 +135,7 @@ function Invoke-CleanPython {
     param(
         [Parameter(Mandatory = $true)][string] $Python,
         [Parameter(Mandatory = $true)][string] $ScriptsPath,
+        [Parameter()][switch] $NoSite,
         [Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments
     )
     $removedNames = @(
@@ -198,7 +199,12 @@ function Invoke-CleanPython {
         )
         [System.Environment]::SetEnvironmentVariable("TMP", $script:tempPath, "Process")
         [System.Environment]::SetEnvironmentVariable("TEMP", $script:tempPath, "Process")
-        & $Python -I @Arguments
+        if ($NoSite) {
+            & $Python -I -S @Arguments
+        }
+        else {
+            & $Python -I @Arguments
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "Clean Python command failed (exit code $LASTEXITCODE): $($Arguments -join ' ')"
         }
@@ -238,6 +244,11 @@ if (-not [System.IO.File]::Exists($bootstrapPython)) {
     throw "Hash-locked bootstrap Python executable not found: $bootstrapPython"
 }
 Assert-NoReparsePathChain -LiteralPath $bootstrapPython
+$script:pythonBaseRoot = (& $bootstrapPython -I -S -c "import sys; print(sys.base_prefix)").Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($script:pythonBaseRoot)) {
+    throw "Could not resolve the locked CPython base prefix without site initialization."
+}
+Assert-NoReparsePathChain -LiteralPath $script:pythonBaseRoot
 
 $gitCommand = Get-Command git -ErrorAction SilentlyContinue
 if ($null -eq $gitCommand) {
@@ -264,6 +275,7 @@ $requiredFiles = @(
     (Join-Path $projectRoot "python_runtime.lock.json"),
     (Join-Path $projectRoot "wheelhouse.lock.json"),
     (Join-Path $projectRoot "scripts\verify_release_inputs.py"),
+    (Join-Path $projectRoot "scripts\audit_bootstrap_python.py"),
     (Join-Path $projectRoot "scripts\audit_frozen_bundle.py"),
     (Join-Path $projectRoot "scripts\generate_build_manifest.py"),
     (Join-Path $projectRoot "release_assets\MODEL_REPLACEMENT.txt"),
@@ -319,9 +331,11 @@ $archiveChecksumPath = Resolve-ManagedChildPath -Root $releaseRoot -Child "$arch
 $releaseRecordPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "DaguandanAssistant.release.json")
 $sourceIdentityPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "source_identity.json")
 $releaseInputAuditPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "release_input_audit.json")
+$bootstrapAuditPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "bootstrap_python_audit.json")
 $buildManifestPath = Join-Path $bundlePath "build_manifest.json"
 $nativeAuditPath = Join-Path $bundlePath "native_dependency_audit.json"
 $bundledInputAuditPath = Join-Path $bundlePath "release_input_audit.json"
+$bundledBootstrapAuditPath = Join-Path $bundlePath "bootstrap_python_audit.json"
 
 foreach ($directory in @($distPath, $workPath, $specPath, $payloadPath, $script:tempPath, $script:pyinstallerConfigPath)) {
     [System.IO.Directory]::CreateDirectory($directory) | Out-Null
@@ -339,15 +353,23 @@ Invoke-PythonCommand $bootstrapPython `
     --project-root $projectRoot `
     --expected $sourceIdentityPath
 
-$script:pythonBaseRoot = (& $bootstrapPython -I -c "import sys; print(sys.base_prefix)").Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($script:pythonBaseRoot)) {
-    throw "Could not resolve the locked CPython base prefix."
-}
-Assert-NoReparsePathChain -LiteralPath $script:pythonBaseRoot
-
 Write-Host "[2/7] Creating a fresh isolated build environment..." -ForegroundColor Cyan
-Invoke-CleanPython $bootstrapPython (Split-Path -Parent $bootstrapPython) `
-    -m venv $buildEnvPath
+$bootstrapAuditArguments = @(
+    (Join-Path $projectRoot "scripts\audit_bootstrap_python.py"),
+    "--python-root", $script:pythonBaseRoot,
+    "--runtime-lock", (Join-Path $projectRoot "python_runtime.lock.json"),
+    "--output", $bootstrapAuditPath
+)
+Invoke-CleanPython `
+    -Python $bootstrapPython `
+    -ScriptsPath (Split-Path -Parent $bootstrapPython) `
+    -NoSite `
+    -Arguments $bootstrapAuditArguments
+Invoke-CleanPython `
+    -Python $bootstrapPython `
+    -ScriptsPath (Split-Path -Parent $bootstrapPython) `
+    -NoSite `
+    -Arguments @("-m", "venv", $buildEnvPath)
 $buildPython = Join-Path $buildEnvPath "Scripts\python.exe"
 if (-not [System.IO.File]::Exists($buildPython)) {
     throw "Fresh build environment did not create python.exe."
@@ -425,6 +447,7 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Collect_Diagnosti
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.bat") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.ps1") -Destination $bundlePath
 Copy-Item -LiteralPath $releaseInputAuditPath -Destination $bundledInputAuditPath
+Copy-Item -LiteralPath $bootstrapAuditPath -Destination $bundledBootstrapAuditPath
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     (Join-Path $projectRoot "scripts\audit_frozen_bundle.py") `
     --bundle-root $bundlePath `

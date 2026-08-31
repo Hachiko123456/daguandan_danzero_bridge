@@ -259,7 +259,11 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
     assert "Assert-NoReparseTree" in script
     assert "--porcelain=v1 --untracked-files=all" in script
     assert "Source tree is dirty" in script
-    assert "-m venv $buildEnvPath" in script
+    assert '& $Python -I -S @Arguments' in script
+    assert '$bootstrapPython -I -S -c "import sys; print(sys.base_prefix)"' in script
+    assert '"-m", "venv", $buildEnvPath' in script
+    assert "audit_bootstrap_python.py" in script
+    assert "bootstrap_python_audit.json" in script
     assert "--isolated" in script
     assert "--no-index" in script
     assert "--require-hashes" in script

@@ -82,6 +82,11 @@ Qt/QML、Java、Conda 和 Poppler 等宿主变量。PyInstaller 完成后必须�
 缺失导入都会令构建失败。`native_dependency_audit.json`、完整安装包清单和所有
 锁文件摘要均进入并受 `build_manifest.json` 哈希保护。
 
+创建 build venv 之前的引导解释器统一使用 `-I -S`，不会加载宿主机的
+`site-packages`、`.pth`、`sitecustomize` 或用户 site。脚本还会生成
+`bootstrap_python_audit.json`，逐项确认 no-site/isolated 标志和 `sys.path` 只含
+已锁定 CPython 根目录；该审计随发布包进入严格清单，正式资格流程会再次验证。
+
 CPython 本身也不是只锁一个 `python.exe`：`python_runtime.lock.json` 完整记录
 会影响 venv 与 PyInstaller 输出的基础运行时文件，包括 `Lib` 标准库、`venv`、
 `encodings`、ensurepip wheels、`DLLs`、`libs`、解释器和 Python/CRT DLL。

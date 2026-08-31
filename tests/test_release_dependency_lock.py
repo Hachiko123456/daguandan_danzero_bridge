@@ -222,7 +222,7 @@ def test_fresh_venv_uses_the_hash_locked_python_launcher_and_pip(tmp_path):
     bootstrap = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
     build_env = tmp_path / "build-env"
     created = subprocess.run(
-        [str(bootstrap), "-I", "-m", "venv", str(build_env)],
+        [str(bootstrap), "-I", "-S", "-m", "venv", str(build_env)],
         capture_output=True,
         text=True,
         check=False,

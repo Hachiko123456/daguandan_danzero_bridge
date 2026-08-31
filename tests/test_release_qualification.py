@@ -82,6 +82,37 @@ def test_tree_hash_is_order_independent(tmp_path):
     assert first == second
 
 
+def test_qualification_requires_clean_no_site_bootstrap_audit(tmp_path):
+    path = tmp_path / "bootstrap_python_audit.json"
+    report = {
+        "schema": "guandan.bootstrap-python-audit/1",
+        "status": "PASS",
+        "flags": {
+            "isolated": 1,
+            "no_site": 1,
+            "ignore_environment": 1,
+            "no_user_site": 1,
+            "safe_path": True,
+        },
+        "sys_path": ["<python-root>/Lib", "<python-root>/DLLs", "<python-root>"],
+        "site_modules_loaded": [],
+        "runtime_lock_sha256": MODULE.sha256_file(
+            PROJECT_ROOT / "python_runtime.lock.json"
+        ),
+        "errors": [],
+    }
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    passed = MODULE._validate_bootstrap_python_audit(path)
+    assert passed["status"] == "PASS"
+
+    report["sys_path"].append("<external>/site-packages")
+    path.write_text(json.dumps(report), encoding="utf-8")
+    failed = MODULE._validate_bootstrap_python_audit(path)
+    assert failed["status"] == "FAIL"
+    assert "sys_path" in failed["failures"]
+
+
 def test_clean_runtime_environment_removes_host_pollution(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", "private")
     monkeypatch.setenv("JAVA_HOME", "jdk")

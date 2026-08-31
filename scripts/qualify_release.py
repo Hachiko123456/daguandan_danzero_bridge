@@ -313,6 +313,16 @@ class Qualification:
         self.archive_checksum = self.release_root / "DaguandanAssistant.zip.sha256"
         if completed.returncode != 0 or not self.executable.is_file():
             raise _StageFailure("clean frozen package failed", completed.returncode, command, log, {"release_root": str(self.release_root)})
+        bootstrap_audit_path = self.bundle_root / "bootstrap_python_audit.json"
+        bootstrap_validation = _validate_bootstrap_python_audit(bootstrap_audit_path)
+        if bootstrap_validation.get("status") != "PASS":
+            raise _StageFailure(
+                "bootstrap Python no-site audit did not pass",
+                2,
+                command,
+                log,
+                bootstrap_validation,
+            )
         self.archive_hash_before = sha256_file(self.archive) if self.archive.is_file() else None
         return {
             "command": command,
@@ -321,6 +331,7 @@ class Qualification:
             "executable": str(self.executable),
             "archive": str(self.archive),
             "archive_sha256": self.archive_hash_before,
+            "bootstrap_python_audit": bootstrap_validation,
         }
 
     def _source_immutability(self) -> Mapping[str, object]:
@@ -855,6 +866,51 @@ def _read_json(path: Path) -> dict[str, object]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _validate_bootstrap_python_audit(path: Path) -> dict[str, object]:
+    report = _read_json(path)
+    failures: list[str] = []
+    if report.get("schema") != "guandan.bootstrap-python-audit/1":
+        failures.append("schema")
+    if report.get("status") != "PASS" or report.get("errors") != []:
+        failures.append("status")
+    flags = report.get("flags") if isinstance(report.get("flags"), Mapping) else {}
+    expected_flags = {
+        "isolated": 1,
+        "no_site": 1,
+        "ignore_environment": 1,
+        "no_user_site": 1,
+        "safe_path": True,
+    }
+    if dict(flags) != expected_flags:
+        failures.append("flags")
+    search_paths = report.get("sys_path")
+    if (
+        not isinstance(search_paths, list)
+        or not search_paths
+        or any(
+            not isinstance(item, str)
+            or not item.startswith("<python-root>")
+            or "site-packages" in item.casefold()
+            for item in search_paths
+        )
+    ):
+        failures.append("sys_path")
+    if report.get("site_modules_loaded") != []:
+        failures.append("site_modules")
+    expected_lock = sha256_file(PROJECT_ROOT / "python_runtime.lock.json")
+    if report.get("runtime_lock_sha256") != expected_lock:
+        failures.append("runtime_lock")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failures": failures,
+        "report": str(path),
+        "report_sha256": sha256_file(path) if path.is_file() else None,
+        "flags": dict(flags),
+        "sys_path": search_paths if isinstance(search_paths, list) else [],
+        "runtime_lock_sha256": report.get("runtime_lock_sha256"),
+    }
 
 
 def _build_id(bundle: Path | None) -> str | None:
