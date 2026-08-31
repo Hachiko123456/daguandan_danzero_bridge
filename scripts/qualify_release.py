@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
@@ -505,9 +506,25 @@ class Qualification:
         # can exceed legacy Win32 MAX_PATH while copying the preauthorized
         # baseline's Qt tree; the product's default LocalAppData root is also
         # a short sibling-style layout.
-        runtime = self.work_root.parent / f"qi-{uuid4().hex[:10]}"
+        runtime = _short_qualification_runtime_root()
         if runtime.exists():
             raise FileExistsError(f"qualification install root exists: {runtime}")
+        for protected in (
+            PROJECT_ROOT,
+            self.release_root,
+            self.work_root,
+            Path(self.args.wheelhouse).resolve(),
+        ):
+            if _paths_overlap(runtime, protected):
+                raise ValueError(
+                    f"qualification install root overlaps protected root: {protected}"
+                )
+        baseline_auth = _read_json(Path(self.args.baseline_auth))
+        projected = _projected_legacy_path_length(runtime, baseline_auth)
+        if projected >= 240:
+            raise ValueError(
+                f"qualification legacy path projection is too long: {projected}"
+            )
         baseline = register_legacy_baseline(
             Path(self.args.baseline_bundle),
             baseline_auth_path=Path(self.args.baseline_auth),
@@ -565,7 +582,9 @@ class Qualification:
         )
         return {
             "runtime_root": str(runtime),
-            "runtime_root_is_short_unique_sibling": True,
+            "runtime_root_is_short_external": True,
+            "runtime_root_cleanup_policy": "preserve_for_audit",
+            "projected_deepest_legacy_path_chars": projected,
             "baseline_release": baseline.to_dict(),
             "candidate_release": candidate.to_dict(),
             "active_after_rollback": status,
@@ -833,6 +852,57 @@ def _is_below(path: Path, root: Path) -> bool:
 
 def _paths_overlap(first: Path, second: Path) -> bool:
     return _is_below(first, second) or _is_below(second, first)
+
+
+def _short_qualification_runtime_root() -> Path:
+    """Return an absent production-like short root outside descriptive work paths."""
+
+    return (
+        Path(tempfile.gettempdir()).resolve()
+        / f"dga-q-{uuid4().hex[:10]}"
+    )
+
+
+def _projected_legacy_path_length(
+    runtime_root: Path,
+    baseline_auth: Mapping[str, object],
+) -> int:
+    artifact = baseline_auth.get("artifact")
+    files = artifact.get("files") if isinstance(artifact, Mapping) else None
+    executable = baseline_auth.get("executable")
+    executable_hash = (
+        str(executable.get("sha256") or "")
+        if isinstance(executable, Mapping)
+        else ""
+    )
+    if not isinstance(files, list) or not files or len(executable_hash) < 12:
+        raise ValueError("baseline auth lacks path projection metadata")
+    release_id = (
+        f"legacy-baseline-{BASELINE_SOURCE_COMMIT[:12]}-{executable_hash[:12]}"
+    )
+    prefixes = (
+        runtime_root
+        / "install"
+        / "versions"
+        / release_id
+        / "approved"
+        / "DaguandanAssistant",
+        runtime_root
+        / "install"
+        / "versions"
+        / release_id
+        / "run"
+        / "DaguandanAssistant",
+    )
+    lengths: list[int] = []
+    for raw in files:
+        if not isinstance(raw, Mapping) or not raw.get("path"):
+            raise ValueError("baseline auth artifact path record is invalid")
+        relative = Path(str(raw["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("baseline auth artifact path is unsafe")
+        lengths.extend(len(str(prefix / relative)) for prefix in prefixes)
+    return max(lengths)
 
 
 def _root_overlap_failures(
