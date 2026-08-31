@@ -1,5 +1,5 @@
 {
-  "schema": "guandan.release-toolchain-lock/2",
+  "schema": "guandan.release-toolchain-lock/3",
   "platform": {
     "architecture": "AMD64",
     "python_cache_tag": "cpython-312",
@@ -11,34 +11,19 @@
     "sha256": "d55736b9f3d6b4ca7985b82db8ce11edfa09994cf93ce31c6b506543b74f32eb"
   },
   "python_runtime": {
-    "aggregate_sha256": "b2d7148965e9b545ce7d37fbba0f666be5d7dcba67273df09aad4b481b49fffe",
+    "inventory_lock": {
+      "path": "python_runtime.lock.json",
+      "bytes": 407187,
+      "sha256": "ef0ad810ea1837a37dc16359a116a2e36a59359e7774c08228714dcca8e8d0dd"
+    },
+    "aggregate_sha256": "252b33fa123ec4b5ad65912aae30b9a053ae494593dc19472f2a9f3138d8f4da",
+    "file_count": 2367,
+    "bytes": 66161613,
     "python_dll": {
       "path": "python312.dll",
       "bytes": 6972184,
       "sha256": "e7890e38256f04ee0b55ac5276bbf3ac61392c3a3ce150bb5497b709803e17ce"
-    },
-    "files": [
-      {"path": "DLLs/_bz2.pyd", "bytes": 84760, "sha256": "02d772c03704fe243c8de2672c210a5804d075c1f75e738d6130a173d08dfcde"},
-      {"path": "DLLs/_ctypes.pyd", "bytes": 124696, "sha256": "bc3b83d2dc9e2f0e6386ed952384c6cf48f6eed51129a50dfd5ef6cbbc0a8fb3"},
-      {"path": "DLLs/_decimal.pyd", "bytes": 253208, "sha256": "a28c543976aa4b6d37da6f94a280d72124b429f458d0d57b7dbcf71b4bea8f73"},
-      {"path": "DLLs/_hashlib.pyd", "bytes": 64792, "sha256": "e47e76d70d508b62924fe480f30e615b12fdd7745c0aac68a2cddabd07b692ae"},
-      {"path": "DLLs/_lzma.pyd", "bytes": 159512, "sha256": "34130d8abe27586ee315262d69af4e27429b7eab1f3131ea375c2bb62cf094be"},
-      {"path": "DLLs/_socket.pyd", "bytes": 83224, "sha256": "b38e66e6ee413e5955ef03d619cadd40fca8be035b43093d2342b6f3739e883e"},
-      {"path": "DLLs/_ssl.pyd", "bytes": 177432, "sha256": "a4ce52a9e0daddbbe7a539d1a7eda787494f2173ddcc92a3faf43b7cf597452b"},
-      {"path": "DLLs/libcrypto-3.dll", "bytes": 5162776, "sha256": "2a234b5aa20c3faecf725bbb54fb33f3d94543f78fa7045408e905593e49960a"},
-      {"path": "DLLs/libffi-8.dll", "bytes": 39696, "sha256": "eff52743773eb550fcc6ce3efc37c85724502233b6b002a35496d828bd7b280a"},
-      {"path": "DLLs/libssl-3.dll", "bytes": 790296, "sha256": "41ad1a04ca27a7959579e87fbbda87c93099616a64a0e66260c983381c5570d1"},
-      {"path": "DLLs/pyexpat.pyd", "bytes": 200472, "sha256": "e1d56ffbf5e5fab481d7a14691481b8ff5d2f4c6bf5d1a4664c832756c5942fe"},
-      {"path": "DLLs/select.pyd", "bytes": 31000, "sha256": "bc71fbdfd1441d62dd86d33ff41b35dc3cc34875f625d885c58c8dc000064dab"},
-      {"path": "DLLs/unicodedata.pyd", "bytes": 1137944, "sha256": "2480a78815f619a631210e577e733c9bafecb7f608042e979423c5850ee390ff"},
-      {"path": "Lib/encodings/__init__.py", "bytes": 6058, "sha256": "8b997e9f7beef09de01c34ac34191866d3ab25e17164e08f411940b070bc3e74"},
-      {"path": "Lib/importlib/__init__.py", "bytes": 4912, "sha256": "96dc7e6276beaf680d6576917173fd67b1260bc3b10bb7324f481c424ecb3f4e"},
-      {"path": "Lib/json/__init__.py", "bytes": 14379, "sha256": "feb17670e443e5db2723f217727dcc5d5e155c40e4e6935b16061c88542f24e7"},
-      {"path": "python3.dll", "bytes": 68376, "sha256": "1e9224ba7190b6301ef47befa8e383d0c55700255d04a36f7dac88ea9573f2fb"},
-      {"path": "python312.dll", "bytes": 6972184, "sha256": "e7890e38256f04ee0b55ac5276bbf3ac61392c3a3ce150bb5497b709803e17ce"},
-      {"path": "vcruntime140.dll", "bytes": 109392, "sha256": "a8f950b4357ec12cfccddc9094cca56a3d5244b95e09ea6e9a746489f2d58736"},
-      {"path": "vcruntime140_1.dll", "bytes": 49520, "sha256": "e4b533a94e02c574780e4b333fcf0889f65ed00d39e32c0fbbda2116f185873f"}
-    ]
+    }
   },
   "tools": {
     "pip": "23.2.1",
@@ -47,6 +32,7 @@
   "locks": {
     "requirements_input_sha256": "e896c122c966c5f3b53539ec4a8f8cfa01876da048c28758bc29cef28e522f5e",
     "requirements_lock_sha256": "0158e4ff4ed3100bfcc67c2e66ab92cd7e99944bd7103f1d2d16f4cffaa4a741",
+    "python_runtime_lock_sha256": "ef0ad810ea1837a37dc16359a116a2e36a59359e7774c08228714dcca8e8d0dd",
     "wheelhouse_lock_sha256": "dc72bc5cc2c87e071e282e1f93ff3c2c885e0766388ffb113a953a0576c3537f"
   },
   "policy": {
@@ -55,5 +41,14 @@
     "ignore_rlcard_python_upper_bound": true,
     "require_hashes": true,
     "require_isolated_build_environment": true
+  },
+  "acquisition": {
+    "provider": "python.org",
+    "artifact": "python-3.12.0-amd64.exe",
+    "url": "https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe",
+    "install_scope": "per-user CPython 3.12.0 x64",
+    "verification": "Verify the official installer SHA256 below, install to a new directory, then regenerate and review the complete python_runtime.lock.json inventory.",
+    "sha256": "c6bdf93f4b2de6dfa1a3a847e7c24ae10edf7f6318653d452cd4381415700ada",
+    "bytes": 26507904
   }
 }

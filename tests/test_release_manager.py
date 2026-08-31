@@ -403,7 +403,7 @@ def test_dirty_modern_install_cannot_claim_baseline_even_with_tree_preapproval(t
     auth = tmp_path / "external" / "dirty-auth.json"
     write_baseline_auth(bundle, auth, approved=True)
 
-    with pytest.raises(ReleaseManagerError, match="clean frozen source"):
+    with pytest.raises(ReleaseManagerError, match="source identity must be clean"):
         install_release(
             archive,
             release_record_path=record,

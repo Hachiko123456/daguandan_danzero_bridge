@@ -134,6 +134,7 @@ def test_qualified_manifest_binds_locks_complete_inventory_and_native_audit(
         "requirements-release.in",
         "requirements-release.lock",
         "release_toolchain.lock.json",
+        "python_runtime.lock.json",
         "wheelhouse.lock.json",
     ):
         (project / name).write_bytes((PROJECT_ROOT / name).read_bytes())
@@ -184,6 +185,7 @@ def test_qualified_manifest_binds_locks_complete_inventory_and_native_audit(
         "requirements_input",
         "requirements_lock",
         "toolchain_lock",
+        "python_runtime_lock",
         "wheelhouse_lock",
     }
     assert manifest["dependencies"] == DEPENDENCIES
@@ -212,6 +214,7 @@ def test_release_build_inputs_reject_failed_native_audit(tmp_path: Path):
         "requirements-release.in",
         "requirements-release.lock",
         "release_toolchain.lock.json",
+        "python_runtime.lock.json",
         "wheelhouse.lock.json",
     ):
         (project / name).write_bytes((PROJECT_ROOT / name).read_bytes())

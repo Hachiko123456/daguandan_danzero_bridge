@@ -13,10 +13,26 @@ import re
 import stat
 import subprocess
 import sys
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 RELEASE_INPUT_AUDIT_SCHEMA = "guandan.release-input-audit/1"
+PYTHON_RUNTIME_LOCK_SCHEMA = "guandan.python-runtime-lock/1"
+PYTHON_RUNTIME_POLICY = {
+    "schema": "guandan.python-runtime-inventory-policy/1",
+    "root_files": [
+        "LICENSE.txt",
+        "python.exe",
+        "pythonw.exe",
+        "python3.dll",
+        "python312.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    ],
+    "recursive_roots": ["DLLs", "Lib", "libs"],
+    "excluded_directories": ["Lib/site-packages", "__pycache__"],
+    "excluded_suffixes": [".pyc", ".pyo"],
+}
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -42,15 +58,28 @@ def verify_release_inputs(
     wheel_lock = _json(project / "wheelhouse.lock.json")
     requirements_lock = project / "requirements-release.lock"
     requirements_input = project / "requirements-release.in"
-    expected_schema = "guandan.release-toolchain-lock/2"
+    expected_schema = "guandan.release-toolchain-lock/3"
     if toolchain.get("schema") != expected_schema:
         errors.append(_error("LOCK-TOOLCHAIN-SCHEMA", {"expected": expected_schema}))
+    acquisition = toolchain.get("acquisition")
+    if not isinstance(acquisition, Mapping) or (
+        acquisition.get("provider") != "python.org"
+        or acquisition.get("artifact") != "python-3.12.0-amd64.exe"
+        or acquisition.get("url")
+        != "https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe"
+        or _HEX.fullmatch(str(acquisition.get("sha256") or "")) is None
+        or not isinstance(acquisition.get("bytes"), int)
+        or isinstance(acquisition.get("bytes"), bool)
+        or int(acquisition.get("bytes")) <= 0
+    ):
+        errors.append(_error("LOCK-PYTHON-ACQUISITION", {}))
     if wheel_lock.get("schema") != "guandan.wheelhouse-lock/1":
         errors.append(_error("LOCK-WHEELHOUSE-SCHEMA", {}))
     locks = toolchain.get("locks") if isinstance(toolchain.get("locks"), Mapping) else {}
     for label, path in (
         ("requirements_input", requirements_input),
         ("requirements_lock", requirements_lock),
+        ("python_runtime_lock", project / "python_runtime.lock.json"),
         ("wheelhouse_lock", project / "wheelhouse.lock.json"),
     ):
         expected = str(locks.get(f"{label}_sha256", ""))
@@ -77,7 +106,13 @@ def verify_release_inputs(
             )
         )
     python_base_root = _interpreter_base_prefix(python_path)
-    _verify_python_runtime_lock(toolchain, python_base_root, errors)
+    runtime_lock = _load_python_runtime_inventory(project, toolchain, errors)
+    _verify_python_runtime_lock(
+        toolchain,
+        python_base_root,
+        errors,
+        runtime_inventory=runtime_lock,
+    )
     platform_lock = toolchain.get("platform")
     if isinstance(platform_lock, Mapping):
         checks = {
@@ -280,16 +315,88 @@ def runtime_inventory_sha256(records: Sequence[Mapping[str, object]]) -> str:
     ).hexdigest()
 
 
+def collect_python_runtime_inventory(base_root: Path | str) -> list[dict[str, object]]:
+    """Hash every base-runtime input that can affect venv/PyInstaller output."""
+
+    base = Path(base_root).resolve()
+    if not base.is_dir() or _is_link_or_reparse(base):
+        raise ReleaseLockError("Python base runtime is unavailable or unsafe")
+    selected: list[Path] = []
+    for name in PYTHON_RUNTIME_POLICY["root_files"]:
+        candidate = base / str(name)
+        if candidate.is_file() and not _is_link_or_reparse(candidate):
+            selected.append(candidate)
+    for name in PYTHON_RUNTIME_POLICY["recursive_roots"]:
+        root = base / str(name)
+        if not root.is_dir() or _is_link_or_reparse(root):
+            raise ReleaseLockError(f"Python runtime inventory root is missing: {name}")
+        selected.extend(_runtime_tree_files(base, root))
+    records: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for path in sorted(selected, key=lambda item: item.relative_to(base).as_posix().casefold()):
+        relative = path.relative_to(base).as_posix()
+        identity = relative.casefold()
+        if identity in seen:
+            raise ReleaseLockError(f"case-colliding Python runtime path: {relative}")
+        seen.add(identity)
+        before = path.stat()
+        digest = _sha256_file(path)
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ReleaseLockError(f"Python runtime file changed while hashing: {relative}")
+        records.append(
+            {"path": relative, "bytes": after.st_size, "sha256": digest}
+        )
+    return records
+
+
+def create_python_runtime_lock(base_root: Path | str) -> dict[str, object]:
+    records = collect_python_runtime_inventory(base_root)
+    required = {
+        "python.exe",
+        "pythonw.exe",
+        "python3.dll",
+        "python312.dll",
+        "Lib/encodings/__init__.py",
+        "Lib/encodings/aliases.py",
+        "Lib/venv/__init__.py",
+    }
+    present = {str(item["path"]) for item in records}
+    missing = sorted(required - present)
+    if missing:
+        raise ReleaseLockError(
+            "Python runtime inventory is incomplete: " + ", ".join(missing)
+        )
+    ensurepip_wheels = [
+        item for item in records if str(item["path"]).startswith("Lib/ensurepip/_bundled/")
+        and str(item["path"]).casefold().endswith(".whl")
+    ]
+    if not ensurepip_wheels:
+        raise ReleaseLockError("Python runtime inventory has no ensurepip wheels")
+    return {
+        "schema": PYTHON_RUNTIME_LOCK_SCHEMA,
+        "policy": PYTHON_RUNTIME_POLICY,
+        "file_count": len(records),
+        "bytes": sum(int(item["bytes"]) for item in records),
+        "aggregate_sha256": runtime_inventory_sha256(records),
+        "ensurepip_wheels": ensurepip_wheels,
+        "files": records,
+    }
+
+
 def _verify_python_runtime_lock(
     toolchain: Mapping[str, object],
     base_root: Path,
     errors: list[dict[str, object]],
+    *,
+    runtime_inventory: Mapping[str, object] | None = None,
 ) -> None:
     raw_runtime = toolchain.get("python_runtime")
     if not isinstance(raw_runtime, Mapping):
         errors.append(_error("LOCK-PYTHON-RUNTIME-MISSING", {}))
         return
-    raw_files = raw_runtime.get("files")
+    inventory = runtime_inventory if runtime_inventory is not None else raw_runtime
+    raw_files = inventory.get("files") if isinstance(inventory, Mapping) else None
     if not isinstance(raw_files, list) or not raw_files:
         errors.append(_error("LOCK-PYTHON-RUNTIME-FILES", {}))
         return
@@ -326,12 +433,51 @@ def _verify_python_runtime_lock(
         records.append(
             {"path": relative, "bytes": expected_size, "sha256": expected_hash}
         )
+    if runtime_inventory is not None:
+        if runtime_inventory.get("schema") != PYTHON_RUNTIME_LOCK_SCHEMA:
+            errors.append(_error("LOCK-PYTHON-RUNTIME-SCHEMA", {}))
+        if runtime_inventory.get("policy") != PYTHON_RUNTIME_POLICY:
+            errors.append(_error("LOCK-PYTHON-RUNTIME-POLICY", {}))
+        try:
+            actual_records = collect_python_runtime_inventory(base_root)
+        except ReleaseLockError as exc:
+            errors.append(
+                _error("LOCK-PYTHON-RUNTIME-ENUMERATION", {"message": str(exc)})
+            )
+            actual_records = []
+        declared_paths = {str(item["path"]).casefold(): str(item["path"]) for item in records}
+        actual_paths = {
+            str(item["path"]).casefold(): str(item["path"]) for item in actual_records
+        }
+        missing = sorted(
+            (declared_paths[key] for key in set(declared_paths) - set(actual_paths)),
+            key=str.casefold,
+        )
+        unexpected = sorted(
+            (actual_paths[key] for key in set(actual_paths) - set(declared_paths)),
+            key=str.casefold,
+        )
+        if missing or unexpected:
+            errors.append(
+                _error(
+                    "LOCK-PYTHON-RUNTIME-FILESET",
+                    {
+                        "missing": missing[:200],
+                        "unexpected": unexpected[:200],
+                        "missing_count": len(missing),
+                        "unexpected_count": len(unexpected),
+                    },
+                )
+            )
     aggregate = runtime_inventory_sha256(records)
-    if aggregate != raw_runtime.get("aggregate_sha256"):
+    expected_aggregate = (
+        inventory.get("aggregate_sha256") if isinstance(inventory, Mapping) else None
+    )
+    if aggregate != expected_aggregate:
         errors.append(
             _error(
                 "LOCK-PYTHON-RUNTIME-AGGREGATE",
-                {"expected": raw_runtime.get("aggregate_sha256"), "actual": aggregate},
+                {"expected": expected_aggregate, "actual": aggregate},
             )
         )
     platform_lock = toolchain.get("platform")
@@ -354,8 +500,81 @@ def _verify_python_runtime_lock(
         )
 
 
+def _load_python_runtime_inventory(
+    project: Path,
+    toolchain: Mapping[str, object],
+    errors: list[dict[str, object]],
+) -> dict[str, object] | None:
+    raw_runtime = toolchain.get("python_runtime")
+    runtime = raw_runtime if isinstance(raw_runtime, Mapping) else {}
+    raw_lock = runtime.get("inventory_lock")
+    lock = raw_lock if isinstance(raw_lock, Mapping) else {}
+    try:
+        relative = _safe_runtime_relative(lock.get("path"))
+    except ReleaseLockError:
+        errors.append(_error("LOCK-PYTHON-RUNTIME-LOCK-PATH", {}))
+        return None
+    path = project.joinpath(*PurePosixPath(relative).parts)
+    try:
+        path.resolve().relative_to(project)
+    except ValueError:
+        errors.append(_error("LOCK-PYTHON-RUNTIME-LOCK-PATH", {}))
+        return None
+    actual_hash = _sha256_file(path) if path.is_file() and not _is_link_or_reparse(path) else None
+    if actual_hash != lock.get("sha256"):
+        errors.append(
+            _error(
+                "LOCK-PYTHON-RUNTIME-LOCK-HASH",
+                {"expected": lock.get("sha256"), "actual": actual_hash},
+            )
+        )
+        return None
+    try:
+        value = _json(path)
+    except ReleaseLockError as exc:
+        errors.append(_error("LOCK-PYTHON-RUNTIME-LOCK-READ", {"message": str(exc)}))
+        return None
+    return value
+
+
+def _runtime_tree_files(base: Path, root: Path) -> Iterable[Path]:
+    excluded_directories = {
+        str(value).casefold() for value in PYTHON_RUNTIME_POLICY["excluded_directories"]
+    }
+    excluded_suffixes = {
+        str(value).casefold() for value in PYTHON_RUNTIME_POLICY["excluded_suffixes"]
+    }
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        if _is_link_or_reparse(current_path):
+            raise ReleaseLockError("Python runtime inventory traversed a reparse point")
+        kept: list[str] = []
+        for name in directory_names:
+            candidate = current_path / name
+            relative = candidate.relative_to(base).as_posix().casefold()
+            if name.casefold() == "__pycache__" or relative in excluded_directories:
+                continue
+            if _is_link_or_reparse(candidate):
+                raise ReleaseLockError(
+                    f"Python runtime inventory contains a reparse directory: {relative}"
+                )
+            kept.append(name)
+        directory_names[:] = kept
+        for name in file_names:
+            candidate = current_path / name
+            if candidate.suffix.casefold() in excluded_suffixes:
+                continue
+            if _is_link_or_reparse(candidate) or not candidate.is_file():
+                raise ReleaseLockError(
+                    f"Python runtime inventory contains an unsafe file: {name}"
+                )
+            yield candidate
+
+
 def _safe_runtime_relative(value: object) -> str:
-    raw = str(value).replace("\\", "/")
+    if not isinstance(value, str):
+        raise ReleaseLockError("unsafe Python runtime lock path")
+    raw = value.replace("\\", "/")
     path = PurePosixPath(raw)
     if (
         not raw
@@ -464,6 +683,8 @@ __all__ = [
     "RELEASE_INPUT_AUDIT_SCHEMA",
     "ReleaseLockError",
     "collect_installed_distributions",
+    "collect_python_runtime_inventory",
+    "create_python_runtime_lock",
     "interpreter_distribution_paths",
     "runtime_inventory_sha256",
     "verify_release_inputs",

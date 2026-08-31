@@ -160,6 +160,7 @@ def collect_release_build_inputs(
         "requirements_input": project / "requirements-release.in",
         "requirements_lock": project / "requirements-release.lock",
         "toolchain_lock": project / "release_toolchain.lock.json",
+        "python_runtime_lock": project / "python_runtime.lock.json",
         "wheelhouse_lock": project / "wheelhouse.lock.json",
     }
     locks: dict[str, dict[str, object]] = {}
@@ -771,6 +772,7 @@ def _validate_build_inputs(
         "requirements_input",
         "requirements_lock",
         "toolchain_lock",
+        "python_runtime_lock",
         "wheelhouse_lock",
     }:
         errors.append("build_inputs lock inventory is incomplete")

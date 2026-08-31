@@ -62,6 +62,21 @@ Qt/QML、Java、Conda 和 Poppler 等宿主变量。PyInstaller 完成后必须�
 缺失导入都会令构建失败。`native_dependency_audit.json`、完整安装包清单和所有
 锁文件摘要均进入并受 `build_manifest.json` 哈希保护。
 
+CPython 本身也不是只锁一个 `python.exe`：`python_runtime.lock.json` 完整记录
+会影响 venv 与 PyInstaller 输出的基础运行时文件，包括 `Lib` 标准库、`venv`、
+`encodings`、ensurepip wheels、`DLLs`、`libs`、解释器和 Python/CRT DLL。
+校验会拒绝文件缺失、额外文件或任一哈希变化。工具链来源固定为 python.org 的
+`python-3.12.0-amd64.exe`，安装包大小与 SHA256 写在
+`release_toolchain.lock.json`。只有明确升级 CPython 时，才可在干净安装目录运行：
+
+```powershell
+.\.venv\Scripts\python.exe -I .\scripts\refresh_python_runtime_lock.py `
+  --python .\.venv\Scripts\python.exe
+```
+
+生成后必须审查工具链来源、完整文件差异，并重新运行发布锁测试；不能为绕过某台
+机器的校验失败而直接修改清单。
+
 ## 标记与模板
 
 页面会递归读取所选本地文件夹中的 PNG、JPG、JPEG 和 BMP 图片；图片两侧提供上一张/下一张箭头，并显示当前序号，方便连续检查样本。

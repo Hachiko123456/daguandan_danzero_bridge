@@ -261,6 +261,7 @@ $requiredFiles = @(
     (Join-Path $projectRoot "requirements-release.in"),
     (Join-Path $projectRoot "requirements-release.lock"),
     (Join-Path $projectRoot "release_toolchain.lock.json"),
+    (Join-Path $projectRoot "python_runtime.lock.json"),
     (Join-Path $projectRoot "wheelhouse.lock.json"),
     (Join-Path $projectRoot "scripts\verify_release_inputs.py"),
     (Join-Path $projectRoot "scripts\audit_frozen_bundle.py"),

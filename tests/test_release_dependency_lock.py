@@ -42,14 +42,34 @@ def test_toolchain_locks_python_dll_and_critical_runtime_inventory():
         (PROJECT_ROOT / "release_toolchain.lock.json").read_text(encoding="utf-8")
     )
     runtime = toolchain["python_runtime"]
-    records = runtime["files"]
+    inventory_path = PROJECT_ROOT / runtime["inventory_lock"]["path"]
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    records = inventory["files"]
     python_dll = runtime["python_dll"]
 
-    assert toolchain["schema"] == "guandan.release-toolchain-lock/2"
+    assert toolchain["schema"] == "guandan.release-toolchain-lock/3"
+    assert inventory["schema"] == "guandan.python-runtime-lock/1"
+    assert runtime["inventory_lock"]["sha256"] == hashlib.sha256(
+        inventory_path.read_bytes()
+    ).hexdigest()
+    assert toolchain["locks"]["python_runtime_lock_sha256"] == runtime[
+        "inventory_lock"
+    ]["sha256"]
     assert python_dll["path"] == "python312.dll"
     assert python_dll in records
     assert any(item["path"] == "Lib/encodings/__init__.py" for item in records)
-    assert runtime["aggregate_sha256"] == release_lock.runtime_inventory_sha256(records)
+    assert any(item["path"] == "Lib/encodings/aliases.py" for item in records)
+    assert any(item["path"] == "Lib/venv/__init__.py" for item in records)
+    assert any(
+        item["path"].startswith("Lib/ensurepip/_bundled/")
+        and item["path"].endswith(".whl")
+        for item in records
+    )
+    assert runtime["aggregate_sha256"] == inventory["aggregate_sha256"]
+    assert inventory["aggregate_sha256"] == release_lock.runtime_inventory_sha256(records)
+    assert inventory["file_count"] == len(records) >= 2000
+    assert toolchain["acquisition"]["provider"] == "python.org"
+    assert len(toolchain["acquisition"]["sha256"]) == 64
 
 
 def test_runtime_lock_detects_derived_python_dll_mismatch(tmp_path):
@@ -76,6 +96,69 @@ def test_runtime_lock_detects_derived_python_dll_mismatch(tmp_path):
 
     codes = {item["code"] for item in errors}
     assert "LOCK-PYTHON-DLL-DERIVED" in codes
+
+
+def _fake_complete_python_runtime(tmp_path: Path) -> Path:
+    base = tmp_path / "python"
+    contents = {
+        "python.exe": b"python",
+        "pythonw.exe": b"pythonw",
+        "python3.dll": b"python3",
+        "python312.dll": b"python312",
+        "vcruntime140.dll": b"vcruntime",
+        "vcruntime140_1.dll": b"vcruntime1",
+        "LICENSE.txt": b"license",
+        "DLLs/_socket.pyd": b"socket",
+        "Lib/encodings/__init__.py": b"encodings",
+        "Lib/encodings/aliases.py": b"aliases-before",
+        "Lib/venv/__init__.py": b"venv",
+        "Lib/ensurepip/_bundled/pip-test.whl": b"pip-wheel",
+        "Lib/os.py": b"os-module",
+        "libs/python312.lib": b"import-lib",
+    }
+    for relative, payload in contents.items():
+        path = base.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    return base
+
+
+@pytest.mark.parametrize("mutation", ["aliases", "missing", "unexpected"])
+def test_complete_runtime_inventory_rejects_mutated_missing_or_unexpected_input(
+    tmp_path,
+    mutation,
+):
+    base = _fake_complete_python_runtime(tmp_path)
+    inventory = release_lock.create_python_runtime_lock(base)
+    records = inventory["files"]
+    python_dll = next(item for item in records if item["path"] == "python312.dll")
+    toolchain = {
+        "platform": {
+            "python_version": "3.12.0",
+            "python_cache_tag": "cpython-312",
+        },
+        "python_runtime": {"python_dll": python_dll},
+    }
+    if mutation == "aliases":
+        (base / "Lib" / "encodings" / "aliases.py").write_bytes(b"changed")
+    elif mutation == "missing":
+        (base / "Lib" / "os.py").unlink()
+    else:
+        (base / "Lib" / "unexpected.py").write_bytes(b"new input")
+    errors: list[dict[str, object]] = []
+
+    release_lock._verify_python_runtime_lock(
+        toolchain,
+        base,
+        errors,
+        runtime_inventory=inventory,
+    )
+
+    codes = {item["code"] for item in errors}
+    if mutation == "aliases":
+        assert "LOCK-PYTHON-RUNTIME-INTEGRITY" in codes
+    else:
+        assert "LOCK-PYTHON-RUNTIME-FILESET" in codes
 
 
 def test_prepared_release_wheelhouse_matches_all_committed_locks():
