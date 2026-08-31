@@ -126,11 +126,18 @@ def diagnose_root_cause(
         )
 
     expected_level = str(truth.get("expected_level") or "") if truth else ""
+    truth_input_sha256 = str(truth.get("input_pixel_sha256") or "") if truth else ""
+    truth_frame_seq = truth.get("input_frame_seq") if truth else None
     all_candidates = [
         candidate
         for outcome in outcomes
-        for candidate in _candidate_records(outcome)
-        if str(candidate.get("field", "")) == "level_rank"
+        for candidate in _candidate_records(
+            outcome,
+            input_sha256=truth_input_sha256,
+            frame_seq=truth_frame_seq,
+        )
+        if str(candidate.get("field", "")).casefold()
+        in {"level_rank", "round_level"}
     ]
     expected_candidates = [
         item for item in all_candidates if str(item.get("label", "")) == expected_level
@@ -169,6 +176,8 @@ def diagnose_root_cause(
                     "margin": margin,
                     "accepted": accepted,
                     "rejection_reason": rejection_reason,
+                    "input_sha256": truth_input_sha256 or None,
+                    "frame_seq": truth_frame_seq,
                 },
             )
         else:
@@ -183,6 +192,8 @@ def diagnose_root_cause(
                     "threshold": threshold,
                     "runner_up": runner_up,
                     "margin": margin,
+                    "input_sha256": truth_input_sha256 or None,
+                    "frame_seq": truth_frame_seq,
                 },
             )
 
@@ -339,9 +350,32 @@ def _mapping_text(value: object, key: str) -> str | None:
     return str(raw) if raw not in {None, ""} else None
 
 
-def _candidate_records(outcome: Mapping[str, object]) -> Iterable[Mapping[str, object]]:
+def _candidate_records(
+    outcome: Mapping[str, object],
+    *,
+    input_sha256: str,
+    frame_seq: object,
+) -> Iterable[Mapping[str, object]]:
+    frame_results = outcome.get("frame_results")
+    if input_sha256 or frame_seq is not None:
+        for frame in frame_results if isinstance(frame_results, list) else []:
+            if not isinstance(frame, Mapping):
+                continue
+            if input_sha256 and str(frame.get("input_sha256") or "") != input_sha256:
+                continue
+            if frame_seq is not None and frame.get("frame_seq") != frame_seq:
+                continue
+            for item in frame.get("candidate_vector", []) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                if input_sha256 and str(item.get("input_sha256") or "") != input_sha256:
+                    continue
+                if frame_seq is not None and item.get("frame_seq") != frame_seq:
+                    continue
+                yield item
+        return
     raw = outcome.get("candidate_vector")
-    return (item for item in raw or [] if isinstance(item, Mapping))
+    yield from (item for item in raw or [] if isinstance(item, Mapping))
 
 
 def _number(value: object, *, default: float = 0.0) -> float:
