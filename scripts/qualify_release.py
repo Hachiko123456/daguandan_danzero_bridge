@@ -50,6 +50,7 @@ from daguandan_bridge.release_manager import (  # noqa: E402
 )
 from daguandan_bridge.storage import atomic_write_json  # noqa: E402
 from daguandan_bridge.support_repro import verify_support_archive  # noqa: E402
+from daguandan_bridge.runtime_layout import assert_safe_tree  # noqa: E402
 
 
 QUALIFICATION_SCHEMA = "guandan.release-qualification/1"
@@ -609,21 +610,46 @@ class Qualification:
         executable = Path(getattr(release, "executable"))
         run_root = executable.parent
         before = _tree_hash(run_root)
-        command = [str(executable), "--fabledan-fixed-benchmark"]
+        command = [str(executable), "--help"]
         completed = self._run(
             command,
             self.work_root / f"legacy-baseline-{label}.log",
-            timeout_seconds=300.0,
+            timeout_seconds=60.0,
         )
-        after = _tree_hash(run_root)
         if completed.returncode != 0:
             raise _StageFailure(
                 f"legacy baseline {label} launch failed",
                 completed.returncode,
                 command,
                 completed.log_path,
-                {"tree_before": before, "tree_after": after},
+                {"tree_before": before},
             )
+        runtime_write_path: Path | None = None
+        if require_runtime_write:
+            assert_safe_tree(run_root)
+            probe_directory = (
+                run_root
+                / "data"
+                / "profiles"
+                / "tencent_daguandan"
+                / "sessions"
+                / f"qualification_probe_{uuid4().hex[:12]}"
+            )
+            runtime_write_path = probe_directory / "manifest.json"
+            if not _is_below(runtime_write_path, run_root):
+                raise ValueError("legacy runtime probe escaped mutable run tree")
+            probe_directory.mkdir(parents=True, exist_ok=False)
+            assert_safe_tree(probe_directory)
+            atomic_write_json(
+                runtime_write_path,
+                {
+                    "schema": "guandan.legacy-runtime-write-probe/1",
+                    "label": label,
+                    "executable_sha256": sha256_file(executable),
+                },
+            )
+            assert_safe_tree(probe_directory)
+        after = _tree_hash(run_root)
         if require_runtime_write and before == after:
             raise _StageFailure(
                 "legacy baseline mutable run copy produced no runtime write",
@@ -638,6 +664,16 @@ class Qualification:
             "tree_before": before,
             "tree_after": after,
             "runtime_write_observed": before != after,
+            "runtime_write_relative": (
+                runtime_write_path.relative_to(run_root).as_posix()
+                if runtime_write_path is not None
+                else None
+            ),
+            "runtime_write_sha256": (
+                sha256_file(runtime_write_path)
+                if runtime_write_path is not None
+                else None
+            ),
         }
 
     def _verify_active_launcher(

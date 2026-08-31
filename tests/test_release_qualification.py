@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 import importlib.util
 import json
+import shutil
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,12 +106,13 @@ def test_formal_rollback_stage_runs_real_legacy_write_and_relaunch_probes():
     assert 'label="before-candidate"' in method
     assert "require_runtime_write=True" in method
     assert 'label="after-rollback"' in method
-    assert "--fabledan-fixed-benchmark" in method
+    assert 'command = [str(executable), "--help"]' in method
+    assert "qualification_probe_" in method
     assert method.count("verify_baseline_auth(") >= 2
     assert method.count("release_status(runtime)") >= 2
     assert method.count("_verify_active_launcher(") >= 4
     assert "-VerifyOnly" in method
-    assert "timeout_seconds=300.0" in method
+    assert "timeout_seconds=60.0" in method
     assert "_short_qualification_runtime_root()" in method
     assert "runtime_root_is_short_external" in method
     assert 'self.work_root / "install-runtime"' not in method
@@ -141,6 +144,39 @@ def test_short_formal_runtime_ignores_long_work_root_and_projects_under_240(
     assert projected < 240
     assert str(long_work) not in str(runtime)
     assert runtime.name.startswith("dga-q-")
+
+
+def test_legacy_probe_real_launch_writes_only_mutable_run_tree(tmp_path):
+    run_root = tmp_path / "run" / "DaguandanAssistant"
+    run_root.mkdir(parents=True)
+    tar = shutil.which("tar")
+    if tar is None:
+        pytest.skip("Windows tar.exe is unavailable")
+    executable = run_root / "probe.exe"
+    shutil.copy2(tar, executable)
+    qualification = object.__new__(MODULE.Qualification)
+    qualification.work_root = tmp_path / "work"
+    qualification.work_root.mkdir()
+    release = SimpleNamespace(executable=executable)
+
+    first = qualification._legacy_baseline_probe(
+        release,
+        require_runtime_write=True,
+        label="test-write",
+    )
+    second = qualification._legacy_baseline_probe(
+        release,
+        require_runtime_write=False,
+        label="test-relaunch",
+    )
+
+    written = run_root / str(first["runtime_write_relative"])
+    assert first["exit_code"] == 0
+    assert first["runtime_write_observed"] is True
+    assert written.is_file()
+    assert first["runtime_write_sha256"] == MODULE.sha256_file(written)
+    assert second["exit_code"] == 0
+    assert second["runtime_write_relative"] is None
 
 
 def test_host_summary_gate_requires_exact_formal_seven_scenario_pass(tmp_path):
