@@ -282,8 +282,10 @@ $requiredFiles = @(
     (Join-Path $projectRoot "release_assets\Run_FableDan_Fixed_Benchmark.bat"),
     (Join-Path $projectRoot "release_assets\Run_FableDan_Fixed_Benchmark.ps1"),
     (Join-Path $projectRoot "release_assets\Collect_Diagnostics.bat"),
+    (Join-Path $projectRoot "release_assets\Clean-DaguandanDiagnostics.ps1"),
     (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.bat"),
-    (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.ps1")
+    (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.ps1"),
+    (Join-Path $projectRoot "scripts\pyinstaller_live_v2_collection.json")
 )
 $profileSource = Join-Path $projectRoot "data\profiles\tencent_daguandan"
 $modelSource = Join-Path $profileSource "models\best.npz"
@@ -347,11 +349,16 @@ Invoke-PythonCommand $bootstrapPython `
     source-identity `
     --project-root $projectRoot `
     --output $sourceIdentityPath
-Invoke-PythonCommand $bootstrapPython `
-    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
-    verify-source-identity `
-    --project-root $projectRoot `
-    --expected $sourceIdentityPath
+$sourceIdentityVerifyArguments = @(
+    (Join-Path $projectRoot "scripts\generate_build_manifest.py"),
+    "verify-source-identity",
+    "--project-root", $projectRoot,
+    "--expected", $sourceIdentityPath
+)
+if ($AllowDirtyDevelopmentBuild) {
+    $sourceIdentityVerifyArguments += "--allow-dirty"
+}
+Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
 Write-Host "[2/7] Creating a fresh isolated build environment..." -ForegroundColor Cyan
 $bootstrapAuditArguments = @(
@@ -404,6 +411,27 @@ Copy-Item -LiteralPath $modelSource -Destination (Join-Path $payloadProfile "mod
 Copy-Item -LiteralPath $danzeroWeightsSource -Destination (Join-Path $payloadProfile "models\danzero\q_network.ckpt")
 
 Write-Host "[4/7] Building the frozen application from the clean environment..." -ForegroundColor Cyan
+$liveV2CollectionPath = Join-Path $projectRoot "scripts\pyinstaller_live_v2_collection.json"
+$liveV2Collection = Get-Content -LiteralPath $liveV2CollectionPath -Raw | ConvertFrom-Json
+if ($liveV2Collection.schema -ne "guandan.pyinstaller-live-v2-collection/1") {
+    throw "Unsupported live-v2 PyInstaller collection schema."
+}
+$liveV2HiddenImports = @(
+    $liveV2Collection.hidden_imports |
+        ForEach-Object { [string] $_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+)
+if ($liveV2HiddenImports.Count -eq 0) {
+    throw "The live-v2 PyInstaller hidden-import inventory is empty."
+}
+if (($liveV2HiddenImports | Sort-Object -Unique).Count -ne $liveV2HiddenImports.Count) {
+    throw "The live-v2 PyInstaller hidden-import inventory contains duplicates."
+}
+foreach ($module in $liveV2HiddenImports) {
+    if ($module -notmatch '^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$') {
+        throw "Invalid live-v2 PyInstaller hidden import: $module"
+    }
+}
 $pyinstallerArguments = @(
     "-m", "PyInstaller",
     "--noconfirm",
@@ -428,9 +456,12 @@ $pyinstallerArguments = @(
     "--hidden-import", "win32gui",
     "--hidden-import", "win32ui",
     "--hidden-import", "pythoncom",
-    "--hidden-import", "pywintypes",
-    (Join-Path $projectRoot "run.py")
+    "--hidden-import", "pywintypes"
 )
+foreach ($module in $liveV2HiddenImports) {
+    $pyinstallerArguments += @("--hidden-import", $module)
+}
+$pyinstallerArguments += (Join-Path $projectRoot "run.py")
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") @pyinstallerArguments
 $executablePath = Join-Path $bundlePath "$appName.exe"
 if (-not [System.IO.File]::Exists($executablePath)) {
@@ -444,8 +475,17 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\MODEL_REPLACEMENT
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Run_FableDan_Fixed_Benchmark.bat") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Run_FableDan_Fixed_Benchmark.ps1") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Collect_Diagnostics.bat") -Destination $bundlePath
+Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Clean-DaguandanDiagnostics.ps1") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.bat") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\Launch_DaguandanAssistant.ps1") -Destination $bundlePath
+if ($AllowDirtyDevelopmentBuild) {
+    [System.IO.File]::WriteAllText(
+        (Join-Path $bundlePath "DEVELOPMENT_BUILD_NOT_FORMALLY_QUALIFIED.txt"),
+        "This bundle was built from an explicitly allowed dirty working tree.`r`n" +
+        "It is for isolated development validation only and is not a formally qualified release.`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
 Copy-Item -LiteralPath $releaseInputAuditPath -Destination $bundledInputAuditPath
 Copy-Item -LiteralPath $bootstrapAuditPath -Destination $bundledBootstrapAuditPath
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
@@ -459,13 +499,9 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
 
 # PyInstaller imports the source tree for an extended period.  Re-prove the
 # tracked commit/tree/status before signing those bytes into the manifest.
-Invoke-PythonCommand $bootstrapPython `
-    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
-    verify-source-identity `
-    --project-root $projectRoot `
-    --expected $sourceIdentityPath
+Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
-Write-Host "[6/7] Creating and strictly verifying the build manifest..." -ForegroundColor Cyan
+Write-Host "[6/7] Creating and verifying the build manifest..." -ForegroundColor Cyan
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
     create `
@@ -477,12 +513,16 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     --source-identity $sourceIdentityPath `
     --release-input-audit $bundledInputAuditPath `
     --native-audit $nativeAuditPath
-Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
-    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
-    verify `
-    --bundle-root $bundlePath `
-    --manifest $buildManifestPath `
-    --strict
+$manifestVerifyArguments = @(
+    (Join-Path $projectRoot "scripts\generate_build_manifest.py"),
+    "verify",
+    "--bundle-root", $bundlePath,
+    "--manifest", $buildManifestPath
+)
+if (-not $AllowDirtyDevelopmentBuild) {
+    $manifestVerifyArguments += "--strict"
+}
+Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") @manifestVerifyArguments
 
 Write-Host "[7/7] Creating the archive, checksum, and release record..." -ForegroundColor Cyan
 $archiveCreated = $false
@@ -516,11 +556,7 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
 
 # A build hook or concurrent editor must not be able to modify tracked source
 # after manifest creation and still publish a formally qualified archive.
-Invoke-PythonCommand $bootstrapPython `
-    (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
-    verify-source-identity `
-    --project-root $projectRoot `
-    --expected $sourceIdentityPath
+Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
 $size = (Get-ChildItem -LiteralPath $bundlePath -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
 Write-Host ("Complete bundle: {0}" -f $bundlePath) -ForegroundColor Green

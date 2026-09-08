@@ -307,6 +307,7 @@ class VisualRecognitionReplayThread(QThread):
                 wait_for_position=self._wait_for_position,
                 use_live_pipeline=getattr(self, "replay_mode", "pipeline") == "pipeline",
                 recognition_strategy=getattr(self, "recognition_strategy", "two_valid_streak"),
+                use_saved_baseline=bool(getattr(self, "use_saved_baseline", False)),
             )
             if self._stop_requested.is_set():
                 self.cancelled.emit()
@@ -383,6 +384,10 @@ class ReplayPage(QWidget):
         self._truth_draft_assembler: ReplayTurnDraftAssembler | None = None
         self._truth_scan_next_source_turn_id = 1
         self._truth_scan_failure: str | None = None
+        self._truth_scan_status: str = "idle"
+        self._truth_scan_status_reason: str = ""
+        self._truth_scan_untrusted_passes: list[dict[str, object]] = []
+        self._truth_scan_discard_actions = False
         self._truth_scan_session: Path | None = None
         self._truth_scan_progress_processed = 0
         self._truth_scan_progress_total = 0
@@ -1635,6 +1640,7 @@ class ReplayPage(QWidget):
         thread.frame_progress.connect(self._truth_scan_progress_changed)
         thread.finished.connect(self._on_visual_thread_finished)
         thread.replay_mode = "pipeline"
+        thread.use_saved_baseline = True
         thread.recognition_strategy = str(self.recognition_strategy_combo.currentData())
         self._visual_thread = thread
         self.visual_replay_button.setEnabled(False)
@@ -1678,6 +1684,10 @@ class ReplayPage(QWidget):
         self._truth_draft_assembler = ReplayTurnDraftAssembler(baseline)
         self._truth_scan_next_source_turn_id = 1
         self._truth_scan_failure = None
+        self._truth_scan_status = "running"
+        self._truth_scan_status_reason = ""
+        self._truth_scan_untrusted_passes = []
+        self._truth_scan_discard_actions = False
         self._truth_scan_session = self.current_session
         self._start_truth_scan_progress()
         self._show_truth_log_editor(baseline)
@@ -1800,6 +1810,21 @@ class ReplayPage(QWidget):
             scrollbar = self.diagnostics.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
             return
+        if self._truth_scan_discard_actions:
+            return
+        if (
+            bool(record.get("recognized_pass"))
+            and str(record.get("pass_audit", "")) == "inferred"
+        ):
+            self._truth_scan_untrusted_passes.append(record)
+            self._truth_scan_discard_actions = True
+            reason = (
+                "检测到无充分视觉证据的推导不出；后续动作不写入可靠草稿"
+            )
+            self._truth_scan_status = "partial"
+            self._truth_scan_status_reason = reason
+            self.diagnostics.insertPlainText(f"\n[扫描待复核] {reason}\n")
+            return
         cards = tuple(str(card) for card in record.get("recognized_cards", ()))
         is_pass = bool(record.get("recognized_pass"))
         if not is_pass and not cards:
@@ -1905,6 +1930,15 @@ class ReplayPage(QWidget):
         if self._truth_scan_failure is not None:
             self._truth_scan_base = None
             return
+        result_status = str(getattr(_value, "status", "complete") or "complete")
+        result_reason = str(getattr(_value, "status_reason", "") or "")
+        if self._truth_scan_untrusted_passes and result_status == "complete":
+            result_status = "partial"
+            result_reason = (
+                "存在无充分证据的推导不出，不能直接作为可靠 truth log"
+            )
+        self._truth_scan_status = result_status
+        self._truth_scan_status_reason = result_reason
         frame_count = getattr(_value, "frame_count", None)
         if (
             isinstance(frame_count, int)
@@ -1928,20 +1962,36 @@ class ReplayPage(QWidget):
                 self._truth_scan_base,
                 self._truth_scan_turns,
             )
-        self._truth_scan_base = None
         assert self._truth_scan_log is not None
         self.truth_log = self._truth_scan_log
         self.truth_status.setText(
             f"出牌日志：扫描得到 {len(self._truth_scan_log.turns)} 条（未保存）"
         )
-        self.truth_scan_status.setText(
-            "扫描完成：可编辑并点击『保存日志』写入 truth_log.json"
-        )
-        InfoBar.success(
-            title="扫描完成",
-            content="可编辑并点击『保存日志』写入 truth_log.json",
-            parent=self,
-        )
+        if result_status == "complete":
+            self.truth_scan_status.setText(
+                "扫描完成：动作链已闭合，可编辑并点击『保存日志』写入 truth_log.json"
+            )
+            InfoBar.success(
+                title="扫描完成",
+                content="动作链已闭合，可编辑并点击『保存日志』写入 truth_log.json",
+                parent=self,
+            )
+        else:
+            detail = result_reason or "动作链未闭合或证据不足"
+            self.truth_scan_status.setText(
+                f"扫描{result_status}：{detail}；未生成可直接保存的可靠日志"
+            )
+            InfoBar.warning(
+                title=f"扫描{result_status}",
+                content=f"{detail}；请人工核对后再决定是否保存，正式日志保持不变",
+                parent=self,
+            )
+            self.diagnostics.insertPlainText(
+                f"\n[扫描{result_status}] {detail}\n"
+                f"处理帧数：{getattr(_value, 'frame_count', '?')}；"
+                f"动作数：{len(self._truth_scan_log.turns)}\n"
+            )
+        self._truth_scan_base = None
         if self._truth_editor is None:
             self._show_truth_log_editor(self._truth_scan_log)
         if self._truth_editor is not None:

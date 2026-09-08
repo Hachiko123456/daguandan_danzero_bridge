@@ -10,9 +10,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from daguandan_bridge.application.shadow_live_replay import (
     AbsolutePacer,
+    ReplayTransportClock,
     FaultProfile,
     ShadowLiveReplayConfig,
     ShadowLiveReplayRunner,
@@ -21,8 +23,16 @@ from daguandan_bridge.application.shadow_live_replay import (
     compare_repeat_results,
     summarize_advice_lifecycle,
     summarize_fault_applications,
+    _initial_state,
+    _action_latency,
+    _profile_location_for_session,
 )
+from daguandan_bridge.config import PROFILES_ROOT
 from daguandan_bridge.live.replay import FrameIndexRecord
+from daguandan_bridge.live.orchestrator import LiveOrchestrator
+from daguandan_bridge.live.reducer import LiveReducer
+from daguandan_bridge.domain.recognition import FastSignalResult, PlayRegionResult
+from daguandan_bridge.live.truth_log import TruthInitialState, TruthLog, TruthTurn, save_truth_log
 
 
 def _records(count: int = 4) -> tuple[FrameIndexRecord, ...]:
@@ -30,6 +40,57 @@ def _records(count: int = 4) -> tuple[FrameIndexRecord, ...]:
         FrameIndexRecord(index, 1_000 + index * 100, f"t{index}")
         for index in range(count)
     )
+
+
+def test_old_session_initial_state_uses_later_lead_confirmation(tmp_path):
+    session = tmp_path / "game-old"
+    session.mkdir()
+    (session / "timeline.jsonl").write_text(
+        "\n".join(
+            (
+                json.dumps(
+                    {
+                        "event_type": "initial_state_confirmed",
+                        "actor": None,
+                        "payload": {
+                            "round_level": "2",
+                            "hand": ["AH"],
+                            "lead_player": None,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_type": "lead_player_confirmed",
+                        "actor": "opposite",
+                        "payload": {"lead_player": "opposite"},
+                    }
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    initial = _initial_state(session)
+
+    assert initial["round_level"] == "2"
+    assert initial["hand"] == ("AH",)
+    assert initial["lead_player"] == "opposite"
+
+
+def test_exported_session_uses_local_profile_named_by_manifest(tmp_path):
+    session = tmp_path / "exported-game"
+    session.mkdir()
+    (session / "manifest.json").write_text(
+        json.dumps({"profile": "tencent_daguandan"}),
+        encoding="utf-8",
+    )
+
+    profiles_root, profile_name = _profile_location_for_session(session)
+
+    assert profiles_root == PROFILES_ROOT
+    assert profile_name == "tencent_daguandan"
 
 
 def test_fault_plan_is_seeded_hashed_and_captured_clock_never_regresses():
@@ -76,6 +137,39 @@ def test_each_fault_is_explicitly_planned_and_applied():
     assert len(duplicated.entries[0]["deliveries"]) == 2
     assert paused.entries[0]["faults"]["pause"]["value_ms"] == 500
     assert paused.entries[0]["deliveries"][0]["planned_delivery_ms"] == 500
+
+
+def test_processing_and_recording_delays_are_seeded_plan_data_not_time_scale():
+    profile = FaultProfile(
+        drop_probability=0.25,
+        duplicate_probability=0.5,
+        pause_probability=0.5,
+        pause_ms=300,
+        analysis_delay_ms=450,
+        recording_io_delay_ms=275,
+    )
+
+    first = build_fault_plan(_records(20), profile, seed=19, time_scale=4)
+    repeat = build_fault_plan(_records(20), profile, seed=19, time_scale=4)
+    temporal_only = build_fault_plan(
+        _records(20),
+        FaultProfile(
+            drop_probability=0.25,
+            duplicate_probability=0.5,
+            pause_probability=0.5,
+            pause_ms=300,
+        ),
+        seed=19,
+        time_scale=4,
+    )
+
+    assert first.to_dict() == repeat.to_dict()
+    assert first.entries == temporal_only.entries
+    assert first.document["time_scale"] == 4
+    assert first.document["analysis_delay"] == {"planned": True, "delay_ms": 450}
+    assert first.document["recording_io_delay"] == {"planned": True, "delay_ms": 275}
+    assert first.document["profile"]["analysis_delay_ms"] == 450
+    assert first.document["profile"]["recording_io_delay_ms"] == 275
 
 
 def test_absolute_pacer_uses_fixed_epoch_without_relative_sleep_drift():
@@ -349,6 +443,163 @@ def test_cli_returns_nonzero_for_sessions_root_output(tmp_path: Path):
     assert "outside the source sessions root" in completed.stderr
 
 
+def test_transport_mapping_preserves_plan_and_duplicate_capture_identity():
+    plan = build_fault_plan(_records(3), FaultProfile(duplicate_probability=1), seed=17, time_scale=2)
+    original = json.dumps(plan.to_dict(), sort_keys=True)
+    mapping = ReplayTransportClock(9_000_000.25, 1_000, 2)
+    first = plan.entries[0]
+    assert len(first["deliveries"]) == 2
+    capture, capture_seq = mapping.capture_for_entry(first)
+    assert capture == 9_000_000 and capture_seq == 1
+    assert first["deliveries"][0]["captured_monotonic_ms"] != first["deliveries"][1]["captured_monotonic_ms"]
+    assert mapping.capture_for_entry(first) == (capture, capture_seq)
+    assert mapping.capture_for_entry(plan.entries[1])[0] - capture == 50
+    assert mapping.reference_ms(1_100) == 9_000_050.25
+    assert json.dumps(plan.to_dict(), sort_keys=True) == original
+
+
+def test_action_latency_compares_mapped_event_and_truth_in_same_clock_domain(tmp_path):
+    session = _make_session(tmp_path / "sessions", frame_count=2)
+    save_truth_log(session / "truth_log.json", TruthLog(
+        source_session_id="game-short", initial_state=TruthInitialState("2", "right", ("2S",)),
+        turns=(TruthTurn(1, "right", False, ("3S",), frame_index=1, monotonic_ms=1_100),),
+    ))
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "timeline.jsonl").write_text(json.dumps({
+        "event_id": "EVT-1", "event_type": "player_played", "monotonic_ms": 9_000_080,
+    }) + "\n", encoding="utf-8")
+    result = _action_latency(session, runtime, _records(2), transport_clock=ReplayTransportClock(9_000_000, 1_000, 2))
+    assert result["available"] is True
+    row = result["rows"][0]
+    assert row["reference_monotonic_ms"] == 1_100
+    assert row["reference_replay_monotonic_ms"] == 9_000_050
+    assert row["latency_ms"] == 30
+
+
+class _HintReplayRecognition:
+    def __init__(self, clock, *, queue_delay_ms=0):
+        self.clock = clock
+        self.queue_delay_ms = queue_delay_ms
+        self.fast_calls = 0
+
+    def recognize_fast_signals(self, _image, expected_player, *, allow_pass=True):
+        self.fast_calls += 1
+        if self.queue_delay_ms:
+            # Work already submitted has become old. Advance the processing
+            # clock without changing its immutable mapped capture timestamp.
+            with self.clock.lock:
+                self.clock.value += self.queue_delay_ms / 1_000
+        return FastSignalResult(
+            expected_player=expected_player, active_player="self", pass_visible=False,
+            self_action_buttons_visible=True, effect_visible=False,
+            cannot_beat_visible=True, cannot_beat_confidence=.99,
+            cannot_beat_box=(10, 10, 20, 10),
+        )
+
+    def recognize_play_region(self, _image, seat, *, wild_rank, allow_pass=True):
+        return PlayRegionResult(seat, (), False, 0.0, ("no_card_evidence",), (), source="clock-acceptance")
+
+
+def _real_core_hint_replay(tmp_path, *, frames=2, profile=FaultProfile(), time_scale=1.0, processing_delay_ms=0, clock=None):
+    session = _make_session(tmp_path / "profile" / "sessions", frame_count=frames)
+    initial = json.loads((session / "timeline.jsonl").read_text("utf-8"))
+    initial["payload"]["hand"] = [f"{rank}{suit}" for rank in ("2", "3", "4", "5", "6", "7") for suit in "SHCD"] + ["8S", "8H", "8C"]
+    (session / "timeline.jsonl").write_text(json.dumps(initial) + "\n", encoding="utf-8")
+    original = {path: path.read_bytes() for path in session.rglob("*") if path.is_file()}
+    expected_plan = build_fault_plan(_records(frames), profile, seed=7, time_scale=time_scale, canvas_size=(64, 32))
+    clock = clock or _VirtualClock()
+    with clock.lock:
+        clock.value = 1_000_000.0  # Clearly unrelated to historical source1000ms.
+    updates, observed_inputs, holder = [], [], {}
+    recognition = _HintReplayRecognition(clock, queue_delay_ms=processing_delay_ms)
+
+    def factory(*, store, recorder, recognition, advisor, processing_clock_ms):
+        value = LiveOrchestrator(
+            reducer=LiveReducer(store.session_id), store=store, recorder=recorder,
+            recognition_service=recognition, advisor=None, settle_ms=0,
+            minimum_free_bytes=0, processing_clock_ms=processing_clock_ms,
+            on_update=updates.append,
+        )
+        original_analyze = value.analyze_frame
+
+        def inspect_input(image, *, monotonic_ms, trace_context):
+            observed_inputs.append((monotonic_ms, dict(trace_context), processing_clock_ms()))
+            return original_analyze(image, monotonic_ms=monotonic_ms, trace_context=trace_context)
+
+        value.analyze_frame = inspect_input
+        holder["core"] = value
+        return value
+
+    result = ShadowLiveReplayRunner(
+        recognition_factory=lambda _session: recognition, advisor_factory=lambda *_: _Advisor(),
+        orchestrator_factory=factory, clock=clock.now, sleep=clock.sleep,
+    ).run(ShadowLiveReplayConfig(
+        session=session, output=tmp_path / "reports", run_id="mapped",
+        fault_profile=profile, seed=7, time_scale=time_scale,
+        expected_plan_sha256=expected_plan.sha256, drain_timeout_sec=2,
+    ))
+    assert {path: path.read_bytes() for path in session.rglob("*") if path.is_file()} == original
+    assert json.loads(result.fault_plan_path.read_text("utf-8")) == expected_plan.to_dict()
+    assert result.summary["source_integrity"]["unchanged"] is True
+    return result, updates, observed_inputs, holder["core"]
+
+
+@pytest.mark.parametrize("time_scale", [1.0, 2.0])
+def test_old_video_replayed_with_real_core_clock_produces_fresh_two_frame_hint(tmp_path, time_scale):
+    result, updates, inputs, core = _real_core_hint_replay(tmp_path, time_scale=time_scale)
+    assert result.execution_ok
+    assert len(inputs) == 2
+    assert any(update.local_rule_hint is not None for update in updates)
+    assert all(captured >= 1_000_000_000 for captured, _, _ in inputs)
+    assert all(context["source_monotonic_ms"] in {1_000, 1_100} for _, context, _ in inputs)
+    assert all(context["capture_generation"] == 1 and context["capture_seq"] > 0 for _, context, _ in inputs)
+    assert inputs[1][0] - inputs[0][0] == 100 / time_scale
+    assert all(0 <= processing - captured <= 500 for captured, _, processing in inputs)
+    mapping = json.loads((result.run_directory / "clock_mapping.json").read_text("utf-8"))
+    assert mapping["processing_clock_injected"] is True
+    assert mapping["fault_plan_sha256"] == result.summary["fault_plan_sha256"]
+    assert core.snapshot.revision == 1 and not core.snapshot.play_history
+
+
+def test_delayed_replay_processing_does_not_refresh_old_frame_capture_time(tmp_path):
+    result, updates, inputs, core = _real_core_hint_replay(tmp_path, processing_delay_ms=800)
+    assert len(inputs) == 2
+    assert inputs[1][0] - inputs[0][0] == 100
+    assert not any(update.local_rule_hint is not None for update in updates)
+    rows = _json_lines(result.run_directory / "analysis.jsonl")
+    assert any(row["analyze_ms"] >= 799 for row in rows)
+    assert core.snapshot.revision == 1 and not core.snapshot.play_history
+
+
+def test_late_replay_scheduler_does_not_stamp_old_delivery_as_new_capture(tmp_path):
+    class VeryLateClock(_VirtualClock):
+        def sleep(self, seconds):
+            with self.lock:
+                self.sleeps.append(seconds)
+                self.value += seconds + .8
+
+    result, updates, inputs, core = _real_core_hint_replay(tmp_path, clock=VeryLateClock())
+    assert len(inputs) == 2
+    assert inputs[1][0] - inputs[0][0] == 100
+    assert not any(update.local_rule_hint is not None for update in updates)
+    deliveries = _json_lines(result.run_directory / "deliveries.jsonl")
+    assert max(row["capture_age_at_delivery_ms"] for row in deliveries) >= 799
+    assert any(processing - captured >= 799 for captured, _, processing in inputs)
+    assert not result.summary["schedule"]["strict_no_fault_timing_pass"]
+    assert core.snapshot.revision == 1 and not core.snapshot.play_history
+
+
+def test_fault_duplicate_delivery_is_not_two_real_core_capture_samples(tmp_path):
+    result, updates, inputs, core = _real_core_hint_replay(tmp_path, frames=1, profile=FaultProfile(duplicate_probability=1))
+    assert len(inputs) == 2
+    assert inputs[0][0] == inputs[1][0]
+    assert inputs[0][1]["capture_seq"] == inputs[1][1]["capture_seq"]
+    assert inputs[0][1]["planned_captured_monotonic_ms"] != inputs[1][1]["planned_captured_monotonic_ms"]
+    assert not any(update.local_rule_hint is not None for update in updates)
+    assert core.snapshot.revision == 1 and not core.snapshot.play_history
+
+
 class _VirtualClock:
     def __init__(self) -> None:
         self.value = 0.0
@@ -548,3 +799,46 @@ def _make_session(sessions: Path, *, frame_count: int) -> Path:
 
 def _json_lines(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line]
+
+
+def test_runner_injects_real_analysis_and_recording_work_delays(tmp_path):
+    session = _make_session(tmp_path / "profile" / "sessions", frame_count=1)
+    clock = _VirtualClock()
+    result = ShadowLiveReplayRunner(
+        recognition_factory=lambda _session: object(),
+        advisor_factory=lambda *_args: _Advisor(),
+        orchestrator_factory=lambda **kwargs: _FakeOrchestrator(**kwargs),
+        clock=clock.now,
+        sleep=clock.sleep,
+        analysis_sleep=clock.sleep,
+        recording_sleep=clock.sleep,
+    ).run(
+        ShadowLiveReplayConfig(
+            session=session,
+            output=tmp_path / "reports",
+            run_id="slow-machine",
+            max_frames=1,
+            fault_profile=FaultProfile(
+                analysis_delay_ms=400,
+                recording_io_delay_ms=250,
+            ),
+        )
+    )
+
+    delivery = _json_lines(result.run_directory / "deliveries.jsonl")[0]
+    analysis = _json_lines(result.run_directory / "analysis.jsonl")[0]
+    assert delivery["record_ms"] >= 250
+    assert delivery["injected_recording_io_delay_ms"] == 250
+    assert analysis["analyze_ms"] >= 400
+    assert analysis["injected_analysis_delay_ms"] == 400
+    assert result.summary["faults"]["recording_io_delay"] == {
+        "planned": 1,
+        "applied": 1,
+        "skipped": 0,
+    }
+    assert result.summary["faults"]["analysis_delay"] == {
+        "planned": 1,
+        "applied": 1,
+        "skipped": 0,
+    }
+    assert result.summary["schedule"]["strict_no_fault_timing_required"] is False

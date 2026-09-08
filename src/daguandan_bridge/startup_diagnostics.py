@@ -15,6 +15,7 @@ import faulthandler
 import json
 import os
 from pathlib import Path
+from .bounded_log import RotatingTextLog, append_bounded_event
 import re
 import sys
 import tempfile
@@ -172,15 +173,11 @@ def initialize_startup_diagnostics(
             fault_path = run_directory / "faulthandler.log"
             console_path = run_directory / "startup.log"
 
-            _EXCEPTION_HANDLE = exception_path.open(
-                "a", encoding="utf-8", buffering=1, newline="\n"
-            )
+            _EXCEPTION_HANDLE = RotatingTextLog(exception_path)
             _FAULT_HANDLE = fault_path.open(
                 "a", encoding="utf-8", buffering=1, newline="\n"
             )
-            _CONSOLE_HANDLE = console_path.open(
-                "a", encoding="utf-8", buffering=1, newline="\n"
-            )
+            _CONSOLE_HANDLE = RotatingTextLog(console_path)
             if sys.stdout is None or sys.stderr is None:
                 _STDIO_REDIRECTED = True
                 if sys.stdout is None:
@@ -268,13 +265,7 @@ def _append_event(event: str, evidence: Mapping[str, object]) -> None:
     }
     try:
         with _EVENT_WRITE_LOCK:
-            with (state.run_directory / "startup.jsonl").open(
-                "a", encoding="utf-8", newline="\n"
-            ) as handle:
-                handle.write(
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                )
-                handle.write("\n")
+            append_bounded_event(state.run_directory / "startup.jsonl", payload)
     except BaseException:
         return
 

@@ -320,6 +320,33 @@ def test_source_identity_gate_detects_tracked_mutation_during_build(tmp_path: Pa
         verify_source_identity(project, expected)
 
 
+def test_development_source_identity_allows_stable_dirty_tree_only(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run(
+        ["git", "-C", str(project), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project), "config", "user.name", "Release Test"],
+        check=True,
+    )
+    tracked = project / "tracked.py"
+    tracked.write_text("before = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "tracked.py"], check=True)
+    subprocess.run(["git", "-C", str(project), "commit", "-qm", "initial"], check=True)
+    tracked.write_text("dirty = 1\n", encoding="utf-8")
+    expected = build_manifest_module.collect_source_identity(project)
+
+    verified = verify_source_identity(project, expected, require_clean=False)
+    assert verified["dirty"] is True
+
+    tracked.write_text("dirty = 2\n", encoding="utf-8")
+    with pytest.raises(BuildManifestError, match="source identity changed"):
+        verify_source_identity(project, expected, require_clean=False)
+
+
 def test_immutable_runtime_and_missing_seed_config_are_both_errors(
     tmp_path: Path,
 ):

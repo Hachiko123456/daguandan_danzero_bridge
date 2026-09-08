@@ -1,0 +1,29 @@
+{
+  "schema": "guandan.pyinstaller-live-v2-collection/1",
+  "hidden_imports": [
+    "daguandan_bridge.application.live_v2_advice_protocol",
+    "daguandan_bridge.application.live_v2_advice_runtime",
+    "daguandan_bridge.application.live_v2_frame_pipeline",
+    "daguandan_bridge.application.live_v2_session_runtime",
+    "daguandan_bridge.application.live_v2_vision_protocol",
+    "daguandan_bridge.application.live_v2_vision_runtime",
+    "daguandan_bridge.application.live_v2_worker_protocol",
+    "daguandan_bridge.application.recording_process_protocol",
+    "daguandan_bridge.fabledan.advisor",
+    "daguandan_bridge.infrastructure.live_v2_advice_service_factory",
+    "daguandan_bridge.infrastructure.live_v2_advice_worker",
+    "daguandan_bridge.infrastructure.live_v2_rule_session",
+    "daguandan_bridge.infrastructure.live_v2_vision_service_factory",
+    "daguandan_bridge.infrastructure.live_v2_vision_worker",
+    "daguandan_bridge.infrastructure.live_v2_worker_host",
+    "daguandan_bridge.infrastructure.live_v2_worker_process",
+    "daguandan_bridge.infrastructure.process_session_recorder",
+    "daguandan_bridge.infrastructure.recording_process",
+    "daguandan_bridge.infrastructure.recording_process_forensics",
+    "daguandan_bridge.infrastructure.recording_process_worker",
+    "daguandan_bridge.recognition_service",
+    "multiprocessing.popen_spawn_win32",
+    "multiprocessing.reduction",
+    "multiprocessing.spawn"
+  ]
+}

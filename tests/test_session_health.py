@@ -10,6 +10,7 @@ from daguandan_bridge.session_health import (
     ACTION_CHAIN_INCONSISTENT,
     FINISHED_SEATS_INCONSISTENT,
     PREMATURE_GAME_END,
+    RECORDING_INCOMPLETE,
     audit_session_health,
 )
 from daguandan_bridge.live.session_store import LiveSessionStore
@@ -65,6 +66,77 @@ def test_no_terminal_control_produces_no_premature_terminal_issue():
 
     assert report["status"] == "PASS"
     assert report["issues"] == []
+
+
+def test_recording_integrity_mismatch_is_exposed_as_health_failure():
+    snapshot = SimpleNamespace(
+        remaining_cards={"self": 27, "right": 27, "opposite": 27, "left": 27},
+        finished_seats=frozenset(),
+        play_history=(),
+    )
+
+    report = audit_session_health(
+        snapshot,
+        (),
+        recording_integrity={
+            "status": "FAIL",
+            "writer_frame_count": 1076,
+            "indexed_frame_count": 1076,
+            "decodable_frame_count": 1033,
+            "last_decodable_frame_index": 1032,
+            "issues": ["indexed_decodable_count_mismatch"],
+        },
+    )
+
+    issue = next(item for item in report["issues"] if item["code"] == RECORDING_INCOMPLETE)
+    assert report["status"] == "FAIL"
+    assert issue["evidence"]["indexed_frame_count"] == 1076
+    assert issue["evidence"]["decodable_frame_count"] == 1033
+
+
+def test_recovered_tail_is_not_reported_as_false_health_failure():
+    snapshot = SimpleNamespace(
+        remaining_cards={"self": 27, "right": 27, "opposite": 27, "left": 27},
+        finished_seats=frozenset(),
+        play_history=(),
+    )
+
+    report = audit_session_health(
+        snapshot,
+        (),
+        recording_integrity={
+            "status": "RECOVERED",
+            "indexed_frame_count": 5,
+            "decodable_frame_count": 3,
+            "recovered_frame_count": 2,
+        },
+    )
+
+    assert report["status"] == "PASS"
+    assert not any(item["code"] == RECORDING_INCOMPLETE for item in report["issues"])
+
+
+def test_partial_tail_recovery_remains_a_health_failure():
+    snapshot = SimpleNamespace(
+        remaining_cards={"self": 27, "right": 27, "opposite": 27, "left": 27},
+        finished_seats=frozenset(),
+        play_history=(),
+    )
+
+    report = audit_session_health(
+        snapshot,
+        (),
+        recording_integrity={
+            "status": "PARTIAL",
+            "indexed_frame_count": 8,
+            "decodable_frame_count": 3,
+            "tail_recovery": {"status": "unavailable"},
+        },
+    )
+
+    assert report["status"] == "FAIL"
+    issue = next(item for item in report["issues"] if item["code"] == RECORDING_INCOMPLETE)
+    assert issue["evidence"]["status"] == "PARTIAL"
 
 
 def test_health_fail_is_appended_after_seal_without_timeline_mutation(tmp_path):

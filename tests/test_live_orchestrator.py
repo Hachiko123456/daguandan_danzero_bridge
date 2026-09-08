@@ -3,28 +3,40 @@ from __future__ import annotations
 import json
 import threading
 import time
+from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
+from daguandan_bridge.application.ports import LiveRuntimePort
+from daguandan_bridge.domain.live_runtime import (
+    AdviceRequestKey as DomainAdviceRequestKey,
+    LiveAdvice as DomainLiveAdvice,
+    LiveUpdate as DomainLiveUpdate,
+)
 from daguandan_bridge.live.orchestrator import (
+    AdviceRequestKey,
     LiveOrchestrator,
     ReviewCandidate,
     ReviewRequest,
+    _AdviceJob,
     _TurnOwnershipWindow,
 )
 from daguandan_bridge.live.models import LiveEvent
 from daguandan_bridge.live.consensus import ConsensusResult, RecognitionSample
 from daguandan_bridge.live.recorder import SessionRecorder
 from daguandan_bridge.live.reducer import LiveReducer
+from daguandan_bridge.live.replay import EventReplayer
 from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
-from daguandan_bridge.live.zone_lifecycle import ZoneFrameMetrics
+from daguandan_bridge.live.zone_lifecycle import ZoneDecision, ZoneFrameMetrics, ZonePhase
+from daguandan_bridge.domain.advice import AdviceResult
 from daguandan_bridge.recognition_service import (
     FastSignalResult,
     OpeningSignal,
     PlacementSignal,
     PlayRegionResult,
+    RecognitionAnnotation,
 )
 from daguandan_bridge.gui.workers import LatestOnlyWorker
 
@@ -39,7 +51,9 @@ HAND = tuple(
 def test_confirmed_expected_roi_handoff_precedes_fast_turn_recovery():
     cards = ("10D", "10S", "QD", "QH", "QS")
     samples = [
-        RecognitionSample(cards, False, 0.91, "template:cards", f"OBS-{index}")
+        RecognitionSample(cards, False, 0.91, "template:cards", f"OBS-{index}",
+                          captured_ms=1_000 + index * 50, capture_seq=index,
+                          action_epoch=("session", 31, 32, "right", 0))
         for index in (1, 2)
     ]
     window = _TurnOwnershipWindow(
@@ -49,6 +63,7 @@ def test_confirmed_expected_roi_handoff_precedes_fast_turn_recovery():
         turn_recovery_pending=True,
         turn_recovery_detected_ms=1_188,
         handoff_samples=samples,
+        evidence_epoch=("session", 31, 32, "right", 0),
     )
     result = ConsensusResult(
         status="confirmed",
@@ -72,6 +87,349 @@ def test_confirmed_expected_roi_handoff_precedes_fast_turn_recovery():
         window,
         replace(result, is_pass=True, cards=()),
     )
+
+
+def test_recovery_real_deadline_emits_under_busy_analysis_lock_with_generation(tmp_path):
+    notices = []
+    notice_ready = threading.Event()
+
+    def on_update(update):
+        notices.append(update)
+        if update.block_reason == "turn_recovery_budget_exceeded":
+            notice_ready.set()
+
+    orchestrator = _orchestrator(tmp_path, [], lead_player="right", on_update=on_update)
+    orchestrator._capture_generation = 2
+    window = orchestrator._ensure_turn_ownership_window()
+    fast = FastSignalResult("right", "self", False, True, False)
+    orchestrator._begin_turn_recovery(window, fast, 100, reason="test_missing_lead")
+    began = time.monotonic()
+    with orchestrator._state_lock:
+        orchestrator._withhold_advice_for_turn_recovery(window, 100)
+        assert notice_ready.wait(2.6), "deadline notice must not wait for analysis lock"
+        notice = notices[-1]
+        assert time.monotonic() - began < 2.6
+        assert notice.capture_generation == 2 and notice.update_sequence > 0
+        assert notice.missing_player == "right" and notice.missing_action_kind == "lead"
+        assert window.turn_recovery_deadline_expired
+    orchestrator.poll_deadlines()
+    assert window.turn_recovery_failed
+    orchestrator.finish()
+
+
+def test_obsolete_deadline_cannot_overwrite_new_revision_or_generation(tmp_path):
+    notices = []
+    orchestrator = _orchestrator(tmp_path, [], lead_player="right", on_update=notices.append)
+    window = orchestrator._ensure_turn_ownership_window()
+    fast = FastSignalResult("right", "self", False, True, False)
+    orchestrator._begin_turn_recovery(window, fast, 100, reason="test")
+    orchestrator._withhold_advice_for_turn_recovery(window, 100)
+    callback = orchestrator._deadline_timer.function
+    orchestrator.commit_trusted_action(actor="right", cards=("9C",), is_pass=False, monotonic_ms=200)
+    before = len(notices)
+    callback()
+    assert len(notices) == before
+    assert not orchestrator._turn_ownership_window.turn_recovery_failed
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("through_fast_signal", [False, True])
+def test_new_capture_generation_clears_old_deadline_before_poll(tmp_path, through_fast_signal):
+    clock = [1_000]
+    orchestrator = _orchestrator(tmp_path, [], lead_player="right", processing_clock_ms=lambda: clock[0])
+    window = orchestrator._ensure_turn_ownership_window()
+    fast = FastSignalResult("right", "self", False, True, False)
+    orchestrator._begin_turn_recovery(window, fast, 100, reason="test")
+    orchestrator._withhold_advice_for_turn_recovery(window, 100)
+    window.turn_recovery_deadline_expired = True
+    clock[0] = 3_000
+    if through_fast_signal:
+        orchestrator._recognition_trace_context = {"capture_generation": 2}
+        orchestrator._observe_local_rule_hint(fast, 2_900, frame_size=(64, 32))
+    else:
+        orchestrator._capture_generation = 2
+    orchestrator.poll_deadlines()
+    assert not window.turn_recovery_failed
+    assert not window.turn_recovery_deadline_expired
+    assert window.turn_recovery_processing_started_ms is None
+    assert window.turn_recovery_deadline_identity == ()
+    assert window.turn_recovery_pending, "unresolved history still must not admit a model"
+    orchestrator.finish()
+
+
+def test_deadline_listener_reentering_pause_has_no_publication_state_lock_inversion(tmp_path):
+    callback_entered = threading.Event()
+    worker_holds_state = threading.Event()
+    worker_done = threading.Event()
+    callback_done = threading.Event()
+    orchestrator = _orchestrator(tmp_path, [], lead_player="right")
+
+    def listener(update):
+        if update.block_reason == "turn_recovery_budget_exceeded":
+            callback_entered.set()
+            orchestrator.pause()
+
+    orchestrator._update_listener = listener
+    window = orchestrator._ensure_turn_ownership_window()
+    fast = FastSignalResult("right", "self", False, True, False)
+    orchestrator._begin_turn_recovery(window, fast, 100, reason="test")
+    orchestrator._withhold_advice_for_turn_recovery(window, 100)
+    callback = orchestrator._deadline_timer.function
+    orchestrator._deadline_timer.cancel()
+
+    def state_worker():
+        with orchestrator._state_lock:
+            worker_holds_state.set()
+            assert callback_entered.wait(1)
+            orchestrator._update()
+        worker_done.set()
+
+    def run_callback():
+        callback()
+        callback_done.set()
+
+    worker = threading.Thread(target=state_worker, daemon=True)
+    timer = threading.Thread(target=run_callback, daemon=True)
+    worker.start()
+    assert worker_holds_state.wait(1)
+    timer.start()
+    assert worker_done.wait(1), "publication listener must not retain the small publication lock"
+    assert callback_done.wait(1)
+    assert orchestrator.status == "paused"
+    orchestrator.finish()
+
+
+def test_high_risk_verification_expires_without_new_capture(tmp_path):
+    orchestrator, target, _advisor, submitted = _open_adjacent_action_reread(tmp_path)
+    target.processing_opened_ms = 1_000
+    orchestrator._processing_clock_ms = lambda: 2_200
+    orchestrator.poll_deadlines()
+    assert target.state == "expired"
+    assert submitted
+    orchestrator.finish()
+
+
+def test_turn_recovery_waits_for_self_opportunity_beyond_capture_wall_clock(tmp_path):
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="self",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10,
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None and window.expected_player == "right"
+    orchestrator._begin_turn_recovery(
+        window,
+        FastSignalResult("right", "opposite", False, False, False),
+        100,
+        reason="active_player_crossed_handoff",
+    )
+
+    result = orchestrator._advance_turn_recovery(
+        window,
+        FastSignalResult("right", "left", False, False, False),
+        4_500,
+        metrics=ZoneFrameMetrics(4_500, False, 0.0, False, False),
+        decision=ZoneDecision(ZonePhase.WAIT_ACTION),
+    )
+
+    assert result is None
+    assert window.turn_recovery_pending
+    assert not window.turn_recovery_failed
+    assert window.turn_recovery_processing_started_ms is None
+    assert not any(
+        event.event_type == "advice_recovery_failed"
+        and event.payload.get("reason") == "capture_evidence_window_expired"
+        for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+def test_ordinary_exact_play_does_not_arm_blocking_previous_action_reread(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [], lead_player="opposite")
+    update = orchestrator.commit_trusted_action(
+        actor="opposite", cards=("9C",), is_pass=False, monotonic_ms=10, confidence=.90,
+    )
+    assert update.event.event_id not in orchestrator._previous_action_verifications
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=20)
+    assert orchestrator._previous_action_verification_target(orchestrator.snapshot) is None
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("case", ["fresh", "stale", "not_in_hand", "duplicate", "generation", "controls_visible", "effect", "late", "wrong_successor"])
+def test_self_static_handoff_is_a_bounded_known_hand_probe_not_a_motion_bypass(tmp_path, case):
+    class SelfPixels(FakeRecognitionService):
+        active = "self"
+        controls = True
+        effect = False
+
+        @staticmethod
+        def play_roi(frame, seat):
+            index = ("self", "right", "opposite", "left").index(seat)
+            return frame[:, index * 16:(index + 1) * 16]
+
+        def recognize_fast_signals(self, image, expected_player, **kwargs):
+            return FastSignalResult(expected_player, self.active, False, self.controls, self.effect)
+
+        def recognize_play_region(self, image, seat, **kwargs):
+            self.targeted_calls += 1
+            cards = ("small_joker",) if self.play_roi(image, seat).any() else ()
+            return PlayRegionResult(seat, cards, False, .96 if cards else 0., (), (), source="self-pixel-code")
+
+    recognition = SelfPixels([])
+    hand = HAND if case == "not_in_hand" else (*HAND[:-1], "small_joker")
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, lead_player="opposite", hand=hand, round_level="6")
+    orchestrator.commit_trusted_action(actor="opposite", cards=("6D",), is_pass=False, monotonic_ms=10)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=20)
+    baseline = np.zeros((32, 64, 3), np.uint8)
+    played = baseline.copy()
+    played[3:29, 2:14] = 220
+    for stamp in (100, 200):
+        orchestrator.analyze_frame(played if case == "stale" else baseline, monotonic_ms=stamp,
+            metrics=ZoneFrameMetrics(stamp, False, 0., False, False),
+            trace_context={"capture_generation": 1, "capture_seq": stamp})
+    before = orchestrator.snapshot
+    recognition.active = "left" if case == "wrong_successor" else "right"
+    recognition.controls = case == "controls_visible"
+    recognition.effect = case == "effect"
+    stamps = (300, 300) if case == "duplicate" else (300, 1_401) if case == "late" else (300, 400)
+    for index, stamp in enumerate(stamps):
+        update = orchestrator.analyze_frame(played, monotonic_ms=stamp,
+            metrics=ZoneFrameMetrics(stamp, False, 0., False, recognition.effect),
+            trace_context={"capture_generation": 2 if case == "generation" and index else 1, "capture_seq": stamp})
+    if case == "fresh":
+        assert update.event is not None and update.event.source == "self_static_handoff_known_hand"
+        assert update.event.payload["cards"] == ["small_joker"]
+        assert update.snapshot.current_player == "right"
+        assert "small_joker" not in update.snapshot.my_hand
+    else:
+        assert orchestrator.snapshot == before
+    assert recognition.targeted_calls <= 4
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("case,expected", [("golden_joker", "visible_nonpass"), ("changed_empty", "unknown"), ("exception", "unknown"), ("stable_empty", "empty")])
+def test_pass_inference_distinguishes_weak_cards_and_unknown_from_stable_empty(tmp_path, case, expected):
+    class SurfaceRecognition(FakeRecognitionService):
+        def recognize_play_region(self, frame, seat, **kwargs):
+            if case == "exception":
+                raise RuntimeError("temporary matcher failure")
+            cards = ("big_joker",) if case == "golden_joker" else ()
+            return PlayRegionResult(seat, cards, False, .67 if cards else 0., (), (), source="surface-state-fixture")
+
+    orchestrator = _orchestrator(tmp_path, [], recognition=SurfaceRecognition([]), lead_player="opposite")
+    orchestrator.commit_trusted_action(actor="opposite", cards=("9C",), is_pass=False, monotonic_ms=10)
+    window = orchestrator._ensure_turn_ownership_window()
+    frame = np.zeros((32, 64, 3), np.uint8)
+    window.surface_baseline_frames = {"left": frame.copy()}
+    if case != "stable_empty":
+        frame[:] = 200
+    fast = FastSignalResult("left", "self", False, True, False)
+    state = orchestrator._pass_inference_surface_state(window, orchestrator.reducer, frame, fast,
+        ZoneFrameMetrics(100, True, 0., False, False), "left")
+    assert state == expected
+    window.temporal_confirmed_actives = ["left", "self"]
+    before = orchestrator.snapshot
+    candidates = orchestrator._temporal_turn_recovery_cycle(window, frame, fast,
+        metrics=ZoneFrameMetrics(100, True, 0., False, False))
+    assert orchestrator.snapshot == before
+    assert (candidates is not None) == (case == "stable_empty")
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("expected,next_seat,leader", [
+    ("self", "right", "left"), ("right", "opposite", "self"),
+    ("opposite", "left", "right"), ("left", "self", "opposite"),
+])
+def test_normal_pass_rotations_bypass_generic_recovery(tmp_path, expected, next_seat, leader):
+    class RotationSignals(FakeRecognitionService):
+        def recognize_fast_signals(self, image, expected_player, **kwargs):
+            self.fast_calls += 1
+            passed = self.fast_calls >= 2
+            active = next_seat if passed else expected
+            return FastSignalResult(
+                expected_player, active, passed, active == "self", False,
+                pass_marker_player=expected if passed else None,
+                pass_marker_players=(expected,) if passed else (),
+            )
+
+    recognition = RotationSignals([])
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, lead_player=leader)
+    orchestrator.commit_trusted_action(actor=leader, cards=("3C",), is_pass=False, monotonic_ms=10)
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for stamp in (100, 200, 300):
+        update = orchestrator.ingest_frame(frame, monotonic_ms=stamp, wall_time=str(stamp),
+            metrics=ZoneFrameMetrics(stamp, False, 0.0, False, False))
+    assert update.event is not None and update.event.event_type == "player_passed"
+    assert update.event.actor == expected
+    assert update.event.source == "unseen_direct_next_pass_marker"
+    assert update.snapshot.current_player == next_seat
+    assert not any(event.event_type == "advice_withheld" and event.payload.get("reason") == "turn_recovery_pending"
+                   for event in orchestrator.events)
+    assert recognition.targeted_calls == 0
+    orchestrator.finish()
+
+
+def test_pre_switch_surface_cache_recovers_already_static_fast_play(tmp_path):
+    class StaticFastPlay(FakeRecognitionService):
+        def play_roi(self, frame, seat):
+            index = ("self", "right", "opposite", "left").index(seat)
+            return frame[:, index * 16:(index + 1) * 16]
+
+        def recognize_fast_signals(self, image, expected_player, **kwargs):
+            return FastSignalResult(expected_player, "opposite", False, False, False)
+
+    recognition = StaticFastPlay([_seat_play("right", "9C")] * 4)
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, lead_player="self")
+    baseline = np.zeros((32, 64, 3), np.uint8)
+    changed = baseline.copy()
+    changed[:, 16:32] = 255  # Right already played before self is formally committed.
+    orchestrator._update_surface_generations(baseline, 100)
+    orchestrator._update_surface_generations(changed, 200)
+    orchestrator.commit_trusted_action(actor="self", cards=("3C",), is_pass=False, monotonic_ms=220)
+    update = None
+    for stamp in (300, 400, 500, 600):
+        update = orchestrator.ingest_frame(changed, monotonic_ms=stamp, wall_time=str(stamp))
+        if update.event is not None:
+            break
+    assert update is not None and update.event is not None
+    assert update.event.actor == "right" and update.event.payload["cards"] == ["9C"]
+    assert update.snapshot.current_player == "opposite"
+    assert orchestrator._turn_evidence.retained_bytes <= 16 * 1024 * 1024
+    orchestrator.finish()
+
+
+def test_warm_cache_does_not_reread_consumed_static_cards_after_fast_full_cycle(tmp_path):
+    class StaticResidual(FakeRecognitionService):
+        def play_roi(self, frame, seat):
+            index = ("self", "right", "opposite", "left").index(seat)
+            return frame[:, index * 16:(index + 1) * 16]
+
+        def recognize_fast_signals(self, image, expected_player, **kwargs):
+            return FastSignalResult(expected_player, "opposite", False, False, False)
+
+    recognition = StaticResidual([_seat_play("right", "9C")] * 10)
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, lead_player="right")
+    baseline = np.zeros((32, 64, 3), np.uint8)
+    residual = baseline.copy()
+    residual[:, 16:32] = 255
+    orchestrator._update_surface_generations(baseline, 100)
+    orchestrator._update_surface_generations(residual, 200)
+    orchestrator.commit_trusted_action(actor="right", cards=("9C",), is_pass=False, monotonic_ms=220)
+    for seat, stamp in (("opposite", 240), ("left", 260), ("self", 280)):
+        orchestrator.commit_trusted_action(actor=seat, is_pass=True, monotonic_ms=stamp)
+    assert orchestrator.snapshot.current_player == "right" and not orchestrator.snapshot.trick_plays
+    for stamp in (300, 400, 500):
+        orchestrator.ingest_frame(residual, monotonic_ms=stamp, wall_time=str(stamp))
+    right_actions = [event for event in orchestrator.events if event.event_type == "player_played" and event.actor == "right"]
+    assert len(right_actions) == 1
+    assert recognition.targeted_calls == 0
+    assert orchestrator.snapshot.current_player == "right"
+    orchestrator.finish()
 
 
 class FakeRecognitionService:
@@ -150,6 +508,273 @@ class ScheduledActiveRecognitionService(FakeRecognitionService):
         )
 
 
+class CannotBeatRecognitionService(FakeRecognitionService):
+    def __init__(
+        self,
+        signals: list[tuple[bool, float, tuple[int, int, int, int] | None, bool]],
+        *,
+        active_players: list[str | None] | None = None,
+    ):
+        super().__init__([])
+        self.signals = list(signals)
+        self.active_players = list(active_players or ["self"])
+        self._index = 0
+
+    def recognize_fast_signals(self, _image, expected_player, *, allow_pass=True):
+        del allow_pass
+        self.fast_calls += 1
+        index = min(self._index, len(self.signals) - 1)
+        visible, confidence, box, effect = self.signals[index]
+        active = self.active_players[min(index, len(self.active_players) - 1)]
+        self._index += 1
+        return FastSignalResult(
+            expected_player=expected_player,
+            active_player=active,
+            pass_visible=False,
+            self_action_buttons_visible=visible,
+            effect_visible=effect,
+            cannot_beat_visible=visible,
+            cannot_beat_confidence=confidence,
+            cannot_beat_box=box,
+        )
+
+
+class FastCycleRecognitionService(FakeRecognitionService):
+    def __init__(self, first_cards: tuple[str, ...]):
+        super().__init__([])
+        self.first_cards = first_cards
+        self.calls: list[str] = []
+
+    def recognize_fast_signals(self, _image, expected_player, *, allow_pass=True):
+        del allow_pass
+        return FastSignalResult(
+            expected_player=expected_player,
+            active_player="self",
+            pass_visible=False,
+            self_action_buttons_visible=True,
+            effect_visible=False,
+            pass_marker_players=("opposite", "left"),
+        )
+
+    def recognize_play_region(
+        self,
+        _image,
+        seat,
+        *,
+        wild_rank,
+        allow_pass=True,
+        allow_unknown_suit=True,
+    ):
+        del wild_rank, allow_pass, allow_unknown_suit
+        self.calls.append(seat)
+        if seat == "right":
+            return PlayRegionResult(
+                player=seat,
+                cards=self.first_cards,
+                is_pass=False,
+                confidence=0.96,
+                diagnostics=(),
+                annotations=(),
+                source="synthetic-fast-cycle",
+            )
+        return PlayRegionResult(
+            player=seat,
+            cards=(),
+            is_pass=True,
+            confidence=0.99,
+            diagnostics=(),
+            annotations=(),
+            source="synthetic-seat-pass",
+        )
+
+
+class PixelFastCycleRecognitionService(FastCycleRecognitionService):
+    _SLICES = {
+        "self": slice(0, 16),
+        "right": slice(16, 32),
+        "opposite": slice(32, 48),
+        "left": slice(48, 64),
+    }
+
+    def __init__(self, first_cards: tuple[str, ...]):
+        super().__init__(first_cards)
+        self.fast_index = 0
+
+    def recognize_fast_signals(self, _image, expected_player, *, allow_pass=True):
+        del allow_pass
+        self.fast_index += 1
+        returned = self.fast_index >= 2
+        return FastSignalResult(
+            expected_player=expected_player,
+            active_player="self" if returned else expected_player,
+            pass_visible=False,
+            self_action_buttons_visible=returned,
+            effect_visible=False,
+            pass_marker_players=("opposite", "left") if returned else (),
+        )
+
+    def play_roi(self, image, seat):
+        return image[:, self._SLICES[seat], :]
+
+    def recognize_play_region(
+        self,
+        image,
+        seat,
+        *,
+        wild_rank,
+        allow_pass=True,
+        allow_unknown_suit=True,
+    ):
+        if self.fast_index <= 1 and seat == "right":
+            return PlayRegionResult(
+                player=seat,
+                cards=(),
+                is_pass=False,
+                confidence=0.0,
+                diagnostics=(),
+                annotations=(),
+                source="empty-turn-baseline",
+            )
+        return super().recognize_play_region(
+            image,
+            seat,
+            wild_rank=wild_rank,
+            allow_pass=allow_pass,
+            allow_unknown_suit=allow_unknown_suit,
+        )
+
+
+class SelfControlEdgeConsumptionRecognitionService(FakeRecognitionService):
+    def __init__(self):
+        super().__init__([])
+        self.frames = [
+            ("self", False),
+            ("self", True),
+            ("self", True),
+            ("self", True),
+            ("self", True),
+        ]
+        self.index = 0
+
+    def recognize_fast_signals(self, _image, expected_player, *, allow_pass=True):
+        del allow_pass
+        index = min(self.index, len(self.frames) - 1)
+        active, buttons = self.frames[index]
+        self.index += 1
+        return FastSignalResult(
+            expected_player=expected_player,
+            active_player=active,
+            pass_visible=False,
+            self_action_buttons_visible=buttons,
+            effect_visible=False,
+        )
+
+    def recognize_play_region(
+        self,
+        _image,
+        seat,
+        *,
+        wild_rank,
+        allow_pass=True,
+        allow_unknown_suit=True,
+    ):
+        del wild_rank, allow_pass, allow_unknown_suit
+        return PlayRegionResult(
+            player=seat,
+            cards=(),
+            is_pass=False,
+            confidence=0.0,
+            diagnostics=(),
+            annotations=(),
+            source="empty-surface",
+        )
+
+
+class TemporalPassCycleRecognitionService(FakeRecognitionService):
+    def __init__(self):
+        super().__init__([])
+        self.fast_frames = [
+            ("self", True, ()),
+            ("self", True, ()),
+            ("right", False, ()),
+            ("right", False, ()),
+            ("opposite", False, ("right",)),
+            ("opposite", False, ("right",)),
+            ("left", False, ("right", "opposite")),
+            ("left", False, ("right", "opposite")),
+            ("self", True, ("right", "opposite")),
+            ("self", True, ("right", "opposite")),
+        ]
+        self.fast_index = 0
+
+    def recognize_fast_signals(self, _image, expected_player, *, allow_pass=True):
+        del allow_pass
+        index = min(self.fast_index, len(self.fast_frames) - 1)
+        active, buttons, markers = self.fast_frames[index]
+        self.fast_index += 1
+        return FastSignalResult(
+            expected_player=expected_player,
+            active_player=active,
+            pass_visible=expected_player in markers,
+            self_action_buttons_visible=buttons,
+            effect_visible=False,
+            pass_marker_player=expected_player if expected_player in markers else None,
+            pass_marker_players=markers,
+        )
+
+    def recognize_play_region(
+        self,
+        _image,
+        seat,
+        *,
+        wild_rank,
+        allow_pass=True,
+        allow_unknown_suit=True,
+    ):
+        del wild_rank, allow_pass, allow_unknown_suit
+        if seat == "right":
+            return PlayRegionResult(
+                player=seat,
+                cards=("10C",),
+                is_pass=False,
+                confidence=0.95,
+                diagnostics=(),
+                annotations=(),
+                source="residual-right-surface",
+            )
+        return PlayRegionResult(
+            player=seat,
+            cards=(),
+            is_pass=False,
+            confidence=0.0,
+            diagnostics=(),
+            annotations=(),
+            source="empty-surface",
+        )
+
+
+class SuccessfulAdviceService:
+    strategy_id = "synthetic-success"
+    display_name = "合成建议"
+
+    def __init__(self):
+        self.calls = 0
+        self.called = threading.Event()
+
+    def recommend(self, state, *, request_id):
+        self.calls += 1
+        self.called.set()
+        return AdviceResult(
+            strategy=self.strategy_id,
+            cards=(),
+            play_type="PASS",
+            is_pass=True,
+            state_revision=state.revision,
+            elapsed_ms=1.0,
+            request_id=request_id,
+        )
+
+
 def _play(*cards: str) -> PlayRegionResult:
     return PlayRegionResult(
         player="right",
@@ -214,6 +839,658 @@ def _orchestrator(
         monotonic_ms=0,
     )
     return orchestrator
+
+
+def test_live_orchestrator_satisfies_application_runtime_port(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [])
+    try:
+        assert isinstance(orchestrator, LiveRuntimePort)
+    finally:
+        orchestrator.finish()
+
+
+def test_legacy_orchestrator_dto_imports_are_domain_aliases():
+    from daguandan_bridge.live.orchestrator import LiveAdvice, LiveUpdate
+
+    assert AdviceRequestKey is DomainAdviceRequestKey
+    assert LiveAdvice is DomainLiveAdvice
+    assert LiveUpdate is DomainLiveUpdate
+
+
+def test_self_action_consumes_response_control_edge_before_next_foreign_turn(tmp_path):
+    recognition = SelfControlEdgeConsumptionRecognitionService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="left",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    orchestrator.commit_trusted_action(
+        actor="left", cards=("3C",), is_pass=False, monotonic_ms=10,
+    )
+    assert orchestrator.snapshot.current_player == "self"
+    frame = np.zeros((32, 64, 3), np.uint8)
+
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=100,
+        wall_time="self-controls-absent",
+        metrics=ZoneFrameMetrics(100, False, 0.0, False, False),
+    )
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=200,
+        wall_time="self-controls-visible-1",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=300,
+        wall_time="self-controls-visible-2",
+        metrics=ZoneFrameMetrics(300, False, 0.0, False, False),
+    )
+    assert orchestrator._response_controls_streak >= 2
+
+    orchestrator.commit_trusted_action(
+        actor="self", cards=(), is_pass=True, monotonic_ms=350,
+    )
+    assert orchestrator.snapshot.current_player == "right"
+    assert orchestrator._response_controls_visible is True
+    assert orchestrator._response_controls_edge_identity == ()
+    assert orchestrator._response_controls_streak == 0
+
+    update = None
+    for timestamp in (400, 500):
+        update = orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"lingering-self-controls-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, False, 0.0, False, False),
+        )
+
+    assert update is not None
+    assert update.snapshot.current_player == "right"
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+    assert not window.turn_recovery_pending
+    assert window.pre_recovery_chain_signature is None
+    assert not any(
+        event.event_type == "advice_withheld"
+        and event.payload.get("reason") == "turn_recovery_pending"
+        for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("right_cards", (("10C",), ("5D",)))
+def test_fast_foreign_cycle_is_atomically_recovered_before_local_advice(
+    tmp_path,
+    right_cards,
+):
+    recognition = PixelFastCycleRecognitionService(right_cards)
+    advisor = SuccessfulAdviceService()
+    # The user's log contains an earlier self AH action.  The recoverable
+    # turn itself must still be rule-valid, so this minimal fixture uses a 3C
+    # table card before the observed right 10C/5D response.
+    hand = ("3C", "9S", *(card for card in HAND if card not in {"3C", "5D"}))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        hand=hand,
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="self",
+        cards=("3C",),
+        is_pass=False,
+        monotonic_ms=10,
+    )
+    assert orchestrator.snapshot.current_player == "right"
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+    baseline = np.zeros((32, 64, 3), np.uint8)
+    frame = baseline.copy()
+    frame[:, 16:32, :] = 255
+
+    orchestrator.ingest_frame(
+        baseline,
+        monotonic_ms=200,
+        wall_time="fast-cycle-baseline",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+    first = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=300,
+        wall_time="fast-cycle-first",
+        metrics=ZoneFrameMetrics(300, True, 0.0, False, False),
+    )
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=400,
+        wall_time="fast-cycle-controls-confirmed",
+        metrics=ZoneFrameMetrics(400, True, 0.0, False, False),
+    )
+    second = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=500,
+        wall_time="fast-cycle-second",
+        metrics=ZoneFrameMetrics(500, True, 0.0, False, False),
+    )
+
+    assert first.event is None
+    assert second.snapshot.current_player == "self"
+    actions = [
+        event
+        for event in orchestrator.events
+        if event.event_type in {"player_played", "player_passed"}
+    ]
+    assert [(event.actor, event.payload.get("cards", [])) for event in actions[-4:]] == [
+        ("self", ["3C"]),
+        ("right", list(right_cards)),
+        ("opposite", []),
+        ("left", []),
+    ]
+    assert actions[-3].event_type == "player_played"
+    assert actions[-2].event_type == "player_passed"
+    assert actions[-1].event_type == "player_passed"
+    assert recognition.calls[-6:] == [
+        "right", "opposite", "left", "right", "opposite", "left"
+    ]
+    assert any(
+        event.event_type == "turn_recovery_cycle_recovered"
+        for event in orchestrator.events
+    )
+    assert any(
+        event.event_type == "advice_requested"
+        for event in orchestrator.events
+    )
+    recovered_ids = {
+        event.event_id
+        for event in orchestrator.events
+        if event.event_type in {"player_played", "player_passed"}
+        and event.source.startswith("turn_recovery_cycle")
+    }
+    reducer_by_id = {
+        event.event_id: event
+        for event in orchestrator.reducer.events
+        if event.event_id in recovered_ids
+    }
+    published_by_id = {
+        event.event_id: event
+        for event in orchestrator.events
+        if event.event_id in recovered_ids
+    }
+    assert set(reducer_by_id) == recovered_ids
+    assert {
+        event_id: event.to_dict()
+        for event_id, event in reducer_by_id.items()
+    } == {
+        event_id: event.to_dict()
+        for event_id, event in published_by_id.items()
+    }
+
+    semantic_events = tuple(
+        event
+        for event in orchestrator.events
+        if event.event_type
+        in {
+            "initial_state_confirmed",
+            "lead_player_confirmed",
+            "player_played",
+            "player_passed",
+            "player_finished",
+        }
+    )
+    replayed = EventReplayer(lambda: LiveReducer("game")).replay(semantic_events)
+    assert replayed.final_snapshot == orchestrator.snapshot
+    assert not any(
+        event.event_type in {"terminal_history_gap", "turn_desynchronized"}
+        for event in orchestrator.events
+    )
+    assert 400 - 300 <= 1_500
+    assert orchestrator.wait_for_advice_idle(timeout=2.0)
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=500,
+        wall_time="fast-cycle-advice-visible",
+        metrics=ZoneFrameMetrics(500, False, 0.0, False, False),
+    )
+    assert orchestrator.latest_advice is not None
+    assert orchestrator.latest_advice.status == "ready"
+    assert orchestrator.latest_advice.visible is True
+    orchestrator.finish()
+    health = json.loads(orchestrator.store.directory.joinpath("health_audit.json").read_text(encoding="utf-8"))
+    assert health["status"] == "PASS"
+    assert not any(
+        issue["code"] == "HEALTH-ACTION-CHAIN-INCONSISTENT"
+        for issue in health["issues"]
+    )
+
+
+def test_fast_cycle_never_commits_a_stale_non_pass_surface(tmp_path):
+    recognition = PixelFastCycleRecognitionService(("10C",))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        hand=("3C", "9S", *(card for card in HAND if card not in {"3C", "5D"})),
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for timestamp in (300, 400, 500):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"stale-fast-cycle-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.0, False, False),
+        )
+
+    assert orchestrator.snapshot.current_player == "right"
+    assert not any(
+        event.actor == "right"
+        and event.event_type in {"player_played", "player_passed"}
+        for event in orchestrator.events
+    )
+    assert orchestrator.latest_advice is not None
+    assert orchestrator.latest_advice.withhold_reason == "turn_recovery_pending"
+    orchestrator.finish()
+
+
+def test_stale_non_pass_is_not_fresh_even_after_two_matching_reads(tmp_path):
+    """Repeated recognition of the old card cannot substitute for a new surface."""
+
+    recognition = PixelFastCycleRecognitionService(("10C",))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        hand=("3C", "9S", *(card for card in HAND if card not in {"3C", "5D"})),
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=200,
+        wall_time="stale-read-baseline",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+    window.handoff_samples = [
+        RecognitionSample(
+            cards=("10C",),
+            is_pass=False,
+            confidence=0.95,
+            source="stale-surface",
+            evidence_ref=f"OBS-{index}",
+        )
+        for index in (1, 2)
+    ]
+    observation = recognition.recognize_play_region(
+        frame,
+        "right",
+        wild_rank=orchestrator.snapshot.wild_rank,
+    )
+    candidate = ConsensusResult(
+        status="confirmed",
+        cards=("10C",),
+        is_pass=False,
+        confidence=0.95,
+        source="stale-surface",
+        vote_count=2,
+        candidates=(),
+    )
+
+    assert not orchestrator._turn_recovery_non_pass_is_fresh(
+        window,
+        "right",
+        candidate,
+        frame,
+        observation,
+    )
+    orchestrator.finish()
+
+
+def test_recovery_freshness_prefers_blank_seat_roi_over_stale_full_frame_anchor(tmp_path):
+    recognition = PixelFastCycleRecognitionService(("10C",))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+
+    blank = np.zeros((32, 64, 3), np.uint8)
+    current = blank.copy()
+    current[:, 16:32, :] = 240
+    # The old full-frame ring already contains the same visible card in the
+    # absolute annotation box, reproducing the full-size stale-anchor failure.
+    window.surface_baseline_full_frame = current.copy()
+    window.surface_baseline_frames = {"right": blank[:, 16:32, :].copy()}
+    candidate = ConsensusResult(
+        status="confirmed",
+        cards=("10C",),
+        is_pass=False,
+        confidence=0.95,
+        source="synthetic",
+        vote_count=2,
+        candidates=(),
+    )
+    observation = PlayRegionResult(
+        player="right",
+        cards=("10C",),
+        is_pass=False,
+        confidence=0.95,
+        diagnostics=(),
+        annotations=(
+            RecognitionAnnotation("10", (18, 6, 8, 10), 0.91, "play"),
+        ),
+        source="synthetic",
+    )
+
+    assert orchestrator._turn_recovery_non_pass_is_fresh(
+        window,
+        "right",
+        candidate,
+        current,
+        observation,
+    )
+    orchestrator.finish()
+
+
+def test_recovery_freshness_rejects_same_old_seat_roi_with_absolute_annotation(tmp_path):
+    recognition = PixelFastCycleRecognitionService(("10C",))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+
+    current = np.zeros((32, 64, 3), np.uint8)
+    current[:, 16:32, :] = 240
+    window.surface_baseline_full_frame = np.zeros_like(current)
+    window.surface_baseline_frames = {"right": current[:, 16:32, :].copy()}
+    candidate = ConsensusResult(
+        status="confirmed",
+        cards=("10C",),
+        is_pass=False,
+        confidence=0.95,
+        source="synthetic",
+        vote_count=2,
+        candidates=(),
+    )
+    observation = PlayRegionResult(
+        player="right",
+        cards=("10C",),
+        is_pass=False,
+        confidence=0.95,
+        diagnostics=(),
+        annotations=(
+            RecognitionAnnotation("10", (18, 6, 8, 10), 0.91, "play"),
+        ),
+        source="synthetic",
+    )
+
+    assert not orchestrator._turn_recovery_non_pass_is_fresh(
+        window,
+        "right",
+        candidate,
+        current,
+        observation,
+    )
+    orchestrator.finish()
+
+
+def test_real_pixel_change_creates_fresh_generation_and_recovers_cycle(tmp_path):
+    recognition = PixelFastCycleRecognitionService(("10C",))
+    hand = ("3C", "9S", *(card for card in HAND if card not in {"3C", "5D"}))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        hand=hand,
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+        advisor=SuccessfulAdviceService(),
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+    baseline = np.zeros((32, 64, 3), np.uint8)
+    changed = baseline.copy()
+    changed[:, 16:32, :] = 255
+
+    orchestrator.ingest_frame(
+        baseline,
+        monotonic_ms=200,
+        wall_time="pixel-baseline",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+    assert orchestrator._surface_generation_by_seat["right"] == 0
+    orchestrator.ingest_frame(
+        changed,
+        monotonic_ms=300,
+        wall_time="pixel-fresh-first",
+        metrics=ZoneFrameMetrics(300, True, 0.0, False, False),
+    )
+    assert orchestrator._surface_generation_by_seat["right"] == 1
+    assert orchestrator._surface_generation_by_seat["opposite"] == 0
+    orchestrator.ingest_frame(
+        changed,
+        monotonic_ms=400,
+        wall_time="pixel-fresh-controls-confirmed",
+        metrics=ZoneFrameMetrics(400, True, 0.0, False, False),
+    )
+    update = orchestrator.ingest_frame(
+        changed,
+        monotonic_ms=500,
+        wall_time="pixel-fresh-second",
+        metrics=ZoneFrameMetrics(500, True, 0.0, False, False),
+    )
+
+    assert update.snapshot.current_player == "self"
+    actions = [
+        event for event in orchestrator.events
+        if event.event_type in {"player_played", "player_passed"}
+    ]
+    assert [(event.actor, event.event_type) for event in actions[-3:]] == [
+        ("right", "player_played"),
+        ("opposite", "player_passed"),
+        ("left", "player_passed"),
+    ]
+    assert any(event.event_type == "advice_requested" for event in orchestrator.events)
+    assert 500 - 300 <= 1_500
+    orchestrator.finish()
+
+
+def test_temporal_active_and_pass_edges_recover_real_sequence_without_residual_10c(
+    tmp_path,
+):
+    recognition = TemporalPassCycleRecognitionService()
+    hand = ("AH", *(card for card in HAND if card != "5D"))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        hand=hand,
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+        advisor=SuccessfulAdviceService(),
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("AH",), is_pass=False, monotonic_ms=10
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    update = None
+    for index in range(10):
+        timestamp = 100 + index * 100
+        update = orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"temporal-pass-{index}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.0, False, False),
+        )
+
+    assert update is not None
+    assert update.snapshot.current_player == "self"
+    actions = [
+        event for event in orchestrator.events
+        if event.event_type in {"player_played", "player_passed"}
+    ]
+    assert [(event.actor, event.event_type) for event in actions[-4:]] == [
+        ("self", "player_played"),
+        ("right", "player_passed"),
+        ("opposite", "player_passed"),
+        ("left", "player_passed"),
+    ]
+    assert not any(
+        event.actor == "right"
+        and event.event_type == "player_played"
+        and event.payload.get("cards") == ["10C"]
+        for event in actions
+    )
+    left_pass = actions[-1]
+    assert left_pass.source == "turn_recovery_derived_pass_from_active_transition"
+    assert left_pass.payload["integrity_warnings"] == [
+        "derived_pass_from_confirmed_active_transition"
+    ]
+    assert any(event.event_type == "advice_requested" for event in orchestrator.events)
+    # Confirmed right at 400ms -> recovered on the second self frame at 1000ms.
+    assert 1_000 - 400 <= 1_500
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("failure_point", (1, 2, 3, "store"))
+def test_fast_cycle_transaction_failure_leaves_no_partial_history(
+    tmp_path,
+    monkeypatch,
+    failure_point,
+):
+    recognition = PixelFastCycleRecognitionService(("10C",))
+    hand = ("3C", "9S", *(card for card in HAND if card not in {"3C", "5D"}))
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="self",
+        hand=hand,
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3C",), is_pass=False, monotonic_ms=10
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    assert window is not None
+    baseline = np.zeros((32, 64, 3), np.uint8)
+    frame = baseline.copy()
+    frame[:, 16:32, :] = 255
+    orchestrator.ingest_frame(
+        baseline,
+        monotonic_ms=200,
+        wall_time="atomic-failure-baseline",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+    orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=300,
+        wall_time="atomic-failure-prime",
+        metrics=ZoneFrameMetrics(300, True, 0.0, False, False),
+    )
+    # The first fresh new-control frame stores only a full-chain pre-vote. The
+    # second distinct controls frame both authenticates the response and tests
+    # the independent atomic card-chain transaction.
+    before_snapshot = orchestrator.snapshot
+    before_reducer_events = orchestrator.reducer.events
+    before_all_events = tuple(orchestrator.events)
+    before_timeline = orchestrator.store.timeline_path.read_bytes()
+    before_advice = orchestrator.store.advice_path.read_bytes()
+    before_verifications = deepcopy(orchestrator._previous_action_verifications)
+    before_retirements = deepcopy(orchestrator._pending_previous_action_retirements)
+    before_window = deepcopy(window.__dict__)
+    before_generations = dict(orchestrator._surface_generation_by_seat)
+
+    if failure_point == "store":
+        monkeypatch.setattr(
+            orchestrator.store,
+            "append_event_batch",
+            lambda _events: (_ for _ in ()).throw(RuntimeError("batch disk failure")),
+        )
+    else:
+        original = orchestrator._stage_recovery_action
+        calls = {"count": 0}
+
+        def fail_staging(staged, candidate, index):
+            calls["count"] += 1
+            if index == failure_point:
+                raise RuntimeError(f"stage {index} failure")
+            return original(staged, candidate, index)
+
+        monkeypatch.setattr(orchestrator, "_stage_recovery_action", fail_staging)
+
+    with pytest.raises(RuntimeError):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=400,
+            wall_time="atomic-failure-controls-confirmed",
+            metrics=ZoneFrameMetrics(400, True, 0.0, False, False),
+        )
+
+    assert orchestrator.snapshot == before_snapshot
+    assert orchestrator.reducer.events == before_reducer_events
+    assert tuple(orchestrator.events) == before_all_events
+    assert orchestrator.store.timeline_path.read_bytes() == before_timeline
+    assert orchestrator.store.advice_path.read_bytes() == before_advice
+    assert orchestrator._previous_action_verifications == before_verifications
+    assert orchestrator._pending_previous_action_retirements == before_retirements
+    for key, expected in before_window.items():
+        actual = window.__dict__[key]
+        if isinstance(expected, np.ndarray):
+            assert np.array_equal(actual, expected), key
+        elif isinstance(expected, dict) and any(
+            isinstance(value, np.ndarray) for value in expected.values()
+        ):
+            assert set(actual) == set(expected), key
+            for nested_key, nested_expected in expected.items():
+                assert np.array_equal(actual[nested_key], nested_expected), (
+                    key,
+                    nested_key,
+                )
+        else:
+            assert actual == expected, key
+    assert orchestrator._surface_generation_by_seat == before_generations
+    orchestrator.finish()
 
 
 def test_visual_opening_anchor_commits_the_already_visible_first_action(tmp_path):
@@ -913,7 +2190,7 @@ def test_direct_handoff_global_deadline_starts_recovery_even_with_short_zone_tim
     orchestrator.finish()
 
 
-def test_direct_handoff_crossing_keeps_two_frame_expected_play_before_recovery(tmp_path):
+def test_direct_handoff_crossing_does_not_relabel_late_sample_as_pre_recovery(tmp_path):
     recognition = ScheduledActiveRecognitionService(
         [_seat_play("left"), _seat_play("left")] + [_seat_play("left", "2C")] * 8,
         ["left", "left", "self", "right"],
@@ -944,17 +2221,16 @@ def test_direct_handoff_crossing_keeps_two_frame_expected_play_before_recovery(t
         for index, timestamp in enumerate((100, 200, 300, 400))
     ]
 
-    assert updates[-1].event is not None
-    assert updates[-1].event.event_type == "player_played"
-    assert updates[-1].event.actor == "left"
-    assert updates[-1].event.payload["cards"] == ["2C"]
-    assert orchestrator.snapshot.current_player == "self"
+    # The second read happens after recovery began, so these two reads cannot
+    # prove a confirmed handoff from before the active-seat crossing.
+    assert updates[-1].event is None
+    assert orchestrator.snapshot.current_player == "left"
     window = orchestrator._turn_ownership_window
     assert window is not None
-    assert window.expected_player == "self"
+    assert window.expected_player == "left"
     assert not any(event.event_type == "player_passed" for event in orchestrator.events)
     traces = read_json_lines(orchestrator.store.recognition_trace_path)
-    assert any(
+    assert not any(
         row.get("outcome") == "confirmed_handoff_before_turn_recovery"
         for row in traces
     )
@@ -1579,7 +2855,7 @@ def test_delayed_pass_marker_after_empty_handoff_recovers_without_timer_gap(
     orchestrator.finish()
 
 
-def test_turn_recovery_uses_eight_second_local_advice_target_without_global_latch(
+def test_turn_recovery_has_two_second_terminal_without_global_latch(
     tmp_path,
 ):
     """Local controls start an advice target, not a session-wide shutdown."""
@@ -1615,15 +2891,17 @@ def test_turn_recovery_uses_eight_second_local_advice_target_without_global_latc
     assert window is not None
     assert window.turn_recovery_pending is True
     assert window.turn_recovery_local_started_ms == 300
-    assert window.turn_recovery_local_deadline_ms == 8_300
+    assert window.turn_recovery_local_deadline_ms == 2_300
     assert window.turn_recovery_target_exceeded is True
+    assert window.turn_recovery_failed is True
     assert orchestrator._advice_suspended_reason is None
     assert not any(
         event.event_type == "turn_desynchronized" for event in orchestrator.events
     )
-    advice_records = read_json_lines(orchestrator.store.directory / "advice.jsonl")
-    assert advice_records[-1]["outcome"] == "recovery_target_exceeded"
-    assert advice_records[-1]["target_ms"] == 8_000
+    terminals = [event for event in orchestrator.events if event.event_type == "advice_recovery_failed"]
+    assert len(terminals) == 1
+    assert terminals[0].payload["response_budget_ms"] == 2_000
+    assert orchestrator.latest_advice.withhold_reason in {"turn_recovery_expired", "turn_recovery_budget_exceeded"}
     orchestrator.finish()
 
 
@@ -1748,9 +3026,15 @@ def test_wind_catch_recovers_final_opponent_pass_after_timer_already_reaches_par
     """接风方可先亮计时器，但只能补录有两帧座位归属的最后 PASS。"""
 
     recognition = ScheduledActiveRecognitionService(
-        [_seat_play("opposite", "6S")] * 3,
-        ["right", "right", "right"],
-        pass_marker_players=["opposite", "opposite", "opposite"],
+        [_seat_play("opposite", "6S")] * 5,
+        ["right"] * 5,
+        pass_marker_players=[
+            "opposite",
+            "opposite",
+            None,
+            "opposite",
+            "opposite",
+        ],
     )
     orchestrator = _orchestrator(
         tmp_path,
@@ -1798,9 +3082,10 @@ def test_wind_catch_recovers_final_opponent_pass_after_timer_already_reaches_par
                 False,
             ),
         )
-        for index, timestamp in enumerate((100, 200))
+        for index, timestamp in enumerate((100, 200, 300, 400, 500))
     ]
 
+    assert updates[1].event is None
     assert updates[-1].event is not None
     assert updates[-1].event.event_type == "player_passed"
     assert updates[-1].event.actor == "opposite"
@@ -1823,6 +3108,159 @@ def test_wind_catch_recovers_final_opponent_pass_after_timer_already_reaches_par
         and item["strategy"]["is_pass"] is True
         for item in traces
     )
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("case", [
+    "persistent_left_pass", "persistent_left_pass_with_residual_j", "missing_prefix_marker",
+    "stale_prefix_marker", "one_prefix_capture", "missing_tail_handoff", "wrong_tail_handoff",
+    "no_self_controls", "fresh_legal_left_bomb",
+])
+def test_partial_timer_chain_does_not_relax_the_complete_temporal_cycle_gate(tmp_path, case):
+    """20260814 frames617..628: opposite timer hidden by straight-flush effect.
+
+    Only left->self timers survive. Opposite has a newly confirmed PASS; a
+    persistent left badge must not need a disappearance animation, but neither
+    the old badge alone nor a fresh legal left play can be inferred as PASS.
+    """
+    left_cards = (
+        ("AC", "AC", "AD", "AD", "AH", "AS") if case == "fresh_legal_left_bomb"
+        else ("JC",) if case == "persistent_left_pass_with_residual_j" else ()
+    )
+    recognition = FakeRecognitionService([PlayRegionResult(
+        "left", left_cards, False, .95 if left_cards else 0., (), (), source="fixture-left-surface",
+    )])
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, lead_player="right", round_level="6")
+    orchestrator._last_pass_marker_players = frozenset({"self", "left"})
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("6C", "7C", "6H", "9C", "10C"), is_pass=False, monotonic_ms=10,
+    )
+    window = orchestrator._ensure_turn_ownership_window()
+    window.temporal_confirmed_actives = ["left", "self"]
+    window.temporal_confirmed_passes = {"opposite"}
+    window.temporal_pass_seen_absent = {"opposite"}
+    window.temporal_pass_marker_streaks = {"opposite": 2}
+    frame = np.zeros((32, 64, 3), np.uint8)
+    window.surface_baseline_full_frame = frame.copy()
+    window.surface_baseline_frames = {"left": frame.copy()}
+    if case == "missing_prefix_marker":
+        window.temporal_confirmed_passes.clear()
+    elif case == "stale_prefix_marker":
+        window.temporal_pass_seen_absent.clear()
+    elif case == "one_prefix_capture":
+        window.temporal_pass_marker_streaks["opposite"] = 1
+    elif case == "missing_tail_handoff":
+        window.temporal_confirmed_actives = ["left"]
+    elif case == "wrong_tail_handoff":
+        window.temporal_confirmed_actives = ["right", "self"]
+    elif case == "fresh_legal_left_bomb":
+        frame[:] = 255
+    fast = FastSignalResult("opposite", "self", True, case != "no_self_controls", False,
+        pass_marker_player="opposite", pass_marker_players=("opposite", "left"))
+    before = orchestrator.snapshot
+    candidates = orchestrator._temporal_turn_recovery_cycle(
+        window, frame, fast, metrics=ZoneFrameMetrics(1_000, True, 0., False, False),
+    )
+    assert orchestrator.snapshot == before, "proof must remain a staged preview"
+    # Partial timers do not authorize this all-PASS temporal path. The static
+    # path must independently prove badge disappearance/reappearance, or the
+    # separate last-response path needs a preceding formal PASS + new controls.
+    assert candidates is None
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("freshness", ["none", "absence_only", "single_marker", "two_markers"])
+def test_static_cycle_replaces_old_pass_baseline_only_after_real_new_marker_lifecycle(tmp_path, freshness):
+    recognition = FakeRecognitionService([
+        PlayRegionResult(seat, (), True, .99, (), (), source="new-pass-marker")
+        for seat in ("opposite", "left")
+    ])
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, lead_player="right", round_level="6")
+    orchestrator._last_pass_marker_players = frozenset({"self", "left"})
+    orchestrator.commit_trusted_action(actor="right", cards=("6C", "7C", "6H", "9C", "10C"),
+                                      is_pass=False, monotonic_ms=10)
+    window = orchestrator._ensure_turn_ownership_window()
+    assert "left" in window.pass_marker_baseline
+    if freshness != "none":
+        window.temporal_pass_seen_absent = {"left"}
+    if freshness in {"single_marker", "two_markers"}:
+        window.temporal_pass_marker_streaks = {"left": 1 if freshness == "single_marker" else 2}
+        window.temporal_confirmed_passes = {"left"}
+    fast = FastSignalResult("opposite", "self", True, True, False,
+        pass_marker_player="opposite", pass_marker_players=("opposite", "left"))
+    before = orchestrator.snapshot
+    result = orchestrator._scan_turn_recovery_cycle(window, np.zeros((32, 64, 3), np.uint8), fast,
+        metrics=ZoneFrameMetrics(1_000, True, 0., False, False))
+    assert orchestrator.snapshot == before
+    if freshness == "two_markers":
+        assert result is not None and [(seat, candidate.is_pass) for seat, candidate in result] == [("opposite", True), ("left", True)]
+    else:
+        assert result is None
+    orchestrator.finish()
+
+
+def test_opposite_head_wind_catch_reaches_self_before_generic_recovery(
+    tmp_path, monkeypatch,
+):
+    """对家头游后，右家最后一个 PASS 必须直接接风给自己。"""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("right", "6S")] * 3,
+        ["self", "self", "self"],
+        pass_marker_players=[None, "right", "right"],
+    )
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="opposite",
+        settle_ms=0,
+        recognition_strategy="two_valid_streak",
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="opposite", cards=HAND, is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(
+        actor="left", is_pass=True, monotonic_ms=20
+    )
+    orchestrator.commit_trusted_action(
+        actor="self", is_pass=True, monotonic_ms=30
+    )
+    assert orchestrator.snapshot.finished_seats == frozenset({"opposite"})
+    assert orchestrator.snapshot.current_player == "right"
+    assert orchestrator.reducer.wind_receiver_after_current_pass("right") == "self"
+    monkeypatch.setattr(
+        orchestrator, "_probe_previous_action", lambda *_args, **_kwargs: None
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    updates = [
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"opposite-head-wind-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, True, 0.001, True, False),
+        )
+        for timestamp in (100, 200, 300)
+    ]
+
+    assert updates[-1].event is not None
+    assert updates[-1].event.actor == "right"
+    assert updates[-1].event.source == "wind_catch_pass_marker"
+    assert orchestrator.snapshot.current_player == "self"
+    assert orchestrator.snapshot.lead_player == "self"
+    assert any(
+        event.event_type == "wind_caught"
+        and event.payload == {"from_player": "opposite", "to_player": "self"}
+        for event in updates[-1].events
+    )
+    assert not any(
+        event.event_type == "advice_withheld"
+        and event.payload.get("reason") == "turn_recovery_pending"
+        for event in orchestrator.events
+    )
+    assert any(event.event_type == "advice_requested" for event in orchestrator.events)
     orchestrator.finish()
 
 
@@ -1873,7 +3311,26 @@ def test_wind_catch_does_not_recover_without_the_expected_pass_marker(
 
     assert updates[-1].event is None
     assert orchestrator._turn_ownership_window is not None
-    assert orchestrator._turn_ownership_window.turn_recovery_pending is True
+    window = orchestrator._turn_ownership_window
+    assert window.turn_recovery_pending is False
+    assert window.wind_catch_pass_recovery_pending is False
+    assert window.wind_catch_pass_recovery_failed is True
+    assert window.wind_catch_pass_recovery_failure_reason == (
+        "wind_catch_pass_marker_deadline"
+    )
+    assert window.wind_catch_pass_recovery_deadline_ms == 1_900
+    assert not any(
+        event.event_type == "advice_withheld"
+        and event.payload.get("reason") == "turn_recovery_pending"
+        for event in orchestrator.events
+    )
+    wind_withheld = [
+        event
+        for event in orchestrator.events
+        if event.event_type == "advice_withheld"
+        and event.payload.get("reason") == "wind_catch_pass_recovery_pending"
+    ]
+    assert len(wind_withheld) == 1
     assert not any(
         event.event_type == "turn_desynchronized" for event in orchestrator.events
     )
@@ -1881,6 +3338,822 @@ def test_wind_catch_does_not_recover_without_the_expected_pass_marker(
         event.event_type == "player_passed"
         and event.actor == "opposite"
         and event.source == "wind_catch_pass_marker"
+        for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+def test_late_opposite_head_placement_gets_one_short_wind_recovery_attempt(
+    tmp_path,
+):
+    """现场末段：对家头游标志晚到时，不得再启动普通八秒恢复。"""
+
+    recognition = ScheduledActiveRecognitionService(
+        [_seat_play("right", "6S")] * 6,
+        ["self", "self", "left", "right", None, "self"],
+        pass_marker_players=[None] * 6,
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="opposite",
+        settle_ms=0,
+        action_timeout_ms=20_000,
+    )
+    orchestrator.commit_trusted_action(
+        actor="opposite",
+        cards=("8C", "8D", "8H", "8S"),
+        is_pass=False,
+        monotonic_ms=10,
+    )
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="self", is_pass=True, monotonic_ms=30)
+    assert orchestrator.snapshot.current_player == "right"
+    placement = FastSignalResult(
+        expected_player="right",
+        active_player="self",
+        pass_visible=False,
+        self_action_buttons_visible=True,
+        effect_visible=False,
+        placements=(
+            PlacementSignal(
+                player="opposite",
+                placement="head",
+                confidence=0.98,
+                source="late-head-fixture",
+            ),
+        ),
+    )
+    assert orchestrator._apply_visual_placements(placement) == ()
+    assert len(orchestrator._apply_visual_placements(placement)) == 1
+    assert orchestrator.snapshot.finished_seats == frozenset({"opposite"})
+    assert orchestrator.reducer.wind_receiver_after_current_pass("right") == "self"
+
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for timestamp in (100, 1_000, 2_000, 2_100, 2_200, 10_000):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"late-opposite-head-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, False, 0.0, False, False),
+        )
+
+    window = orchestrator._turn_ownership_window
+    assert window is not None
+    assert window.wind_catch_pass_recovery_failed is True
+    assert window.turn_recovery_pending is False
+    assert window.disposition == "wind_catch_pass_recovery_failed"
+    assert window.wind_catch_pass_recovery_detected_ms == 100
+    assert window.wind_catch_pass_recovery_deadline_ms == 1_900
+    assert orchestrator.latest_advice is not None
+    assert "未能确认接风前右家的不出" in orchestrator.latest_advice.error
+    assert sum(
+        event.event_type == "advice_withheld"
+        and event.payload.get("reason") == "wind_catch_pass_recovery_pending"
+        for event in orchestrator.events
+    ) == 1
+    failures = [
+        event
+        for event in orchestrator.events
+        if event.event_type == "wind_catch_pass_recovery_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].payload["reason"] == "wind_catch_pass_marker_deadline"
+    assert failures[0].payload["elapsed_ms"] <= 1_900
+    assert not any(
+        event.event_type == "advice_recovery_target_exceeded"
+        for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("active_players", (["self", "self"], [None, None]))
+def test_cannot_beat_two_stable_frames_advise_pass_without_advancing_turn(
+    tmp_path,
+    active_players,
+):
+    recognition = CannotBeatRecognitionService(
+        [
+            (True, 0.94, (410, 620, 88, 36), False),
+            (True, 0.93, (412, 619, 88, 36), False),
+        ],
+        active_players=active_players,
+    )
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    orchestrator._request_advice_if_needed()
+    assert orchestrator.snapshot.current_player == "self"
+    assert advisor.calls == 0
+    before = orchestrator.snapshot
+    requested_before = sum(
+        event.event_type == "advice_requested" for event in orchestrator.events
+    )
+    frame = np.zeros((32, 64, 3), np.uint8)
+    first = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=100,
+        wall_time="cannot-beat-first",
+        metrics=ZoneFrameMetrics(100, False, 0.0, False, False),
+    )
+    assert first.event is None
+    assert advisor.calls == 0
+    second = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=200,
+        wall_time="cannot-beat-second",
+        metrics=ZoneFrameMetrics(200, False, 0.0, False, False),
+    )
+
+    assert second.event is not None
+    assert second.event.event_type == "button_advice_ready"
+    assert second.advice.status == "ready"
+    assert second.advice.visible is True
+    assert second.advice.advice.is_pass is True
+    assert second.advice.advice.strategy == "button_cannot_beat"
+    assert second.event.payload["model_required"] is False
+    assert second.event.payload["model_call_skipped_for_button"] is True
+    assert second.event.payload["model_requested_for_state"] is False
+    assert "model_called" not in second.event.payload
+    assert second.advice.advice.engine_input["model_requested_for_state"] is False
+    assert orchestrator.snapshot == before
+    assert sum(
+        event.event_type == "advice_requested" for event in orchestrator.events
+    ) == requested_before
+    assert not advisor.called.wait(0.40)
+    assert advisor.calls == 0
+    for timestamp in (300, 400, 500):
+        orchestrator.ingest_frame(
+            frame, monotonic_ms=timestamp, wall_time=str(timestamp),
+            metrics=ZoneFrameMetrics(timestamp, False, 0.0, False, False),
+        )
+    assert orchestrator.snapshot == before
+    assert sum(e.event_type == "button_advice_ready" for e in orchestrator.events) == 1
+    assert not any(e.event_type == "player_passed" and e.actor == "self"
+                   for e in orchestrator.events)
+    # Only a later seat-bound execution marker may become a formal action.
+    orchestrator.recognition_service = ScheduledActiveRecognitionService(
+        [_pass("self")] * 4, ["right"] * 4,
+        pass_marker_players=["self"] * 4,
+    )
+    for index, timestamp in enumerate((600, 700, 800, 900)):
+        orchestrator.ingest_frame(
+            frame, monotonic_ms=timestamp, wall_time=str(timestamp),
+            metrics=ZoneFrameMetrics(timestamp, False, 0.0, True, False),
+        )
+        if orchestrator.snapshot.current_player != "self":
+            break
+    passed = [e for e in orchestrator.events
+              if e.event_type == "player_passed" and e.actor == "self"]
+    assert len(passed) == 1
+    assert passed[0].source != "button_cannot_beat"
+    assert orchestrator.snapshot.current_player == "right"
+    orchestrator.finish()
+
+
+def _button_response_fixture(tmp_path, advisor=None):
+    advisor = advisor or SuccessfulAdviceService()
+    recognition = CannotBeatRecognitionService([(True, 0.95, (410, 620, 88, 36), False)])
+    orchestrator = _orchestrator(tmp_path, [], recognition=recognition, advisor=advisor, settle_ms=0)
+    orchestrator.commit_trusted_action(actor="right", cards=("3S",), is_pass=False, monotonic_ms=10)
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    fast = recognition.recognize_fast_signals(np.zeros((32, 64, 3), np.uint8), "self")
+    return orchestrator, advisor, fast
+
+
+def test_cannot_beat_duplicate_capture_timestamp_never_counts_as_two_frames(tmp_path):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    before = orchestrator.snapshot
+    for timestamp in (100, 100, 99, 100):
+        assert orchestrator._advance_cannot_beat_confirmation(fast, timestamp) is None
+    assert orchestrator._turn_ownership_window.cannot_beat_streak == 1
+    confirmed = orchestrator._advance_cannot_beat_confirmation(fast, 101)
+    assert confirmed.event.event_type == "button_advice_ready"
+    assert orchestrator.snapshot == before
+    assert advisor.calls == 0
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"cannot_beat_confidence": float("inf")},
+    {"cannot_beat_confidence": float("-inf")},
+    {"cannot_beat_confidence": float("nan")},
+    {"cannot_beat_confidence": 1.00001},
+    {"cannot_beat_confidence": -0.5},
+    {"cannot_beat_confidence": "invalid"},
+    {"cannot_beat_confidence": True},
+    {"cannot_beat_box": (float("inf"), 620, 88, 36)},
+    {"cannot_beat_box": (410, float("nan"), 88, 36)},
+    {"cannot_beat_box": (410, 620, float("inf"), 36)},
+    {"cannot_beat_box": (410, 620, -88, 36)},
+    {"cannot_beat_box": (410, 620, 88, 0)},
+    {"cannot_beat_box": (410, 620, 88, -1)},
+    {"cannot_beat_box": (-1, 620, 88, 36)},
+    {"cannot_beat_box": (410.5, 620, 88, 36)},
+    {"cannot_beat_box": (410, 620, 88)},
+    {"cannot_beat_box": (410, 620, 88, 36, 0)},
+    {"cannot_beat_box": "410,620,88,36"},
+    {"cannot_beat_box": (410, 620, 88, None)},
+    {"cannot_beat_box": (410, 620, 88, True)},
+    {"cannot_beat_box": (410, 620, 88, 2**10000)},
+])
+def test_invalid_button_numeric_evidence_revokes_half_vote_even_at_same_timestamp(tmp_path, overrides):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    before = orchestrator.snapshot
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 100) is None
+    invalid = replace(fast, **overrides)
+    assert orchestrator._advance_cannot_beat_confirmation(invalid, 100) is None
+    window = orchestrator._turn_ownership_window
+    assert window.cannot_beat_streak == 0
+    assert window.cannot_beat_last_capture_ms == 100
+    assert orchestrator._button_advice_key is None
+    assert not any(event.event_type == "button_advice_ready" for event in orchestrator.events)
+    # Replaying the valid version of the already-invalidated capture cannot
+    # restore its half vote; a later single capture is still insufficient.
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 100) is None
+    assert window.cannot_beat_streak == 0
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 200) is None
+    assert window.cannot_beat_streak == 1
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 201).event.event_type == "button_advice_ready"
+    assert advisor.calls == 0
+    assert orchestrator.snapshot == before
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("confidence", [0.8, 1.0])
+def test_cannot_beat_confidence_closed_valid_range_remains_supported(tmp_path, confidence):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    fast = replace(fast, cannot_beat_confidence=confidence)
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 100) is None
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 200).event.event_type == "button_advice_ready"
+    assert advisor.calls == 0
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"cannot_beat_confidence": float("inf")},
+    {"cannot_beat_box": (410, 620, float("nan"), 36)},
+    {"cannot_beat_box": (410, 620, 88, -36)},
+])
+def test_invalid_button_control_releases_preflight_to_normal_model(tmp_path, overrides):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    orchestrator._request_advice_if_needed()
+    assert orchestrator._self_response_preflight_key is not None
+    fast = replace(fast, **overrides)
+    assert orchestrator._advance_cannot_beat_confirmation(fast, 100) is None
+    orchestrator._resolve_self_response_preflight_from_fast(fast, 100)
+    assert orchestrator.wait_for_advice_idle(timeout=3)
+    assert advisor.calls == 1
+    assert orchestrator.latest_advice.advice.strategy == "synthetic-success"
+    assert not any(event.event_type == "button_advice_ready" for event in orchestrator.events)
+    orchestrator.finish()
+
+
+def test_confirmed_button_disappears_without_model_inflight_restarts_real_advice(tmp_path):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    before = orchestrator.snapshot
+    orchestrator._advance_cannot_beat_confirmation(fast, 100)
+    orchestrator._advance_cannot_beat_confirmation(fast, 200)
+    assert orchestrator.latest_advice.advice.strategy == "button_cannot_beat"
+    orchestrator._advance_cannot_beat_confirmation(replace(fast, cannot_beat_visible=False), 300)
+    assert orchestrator.wait_for_advice_idle(timeout=3)
+    assert advisor.calls == 1
+    assert orchestrator.latest_advice.status == "ready"
+    assert orchestrator.latest_advice.advice.strategy == "synthetic-success"
+    assert orchestrator.snapshot == before
+    orchestrator.finish()
+
+
+def test_pause_clears_confirmed_button_and_resume_does_not_leave_stale_advice(tmp_path):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    orchestrator._advance_cannot_beat_confirmation(fast, 100)
+    orchestrator._advance_cannot_beat_confirmation(fast, 200)
+    update = orchestrator.pause()
+    assert orchestrator._button_advice_key is None
+    assert update.advice.status != "ready"
+    assert update.advice.visible is False
+    assert orchestrator._turn_ownership_window.cannot_beat_last_capture_ms is None
+    orchestrator.resume(monotonic_ms=300)
+    assert orchestrator.wait_for_advice_idle(timeout=3)
+    assert advisor.calls == 1
+    assert orchestrator.latest_advice.advice.strategy == "synthetic-success"
+    orchestrator.finish()
+
+
+def test_late_model_discarded_for_button_can_be_requested_again_when_button_disappears(tmp_path):
+    release = threading.Event()
+
+    class GatedAdvisor(SuccessfulAdviceService):
+        def recommend(self, state, *, request_id):
+            self.called.set()
+            assert release.wait(3)
+            return super().recommend(state, request_id=request_id)
+
+    advisor = GatedAdvisor()
+    orchestrator, _, fast = _button_response_fixture(tmp_path, advisor)
+    orchestrator._request_advice_if_needed(bypass_response_preflight=True)
+    assert advisor.called.wait(1)
+    orchestrator._advance_cannot_beat_confirmation(fast, 100)
+    confirmed = orchestrator._advance_cannot_beat_confirmation(fast, 200)
+    assert confirmed.event.payload["model_required"] is False
+    assert confirmed.event.payload["model_call_skipped_for_button"] is True
+    assert confirmed.event.payload["model_requested_for_state"] is True
+    assert "model_called" not in confirmed.event.payload
+    assert orchestrator.latest_advice.advice.engine_input["model_requested_for_state"] is True
+    release.set()
+    assert orchestrator.wait_for_advice_idle(timeout=3)
+    assert orchestrator.latest_advice.advice.strategy == "button_cannot_beat"
+    assert not orchestrator._pending_model_advice
+    orchestrator._advance_cannot_beat_confirmation(replace(fast, cannot_beat_visible=False), 300)
+    assert orchestrator.wait_for_advice_idle(timeout=3)
+    assert advisor.calls == 2
+    assert orchestrator.latest_advice.status == "ready"
+    assert orchestrator.latest_advice.advice.strategy == "synthetic-success"
+    orchestrator.finish()
+
+
+def test_button_disappearing_while_model_inflight_does_not_create_duplicate_job(tmp_path):
+    release = threading.Event()
+
+    class GatedAdvisor(SuccessfulAdviceService):
+        def recommend(self, state, *, request_id):
+            self.called.set()
+            assert release.wait(3)
+            return super().recommend(state, request_id=request_id)
+
+    advisor = GatedAdvisor()
+    orchestrator, _, fast = _button_response_fixture(tmp_path, advisor)
+    orchestrator._request_advice_if_needed(bypass_response_preflight=True)
+    assert advisor.called.wait(1)
+    orchestrator._advance_cannot_beat_confirmation(fast, 100)
+    orchestrator._advance_cannot_beat_confirmation(fast, 200)
+    orchestrator._advance_cannot_beat_confirmation(replace(fast, cannot_beat_visible=False), 300)
+    assert orchestrator.latest_advice.status == "requested"
+    release.set()
+    assert orchestrator.wait_for_advice_idle(timeout=3)
+    assert advisor.calls == 1
+    assert orchestrator.latest_advice.advice.strategy == "synthetic-success"
+    orchestrator.finish()
+
+
+def test_existing_button_advice_never_bypasses_new_recovery_hold(tmp_path):
+    orchestrator, advisor, fast = _button_response_fixture(tmp_path)
+    before = orchestrator.snapshot
+    orchestrator._advance_cannot_beat_confirmation(fast, 100)
+    orchestrator._advance_cannot_beat_confirmation(fast, 200)
+    orchestrator._turn_ownership_window.turn_recovery_pending = True
+    assert orchestrator._request_advice_if_needed(bypass_response_preflight=True) is None
+    assert orchestrator._button_advice_key is None
+    assert orchestrator.latest_advice.status != "ready"
+    assert orchestrator.latest_advice.visible is False
+    assert advisor.calls == 0
+    assert orchestrator.snapshot == before
+    assert orchestrator._request_advice_if_needed(bypass_response_preflight=True) is None
+    assert advisor.calls == 0
+    orchestrator.finish()
+
+
+def test_terminal_signal_stops_frame_admission_before_sealing(tmp_path):
+    orchestrator = _orchestrator(tmp_path, [])
+    frame = np.zeros((32, 64, 3), np.uint8)
+    orchestrator.record_frame(frame, monotonic_ms=1, wall_time="before")
+    count = orchestrator.recorder.frame_count
+    orchestrator._game_end_detected = True
+    for timestamp in range(2, 20):
+        orchestrator.record_frame(frame, monotonic_ms=timestamp, wall_time="settlement")
+    assert orchestrator.recorder.frame_count == count
+    assert len(read_json_lines(orchestrator.recorder.index_path)) == count
+    orchestrator.finish()
+
+
+def test_cannot_beat_foreign_active_never_commits_local_pass(tmp_path):
+    recognition = CannotBeatRecognitionService(
+        [
+            (True, 0.94, (410, 620, 88, 36), False),
+            (True, 0.93, (411, 620, 88, 36), False),
+        ],
+        active_players=["right", "right"],
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for timestamp in (100, 200):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=timestamp,
+            wall_time=f"cannot-beat-foreign-{timestamp}",
+            metrics=ZoneFrameMetrics(timestamp, False, 0.0, False, False),
+        )
+
+    assert not any(
+        event.event_type == "player_passed"
+        and event.source == "button_cannot_beat"
+        for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("interruption", ["pause", "capture_interrupted"])
+def test_cannot_beat_confirmation_does_not_cross_resumable_interruption(
+    tmp_path,
+    interruption,
+):
+    recognition = CannotBeatRecognitionService(
+        [(True, 0.95, (10, 20, 80, 32), False)] * 3
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    frame = np.zeros((32, 64, 3), np.uint8)
+    first = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=100,
+        wall_time="cannot-beat-before-interruption",
+        metrics=ZoneFrameMetrics(100, False, 0.0, False, False),
+    )
+    assert first.event is None
+    assert orchestrator._turn_ownership_window.cannot_beat_streak == 1
+
+    if interruption == "pause":
+        orchestrator.pause()
+    else:
+        orchestrator.capture_interrupted("test", monotonic_ms=150)
+    assert orchestrator._turn_ownership_window.cannot_beat_streak == 0
+    orchestrator.resume(monotonic_ms=200)
+    second = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=300,
+        wall_time="cannot-beat-after-interruption-first",
+        metrics=ZoneFrameMetrics(300, False, 0.0, False, False),
+    )
+    assert second.event is None
+    third = orchestrator.ingest_frame(
+        frame,
+        monotonic_ms=400,
+        wall_time="cannot-beat-after-interruption-second",
+        metrics=ZoneFrameMetrics(400, False, 0.0, False, False),
+    )
+    assert third.event is not None
+    assert third.event.event_type == "button_advice_ready"
+    assert third.advice.advice.strategy == "button_cannot_beat"
+    assert orchestrator.snapshot.current_player == "self"
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize("interruption", ["begin_finalizing", "finish"])
+def test_cannot_beat_confirmation_is_cleared_by_terminal_interruption(
+    tmp_path,
+    interruption,
+):
+    recognition = CannotBeatRecognitionService(
+        [(True, 0.95, (10, 20, 80, 32), False)]
+    )
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.ingest_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=100,
+        wall_time="cannot-beat-before-terminal",
+        metrics=ZoneFrameMetrics(100, False, 0.0, False, False),
+    )
+    window = orchestrator._turn_ownership_window
+    assert window is not None and window.cannot_beat_streak == 1
+
+    getattr(orchestrator, interruption)()
+    assert window.cannot_beat_streak == 0
+    if interruption == "begin_finalizing":
+        orchestrator.finish()
+
+
+def test_response_preflight_seen_turn_waits_until_transient_recovery_gate_clears(
+    tmp_path,
+):
+    orchestrator, target, _advisor, submitted = _open_adjacent_action_reread(
+        tmp_path
+    )
+    response_turn = (
+        orchestrator.snapshot.session_id,
+        orchestrator.snapshot.turn_id,
+    )
+
+    assert orchestrator._request_advice_if_needed() is None
+    assert orchestrator._self_response_preflight_seen_turn is None
+    assert orchestrator._self_response_preflight_key is None
+    assert orchestrator._request_advice_if_needed(bypass_response_preflight=True) is None
+    assert orchestrator._self_response_preflight_seen_turn is None
+
+    target.state = "expired"
+    assert (
+        orchestrator._request_advice_if_needed(bypass_response_preflight=True)
+        is not None
+    )
+    assert len(submitted) == 1
+    assert orchestrator._self_response_preflight_key is None
+    assert orchestrator._self_response_preflight_seen_turn == response_turn
+    orchestrator.finish()
+
+
+def test_self_response_preflight_releases_model_on_first_non_cannot_frame(
+    tmp_path,
+):
+    recognition = CannotBeatRecognitionService(
+        [(False, 0.0, None, False)]
+    )
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    orchestrator._request_advice_if_needed()
+    assert advisor.calls == 0
+
+    orchestrator.ingest_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=100,
+        wall_time="preflight-non-cannot",
+        metrics=ZoneFrameMetrics(100, False, 0.0, False, False),
+    )
+    assert advisor.called.wait(1.0)
+    assert orchestrator.wait_for_advice_idle(timeout=1.0)
+    assert advisor.calls == 1
+    assert sum(
+        event.event_type == "advice_requested" for event in orchestrator.events
+    ) == 1
+    orchestrator.finish()
+
+
+def test_self_response_preflight_hard_deadline_releases_model_by_300ms(
+    tmp_path,
+):
+    recognition = CannotBeatRecognitionService(
+        [(True, 0.95, (10, 20, 80, 32), False)]
+    )
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player="right",
+        settle_ms=0,
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    orchestrator._request_advice_if_needed()
+    assert orchestrator._self_response_preflight_started_ms == 30
+    assert orchestrator._self_response_preflight_deadline_ms == 330
+
+    orchestrator.ingest_frame(
+        np.zeros((32, 64, 3), np.uint8),
+        monotonic_ms=330,
+        wall_time="preflight-hard-deadline",
+        metrics=ZoneFrameMetrics(330, False, 0.0, False, False),
+    )
+    assert advisor.called.wait(1.0)
+    assert orchestrator.wait_for_advice_idle(timeout=1.0)
+    assert advisor.calls == 1
+    assert not any(
+        event.event_type == "player_passed"
+        and event.source == "button_cannot_beat"
+        for event in orchestrator.events
+    )
+    orchestrator.finish()
+
+
+def test_self_response_preflight_real_timer_survives_missing_capture_frame(
+    tmp_path,
+):
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="right",
+        settle_ms=0,
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    orchestrator._request_advice_if_needed()
+
+    assert advisor.calls == 0
+    assert advisor.called.wait(0.80)
+    assert orchestrator.wait_for_advice_idle(timeout=1.0)
+    assert advisor.calls == 1
+    assert orchestrator._self_response_preflight_key is None
+    orchestrator.finish()
+
+
+def test_self_response_preflight_is_cancelled_by_pause(tmp_path):
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="right",
+        settle_ms=0,
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    orchestrator._request_advice_if_needed()
+    assert orchestrator._self_response_preflight_key is not None
+
+    orchestrator.pause()
+    assert orchestrator._self_response_preflight_key is None
+    assert not advisor.called.wait(0.40)
+    assert advisor.calls == 0
+    orchestrator.finish()
+
+
+def test_self_lead_does_not_wait_for_response_preflight(tmp_path):
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="self",
+        settle_ms=0,
+        advisor=advisor,
+    )
+
+    assert advisor.called.wait(1.0)
+    assert orchestrator.wait_for_advice_idle(timeout=1.0)
+    assert advisor.calls == 1
+    assert orchestrator._self_response_preflight_key is None
+    orchestrator.finish()
+
+
+@pytest.mark.parametrize(
+    ("signals", "lead_player", "prepare_trick", "mark_recovery"),
+    [
+        ([(True, 0.94, (1, 2, 30, 10), False)], "right", True, False),
+        (
+            [
+                (True, 0.60, (1, 2, 30, 10), False),
+                (True, 0.60, (1, 2, 30, 10), False),
+            ],
+            "right",
+            True,
+            False,
+        ),
+        (
+            [
+                (True, 0.94, (1, 2, 30, 10), True),
+                (True, 0.94, (1, 2, 30, 10), True),
+            ],
+            "right",
+            True,
+            False,
+        ),
+        (
+            [
+                (True, 0.94, (1, 2, 30, 10), False),
+                (True, 0.94, (40, 2, 30, 10), False),
+            ],
+            "right",
+            True,
+            False,
+        ),
+        (
+            [
+                (True, 0.94, (1, 2, 30, 10), False),
+                (True, 0.94, (1, 2, 30, 10), False),
+            ],
+            "right",
+            False,
+            False,
+        ),
+        (
+            [
+                (True, 0.94, (1, 2, 30, 10), False),
+                (True, 0.94, (1, 2, 30, 10), False),
+            ],
+            "self",
+            False,
+            False,
+        ),
+        (
+            [
+                (True, 0.94, (1, 2, 30, 10), False),
+                (True, 0.94, (1, 2, 30, 10), False),
+            ],
+            "right",
+            True,
+            True,
+        ),
+    ],
+)
+def test_cannot_beat_rejects_unstable_illegal_or_recovery_evidence(
+    tmp_path,
+    signals,
+    lead_player,
+    prepare_trick,
+    mark_recovery,
+):
+    recognition = CannotBeatRecognitionService(signals)
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        recognition=recognition,
+        lead_player=lead_player,
+        settle_ms=0,
+    )
+    if prepare_trick:
+        orchestrator.commit_trusted_action(
+            actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+        )
+        orchestrator.commit_trusted_action(
+            actor="opposite", is_pass=True, monotonic_ms=20
+        )
+        orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    if mark_recovery:
+        window = orchestrator._ensure_turn_ownership_window()
+        assert window is not None
+        window.turn_recovery_pending = True
+    frame = np.zeros((32, 64, 3), np.uint8)
+    for index in range(len(signals)):
+        orchestrator.ingest_frame(
+            frame,
+            monotonic_ms=100 + index * 100,
+            wall_time=f"cannot-beat-reject-{index}",
+            metrics=ZoneFrameMetrics(100 + index * 100, False, 0.0, False, False),
+        )
+
+    assert not any(
+        event.event_type == "player_passed"
+        and event.actor == "self"
+        and event.source == "button_cannot_beat"
         for event in orchestrator.events
     )
     orchestrator.finish()
@@ -3030,6 +5303,153 @@ def test_stopping_inflight_advice_persists_cancelled_terminal_and_signals(tmp_pa
     assert finished.is_set()
 
 
+def test_preflight_expiry_and_advice_discard_have_bounded_lock_order(
+    tmp_path,
+    monkeypatch,
+):
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="right",
+        settle_ms=0,
+        advisor=advisor,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.advisor = None
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    snapshot = orchestrator.snapshot
+    expiry_key = AdviceRequestKey(
+        snapshot.session_id,
+        snapshot.turn_id,
+        snapshot.revision,
+    )
+    orchestrator._self_response_preflight_key = expiry_key
+    orchestrator._self_response_preflight_started_ms = 30
+    orchestrator._self_response_preflight_deadline_ms = 330
+    discarded_key = AdviceRequestKey("game", 999, 999)
+    discarded_job = _AdviceJob(
+        discarded_key,
+        orchestrator.reducer.to_guandan_state(),
+    )
+
+    discard_has_advice_lock = threading.Event()
+    release_discard = threading.Event()
+    expiry_entered_request = threading.Event()
+    original_append_advice = orchestrator.store.append_advice
+    original_request = orchestrator._request_advice_if_needed
+
+    def gated_append_advice(document):
+        if (
+            document.get("request_id") == discarded_key.request_id
+            and document.get("status") == "cancelled"
+        ):
+            discard_has_advice_lock.set()
+            assert release_discard.wait(1.0)
+        original_append_advice(document)
+
+    def marked_request(*args, **kwargs):
+        expiry_entered_request.set()
+        return original_request(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator.store, "append_advice", gated_append_advice)
+    monkeypatch.setattr(orchestrator, "_request_advice_if_needed", marked_request)
+    discard_thread = threading.Thread(
+        target=orchestrator._discard_advice_job,
+        args=(discarded_job, "stop_discarded"),
+    )
+    discard_thread.start()
+    assert discard_has_advice_lock.wait(1.0)
+    expiry_thread = threading.Thread(
+        target=orchestrator._expire_self_response_preflight,
+        args=(expiry_key,),
+    )
+    expiry_thread.start()
+    assert expiry_entered_request.wait(1.0)
+    release_discard.set()
+
+    discard_thread.join(1.0)
+    expiry_thread.join(1.0)
+    assert not discard_thread.is_alive()
+    assert not expiry_thread.is_alive()
+    assert advisor.called.wait(1.0)
+    assert sum(
+        event.event_type == "advice_cancelled"
+        and event.payload.get("request_id") == discarded_key.request_id
+        for event in orchestrator.events
+    ) == 1
+    assert sum(
+        event.event_type == "advice_requested"
+        and event.payload.get("request_id") == expiry_key.request_id
+        for event in orchestrator.events
+    ) == 1
+    orchestrator.finish()
+
+
+def test_preflight_expiry_waiting_on_finish_cannot_submit_advice(
+    tmp_path,
+    monkeypatch,
+):
+    advisor = SuccessfulAdviceService()
+    orchestrator = _orchestrator(
+        tmp_path,
+        [],
+        lead_player="right",
+        settle_ms=0,
+    )
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.advisor = advisor
+    snapshot = orchestrator.snapshot
+    key = AdviceRequestKey(snapshot.session_id, snapshot.turn_id, snapshot.revision)
+    orchestrator._self_response_preflight_key = key
+    orchestrator._self_response_preflight_started_ms = 30
+    orchestrator._self_response_preflight_deadline_ms = 330
+
+    finish_inside_state = threading.Event()
+    release_finish = threading.Event()
+    original_clear = orchestrator._clear_self_response_preflight
+
+    def gated_clear():
+        if threading.current_thread().name == "bounded-finish":
+            finish_inside_state.set()
+            assert release_finish.wait(1.0)
+        original_clear()
+
+    monkeypatch.setattr(orchestrator, "_clear_self_response_preflight", gated_clear)
+    finish_thread = threading.Thread(
+        target=orchestrator.finish,
+        name="bounded-finish",
+    )
+    finish_thread.start()
+    assert finish_inside_state.wait(1.0)
+    expiry_thread = threading.Thread(
+        target=orchestrator._expire_self_response_preflight,
+        args=(key,),
+    )
+    expiry_thread.start()
+    release_finish.set()
+
+    finish_thread.join(2.0)
+    expiry_thread.join(1.0)
+    assert not finish_thread.is_alive()
+    assert not expiry_thread.is_alive()
+    assert orchestrator.status == "sealed"
+    assert advisor.calls == 0
+    assert not any(
+        event.event_type == "advice_requested"
+        and event.payload.get("request_id") == key.request_id
+        for event in orchestrator.events
+    )
+
+
 def test_recording_path_does_not_run_slow_recognition(tmp_path):
     orchestrator = _orchestrator(tmp_path, [_play("7S") for _ in range(3)])
     recognition = orchestrator.recognition_service
@@ -3348,6 +5768,9 @@ def test_waiting_lead_auto_confirms_from_first_play_marker(tmp_path):
     assert update.status == "running"
     assert update.snapshot.current_player == "right"
     assert update.snapshot.lead_player == "right"
+    manifest = json.loads(orchestrator.store.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["lead_player"] == "right"
+    assert manifest["lead_player_event_id"]
     event_types = [event.event_type for event in orchestrator.events]
     assert "lead_player_confirmed" in event_types
     assert "turn_started" in event_types
@@ -3666,6 +6089,7 @@ def _open_adjacent_action_reread(tmp_path, cards=("2H",)):
         cards=tuple(cards),
         is_pass=False,
         monotonic_ms=10,
+        confidence=0.75,  # Explicitly high-risk fixture: ordinary exact plays no longer reread.
     )
     assert played.event is not None
     assert orchestrator._previous_action_verification_target(orchestrator.snapshot) is None

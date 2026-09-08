@@ -30,6 +30,7 @@ __all__ = [
     "SUPPORT_IMAGE_INDEX_SCHEMA",
     "UnsafeSupportSourceError",
     "export_support_bundle",
+    "sanitize_support_text",
 ]
 
 _MAX_TEXT_FILE_BYTES = 32 * 1024 * 1024
@@ -947,6 +948,27 @@ def _sanitize_document(
         return ("\n".join(lines) + ("\n" if lines else "")), count
     sanitized, count = _redact_text(text, context)
     return _ensure_newline(sanitized), count
+
+
+def sanitize_support_text(
+    text: str,
+    *,
+    classification: str,
+    redaction: RedactionContext | None = None,
+) -> tuple[str, int]:
+    """Apply the same tested text/path redaction used by support bundles."""
+
+    if classification not in {
+        "sanitized-json",
+        "sanitized-jsonl",
+        "sanitized-log",
+    }:
+        raise ValueError("unsupported support text classification")
+    return _sanitize_document(
+        str(text),
+        classification,
+        _effective_redaction_context(redaction),
+    )
 
 
 def _sanitize_json_value(value: Any, context: RedactionContext) -> tuple[Any, int]:

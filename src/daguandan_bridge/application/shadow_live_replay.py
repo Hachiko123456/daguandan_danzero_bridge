@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 from ..advisor_strategy import build_advisor
+from ..config import PROFILES_ROOT
 from ..annotation_service import AnnotationService
 from ..live.latest_worker import LatestOnlyWorker
 from ..live.orchestrator import LiveOrchestrator
@@ -34,7 +35,9 @@ from ..storage import append_json_line, atomic_write_json
 from ..template_service import TemplateService
 
 _ACTION_TYPES = frozenset({"player_played", "player_passed", "manual_confirmed_event"})
-_TERMINAL_ADVICE = frozenset({"ready", "failed", "stale", "withheld", "timeout", "cancelled"})
+_TERMINAL_ADVICE = frozenset({
+    "ready", "local_pass", "failed", "stale", "withheld", "timeout", "cancelled",
+})
 
 
 @dataclass(frozen=True)
@@ -45,12 +48,23 @@ class FaultProfile:
     pause_probability: float = 0.0
     pause_ms: int = 0
     advisor_delay_ms: int = 0
+    analysis_delay_ms: int = 0
+    recording_io_delay_ms: int = 0
     offset_x: int = 0
     offset_y: int = 0
     scale: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.jitter_ms < 0 or self.pause_ms < 0 or self.advisor_delay_ms < 0:
+        if any(
+            delay < 0
+            for delay in (
+                self.jitter_ms,
+                self.pause_ms,
+                self.advisor_delay_ms,
+                self.analysis_delay_ms,
+                self.recording_io_delay_ms,
+            )
+        ):
             raise ValueError("fault delays must be non-negative")
         for name in ("drop_probability", "duplicate_probability", "pause_probability"):
             value = float(getattr(self, name))
@@ -124,6 +138,70 @@ class _AnalysisTask:
     submitted_wall_monotonic_ms: float
     delivery_wall_monotonic_ms: float
     frame: np.ndarray
+    planned_captured_monotonic_ms: int
+    capture_seq: int
+    capture_generation: int
+
+
+@dataclass(frozen=True)
+class ReplayTransportClock:
+    """Map immutable source/plan clocks onto this replay's processing clock.
+
+    The capture timestamp is the *planned first delivery* of a source frame,
+    not when its delayed producer/analysis worker happens to run. Thus decode,
+    scheduling, recording and queue delay remain visible to freshness checks.
+    Duplicate deliveries reuse that first capture timestamp and identity; the
+    immutable fault plan's synthetic +1ms duplicate timestamp stays in audit
+    metadata and must not manufacture a second independent visual capture.
+
+    time_scale compresses planned real scheduling/capture intervals, not the
+    production freshness budget. Plan pauses describe capture blackouts;
+    accidental delivery lateness is transport delay, never a new capture.
+    Virtual clocks obey the same equations and must be monotonic; they do not
+    make wall-performance qualification eligible.
+    """
+
+    replay_epoch_ms: float
+    source_origin_ms: int
+    time_scale: float
+    capture_generation: int = 1
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.replay_epoch_ms) or self.replay_epoch_ms < 0:
+            raise ValueError("replay epoch must be a non-negative monotonic time")
+        if not math.isfinite(self.time_scale) or self.time_scale <= 0:
+            raise ValueError("replay time_scale must be positive")
+
+    def capture_for_entry(self, entry: dict[str, object]) -> tuple[int, int]:
+        deliveries = tuple(entry.get("deliveries", ()))
+        if not deliveries:
+            raise ValueError("dropped source frame has no transport capture")
+        first = deliveries[0]
+        return (
+            math.floor(self.replay_epoch_ms + float(first["planned_delivery_ms"])),
+            int(first["delivery_seq"]),
+        )
+
+    def reference_ms(self, source_ms: int) -> float:
+        return self.replay_epoch_ms + (source_ms - self.source_origin_ms) / self.time_scale
+
+    def document(self, *, fault_plan_sha256: str, injected_processing_clock: bool) -> dict[str, object]:
+        return {
+            "schema": "guandan.shadow-transport-clock/1",
+            "replay_epoch_monotonic_ms": self.replay_epoch_ms,
+            "source_origin_monotonic_ms": self.source_origin_ms,
+            "time_scale": self.time_scale,
+            "capture_generation": self.capture_generation,
+            "fault_plan_sha256": fault_plan_sha256,
+            "processing_clock_injected": injected_processing_clock,
+            "capture_formula": "floor(replay_epoch_ms + source_frame_first_planned_delivery_ms)",
+            "processing_formula": "floor(runner.clock() * 1000)",
+            "duplicate_policy": "same_source_frame_same_capture_timestamp_and_capture_seq",
+            "delay_policy": "never_retimestamp_at_delivery_submission_or_analysis",
+            "time_scale_policy": "compress_schedule_not_freshness_budget",
+            "pause_policy": "planned_capture_blackout_not_delayed_old_frame",
+            "truth_reference_formula": "replay_epoch_ms + (source_ms - source_origin_ms) / time_scale",
+        }
 
 
 class _TaskFailure(RuntimeError):
@@ -278,6 +356,14 @@ def build_fault_plan(
             "planned": profile.advisor_delay_ms > 0,
             "delay_ms": profile.advisor_delay_ms,
         },
+        "analysis_delay": {
+            "planned": profile.analysis_delay_ms > 0,
+            "delay_ms": profile.analysis_delay_ms,
+        },
+        "recording_io_delay": {
+            "planned": profile.recording_io_delay_ms > 0,
+            "delay_ms": profile.recording_io_delay_ms,
+        },
         "entries": entries,
     }
     payload = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -330,6 +416,8 @@ class ShadowLiveReplayRunner:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         advisor_sleep: Callable[[float], None] = time.sleep,
+        analysis_sleep: Callable[[float], None] = time.sleep,
+        recording_sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.recognition_factory = recognition_factory or _recognizer_for_session
         self.advisor_factory = advisor_factory or _advisor_for_profile
@@ -337,6 +425,8 @@ class ShadowLiveReplayRunner:
         self.clock = clock
         self.sleep = sleep
         self.advisor_sleep = advisor_sleep
+        self.analysis_sleep = analysis_sleep
+        self.recording_sleep = recording_sleep
 
     def run(self, config: ShadowLiveReplayConfig) -> ShadowLiveReplayResult:
         session = Path(config.session).resolve()
@@ -383,28 +473,40 @@ class ShadowLiveReplayRunner:
         )
         recorder = InMemorySessionRecorder(store.directory)
         recognition = self.recognition_factory(session)
-        advisor = self.advisor_factory(session.parent.parent.parent, session.parent.parent.name)
+        profiles_root, profile_name = _profile_location_for_session(session)
+        advisor = self.advisor_factory(profiles_root, profile_name)
         if config.fault_profile.advisor_delay_ms:
             advisor = DelayedAdvisor(
                 advisor,
                 config.fault_profile.advisor_delay_ms,
                 sleep=self.advisor_sleep,
             )
-        orchestrator = self.orchestrator_factory(
-            store=store,
-            recorder=recorder,
-            recognition=recognition,
-            advisor=advisor,
-        )
+        factory_parameters = signature(self.orchestrator_factory).parameters
+        inject_processing_clock = "processing_clock_ms" in factory_parameters
+        factory_arguments = dict(store=store, recorder=recorder, recognition=recognition, advisor=advisor)
+        if inject_processing_clock:
+            factory_arguments["processing_clock_ms"] = lambda: math.floor(self.clock() * 1_000.0)
+        orchestrator = self.orchestrator_factory(**factory_arguments)
+        if isinstance(orchestrator, LiveOrchestrator) and not inject_processing_clock:
+            orchestrator.finish()
+            raise ValueError("a real replay orchestrator_factory must explicitly accept and forward processing_clock_ms")
         initial = _initial_state(session)
+        pacer = AbsolutePacer(clock=self.clock, sleep=self.sleep)
+        transport_clock = ReplayTransportClock(
+            replay_epoch_ms=pacer.start() * 1_000.0,
+            source_origin_ms=int(plan.document["source_origin_monotonic_ms"]),
+            time_scale=config.time_scale,
+        )
+        clock_mapping = transport_clock.document(
+            fault_plan_sha256=plan.sha256, injected_processing_clock=inject_processing_clock,
+        )
+        atomic_write_json(run_directory / "clock_mapping.json", clock_mapping)
         orchestrator.start(
             round_level=initial["round_level"],
             hand=initial["hand"],
             lead_player=initial["lead_player"],
-            monotonic_ms=records[0].monotonic_ms,
+            monotonic_ms=math.floor(transport_clock.replay_epoch_ms),
         )
-
-        pacer = AbsolutePacer(clock=self.clock, sleep=self.sleep)
         delivery_rows: dict[int, dict[str, object]] = {}
         plan_drop_rows: list[dict[str, object]] = []
         analysis_rows: list[dict[str, object]] = []
@@ -417,6 +519,8 @@ class ShadowLiveReplayRunner:
         def analyze(task: _AnalysisTask) -> dict[str, object]:
             started = self.clock()
             try:
+                if config.fault_profile.analysis_delay_ms:
+                    self.analysis_sleep(config.fault_profile.analysis_delay_ms / 1_000.0)
                 update = orchestrator.analyze_frame(
                     task.frame,
                     monotonic_ms=task.captured_monotonic_ms,
@@ -426,7 +530,11 @@ class ShadowLiveReplayRunner:
                         "source_frame_index": task.source_frame_index,
                         "source_monotonic_ms": task.source_monotonic_ms,
                         "planned_delivery_ms": task.planned_delivery_ms,
+                        "planned_captured_monotonic_ms": task.planned_captured_monotonic_ms,
                         "captured_ms": task.captured_monotonic_ms,
+                        "capture_seq": task.capture_seq,
+                        "capture_generation": task.capture_generation,
+                        "transport_clock_schema": "guandan.shadow-transport-clock/1",
                     },
                 )
             except Exception as exc:
@@ -436,10 +544,17 @@ class ShadowLiveReplayRunner:
             row = {
                 "delivery_seq": task.delivery_seq,
                 "source_frame_index": task.source_frame_index,
+                "source_monotonic_ms": task.source_monotonic_ms,
+                "planned_captured_monotonic_ms": task.planned_captured_monotonic_ms,
+                "replay_captured_monotonic_ms": task.captured_monotonic_ms,
+                "capture_seq": task.capture_seq,
+                "capture_generation": task.capture_generation,
+                "capture_age_at_analysis_start_ms": started * 1_000.0 - task.captured_monotonic_ms,
                 "worker_thread_id": threading.get_ident(),
                 "producer_thread_id": producer_thread_id,
                 "queue_wait_ms": (started - task.submitted_wall_monotonic_ms) * 1000.0,
                 "analyze_ms": (ended - started) * 1000.0,
+                "injected_analysis_delay_ms": config.fault_profile.analysis_delay_ms,
                 "end_to_end_ms": (ended - task.delivery_wall_monotonic_ms) * 1000.0,
                 "analysis_started_wall_monotonic_ms": started * 1000.0,
                 "analysis_ended_wall_monotonic_ms": ended * 1000.0,
@@ -511,7 +626,8 @@ class ShadowLiveReplayRunner:
                         else actual
                     )
                     delivery_seq = int(delivery["delivery_seq"])
-                    captured_ms = int(delivery["captured_monotonic_ms"])
+                    planned_captured_ms = int(delivery["captured_monotonic_ms"])
+                    captured_ms, capture_seq = transport_clock.capture_for_entry(entry)
                     delivery_row: dict[str, object] = {
                         "kind": "delivery",
                         "delivery_seq": delivery_seq,
@@ -522,7 +638,11 @@ class ShadowLiveReplayRunner:
                         "actual_wall_monotonic_ms": actual * 1000.0,
                         "actual_elapsed_ms": (actual - pacer_epoch) * 1000.0,
                         "delivery_lag_ms": (actual - pacer_epoch) * 1000.0 - planned_ms,
-                        "captured_monotonic_ms": captured_ms,
+                        "captured_monotonic_ms": planned_captured_ms,
+                        "replay_captured_monotonic_ms": captured_ms,
+                        "capture_seq": capture_seq,
+                        "capture_generation": transport_clock.capture_generation,
+                        "capture_age_at_delivery_ms": actual * 1_000.0 - captured_ms,
                         "decode_ms": (decode_ended - decode_started) * 1000.0,
                         "transform_ms": (transform_ended - transform_started) * 1000.0,
                         "transform": transform,
@@ -530,10 +650,18 @@ class ShadowLiveReplayRunner:
                         "status": "recorded",
                         "recorded_before_submit": True,
                     }
+                    record_started = self.clock()
+                    if config.fault_profile.recording_io_delay_ms:
+                        self.recording_sleep(config.fault_profile.recording_io_delay_ms / 1_000.0)
                     warning = orchestrator.record_frame(
                         transformed,
                         monotonic_ms=captured_ms,
                         wall_time=datetime.now().astimezone().isoformat(),
+                    )
+                    record_ended = self.clock()
+                    delivery_row["record_ms"] = (record_ended - record_started) * 1_000.0
+                    delivery_row["injected_recording_io_delay_ms"] = (
+                        config.fault_profile.recording_io_delay_ms
                     )
                     if warning is not None:
                         recorder_drops += 1
@@ -549,6 +677,9 @@ class ShadowLiveReplayRunner:
                         submitted,
                         actual,
                         transformed,
+                        planned_captured_ms,
+                        capture_seq,
+                        transport_clock.capture_generation,
                     )
                     with lock:
                         delivery_rows[delivery_seq] = delivery_row
@@ -606,7 +737,7 @@ class ShadowLiveReplayRunner:
             errors.append(
                 f"{inferred_advice_terminals} advice request(s) lack an explained worker start or persisted terminal status"
             )
-        action_latency = _action_latency(session, runtime, records)
+        action_latency = _action_latency(session, runtime, records, transport_clock=transport_clock)
         baseline = _baseline_comparison(config.baseline, session, runtime, final_snapshot)
         business_signature = _business_signature(runtime, final_snapshot, advice_lifecycle)
         repeat = _repeat_comparison(config.compare_summary, plan.sha256, business_signature)
@@ -631,6 +762,8 @@ class ShadowLiveReplayRunner:
             and temporal_profile.drop_probability == 0
             and temporal_profile.duplicate_probability == 0
             and temporal_profile.pause_probability == 0
+            and temporal_profile.analysis_delay_ms == 0
+            and temporal_profile.recording_io_delay_ms == 0
         )
         duration_within_tolerance = abs(actual_duration - planned_duration) <= duration_tolerance
         lag_p95 = delivery_lag.get("p95")
@@ -672,7 +805,9 @@ class ShadowLiveReplayRunner:
                 "source": "frame_index.monotonic_ms",
                 "planned": "absolute_epoch_plus_planned_delivery_ms",
                 "actual_wall": "monotonic_clock",
-                "captured": "seeded_monotonic_fault_stream",
+                "plan_captured": "immutable_seeded_monotonic_fault_stream",
+                "captured": "replay_epoch_plus_first_planned_delivery_no_lateness_retimestamp",
+                "mapping": clock_mapping,
             },
             "delivery": {
                 "actual_deliveries": len(delivery_rows),
@@ -703,13 +838,19 @@ class ShadowLiveReplayRunner:
                 "worker_stop_discarded": worker_stats["stop_discarded"],
                 "recorder": recorder_drops,
             },
-            "faults": summarize_fault_applications(plan, advice_lifecycle),
+            "faults": summarize_fault_applications(
+                plan,
+                advice_lifecycle,
+                analyzed_count=len(analysis_rows),
+                recorded_count=len(delivery_rows),
+            ),
             "worker": {**worker_stats, "analysis_drained": analysis_drained, "stopped": worker_stopped},
             "advice_drained": advice_drained,
             "advice": advice_lifecycle,
             "performance": {
                 "decode_ms": summarize_samples([float(row.get("decode_ms", 0.0)) for row in delivery_rows.values()]),
                 "transform_ms": summarize_samples([float(row.get("transform_ms", 0.0)) for row in delivery_rows.values()]),
+                "record_ms": summarize_samples([float(row.get("record_ms", 0.0)) for row in delivery_rows.values()]),
                 "queue_wait_ms": summarize_samples([float(row.get("queue_wait_ms", 0.0)) for row in analysis_rows]),
                 "analyze_ms": summarize_samples([float(row.get("analyze_ms", 0.0)) for row in analysis_rows]),
                 "end_to_end_ms": summarize_samples([float(row.get("end_to_end_ms", 0.0)) for row in analysis_rows]),
@@ -783,6 +924,9 @@ def summarize_samples(values: Iterable[float]) -> dict[str, float | int | None]:
 def summarize_fault_applications(
     plan: FaultPlan,
     advice: dict[str, object],
+    *,
+    analyzed_count: int | None = None,
+    recorded_count: int | None = None,
 ) -> dict[str, dict[str, int]]:
     result: dict[str, dict[str, int]] = {}
     for name in ("jitter", "drop", "duplicate", "pause"):
@@ -810,6 +954,22 @@ def summarize_fault_applications(
         "planned": delay_planned,
         "applied": delay_applied,
         "skipped": max(0, delay_planned - delay_applied),
+    }
+    analysis_delay = plan.document.get("analysis_delay", {})
+    analysis_planned = delivery_count if analysis_delay.get("planned") else 0
+    analysis_applied = min(analysis_planned, max(0, int(analyzed_count or 0)))
+    result["analysis_delay"] = {
+        "planned": analysis_planned,
+        "applied": analysis_applied,
+        "skipped": max(0, analysis_planned - analysis_applied),
+    }
+    recording_delay = plan.document.get("recording_io_delay", {})
+    recording_planned = delivery_count if recording_delay.get("planned") else 0
+    recording_applied = min(recording_planned, max(0, int(recorded_count or 0)))
+    result["recording_io_delay"] = {
+        "planned": recording_planned,
+        "applied": recording_applied,
+        "skipped": max(0, recording_planned - recording_applied),
     }
     return result
 
@@ -875,30 +1035,56 @@ def _video_canvas_size(path: Path) -> tuple[int, int]:
 
 
 def _initial_state(session: Path) -> dict[str, object]:
+    initial: dict[str, object] | None = None
     for event in read_json_lines(session / "timeline.jsonl"):
-        if event.get("event_type") != "initial_state_confirmed":
-            continue
         payload = event.get("payload", {})
         if not isinstance(payload, dict):
+            payload = {}
+        if event.get("event_type") == "initial_state_confirmed":
+            lead = payload.get("lead_player", event.get("actor"))
+            initial = {
+                "round_level": str(payload.get("round_level", "")),
+                "hand": tuple(str(card) for card in payload.get("hand", ())),
+                "lead_player": lead if lead in _SEAT_SET else None,
+            }
             continue
-        lead = payload.get("lead_player", event.get("actor"))
-        return {
-            "round_level": str(payload.get("round_level", "")),
-            "hand": tuple(str(card) for card in payload.get("hand", ())),
-            "lead_player": lead if lead in _SEAT_SET else None,
-        }
-    raise ValueError("source timeline lacks initial_state_confirmed")
+        if (
+            initial is not None
+            and initial["lead_player"] is None
+            and event.get("event_type") == "lead_player_confirmed"
+        ):
+            lead = payload.get("lead_player", event.get("actor"))
+            if lead in _SEAT_SET:
+                initial["lead_player"] = lead
+    if initial is None:
+        raise ValueError("source timeline lacks initial_state_confirmed")
+    return initial
 
 
 _SEAT_SET = frozenset({"self", "right", "opposite", "left"})
 
 
 def _recognizer_for_session(session: Path) -> ScreenshotRecognitionService:
-    profile = session.parent.parent
+    profiles_root, profile_name = _profile_location_for_session(session)
     return ScreenshotRecognitionService(
-        AnnotationService(profile.parent, profile.name),
-        TemplateService(profile.parent, profile.name),
+        AnnotationService(profiles_root, profile_name),
+        TemplateService(profiles_root, profile_name),
     )
+
+
+def _profile_location_for_session(session: Path) -> tuple[Path, str]:
+    """Resolve canonical sessions locally and exported sessions by manifest profile."""
+
+    session = Path(session)
+    if session.parent.name == "sessions":
+        profile = session.parent.parent
+        return profile.parent, profile.name
+    try:
+        manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        manifest = {}
+    profile_name = str(manifest.get("profile") or "tencent_daguandan")
+    return Path(PROFILES_ROOT), profile_name
 
 
 def _advisor_for_profile(profiles_root: Path, profile_name: str) -> Any:
@@ -910,7 +1096,10 @@ def _advisor_for_profile(profiles_root: Path, profile_name: str) -> Any:
     )
 
 
-def _make_orchestrator(*, store: Any, recorder: Any, recognition: Any, advisor: Any) -> LiveOrchestrator:
+def _make_orchestrator(
+    *, store: Any, recorder: Any, recognition: Any, advisor: Any,
+    processing_clock_ms: Callable[[], int],
+) -> LiveOrchestrator:
     return LiveOrchestrator(
         reducer=LiveReducer(store.session_id),
         store=store,
@@ -919,6 +1108,7 @@ def _make_orchestrator(*, store: Any, recorder: Any, recognition: Any, advisor: 
         advisor=advisor,
         recognition_strategy="two_valid_streak",
         minimum_free_bytes=0,
+        processing_clock_ms=processing_clock_ms,
     )
 
 
@@ -1003,6 +1193,11 @@ def summarize_advice_lifecycle(runtime: Path, drained: bool) -> dict[str, object
         wall_latency = _wall_latency_ms(requested, terminal)
         request_to_worker_ms = _wall_latency_ms(requested, worker_started)
         worker_duration_ms = _wall_latency_ms(worker_started, terminal) if worker_started else None
+        worker_timing = (
+            terminal.get("worker_timing")
+            if terminal is not None and isinstance(terminal.get("worker_timing"), dict)
+            else None
+        )
         virtual_events = virtual_by_request.get(request_id, ())
         virtual_latency = None
         if virtual_events:
@@ -1020,6 +1215,7 @@ def summarize_advice_lifecycle(runtime: Path, drained: bool) -> dict[str, object
                 "request_to_worker_start_ms": request_to_worker_ms,
                 "worker_start_wall_latency_ms": request_to_worker_ms,
                 "worker_duration_ms": worker_duration_ms,
+                "worker_timing": worker_timing,
                 "worker_started": worker_started is not None,
                 "worker_start_explained": worker_start_explained,
                 "worker_start_skip_reason": (
@@ -1036,6 +1232,33 @@ def summarize_advice_lifecycle(runtime: Path, drained: bool) -> dict[str, object
                 "terminal_reason": None if terminal else "advice drain incomplete" if not drained else "terminal record missing after drain",
             }
         )
+    timing_rows = [
+        row["worker_timing"] for row in requests
+        if isinstance(row.get("worker_timing"), dict)
+    ]
+    timing_delta_names = (
+        "accepted_to_send_start", "send", "send_to_child_received",
+        "child_queue", "child_execution", "child_to_result_received", "total",
+    )
+    timing_summary = {
+        "record_count": len(timing_rows),
+        "complete_count": sum(
+            all(row.get(name) is not None for name in (
+                "host_accepted", "send_start", "send_end", "child_received",
+                "child_start", "child_end", "result_received",
+            ))
+            for row in timing_rows
+        ),
+        "delta_ms": {
+            name: summarize_samples(
+                row.get("delta_ms", {}).get(name)
+                for row in timing_rows
+                if isinstance(row.get("delta_ms"), dict)
+                and row["delta_ms"].get(name) is not None
+            )
+            for name in timing_delta_names
+        },
+    }
     return {
         "requested": len(requests),
         "worker_started": sum(bool(row["worker_started"]) for row in requests),
@@ -1048,6 +1271,7 @@ def summarize_advice_lifecycle(runtime: Path, drained: bool) -> dict[str, object
         "worker_start_wall_latency_ms": summarize_samples(row["worker_start_wall_latency_ms"] for row in requests if row["worker_start_wall_latency_ms"] is not None),
         "worker_duration_ms": summarize_samples(row["worker_duration_ms"] for row in requests if row["worker_duration_ms"] is not None),
         "virtual_latency_ms": summarize_samples(row["virtual_latency_ms"] for row in requests if row["virtual_latency_ms"] is not None),
+        "worker_timing": timing_summary,
         "requests": requests,
     }
 
@@ -1067,6 +1291,7 @@ def _action_latency(
     session: Path,
     runtime: Path,
     records: tuple[FrameIndexRecord, ...],
+    *, transport_clock: ReplayTransportClock | None = None,
 ) -> dict[str, object]:
     truth_path = session / "truth_log.json"
     if not truth_path.is_file():
@@ -1087,13 +1312,18 @@ def _action_latency(
             source = "truth_frame_index_to_source_monotonic"
         action = actual[index] if index < len(actual) else None
         actual_ms = _int_or_none(action.get("monotonic_ms")) if action else None
-        latency = actual_ms - reference_ms if actual_ms is not None and reference_ms is not None else None
+        reference_replay_ms = (
+            transport_clock.reference_ms(reference_ms)
+            if transport_clock is not None and reference_ms is not None else reference_ms
+        )
+        latency = actual_ms - reference_replay_ms if actual_ms is not None and reference_replay_ms is not None else None
         if latency is not None:
             latencies.append(float(latency))
         rows.append(
             {
                 "turn_id": turn.index,
                 "reference_monotonic_ms": reference_ms,
+                "reference_replay_monotonic_ms": reference_replay_ms,
                 "reference_source": source if reference_ms is not None else "N/A",
                 "actual_event_id": action.get("event_id") if action else None,
                 "actual_monotonic_ms": actual_ms,
@@ -1208,9 +1438,19 @@ def _write_summary_markdown(path: Path, summary: dict[str, object]) -> None:
         f"- 识别 worker drain：{summary.get('worker', {}).get('analysis_drained')}",
         f"- FableDan drain：{summary.get('advice_drained')}",
         "",
-        "## 错误",
+        "## 视频完整性",
         "",
     ]
+    video_warnings = summary.get("video_warnings", ())
+    if video_warnings:
+        lines.extend(
+            f"- {item.get('reason')}: {item.get('details')}"
+            for item in video_warnings
+            if isinstance(item, dict)
+        )
+    else:
+        lines.append("- 无")
+    lines.extend(("", "## 错误", ""))
     errors = summary.get("errors", ())
     lines.extend(f"- {error}" for error in errors)
     if not errors:

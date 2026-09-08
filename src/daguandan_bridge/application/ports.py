@@ -6,9 +6,10 @@ from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from ..danzero.state import GuanDanState, Seat
 from ..domain.advice import AdviceResult, StrategyExecutionTrace
+from ..domain.live_runtime import LiveAdvice, LiveStatus, LiveUpdate
 from ..domain.recognition import FastSignalResult, OpeningSignal, PlayRegionResult
 from ..domain.recording import RecorderWarning, RecordingResult
-from ..domain.live import LiveEvent
+from ..domain.live import LiveEvent, LiveSnapshot
 
 
 @runtime_checkable
@@ -51,12 +52,15 @@ class AdvicePort(Protocol):
 
 @runtime_checkable
 class SessionPersistencePort(Protocol):
+    @property
+    def is_started(self) -> bool: ...
     session_id: str
     directory: Path
     persistence_enabled: bool
 
     def start(self, manifest: dict[str, object]) -> None: ...
     def append_event(self, event: LiveEvent) -> None: ...
+    def append_event_batch(self, events: Iterable[LiveEvent]) -> None: ...
     def append_advice(self, record: dict[str, object]) -> None: ...
     def append_observation(self, record: dict[str, object]) -> None: ...
     def append_recognition_trace(self, record: dict[str, object]) -> None: ...
@@ -95,12 +99,15 @@ class SessionPersistencePort(Protocol):
         state: dict[str, object],
         monotonic_ms: int,
     ) -> None: ...
+    def record_automatic_log_delivery(self, result: dict[str, object]) -> None: ...
 
 
 @runtime_checkable
 class RecordingPort(Protocol):
     @property
     def frame_count(self) -> int: ...
+    @property
+    def dropped_frames(self) -> int: ...
     def write_frame(
         self,
         frame: Any,
@@ -135,11 +142,130 @@ class CapturePort(Protocol):
     def lock_target_client_size(self, profile_name: str) -> Any: ...
 
 
+@runtime_checkable
+class LiveRuntimePort(Protocol):
+    """Narrow application contract implemented by the production live core."""
+
+    status: LiveStatus
+    store: SessionPersistencePort
+    recorder: RecordingPort
+    recognition_service: RecognitionPort
+    latest_advice: LiveAdvice | None
+    automatic_log_delivery_result: dict[str, object] | None
+
+    @property
+    def snapshot(self) -> LiveSnapshot: ...
+
+    @property
+    def needs_first_action_frames(self) -> bool: ...
+
+    def start(
+        self,
+        *,
+        round_level: str,
+        hand: tuple[str, ...],
+        lead_player: Seat | None,
+        monotonic_ms: int,
+        wall_time: str | None = None,
+        historical_scan: bool = False,
+    ) -> LiveUpdate: ...
+
+    def bind_capture_generation(self, generation: int) -> LiveUpdate: ...
+
+    def analyze_frame(
+        self,
+        frame: Any,
+        *,
+        monotonic_ms: int,
+        metrics: Any | None = None,
+        trace_context: dict[str, object] | None = None,
+    ) -> LiveUpdate: ...
+
+    def record_frame(
+        self,
+        frame: Any,
+        *,
+        monotonic_ms: int,
+        wall_time: str,
+    ) -> RecorderWarning | None: ...
+
+    def preview_controls(
+        self,
+        fast: FastSignalResult,
+        *,
+        captured_ms: int,
+        capture_generation: int,
+        frame_size: tuple[int, int],
+    ) -> LiveUpdate | None: ...
+
+    def commit_trusted_action(
+        self,
+        *,
+        actor: Seat,
+        cards: tuple[str, ...] = (),
+        is_pass: bool,
+        monotonic_ms: int,
+        evidence_refs: tuple[str, ...] = (),
+        suit_options: tuple[tuple[str, ...], ...] = (),
+        action_metadata: dict[str, object] | None = None,
+        confidence: float = 1.0,
+        source: str = "trusted_log_replay",
+    ) -> LiveUpdate: ...
+
+    def bootstrap_opening_action(
+        self,
+        *,
+        actor: Seat,
+        cards: tuple[str, ...],
+        expected_next_player: Seat,
+        monotonic_ms: int,
+        confidence: float,
+        source: str,
+    ) -> LiveUpdate: ...
+
+    def confirm_candidate(self, candidate_id: str) -> LiveUpdate: ...
+
+    def confirm_manual_action(
+        self,
+        *,
+        cards: tuple[str, ...] = (),
+        is_pass: bool,
+        action_metadata: dict[str, object] | None = None,
+    ) -> LiveUpdate: ...
+
+    def correct_latest(
+        self,
+        *,
+        cards: tuple[str, ...] = (),
+        is_pass: bool,
+        reason: str = "one_click_correction",
+        action_metadata: dict[str, object] | None = None,
+    ) -> LiveUpdate: ...
+
+    def confirm_lead_player(self, lead_player: Seat) -> LiveUpdate: ...
+
+    def pause(self) -> LiveUpdate: ...
+
+    def resume(self, *, monotonic_ms: int) -> LiveUpdate: ...
+
+    def begin_finalizing(self) -> LiveUpdate: ...
+
+    def capture_interrupted(self, reason: str, *, monotonic_ms: int) -> LiveUpdate: ...
+
+    def analysis_failed(self, reason: str, *, monotonic_ms: int) -> LiveUpdate: ...
+
+    def poll_deadlines(self) -> LiveUpdate: ...
+
+    def wait_for_advice_idle(self, *, timeout: float = 60.0) -> bool: ...
+
+    def finish(self) -> LiveUpdate: ...
+
+
 @dataclass(frozen=True)
 class LiveSessionConstruction:
-    orchestrator: Any
+    orchestrator: LiveRuntimePort
     source: CaptureSourcePort
-    initial_update: Any
+    initial_update: LiveUpdate
 
 
 @runtime_checkable
@@ -153,7 +279,7 @@ class SessionFactoryPort(Protocol):
         hand: tuple[str, ...],
         lead_player: str | None,
         recognition_strategy: str,
-        on_update: Callable[[Any], None] | None = None,
+        on_update: Callable[[LiveUpdate], None] | None = None,
     ) -> LiveSessionConstruction: ...
 
     def start_listener_recording(

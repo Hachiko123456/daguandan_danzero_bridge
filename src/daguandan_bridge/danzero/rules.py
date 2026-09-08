@@ -179,6 +179,16 @@ def logical_action_label(action: list[object] | None, level_rank: str) -> str:
     return "".join(_project_rank(rank) for rank in _logical_ranks(action, level_rank))
 
 
+def logical_action_ranks(
+    action: list[object] | None, level_rank: str
+) -> tuple[str, ...]:
+    """Return the declared project ranks without lossy label concatenation."""
+
+    if action is None:
+        return ()
+    return tuple(_project_rank(rank) for rank in _logical_ranks(action, level_rank))
+
+
 def wildcard_substitutions(
     action: list[object] | None,
     level_rank: str,

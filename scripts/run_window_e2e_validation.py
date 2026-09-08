@@ -99,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     package_log = run_directory / "package_process.log"
     session = args.session.resolve()
     profile_source = args.profile_source.resolve()
+    development_fragment = bool(args.source_only and args.max_frames is not None)
     existing_release = PROJECT_ROOT / "release"
     protected = (session, existing_release)
     integrity_before = snapshot_paths(protected)
@@ -108,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
             run_directory / "host_summary.json",
             {
                 "execution_ok": False,
+                "acceptance_eligible": False,
+                "acceptance_passed": False,
+                "source_only_debug_run": bool(args.source_only),
+                "development_fragment": development_fragment,
                 "errors": [
                     "preflight found an existing exact-title target; close it before validation"
                 ],
@@ -186,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             "output": str(run_directory / "source"),
             "profile_source": str(profile_source),
             "run_kind": "source",
+            "development_fragment": development_fragment,
             "executable_path": sys.executable,
         }
         source_config_path = run_directory / "source_validation_config.json"
@@ -202,6 +208,17 @@ def main(argv: list[str] | None = None) -> int:
         source_summary = _read_json(run_directory / "source" / "summary.json")
         if source_exit != 0:
             host_errors.append(f"source validator exited {source_exit}")
+        source_full_chain = _full_chain_acceptance(source_summary)
+        if not source_full_chain["passed"]:
+            gate_label = (
+                "historical prefix"
+                if development_fragment
+                else "production/opportunity"
+            )
+            host_errors.append(
+                f"source full_chain {gate_label} gate failed: "
+                + ", ".join(source_full_chain["failures"])
+            )
         if not args.source_only:
             _simulator_command(control_path, status_path, "reset", timeout=15.0)
             if args.executable is not None:
@@ -287,9 +304,15 @@ def main(argv: list[str] | None = None) -> int:
                     bundle_log,
                     env=frozen_environment,
                 )
-                bundle_summary = _read_json(run_directory / "bundle" / "summary.json")
-                if bundle_exit != 0:
-                    host_errors.append(f"bundle validator exited {bundle_exit}")
+            bundle_summary = _read_json(run_directory / "bundle" / "summary.json")
+            if bundle_exit != 0:
+                host_errors.append(f"bundle validator exited {bundle_exit}")
+            bundle_full_chain = _full_chain_acceptance(bundle_summary)
+            if not bundle_full_chain["passed"]:
+                host_errors.append(
+                    "bundle full_chain production/opportunity gate failed: "
+                    + ", ".join(bundle_full_chain["failures"])
+                )
     except Exception as exc:
         host_errors.append(f"{type(exc).__name__}: {exc}")
     finally:
@@ -337,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
             "full_chain",
         }
     )
-    execution_ok = bool(
+    formal_execution_ok = bool(
         not host_errors
         and complete_matrix
         and source_exit == 0
@@ -349,6 +372,16 @@ def main(argv: list[str] | None = None) -> int:
         and same_hwnd
         and not forced_simulator_termination
     )
+    fragment_execution_ok = bool(
+        development_fragment
+        and not host_errors
+        and source_exit == 0
+        and source_summary.get("execution_ok")
+        and integrity_unchanged
+        and same_hwnd
+        and not forced_simulator_termination
+    )
+    execution_ok = bool(formal_execution_ok or fragment_execution_ok)
     acceptance_passed = bool(
         execution_ok
         and qualification_run
@@ -363,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         "acceptance_passed": acceptance_passed,
         "complete_source_and_bundle_matrix": complete_matrix,
         "source_only_debug_run": bool(args.source_only),
+        "development_fragment": development_fragment,
         "source_exit_code": source_exit,
         "package_exit_code": package_exit,
         "bundle_exit_code": bundle_exit,
@@ -372,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
         "same_hwnd": same_hwnd,
         "integrity_unchanged": integrity_unchanged,
         "forced_simulator_termination": forced_simulator_termination,
+        "source_full_chain_acceptance": _full_chain_acceptance(source_summary),
+        "bundle_full_chain_acceptance": _full_chain_acceptance(bundle_summary),
         "errors": host_errors,
     }
     atomic_write_json(run_directory / "host_summary.json", host_summary)
@@ -402,6 +438,75 @@ def _run_logged(
             check=False,
         )
     return int(completed.returncode)
+
+
+def _full_chain_acceptance(summary: dict[str, object]) -> dict[str, object]:
+    scenarios = summary.get("scenarios")
+    if not isinstance(scenarios, dict) or "full_chain" not in scenarios:
+        return {"passed": True, "executed": False, "failures": []}
+    full_chain = scenarios.get("full_chain")
+    if not isinstance(full_chain, dict):
+        return {"passed": False, "executed": True, "failures": ["invalid_full_chain"]}
+    failures: list[str] = []
+    development_fragment = bool(summary.get("development_fragment"))
+    business = full_chain.get("business_health")
+    fragment = full_chain.get("fragment_prefix_acceptance")
+    if development_fragment:
+        if not isinstance(fragment, dict) or not fragment.get("passed"):
+            failures.append("fragment_prefix")
+    elif not isinstance(business, dict) or not business.get("passed"):
+        failures.append("business_health")
+    runtime = full_chain.get("runtime_audit")
+    if not isinstance(runtime, dict) or not runtime.get("passed"):
+        failures.append("production_live_v2_runtime")
+    opportunities = full_chain.get("opportunity_acceptance")
+    qualification_required = bool(summary.get("acceptance_eligible"))
+    if not isinstance(opportunities, dict):
+        failures.append("opportunity_audit_missing")
+    elif opportunities.get("available"):
+        if not opportunities.get("passed"):
+            failures.append("opportunity_responses")
+    elif qualification_required:
+        failures.append("opportunity_truth_unavailable")
+    return {
+        "passed": not failures,
+        "executed": True,
+        "development_fragment": development_fragment,
+        "qualification_eligible": False if development_fragment else bool(
+            summary.get("acceptance_eligible")
+        ),
+        "failures": failures,
+        "prefix_expected_count": (
+            fragment.get("prefix_expected_count")
+            if isinstance(fragment, dict) else None
+        ),
+        "prefix_actual_count": (
+            fragment.get("prefix_actual_count")
+            if isinstance(fragment, dict) else None
+        ),
+        "first_divergence": (
+            fragment.get("first_divergence")
+            if isinstance(fragment, dict) else None
+        ),
+        "opportunity_denominators": (
+            opportunities.get("denominators", {})
+            if isinstance(opportunities, dict) else {}
+        ),
+        "opportunity_counts": (
+            opportunities.get("counts", {})
+            if isinstance(opportunities, dict) else {}
+        ),
+        "opportunity_latency_ms": (
+            opportunities.get("latency_ms", {})
+            if isinstance(opportunities, dict) else {}
+        ),
+    }
+
+
+def _full_chain_business_ok(summary: dict[str, object]) -> bool:
+    """Compatibility helper now enforces the full production opportunity gate."""
+
+    return bool(_full_chain_acceptance(summary)["passed"])
 
 
 def _wait_status_ready(
@@ -503,6 +608,7 @@ def _markdown(summary: dict[str, object]) -> str:
             f"- 第三阶段验收：{acceptance_result}",
             f"- 运行执行结果：{'PASS' if summary.get('execution_ok') else 'FAIL'}",
             f"- 验收资格：{summary.get('acceptance_eligible')}",
+            f"- 开发历史片段：{summary.get('development_fragment', False)}",
             f"- 源码退出码：{summary.get('source_exit_code')}",
             f"- 打包退出码：{summary.get('package_exit_code')}",
             f"- EXE 退出码：{summary.get('bundle_exit_code')}",

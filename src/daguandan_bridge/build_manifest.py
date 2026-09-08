@@ -74,13 +74,46 @@ def collect_source_identity(project_root: Path | str) -> dict[str, object]:
         "-z",
         "--untracked-files=all",
     )
+    status_fingerprint = _dirty_worktree_fingerprint(root, status) if status else None
     return {
         "commit": commit,
         "tree": tree,
         "branch": branch,
         "dirty": bool(status),
-        "status_sha256": hashlib.sha256(status).hexdigest() if status else None,
+        "status_sha256": status_fingerprint,
     }
+
+
+def _dirty_worktree_fingerprint(root: Path, status: bytes) -> str:
+    """Hash dirty paths plus tracked diffs and untracked file contents."""
+
+    digest = hashlib.sha256()
+    digest.update(status)
+    digest.update(b"\0tracked-diff\0")
+    digest.update(_git_bytes(root, "diff", "--binary", "HEAD", "--"))
+    untracked = _git_bytes(
+        root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    digest.update(b"\0untracked\0")
+    digest.update(untracked)
+    for raw_path in sorted(item for item in untracked.split(b"\0") if item):
+        relative = Path(os.fsdecode(raw_path))
+        candidate = root / relative
+        digest.update(b"\0path\0")
+        digest.update(raw_path)
+        if candidate.is_file():
+            digest.update(b"\0file\0")
+            digest.update(bytes.fromhex(sha256_file(candidate)))
+        elif candidate.is_symlink():
+            digest.update(b"\0symlink\0")
+            digest.update(os.fsencode(os.readlink(candidate)))
+        else:
+            digest.update(b"\0other\0")
+    return digest.hexdigest()
 
 
 def verify_source_identity(

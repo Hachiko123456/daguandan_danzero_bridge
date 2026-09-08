@@ -452,6 +452,7 @@ def test_advice_expands_an_occluded_initial_hand_before_model_inference(tmp_path
     orchestrator = _build(tmp_path, advisor, hand=hand)
 
     _commit_left_action(orchestrator)
+    _wait_until(lambda: orchestrator.latest_advice is not None)
     advice = orchestrator.wait_for_advice(
         orchestrator.latest_advice.key,
         timeout=2.0,

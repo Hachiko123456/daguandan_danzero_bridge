@@ -42,7 +42,7 @@ from ..live.display_text import (
     seat_text,
 )
 from ..live.models import LiveEvent
-from ..live.orchestrator import LiveAdvice, LiveUpdate, ReviewRequest
+from ..domain.live_runtime import LiveAdvice, LiveUpdate, ReviewRequest
 from ..live.recognition_strategy import RECOGNITION_STRATEGY_OPTIONS
 from ..live.truth_log import card_code_to_text, card_text_to_code
 from .single_image_danzero_page import CardBadge
@@ -68,6 +68,10 @@ _PLAY_TYPE_LABELS = {
     "Bomb": "炸弹",
     "PASS": "不出",
 }
+
+_TURN_RECOVERY_PENDING = "turn_recovery_pending"
+_WIND_CATCH_PASS_RECOVERY_PENDING = "wind_catch_pass_recovery_pending"
+_CANNOT_BEAT_MIN_CONFIDENCE = 0.80
 
 
 class _ClickableCardStrip(QWidget):
@@ -96,6 +100,7 @@ class LiveAssistantPage(ScrollArea):
         self._shown_event_ids: set[str] = set()
         self._last_advice_timeline_key: tuple[object, ...] | None = None
         self._session_active = False
+        self._geometry_terminal_error_visible = False
         self.setObjectName("liveAssistantPage")
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -153,7 +158,7 @@ class LiveAssistantPage(ScrollArea):
         root.setSpacing(16)
         root.addWidget(TitleLabel("实时出牌助手"))
         subtitle = BodyLabel(
-            "持续监听页面：程序只观察与建议，不会点击游戏；稳定识别两次相同的 27 张手牌后自动开始。"
+            "持续监听页面：程序只观察与建议，不会点击游戏；确认起手牌和首出信息后自动开始。"
         )
         subtitle.setWordWrap(True)
         root.addWidget(subtitle)
@@ -209,7 +214,7 @@ class LiveAssistantPage(ScrollArea):
         self.recording_mode_combo.setToolTip(
             "不保存：仅实时建议。\n"
             "对局录制：确认起手牌后开始保存。\n"
-            "全程录制：从开始监听即保存画面。"
+            "完整牌桌录制：保存准备、发牌与对局；大厅和结算仅监听。"
         )
         # Internal normalized codes remain here for the state machine; the
         # user edits the visible card strip through the existing picker.
@@ -304,6 +309,19 @@ class LiveAssistantPage(ScrollArea):
         control_row.addWidget(self.compact_button)
         control_row.addWidget(self.finish_button)
         state_layout.addLayout(control_row)
+        log_row = QHBoxLayout()
+        self.open_log_directory_button = PushButton("打开日志目录")
+        self.export_full_diagnostic_button = PushButton("导出最近一局完整诊断")
+        log_row.addWidget(self.open_log_directory_button)
+        log_row.addWidget(self.export_full_diagnostic_button)
+        state_layout.addLayout(log_row)
+        self.log_delivery_status = CaptionLabel("封局后会自动生成不含截图和视频的诊断 ZIP")
+        self.log_delivery_status.setWordWrap(True)
+        self.log_delivery_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        state_layout.addWidget(self.log_delivery_status)
+        self._apply_log_delivery_availability()
         columns.addWidget(state_card, 2)
         root.addLayout(columns)
 
@@ -388,6 +406,10 @@ class LiveAssistantPage(ScrollArea):
         self.resume_button.clicked.connect(self.runtime.resume)
         self.finish_button.clicked.connect(self.runtime.finish)
         self.compact_button.clicked.connect(self.compact_mode_requested.emit)
+        self.open_log_directory_button.clicked.connect(self._open_log_directory)
+        self.export_full_diagnostic_button.clicked.connect(
+            self._export_full_diagnostic
+        )
         self.fabledan_detail_button.clicked.connect(
             self._toggle_fabledan_details
         )
@@ -416,6 +438,9 @@ class LiveAssistantPage(ScrollArea):
             ("error", self.show_error),
             ("session_finished", self._session_finished),
             ("danzero_warmup_status", self.show_danzero_warmup_status),
+            ("listening_status", self.show_listening_status),
+            ("log_delivery_status", self.show_log_delivery_status),
+            ("recording_status", self.show_recording_status),
         ):
             signal = getattr(self.runtime, name, None)
             if signal is not None:
@@ -532,6 +557,7 @@ class LiveAssistantPage(ScrollArea):
                 mode_setter(mode)
             else:
                 legacy_setter(mode != "none")
+            self._apply_log_delivery_availability()
         except Exception as exc:
             self.show_error(str(exc))
             restored = str(
@@ -550,6 +576,30 @@ class LiveAssistantPage(ScrollArea):
                 self.recording_mode_combo.blockSignals(True)
                 self.recording_mode_combo.setCurrentIndex(index)
                 self.recording_mode_combo.blockSignals(False)
+
+    def _apply_log_delivery_availability(self) -> None:
+        """Keep log actions honest when the user selected no persistence."""
+
+        enabled = self._log_delivery_enabled()
+        self.open_log_directory_button.setEnabled(enabled)
+        if not enabled:
+            self.export_full_diagnostic_button.setEnabled(False)
+            self.log_delivery_status.setText("当前已关闭对局数据保存，日志功能不可用")
+        elif "日志功能不可用" in self.log_delivery_status.text():
+            self.export_full_diagnostic_button.setEnabled(True)
+            self.log_delivery_status.setText("封局后会自动生成不含截图和视频的诊断 ZIP")
+
+    def _log_delivery_enabled(self) -> bool:
+        mode = str(
+            getattr(
+                self.runtime,
+                "recording_mode",
+                "game"
+                if bool(getattr(self.runtime, "session_data_recording_enabled", True))
+                else "none",
+            )
+        )
+        return mode != "none"
 
     def apply_initial_recognition(self, result: object, snapshot: object | None) -> None:
         level = getattr(result, "round_level", None)
@@ -637,6 +687,93 @@ class LiveAssistantPage(ScrollArea):
         self.resume_button.setEnabled(active)
         self.finish_button.setEnabled(active)
 
+    def _open_log_directory(self) -> None:
+        requester = getattr(
+            self.runtime,
+            "request_open_automatic_log_directory",
+            None,
+        )
+        if callable(requester):
+            self.open_log_directory_button.setEnabled(False)
+            self.open_log_directory_button.setText("正在打开…")
+            requester()
+            return
+        opener = getattr(self.runtime, "open_automatic_log_directory", None)
+        if not callable(opener):
+            self.show_error("当前运行时不支持打开日志目录")
+            return
+        try:
+            path = opener()
+        except Exception as exc:
+            self.show_error(str(exc))
+            return
+        self.log_delivery_status.setText(f"已打开日志目录：{path}")
+
+    def _export_full_diagnostic(self) -> None:
+        exporter = getattr(self.runtime, "request_full_diagnostic_export", None)
+        if not callable(exporter):
+            self.show_error("当前运行时不支持完整诊断导出")
+            return
+        self.export_full_diagnostic_button.setEnabled(False)
+        self.export_full_diagnostic_button.setText("正在导出完整诊断…")
+        exporter()
+
+    def show_log_delivery_status(self, value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        status = str(value.get("status", "") or "").upper()
+        status = {
+            "LOADING": "RUNNING",
+            "SUCCESS": "PASS",
+            "FAILURE": "FAIL",
+        }.get(status, status)
+        action = str(value.get("action", "") or "")
+        include_media = bool(value.get("include_media", False))
+        if status != "DISABLED" and not self._log_delivery_enabled():
+            self._apply_log_delivery_availability()
+            return
+        if status == "DISABLED":
+            self.open_log_directory_button.setEnabled(False)
+            self.export_full_diagnostic_button.setEnabled(False)
+            self.log_delivery_status.setText(
+                str(value.get("message") or "当前已关闭对局数据保存，日志功能不可用")
+            )
+            return
+        if action == "open_directory":
+            if status == "RUNNING":
+                self.open_log_directory_button.setEnabled(False)
+                self.open_log_directory_button.setText("正在打开…")
+                self.log_delivery_status.setText("正在打开日志目录")
+                return
+            self.open_log_directory_button.setEnabled(True)
+            self.open_log_directory_button.setText("打开日志目录")
+            if status == "PASS":
+                self.log_delivery_status.setText(
+                    f"已打开日志目录：{value.get('output_directory') or ''}"
+                )
+            elif status == "FAIL":
+                self.log_delivery_status.setText(
+                    f"打开日志目录失败：{value.get('error') or '未知错误'}"
+                )
+            return
+        if status == "RUNNING":
+            self.export_full_diagnostic_button.setEnabled(False)
+            self.export_full_diagnostic_button.setText("正在导出完整诊断…")
+            self.log_delivery_status.setText(
+                str(value.get("message") or "正在后台生成完整诊断")
+            )
+            return
+        self.export_full_diagnostic_button.setEnabled(True)
+        self.export_full_diagnostic_button.setText("导出最近一局完整诊断")
+        if status == "PASS":
+            path = str(value.get("diagnostic_zip_path") or "")
+            prefix = "完整诊断已生成" if include_media else "本局日志已自动生成（不含截图和视频）"
+            self.log_delivery_status.setText(f"{prefix}：{path}")
+        elif status == "FAIL":
+            self.log_delivery_status.setText(
+                f"日志导出失败：{value.get('error') or '未知错误'}"
+            )
+
     def show_frame(self, snapshot: object) -> None:
         image = getattr(snapshot, "image", None)
         if image is None:
@@ -701,14 +838,100 @@ class LiveAssistantPage(ScrollArea):
             self.show_review(update.review)
         else:
             self.review_bar.hide()
-        self._show_advice(update.advice)
+        self._show_advice(
+            update.advice,
+            update.fast_signals,
+            live_status=update.status,
+            snapshot=update.snapshot,
+        )
         if update.status == "sealed":
             self._session_finished(update)
 
-    def _show_advice(self, raw: object | None) -> None:
+    @staticmethod
+    def _cannot_beat_candidate(fast_signals: object | None) -> bool:
+        try:
+            confidence = float(
+                getattr(fast_signals, "cannot_beat_confidence", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return bool(
+            getattr(fast_signals, "cannot_beat_visible", False)
+            and confidence >= _CANNOT_BEAT_MIN_CONFIDENCE
+            and getattr(fast_signals, "active_player", None) in (None, "self")
+            and getattr(fast_signals, "self_action_buttons_visible", False)
+            and not getattr(fast_signals, "effect_visible", False)
+        )
+
+    @staticmethod
+    def _advice_matches_snapshot(advice: LiveAdvice, snapshot: object) -> bool:
+        turn_id = getattr(snapshot, "turn_id", None)
+        revision = getattr(snapshot, "revision", None)
+        if turn_id is None or revision is None:
+            return True
+        return bool(
+            advice.key.turn_id == int(turn_id)
+            and advice.key.state_revision == int(revision)
+        )
+
+    def _show_fast_cannot_beat_status(self) -> None:
+        """Show a provisional local-button status without committing PASS."""
+
+        self.fabledan_debug_card.hide()
+        self.live_status.setText("状态：检测到要不起，正在确认不出")
+        self.turn_status.setText(
+            "确认后直接提示不出；单帧信号不会直接提交动作"
+        )
+
+    def _show_advice(
+        self,
+        raw: object | None,
+        fast_signals: object | None = None,
+        *,
+        live_status: object | None = None,
+        snapshot: object | None = None,
+    ) -> None:
+        cannot_beat_visible = bool(
+            live_status == "running"
+            and getattr(snapshot, "current_player", None) == "self"
+            and self._cannot_beat_candidate(fast_signals)
+        )
+        # Withheld states describe canonical recovery/history state and always
+        # outrank a raw button match.  Outside those states, the current-frame
+        # candidate outranks any advice object left from the preceding turn.
+        if isinstance(raw, LiveAdvice) and raw.status == "withheld":
+            if raw.withhold_reason == _WIND_CATCH_PASS_RECOVERY_PENDING:
+                self.live_status.setText("状态：正在确认接风前的不出")
+                self.turn_status.setText(
+                    raw.error or "确认接风前的不出后将自动继续推荐"
+                )
+            elif raw.withhold_reason == _TURN_RECOVERY_PENDING:
+                self.live_status.setText("状态：正在补齐刚才的快速出牌")
+                self.turn_status.setText(raw.error or "补齐完成后将自动继续推荐")
+            elif raw.withhold_reason == "previous_action_reread_pending":
+                self.live_status.setText("状态：正在复核上一手牌面")
+                self.turn_status.setText(raw.error or "复核完成后将自动更新推荐")
+            else:
+                self.live_status.setText("状态：已确认牌局历史存在缺口")
+                self.turn_status.setText(raw.error or "请补正缺失动作后再继续")
+            return
+        button_ready = bool(
+            isinstance(raw, LiveAdvice) and raw.status == "ready" and raw.visible
+            and getattr(raw.advice, "strategy", None) == "button_cannot_beat"
+            and self._advice_matches_snapshot(raw, snapshot)
+        )
+        if cannot_beat_visible and not button_ready:
+            self._show_fast_cannot_beat_status()
+            return
         if not isinstance(raw, LiveAdvice):
             return
+        if not self._advice_matches_snapshot(raw, snapshot):
+            self.fabledan_debug_card.hide()
+            return
         if raw.status == "ready" and raw.advice is not None:
+            if button_ready:
+                self.live_status.setText("状态：建议不出")
+                self.turn_status.setText("按钮判定，无需模型计算；请点击不出")
             self._show_fabledan_decision(raw.advice)
             suggestion = (
                 "建议：不出"
@@ -1041,10 +1264,41 @@ class LiveAssistantPage(ScrollArea):
         self.review_bar.hide()
 
     def show_error(self, message: str) -> None:
-        self.error_status.setText(f"错误：{message}")
+        text = str(message)
+        self._geometry_terminal_error_visible = (
+            "监听已停止，请打开完整助手" in text
+        )
+        self.error_status.setText(f"错误：{text}")
+
+    def show_recording_status(self, value: object) -> None:
+        if isinstance(value, dict) and value.get("reason") == "recording_capacity_reached":
+            self.error_status.setText("提示：录像容量已达上限，已停止录像，识别和推荐继续")
 
     def show_danzero_warmup_status(self, message: str) -> None:
         self.danzero_warmup_status.setText(str(message))
+
+    def show_listening_status(self, status: object) -> None:
+        if not isinstance(status, dict):
+            return
+        state = str(status.get("state", "") or "")
+        generation = status.get("generation")
+        if isinstance(generation, int):
+            if generation < getattr(self, "_listening_generation", -1):
+                return
+            self._listening_generation = generation
+        if state == "opening" and getattr(self.runtime, "orchestrator", None) is not None:
+            return
+        message = str(status.get("message", "") or "")
+        if message:
+            self.initialization_status.setText(message)
+        if state == "failed":
+            reason = str(status.get("reason", "") or "牌桌窗口恢复失败")
+            self._geometry_terminal_error_visible = True
+            self.error_status.setText(f"错误：{reason}")
+        elif state in {"listening", "recovering", "recovered", "opening"}:
+            if self._geometry_terminal_error_visible:
+                self.error_status.clear()
+                self._geometry_terminal_error_visible = False
 
     def _session_finished(self, _value: object) -> None:
         self._session_active = False

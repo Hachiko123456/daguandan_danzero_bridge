@@ -16,6 +16,7 @@ from ..profiles import normalize_profile_name
 from ..storage import atomic_write_json
 from .display_text import event_action_text, event_prefix, reasons_text
 from .models import LiveEvent
+from .pipeline_timing import PipelineTiming
 
 
 SCHEMA_VERSION = 1
@@ -160,6 +161,7 @@ class LiveSessionStore:
         profile_name: str,
         *,
         session_id: str | None = None,
+        automatic_log_delivery_enabled: bool = False,
     ) -> None:
         self.profile_name = normalize_profile_name(profile_name)
         self.session_id = _validate_session_id(session_id or _new_session_id())
@@ -171,7 +173,8 @@ class LiveSessionStore:
         )
         self.manifest_path = self.directory / "manifest.json"
         self.timeline_path = self.directory / "timeline.jsonl"
-        self.timeline_markdown_path = self.directory / "timeline.md"
+        self._timeline_markdown_path = self.directory / "timeline.md"
+        self._timeline_markdown_dirty = False
         self.advice_path = self.directory / "advice.jsonl"
         self.decisions_path = self.directory / "decisions.jsonl"
         self.recognition_trace_path = self.directory / "recognition_trace.jsonl"
@@ -183,6 +186,11 @@ class LiveSessionStore:
         self._sealed = False
         self._incident_ids: list[str] = []
         self._decisions: dict[str, dict[str, object]] = {}
+        self.pipeline_timing = PipelineTiming()
+        self._pipeline_last_flush_ns = self.pipeline_timing.now_ns()
+        self.automatic_log_delivery_enabled = bool(
+            automatic_log_delivery_enabled
+        )
 
     def start(self, manifest: dict[str, object]) -> None:
         with self._lock:
@@ -200,7 +208,7 @@ class LiveSessionStore:
                 self.observations_part_path,
             ):
                 path.touch()
-            self.timeline_markdown_path.write_text(
+            self._timeline_markdown_path.write_text(
                 f"# 对局时间线：{self.session_id}\n\n",
                 encoding="utf-8",
             )
@@ -218,7 +226,12 @@ class LiveSessionStore:
             atomic_write_json(self.manifest_path, document)
             self._started = True
 
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
     def append_event(self, event: LiveEvent) -> None:
+        started_ns = self.pipeline_timing.now_ns()
         with self._lock:
             self._ensure_writable()
             if event.session_id != self.session_id:
@@ -226,12 +239,101 @@ class LiveSessionStore:
             record = event.to_dict()
             record["schema_version"] = SCHEMA_VERSION
             _append_json_line(self.timeline_path, record, durable=True)
-            with self.timeline_markdown_path.open(
-                "a", encoding="utf-8", newline="\n"
-            ) as handle:
-                handle.write(self._format_timeline_event(event) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._timeline_markdown_dirty = True
+        self.pipeline_timing.elapsed("canonical_event_write", started_ns)
+
+    @property
+    def timeline_markdown_path(self) -> Path:
+        """Materialize the derived human view only on explicit access/seal.
+
+        Canonical JSONL remains synchronously durable. No event-sized memory
+        queue is kept; a crash can always reconstruct this optional view.
+        """
+        self.flush_timeline_markdown()
+        return self._timeline_markdown_path
+
+    def flush_timeline_markdown(self) -> None:
+        with self._lock:
+            if not self._started or not self._timeline_markdown_dirty:
+                return
+            temporary = self._timeline_markdown_path.with_name(
+                f".{self._timeline_markdown_path.name}.pending"
+            )
+            try:
+                with self.timeline_path.open("r", encoding="utf-8") as source:
+                    with temporary.open("x", encoding="utf-8", newline="\n") as target:
+                        target.write(f"# 对局时间线：{self.session_id}\n\n")
+                        for line in source:
+                            if line.strip():
+                                event = LiveEvent.from_dict(json.loads(line))
+                                target.write(self._format_timeline_event(event) + "\n")
+                temporary.replace(self._timeline_markdown_path)
+                self._timeline_markdown_dirty = False
+            except OSError:
+                # Derived diagnostics must never invalidate committed actions.
+                self.pipeline_timing.increment("markdown_write_failed")
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    self.pipeline_timing.increment("markdown_cleanup_failed")
+
+    def flush_pipeline_timing(self, *, force: bool = False) -> None:
+        """Publish one bounded snapshot in the existing exported manifest.
+
+        Capture calls this after recording, at most once per ten seconds.
+        Busy canonical writers win the lock; telemetry is best effort.
+        """
+        now = self.pipeline_timing.now_ns()
+        if not force and now - self._pipeline_last_flush_ns < 10_000_000_000:
+            return
+        if not self._lock.acquire(blocking=False):
+            self.pipeline_timing.increment("telemetry_flush_busy")
+            return
+        try:
+            if not self._started or self._sealed:
+                return
+            self._pipeline_last_flush_ns = now
+            self._update_manifest({"pipeline_timing": self.pipeline_timing.snapshot()})
+        except (OSError, ValueError, TypeError):
+            self.pipeline_timing.increment("telemetry_flush_failed")
+        finally:
+            self._lock.release()
+
+    def append_event_batch(self, events: Iterable[LiveEvent]) -> None:
+        """Atomically publish one formal event batch to the canonical JSONL."""
+
+        batch = tuple(events)
+        if not batch:
+            return
+        with self._lock:
+            self._ensure_writable()
+            if any(event.session_id != self.session_id for event in batch):
+                raise ValueError("事件 batch 的 session_id 与当前对局不一致")
+            timeline_payload = self.timeline_path.read_bytes() + b"".join(
+                (
+                    json.dumps(
+                        {**event.to_dict(), "schema_version": SCHEMA_VERSION},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                for event in batch
+            )
+            temporary = self.timeline_path.with_name(
+                f".{self.timeline_path.name}.{uuid4().hex}.tmp"
+            )
+            try:
+                with temporary.open("xb") as handle:
+                    handle.write(timeline_payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(self.timeline_path)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+            self._timeline_markdown_dirty = True
 
     def append_advice(self, record: dict[str, object]) -> None:
         with self._lock:
@@ -434,6 +536,7 @@ class LiveSessionStore:
     ) -> None:
         with self._lock:
             self._ensure_writable()
+            self.flush_timeline_markdown()
             with self.observations_part_path.open("rb") as source:
                 with gzip.open(self.observations_gzip_path, "wb") as target:
                     shutil.copyfileobj(source, target)
@@ -444,6 +547,7 @@ class LiveSessionStore:
                     "frame_count": frame_count,
                     "dropped_frames": dropped_frames,
                     "incidents": list(self._incident_ids),
+                    "pipeline_timing": self.pipeline_timing.snapshot(),
                 }
             if metrics is not None:
                 changes["performance_metrics"] = dict(metrics)
@@ -550,6 +654,16 @@ class LiveSessionStore:
                 }
             )
 
+    def record_automatic_log_delivery(self, result: dict[str, object]) -> None:
+        """Persist post-seal delivery evidence without mutating the timeline."""
+
+        with self._lock:
+            if not self._started or not self._sealed:
+                raise RuntimeError("automatic log delivery requires a sealed session")
+            document = dict(result)
+            atomic_write_json(self.directory / "automatic_log_delivery.json", document)
+            self._update_manifest({"automatic_log_delivery": document})
+
     def _ensure_writable(self) -> None:
         if not self._started:
             raise RuntimeError("请先启动对局存储")
@@ -645,17 +759,30 @@ class InMemoryLiveSessionStore:
     """
 
     persistence_enabled = False
+    automatic_log_delivery_enabled = False
 
     def __init__(self, profiles_root: Path, profile_name: str) -> None:
         self.profile_name = normalize_profile_name(profile_name)
         self.session_id = f"memory_{uuid4().hex[:12]}"
         self.directory = Path(profiles_root) / self.profile_name
+        self.pipeline_timing = PipelineTiming()
+        self._started = False
 
     def start(self, manifest: dict[str, object]) -> None:
         del manifest
+        if self._started:
+            raise RuntimeError("对局存储已经启动")
+        self._started = True
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
 
     def append_event(self, event: LiveEvent) -> None:
         del event
+
+    def append_event_batch(self, events: Iterable[LiveEvent]) -> None:
+        del events
 
     def append_advice(self, record: dict[str, object]) -> None:
         del record
@@ -724,3 +851,6 @@ class InMemoryLiveSessionStore:
         monotonic_ms: int,
     ) -> None:
         del report, state, monotonic_ms
+
+    def record_automatic_log_delivery(self, result: dict[str, object]) -> None:
+        del result

@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from datetime import datetime
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,11 +16,17 @@ from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.gui.live_controller import (
     LiveAssistantController,
+    _AnalysisDelivery,
     _AnalysisFrameTask,
     _LiveRunToken,
+    _WaitingAnalysisTask,
+    _WaitingRecognitionEnvelope,
 )
-from daguandan_bridge.capture_service import FrameSnapshot
+from daguandan_bridge.gui.recording_dispatcher import RecordingFrame
+from daguandan_bridge.opening_gate import ListeningPageSignal
+from daguandan_bridge.capture_service import FrameSnapshot, LiveCaptureInterrupted
 from daguandan_bridge.danzero.advisor import LocalAdvice
+from daguandan_bridge.domain.recording import RecordingResult
 from daguandan_bridge.image_io import StandardizationResult
 from daguandan_bridge.live.models import LiveEvent
 from daguandan_bridge.live.orchestrator import AdviceRequestKey, LiveAdvice, LiveUpdate
@@ -31,9 +38,30 @@ def _app():
     return QApplication.instance() or QApplication([])
 
 
+def _wait_until(predicate, *, timeout=3.0):
+    app = _app()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    app.processEvents()
+    return bool(predicate())
+
+
 class _CaptureServiceStub:
     def __init__(self, root):
         self.profiles_root = root
+
+
+def _isolated_controller(root):
+    return LiveAssistantController(
+        _CaptureServiceStub(root),
+        recognition_service=SimpleNamespace(),
+        advisor=object(),
+        session_factory=SimpleNamespace(),
+    )
 
 
 class _LockingCaptureServiceStub(_CaptureServiceStub):
@@ -73,6 +101,8 @@ class _ReopeningCaptureServiceStub(_CaptureServiceStub):
 
 
 class _WarmAdvisor:
+    strategy_id = "fabledan"
+
     def __init__(self):
         self.initialize_calls = 0
 
@@ -256,6 +286,234 @@ def _initial_recognition(hand, *, round_level="2"):
     return SimpleNamespace(my_hand=hand, round_level=round_level)
 
 
+@pytest.mark.parametrize("phase", ["opening_seed_invalid", "confirming_opening"])
+def test_opening_title_is_compact_without_losing_structured_state(tmp_path, phase):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._waiting_generation = 3
+    statuses = []
+    controller.listening_status.connect(statuses.append)
+    controller._publish_opening_status(phase, _initial_recognition(("2C",) * 27))
+    assert statuses == [{
+        "state": "opening", "phase": phase, "reason": phase,
+        "hand_count": 27, "generation": 3,
+        "message": "已识别27张，等待首出确认",
+    }]
+
+
+def test_staged_opening_publishes_actual_progress_and_starts_once_with_action(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    controller._table_anchor_observed = True
+    statuses, started = [], []
+    controller.listening_status.connect(statuses.append)
+    monkeypatch.setattr(controller, "start_session", lambda **kw: started.append(kw) or True)
+    hand = tuple(f"{r}{s}" for r in ("3", "4", "5", "6", "7", "8", "9") for s in "SHCD")[:27]
+    from daguandan_bridge.opening_gate import serialized_result
+    for index, confidence in enumerate((.92, .920001, .94)):
+        result = serialized_result(
+            round_level="5", hand=hand, lead_player="left", current_player="self",
+            events=({"player": "left", "cards": ("2C",), "is_pass": False,
+                     "confidence": confidence, "source": f"template:{index}"},),
+        )
+        task = _WaitingAnalysisTask(SimpleNamespace(captured_monotonic_ms=100 + index * 500), 0)
+        controller._consume_waiting_recognition(result, task)
+    assert len(started) == 1
+    assert started[0]["opening_action"].cards == ("2C",)
+    assert started[0]["opening_action"].actor == "left"
+    assert statuses[0]["phase"] == "confirming_hand"
+    assert statuses[-1]["phase"] == "ready"
+    assert all("重新连接" not in status["message"] for status in statuses)
+
+
+def test_off_table_probe_skips_full_recognition_and_media_for_long_idle(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    controller.recording_mode = "all"
+    recording = _ListenerRecordingStub()
+    factory = _ListenerRecordingFactory(recording)
+    controller.session_factory = factory
+
+    class Recognizer:
+        full_calls = 0
+        def recognize_listening_page(self, image):
+            return ListeningPageSignal("settlement", .2, ("continue_game", "change_table"))
+        def recognize(self, image, **kwargs):
+            self.full_calls += 1
+            raise AssertionError("settlement must not run hand recognition")
+
+    recognizer = Recognizer()
+    controller.recognition_service = recognizer
+    snapshot = SimpleNamespace(image=np.zeros((1, 1, 3), dtype=np.uint8), captured_monotonic_ms=100)
+    value, envelope = controller._recognize_waiting_frame(_WaitingAnalysisTask(snapshot, 0))
+    for _ in range(1800):
+        controller._consume_waiting_recognition(value, envelope)
+    assert recognizer.full_calls == 0
+    assert factory.started_with == []
+    assert recording.frames == []
+    assert controller.orchestrator is None
+    assert controller._listening_enabled
+    controller.opening_evidence.close(.2)
+
+
+def test_finish_discards_bounded_recording_tail_before_sealing_without_orphan(
+    tmp_path, monkeypatch
+):
+    app = _app()
+    write_entered = threading.Event()
+    release_write = threading.Event()
+    pending_discarded = threading.Event()
+    finish_called = threading.Event()
+
+    class Recorder:
+        frame_count = 1
+        dropped_frames = 0
+        session_directory = tmp_path
+
+        def close(self):
+            return RecordingResult(
+                tmp_path / "game.avi", tmp_path / "frames.jsonl", 1, 0,
+                integrity={"status": "PASS", "issues": []},
+            )
+
+    class Store:
+        def __init__(self):
+            self.metadata = []
+
+        def update_session_metadata(self, value):
+            self.metadata.append(value)
+
+    class Orchestrator:
+        status = "running"
+        snapshot = SimpleNamespace(session_id="recording-finish")
+
+        def __init__(self):
+            self.recorder = Recorder()
+            self.store = Store()
+            self.recording_result = None
+
+        def begin_finalizing(self):
+            self.status = "finalizing"
+
+        def record_frame(self, image, *, monotonic_ms, wall_time):
+            write_entered.set()
+            assert release_write.wait(2)
+
+        def finish(self):
+            self.recording_result = self.recorder.close()
+            finish_called.set()
+            self.status = "sealed"
+            return SimpleNamespace(status="sealed")
+
+    controller = _isolated_controller(tmp_path)
+    orchestrator = Orchestrator()
+    controller.orchestrator = orchestrator  # type: ignore[assignment]
+    token = controller._activate_live_token(orchestrator)  # type: ignore[arg-type]
+    original_drop = controller._recording_dropped
+
+    def watched_drop(frame, reason):
+        original_drop(frame, reason)
+        if reason == "close" and (
+            token.pipeline_timing.snapshot()["counters"].get(
+                "recording_dispatcher_drop_close"
+            ) == 2
+        ):
+            pending_discarded.set()
+
+    monkeypatch.setattr(controller, "_recording_dropped", watched_drop)
+    controller._start_recording_dispatcher(token)
+    for sequence in (1, 2, 3):
+        assert controller._recording_dispatcher.submit(
+            RecordingFrame(object(), sequence * 100, f"frame-{sequence}", sequence, token)
+        )
+    assert write_entered.wait(1)
+
+    controller.finish()
+    assert pending_discarded.wait(1)
+    assert not finish_called.is_set()
+    release_write.set()
+    assert controller._finish_thread.wait(2_000)
+    app.processEvents()
+
+    counters = token.pipeline_timing.snapshot()["counters"]
+    assert finish_called.is_set()
+    assert counters["recording_dispatcher_close_discarded"] == 2
+    assert counters["recording_dispatcher_closed"] == 1
+    assert orchestrator.recording_result.dropped_frames == 2
+    audit = orchestrator.recording_result.integrity["recording_dispatcher"]
+    assert [item["capture_sequence"] for item in audit["drops"]] == [2, 3]
+    dispatcher_metadata = next(
+        item["recording_dispatcher"]
+        for item in orchestrator.store.metadata
+        if "recording_dispatcher" in item
+    )
+    assert dispatcher_metadata == audit
+    cadence_metadata = next(
+        item["recording_cadence"]
+        for item in orchestrator.store.metadata
+        if "recording_cadence" in item
+    )
+    assert cadence_metadata["target_fps"] == 10
+    assert controller._recording_dispatcher is None
+    assert not any(
+        thread.name == "live-recording-dispatcher" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_complete_table_recording_stops_once_on_settlement_and_rearms_next_table(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller.recording_mode = "all"
+    recording = _ListenerRecordingStub()
+    factory = _ListenerRecordingFactory(recording)
+    controller.session_factory = factory
+    snapshot = SimpleNamespace(image=np.zeros((1, 1, 3), dtype=np.uint8), captured_at=datetime.now().astimezone())
+    assert controller._start_listener_recording()
+    assert factory.started_with == []
+    controller._apply_listening_page(ListeningPageSignal("table", .95), snapshot)
+    assert len(recording.frames) == 1
+    controller._apply_listening_page(ListeningPageSignal("settlement", .1), snapshot)
+    for _ in range(10):
+        controller._record_listener_frame(snapshot)
+        controller._apply_listening_page(ListeningPageSignal("settlement", .1), snapshot)
+    assert recording.closed_with == ["page_settlement"]
+    assert len(recording.frames) == 1
+    controller._apply_listening_page(ListeningPageSignal("table", .95), snapshot)
+    assert len(factory.started_with) == 2
+    controller.stop_listening()
+
+
+def test_stale_page_envelope_cannot_close_new_generation_recording(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    controller._waiting_generation = 2
+    recording = _ListenerRecordingStub()
+    controller._listener_recording = recording
+    controller._listening_page = ListeningPageSignal("table", .95)
+    envelope = _WaitingRecognitionEnvelope(SimpleNamespace(), 1, None, None, ListeningPageSignal("settlement", .1))
+    controller._consume_waiting_recognition(_initial_recognition(()), envelope)
+    assert controller._listener_recording is recording
+    assert recording.closed_with == []
+    controller.stop_listening()
+
+
+def test_capacity_notice_does_not_stop_recognition_or_emit_capture_error(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    errors, warnings = [], []
+    controller.error.connect(errors.append)
+    controller.recording_status.connect(warnings.append)
+    controller._publish_recording_warning(SimpleNamespace(reason="recording_capacity_reached"))
+    assert errors == []
+    assert controller._listening_enabled
+    assert warnings[0]["reason"] == "recording_capacity_reached"
+
+
 class _UnknownSuitAwareRecognitionStub:
     def __init__(self) -> None:
         self.allow_unknown_suit = None
@@ -360,6 +618,9 @@ def test_full_recording_keeps_listener_frames_when_initial_hand_is_empty(tmp_pat
     factory = _ListenerRecordingFactory(recording)
     controller.session_factory = factory  # type: ignore[assignment]
     controller.recording_mode = "all"
+    controller._listening_enabled = True
+    controller._table_anchor_observed = True
+    controller._listening_page = ListeningPageSignal("table", 1.0)
 
     assert controller._start_listener_recording() is True
     snapshot = SimpleNamespace(
@@ -758,6 +1019,434 @@ def test_stale_analysis_task_cannot_call_replacement_orchestrator(tmp_path):
     assert replacement.calls == 0
 
 
+class _GeometrySource:
+    def __init__(self, snapshots=(), *, error=None, state=None):
+        self.snapshots = tuple(snapshots)
+        self.error = error
+        self.state = dict(state or {})
+        self.capture_calls = 0
+        self.closed = False
+
+    def capture(self):
+        self.capture_calls += 1
+        if self.error is not None:
+            raise self.error
+        if not self.snapshots:
+            raise RuntimeError("no scripted recovery frame")
+        return self.snapshots[min(self.capture_calls - 1, len(self.snapshots) - 1)]
+
+    def diagnostic_state(self):
+        return dict(self.state)
+
+    def close(self):
+        self.closed = True
+
+
+class _GeometryRecoveryCaptureService(_CaptureServiceStub):
+    def __init__(self, root, sources):
+        super().__init__(root)
+        self.sources = list(sources)
+        self.open_calls = 0
+        self.lock_calls = 0
+
+    def lock_target_client_size(self, _profile_name):
+        self.lock_calls += 1
+        return ClientRect(30, 40, 1280, 764)
+
+    def open_live_source(self, _profile_name):
+        self.open_calls += 1
+        if not self.sources:
+            raise RuntimeError("no scripted source")
+        return self.sources.pop(0)
+
+
+class _BlockingAnalysisWorker:
+    def __init__(self):
+        self.release = threading.Event()
+        self.stop_calls = []
+
+    def stop(self, *, timeout=None):
+        self.stop_calls.append(timeout)
+        if timeout is None:
+            self.release.wait()
+            return True
+        return self.release.wait(float(timeout))
+
+
+@pytest.mark.parametrize(
+    ("change_type", "old_rect", "new_rect", "expected_lock_calls"),
+    (
+        ("move", [10, 20, 1280, 764], [30, 40, 1280, 764], 0),
+        ("resize", [10, 20, 1280, 764], [10, 20, 1100, 700], 1),
+    ),
+)
+def test_geometry_move_or_resize_recovers_then_allows_opening_gate(
+    tmp_path,
+    monkeypatch,
+    change_type,
+    old_rect,
+    new_rect,
+    expected_lock_calls,
+):
+    app = _app()
+    frame = _preselection_frame()
+    recovered_source = _GeometrySource(
+        (frame, frame),
+        state={
+            "rect": [30, 40, 1280, 764],
+            "dpi": 96,
+            "backend": "printwindow",
+        },
+    )
+    capture = _GeometryRecoveryCaptureService(tmp_path, (recovered_source,))
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_STABLE_SAMPLE_DELAY_SEC = 0
+    controller._listening_enabled = True
+    controller._table_anchor_observed = True
+    recording = _ListenerRecordingStub()
+    controller._listener_recording = recording
+    old_source = _GeometrySource()
+    old_worker = object()
+    controller._waiting_source = old_source
+    controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+    restarted = []
+    monkeypatch.setattr(
+        controller,
+        "_start_waiting_workers",
+        lambda: restarted.append(controller._recovered_waiting_source),
+    )
+    started = []
+    monkeypatch.setattr(
+        controller,
+        "_start_detected_session",
+        lambda result: started.append(result),
+    )
+    monkeypatch.setattr(controller, "_table_anchor_score", lambda _snapshot: 1.0)
+    incident = LiveCaptureInterrupted(
+        "geometry changed",
+        code="GEOMETRY-CHANGED",
+        details={
+            "old_rect": old_rect,
+            "new_rect": new_rect,
+            "change_types": [change_type],
+            "capture_backend": "printwindow",
+            "old_dpi": 96,
+            "new_dpi": 96,
+        },
+    )
+
+    controller._accept_waiting_error(incident, controller._waiting_generation)
+    recovery_generation = controller._waiting_generation
+    controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+
+    assert _wait_until(lambda: not controller._geometry_recovery_active)
+    assert restarted == [recovered_source]
+    assert controller._listening_enabled is True
+    assert old_source.closed is True
+    assert recovered_source.closed is False
+    assert recording.closed_with == []
+    # Recovery samples are not yet classified as a table; keep them in memory.
+    assert len(recording.frames) == 0
+    assert capture.lock_calls == expected_lock_calls
+    assert recovery_generation > 0
+
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    task = _WaitingAnalysisTask(frame, recovery_generation)
+    controller._consume_waiting_recognition(_initial_recognition(hand), task)
+    next_frame = replace(frame, captured_monotonic_ms=frame.captured_monotonic_ms + 200)
+    controller._consume_waiting_recognition(
+        _initial_recognition(hand), _WaitingAnalysisTask(next_frame, recovery_generation)
+    )
+    app.processEvents()
+
+    assert len(started) == 1
+    controller.stop_listening()
+
+
+@pytest.mark.parametrize(
+    ("code", "change_types", "backend"),
+    (
+        ("WINDOW-MINIMIZED", ["minimized"], "printwindow"),
+        ("GEOMETRY-CHANGED", ["dpi"], "printwindow"),
+        ("GEOMETRY-CHANGED", ["move"], "screen"),
+    ),
+)
+def test_minimized_or_dpi_geometry_path_recovers_with_stable_samples(
+    tmp_path,
+    monkeypatch,
+    code,
+    change_types,
+    backend,
+):
+    frame = _preselection_frame()
+    recovered_source = _GeometrySource((frame, frame))
+    capture = _GeometryRecoveryCaptureService(tmp_path, (recovered_source,))
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_STABLE_SAMPLE_DELAY_SEC = 0
+    controller._listening_enabled = True
+    old_source = _GeometrySource()
+    old_worker = object()
+    controller._waiting_source = old_source
+    controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+    restarted = []
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: restarted.append(True))
+
+    controller._accept_waiting_error(
+        LiveCaptureInterrupted(
+            "window changed",
+            code=code,
+            details={
+                "old_rect": [0, 0, 1280, 764],
+                "new_rect": None,
+                "change_types": change_types,
+                "capture_backend": backend,
+                "old_dpi": 96,
+                "new_dpi": 144 if change_types == ["dpi"] else None,
+            },
+        ),
+        controller._waiting_generation,
+    )
+    controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+
+    assert _wait_until(lambda: not controller._geometry_recovery_active)
+    assert restarted == [True]
+    assert recovered_source.capture_calls == 2
+    assert capture.lock_calls == 1
+    controller.stop_listening()
+
+
+def test_geometry_recovery_waits_for_old_recognition_worker_before_restarting(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    frame = _preselection_frame()
+    recovered_source = _GeometrySource((frame, frame))
+    capture = _GeometryRecoveryCaptureService(tmp_path, (recovered_source,))
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_STABLE_SAMPLE_DELAY_SEC = 0
+    controller._GEOMETRY_ANALYSIS_DRAIN_TIMEOUT_SEC = 2.0
+    controller._listening_enabled = True
+    old_analysis = _BlockingAnalysisWorker()
+    controller._waiting_analysis_worker = old_analysis  # type: ignore[assignment]
+    old_worker = object()
+    controller._waiting_source = _GeometrySource()
+    controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+    restarted_after_old_exit = []
+    monkeypatch.setattr(
+        controller,
+        "_start_waiting_workers",
+        lambda: restarted_after_old_exit.append(old_analysis.release.is_set()),
+    )
+
+    controller._accept_waiting_error(
+        LiveCaptureInterrupted(
+            "geometry changed",
+            code="GEOMETRY-CHANGED",
+            details={
+                "change_types": ["move"],
+                "capture_backend": "printwindow",
+            },
+        ),
+        controller._waiting_generation,
+    )
+    controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+
+    assert _wait_until(lambda: len(old_analysis.stop_calls) >= 2)
+    assert restarted_after_old_exit == []
+    assert capture.open_calls == 0
+
+    old_analysis.release.set()
+    assert _wait_until(lambda: restarted_after_old_exit == [True])
+    assert capture.open_calls == 1
+    controller.stop_listening()
+
+
+def test_geometry_recovery_fails_when_old_recognition_worker_does_not_exit(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    capture = _GeometryRecoveryCaptureService(
+        tmp_path,
+        (_GeometrySource((_preselection_frame(), _preselection_frame())),),
+    )
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_ANALYSIS_DRAIN_TIMEOUT_SEC = 0.02
+    controller._GEOMETRY_RECOVERY_DELAYS_MS = (0,)
+    controller._listening_enabled = True
+    old_analysis = _BlockingAnalysisWorker()
+    controller._waiting_analysis_worker = old_analysis  # type: ignore[assignment]
+    old_worker = object()
+    controller._waiting_source = _GeometrySource()
+    controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+    restarted = []
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: restarted.append(True))
+
+    controller._accept_waiting_error(
+        LiveCaptureInterrupted("geometry changed", code="GEOMETRY-CHANGED"),
+        controller._waiting_generation,
+    )
+    controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+
+    assert _wait_until(lambda: not controller._geometry_recovery_active)
+    assert controller._listening_enabled is False
+    assert capture.open_calls == 0
+    assert restarted == []
+    assert controller._draining_waiting_analysis_worker is old_analysis
+    old_analysis.release.set()
+    controller.stop_listening()
+
+
+def test_slow_waiting_recognition_from_old_generation_is_discarded(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    controller._table_anchor_observed = True
+    old_generation = controller._waiting_generation
+    frame = _preselection_frame()
+    hand = tuple(
+        f"{rank}{suit}"
+        for rank in ("3", "4", "5", "6", "7", "8", "9")
+        for suit in "SHCD"
+    )[:27]
+    started = []
+    monkeypatch.setattr(controller, "_start_detected_session", started.append)
+
+    controller._begin_geometry_recovery(
+        LiveCaptureInterrupted(
+            "moved while recognition was running",
+            code="GEOMETRY-CHANGED",
+        )
+    )
+    stale_task = _WaitingAnalysisTask(frame, old_generation)
+    controller._consume_waiting_recognition(_initial_recognition(hand), stale_task)
+    controller._consume_waiting_recognition(_initial_recognition(hand), stale_task)
+
+    assert controller._waiting_candidate is None
+    assert started == []
+    assert controller._waiting_generation == old_generation + 1
+    controller.stop_listening()
+
+
+def test_continuous_geometry_changes_fail_after_finite_attempts_without_looping(
+    tmp_path,
+):
+    _app()
+    failures = [
+        _GeometrySource(
+            error=LiveCaptureInterrupted(
+                f"still changing {index}",
+                code="GEOMETRY-CHANGED",
+                details={"change_types": ["resize"]},
+            )
+        )
+        for index in range(3)
+    ]
+    capture = _GeometryRecoveryCaptureService(tmp_path, failures)
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_RECOVERY_DELAYS_MS = (0, 0, 0)
+    controller._GEOMETRY_STABLE_SAMPLE_DELAY_SEC = 0
+    controller._listening_enabled = True
+    recording = _ListenerRecordingStub()
+    controller._listener_recording = recording
+    old_worker = object()
+    controller._waiting_source = _GeometrySource()
+    controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+    statuses = []
+    controller.listening_status.connect(statuses.append)
+
+    controller._accept_waiting_error(
+        LiveCaptureInterrupted("geometry changed", code="GEOMETRY-CHANGED"),
+        controller._waiting_generation,
+    )
+    controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+
+    assert _wait_until(lambda: not controller._geometry_recovery_active)
+    assert controller._listening_enabled is False
+    assert controller._geometry_recovery_attempt_count == 3
+    assert capture.open_calls == 3
+    assert all(source.closed for source in failures)
+    assert recording.closed_with == ["geometry_recovery_failed"]
+    assert [status["state"] for status in statuses].count("failed") == 1
+    assert controller._geometry_recovery_timer.isActive() is False
+    assert controller._geometry_recovery_thread is None
+
+
+def test_shutdown_cancels_geometry_stability_wait_and_closes_recovery_source(tmp_path):
+    _app()
+    frame = _preselection_frame()
+    recovery_source = _GeometrySource((frame, frame))
+    capture = _GeometryRecoveryCaptureService(tmp_path, (recovery_source,))
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_STABLE_SAMPLE_DELAY_SEC = 10
+    controller._listening_enabled = True
+    old_worker = object()
+    controller._waiting_source = _GeometrySource()
+    controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+
+    controller._accept_waiting_error(
+        LiveCaptureInterrupted("geometry changed", code="GEOMETRY-CHANGED"),
+        controller._waiting_generation,
+    )
+    controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+    assert _wait_until(lambda: recovery_source.capture_calls >= 1)
+
+    started = time.perf_counter()
+    controller.shutdown()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0
+    assert recovery_source.closed is True
+    assert controller._geometry_recovery_thread is None
+    assert controller._geometry_recovery_timer.isActive() is False
+
+
+def test_repeated_short_lived_geometry_recoveries_hit_cycle_circuit_breaker(
+    tmp_path,
+    monkeypatch,
+):
+    _app()
+    frame = _preselection_frame()
+    stable_sources = [_GeometrySource((frame, frame)) for _ in range(3)]
+    capture = _GeometryRecoveryCaptureService(tmp_path, stable_sources)
+    controller = LiveAssistantController(capture)
+    controller._GEOMETRY_STABLE_SAMPLE_DELAY_SEC = 0
+    controller._listening_enabled = True
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: None)
+
+    for _cycle in range(3):
+        old_worker = object()
+        controller._waiting_source = _GeometrySource()
+        controller._waiting_capture_worker = old_worker  # type: ignore[assignment]
+        controller._accept_waiting_error(
+            LiveCaptureInterrupted("geometry changed", code="GEOMETRY-CHANGED"),
+            controller._waiting_generation,
+        )
+        controller._waiting_capture_finished(old_worker)  # type: ignore[arg-type]
+        assert _wait_until(lambda: not controller._geometry_recovery_active)
+        recovered, controller._recovered_waiting_source = (
+            controller._recovered_waiting_source,
+            None,
+        )
+        assert recovered is not None
+        recovered.close()
+
+    controller._accept_waiting_error(
+        LiveCaptureInterrupted("geometry changed again", code="GEOMETRY-CHANGED"),
+        controller._waiting_generation,
+    )
+
+    assert controller._listening_enabled is False
+    assert controller._geometry_recovery_cycle_count == 4
+    assert controller._geometry_recovery_thread is None
+    assert controller._geometry_recovery_timer.isActive() is False
+
+
 def test_current_analysis_task_uses_its_immutable_token_and_capture_metadata(tmp_path):
     _app()
     controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
@@ -780,7 +1469,578 @@ def test_current_analysis_task_uses_its_immutable_token_and_capture_metadata(tmp
         "worker_token": {"session_id": "session", "nonce": 4, "generation": 9},
         "capture_seq": 17,
         "captured_ms": 456,
+        "capture_generation": 9,
     }
+
+
+def test_pipeline_gui_delivery_is_queued_and_rejects_changed_generation(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    orchestrator = _TokenAnalysisOrchestrator("session")
+    controller.orchestrator = orchestrator
+    token = controller._activate_live_token(orchestrator)
+    delivered = []
+    controller.update_ready.connect(lambda update: delivered.append(threading.get_ident()))
+    update = LiveUpdate(status="running", snapshot=orchestrator.snapshot)
+    controller._accept_analysis_update(token, _AnalysisDelivery(token, update, time.monotonic_ns()))
+    assert delivered == []
+    assert _wait_until(lambda: bool(delivered))
+    assert delivered == [threading.get_ident()]
+    controller._accept_analysis_update(token, _AnalysisDelivery(token, update, time.monotonic_ns()))
+    controller._invalidate_live_token()
+    _app().processEvents()
+    assert len(delivered) == 1
+    assert token.pipeline_timing.snapshot()["counters"]["gui_stale_delivery"] == 1
+
+
+@pytest.mark.parametrize("late_kind", ["older_sequence", "equal_sequence", "no_result", "older_revision", "unversioned"])
+def test_controller_mailbox_keeps_newest_ready_before_window_drains(tmp_path, late_kind):
+    from daguandan_bridge.gui.recommendation_window import RecommendationFloatWindow
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    core = _TokenAnalysisOrchestrator("mailbox")
+    controller.orchestrator = core
+    token = controller._activate_live_token(core)
+    window = RecommendationFloatWindow(controller)
+    ready = _fault_test_update(core, generation=token.generation, sequence=10)
+    late = replace(ready, advice=replace(ready.advice, status="withheld", visible=False,
+                                        withhold_reason="turn_recovery_pending"))
+    if late_kind == "no_result":
+        late = None
+    elif late_kind == "older_sequence":
+        late = replace(late, update_sequence=9)
+    elif late_kind == "older_revision":
+        late = replace(late, update_sequence=11, snapshot=SimpleNamespace(
+            **{**vars(ready.snapshot), "revision": ready.snapshot.revision - 1}))
+    elif late_kind == "unversioned":
+        late = replace(late, update_sequence=0)
+    delivered = []
+    controller.update_ready.connect(delivered.append)
+    controller._accept_analysis_update(token, ready)
+    controller._accept_analysis_update(token, late)
+    assert delivered == []
+    assert controller._pending_gui_delivery.update is ready
+    _app().processEvents()
+    assert delivered == [ready]
+    assert window._card_badges
+    window.hide()
+    controller._invalidate_live_token()
+
+
+def test_controller_mailbox_keeps_newer_block_and_none_cannot_erase_it(tmp_path):
+    from daguandan_bridge.gui.recommendation_window import RecommendationFloatWindow
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    core = _TokenAnalysisOrchestrator("mailbox")
+    controller.orchestrator = core
+    token = controller._activate_live_token(core)
+    window = RecommendationFloatWindow(controller)
+    ready = _fault_test_update(core, generation=token.generation, sequence=10)
+    blocked = replace(ready, update_sequence=11, advice=replace(
+        ready.advice, status="withheld", visible=False, withhold_reason="turn_recovery_pending"))
+    controller._accept_analysis_update(token, ready)
+    controller._accept_analysis_update(token, blocked)
+    for _ in range(20):
+        controller._accept_analysis_update(token, None)
+        controller._accept_analysis_update(token, ready)
+    assert controller._pending_gui_delivery.update is blocked
+    _app().processEvents()
+    assert not window._card_badges
+    assert window.suggestion_label.text() == "确认中…"
+    assert controller._pending_gui_delivery is None
+    assert not controller._gui_delivery_scheduled
+    window.hide()
+    controller._invalidate_live_token()
+
+
+def test_unowned_and_positive_old_callbacks_are_never_retagged(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    core = _TokenAnalysisOrchestrator("session")
+    controller.orchestrator = core
+    controller._capture_generation = 3
+    token = controller._activate_live_token(core)
+    unbound = _fault_test_update(core, generation=0)
+    owned_old = replace(unbound, capture_generation=token.generation - 1)
+    received = []
+    controller.update_ready.connect(received.append)
+    controller._queue_orchestrator_update(owned_old)
+    controller._queue_orchestrator_update(unbound)
+    _app().processEvents()
+    assert received == []
+    assert owned_old.capture_generation == token.generation - 1
+    assert unbound.capture_generation == 0
+    controller._invalidate_live_token()
+
+
+def test_analysis_task_has_no_recording_admission_gate(tmp_path):
+    _app()
+    controller = _isolated_controller(tmp_path)
+    orchestrator = _TokenAnalysisOrchestrator("session")
+    controller.orchestrator = orchestrator
+    token = controller._activate_live_token(orchestrator)
+    task = _AnalysisFrameTask(
+        token, _preselection_frame(), 1, 100,
+        time.monotonic_ns(), time.monotonic_ns(),
+    )
+
+    result = controller._analyze_live_frame(token, task)
+
+    assert isinstance(result, LiveUpdate)
+    assert orchestrator.calls == 1
+    assert "recording_admission_wait" not in token.pipeline_timing.snapshot()["stages"]
+
+
+def test_recording_failure_notice_does_not_block_same_frame_analysis(tmp_path):
+    _app()
+    controller = _isolated_controller(tmp_path)
+    orchestrator = _TokenAnalysisOrchestrator("session")
+    controller.orchestrator = orchestrator
+    controller._listening_enabled = True
+    token = controller._activate_live_token(orchestrator)
+    notices = []
+    controller.recording_status.connect(notices.append)
+    frame = RecordingFrame(object(), 100, "captured-at", 1, token)
+    controller._recording_error(frame, OSError("codec failed"))
+    task = _AnalysisFrameTask(
+        token, _preselection_frame(), 1, 100,
+        time.monotonic_ns(), time.monotonic_ns(),
+    )
+
+    result = controller._analyze_live_frame(token, task)
+
+    assert isinstance(result, LiveUpdate)
+    assert orchestrator.calls == 1
+    assert notices[0]["reason"] == "recording_failed"
+    assert notices[0]["captured_ms"] == 100
+    assert controller._listening_enabled
+    assert token.pipeline_timing.snapshot()["counters"]["recording_failed"] == 1
+
+
+def _fault_test_update(orchestrator, *, generation=0, sequence=1):
+    snapshot = SimpleNamespace(
+        session_id=orchestrator.snapshot.session_id, current_player="self",
+        turn_id=7, revision=8, finished_seats=frozenset(), trick_plays=(),
+    )
+    orchestrator.snapshot = snapshot
+    advice = LiveAdvice(
+        key=AdviceRequestKey(snapshot.session_id, 7, 8), status="ready", visible=True,
+        advice=LocalAdvice(strategy="test", cards=("3S",), play_type="Single", is_pass=False,
+                           state_revision=8, elapsed_ms=1, request_id="ADV-0007-0008", engine_input={}),
+    )
+    return LiveUpdate(status="running", snapshot=snapshot, advice=advice,
+                      capture_generation=generation, update_sequence=sequence)
+
+
+@pytest.mark.parametrize("kind", ["analysis", "capture", "occluded"])
+def test_real_controller_fatal_incident_failure_clears_ui_until_new_generation(tmp_path, kind):
+    from daguandan_bridge.gui.recommendation_window import RecommendationFloatWindow
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    orchestrator = _TokenAnalysisOrchestrator("fault-game")
+    orchestrator.status = "running"
+    def fail_incident(*args, **kwargs):
+        raise OSError("diagnostics disk unavailable")
+    orchestrator.analysis_failed = fail_incident
+    orchestrator.capture_interrupted = fail_incident
+    controller.orchestrator = orchestrator
+    token = controller._activate_live_token(orchestrator)
+    window = RecommendationFloatWindow(controller)
+    faults, errors = [], []
+    controller.live_fault.connect(faults.append)
+    controller.error.connect(errors.append)
+    initial = _fault_test_update(orchestrator, generation=token.generation)
+    controller._accept_analysis_update(token, initial)
+    assert _wait_until(lambda: bool(window._card_badges))
+    assert window._update_gate.generation == token.generation
+    if kind == "analysis":
+        controller._accept_analysis_error(token, RuntimeError("card matcher failed"))
+    else:
+        error = LiveCaptureInterrupted("capture failed", code="CAPTURE-OCCLUDED") if kind == "occluded" else RuntimeError("capture failed")
+        controller._accept_live_error(token, error)
+    assert _wait_until(lambda: bool(faults))
+    assert faults == [{"session_id": "fault-game", "capture_generation": token.generation, "kind": kind}]
+    assert not window._card_badges
+    assert window.suggestion_label.text() == "识别已暂停"
+    assert errors and "diagnostics disk unavailable" in errors[-1]
+    assert controller._active_live_token is None
+    controller.update_ready.emit(replace(initial, capture_generation=token.generation, update_sequence=2))
+    _app().processEvents()
+    assert not window._card_badges
+    replacement = controller._activate_live_token(orchestrator)
+    assert replacement.generation > token.generation
+    controller._accept_analysis_update(replacement, replace(initial, update_sequence=3, capture_generation=replacement.generation))
+    assert _wait_until(lambda: bool(window._card_badges))
+    window.hide()
+    controller._invalidate_live_token()
+
+
+def test_old_or_queued_old_worker_fault_does_not_stop_replacement_capture(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    old = _TokenAnalysisOrchestrator("session")
+    old.analysis_failed = lambda *args, **kwargs: pytest.fail("old core must not be called")
+    controller.orchestrator = old
+    old_token = controller._activate_live_token(old)
+    faults, errors = [], []
+    controller.live_fault.connect(faults.append)
+    controller.error.connect(errors.append)
+    controller._queue_fatal_worker_fault(old_token, kind="analysis", message="old queued error")
+    replacement = _TokenAnalysisOrchestrator("session")
+    controller.orchestrator = replacement
+    replacement_token = controller._activate_live_token(replacement)
+    controller._accept_analysis_error(old_token, RuntimeError("late analysis error"))
+    controller._accept_live_error(old_token, RuntimeError("late capture error"))
+    _app().processEvents()
+    assert faults == errors == []
+    assert controller._active_live_token is replacement_token
+    controller._invalidate_live_token()
+
+
+def test_non_concrete_runtime_reconnect_binds_and_resumes_new_generation(tmp_path, monkeypatch):
+    _app()
+    controller = LiveAssistantController(_ReopeningCaptureServiceStub(tmp_path))
+    orchestrator = _TokenAnalysisOrchestrator("session")
+    orchestrator.status = "running"
+    update = _fault_test_update(orchestrator)
+    calls = []
+    bound_generation = [0]
+    def pause():
+        calls.append("pause")
+        orchestrator.status = "paused"
+    def resume(**kwargs):
+        assert orchestrator.status == "paused"
+        calls.append("resume")
+        orchestrator.status = "running"
+        return replace(update, capture_generation=bound_generation[0])
+    def bind(generation):
+        calls.append("bind")
+        bound_generation[0] = generation
+        return replace(update, capture_generation=generation)
+    orchestrator.pause, orchestrator.resume = pause, resume
+    orchestrator.bind_capture_generation = bind
+    controller.orchestrator = orchestrator
+    token = controller._activate_live_token(orchestrator)
+    faults = []
+    controller.live_fault.connect(faults.append)
+    controller._queue_fatal_worker_fault(token, kind="analysis", message="failed incident")
+    assert _wait_until(lambda: bool(faults))
+    monkeypatch.setattr(controller, "_start_analysis_worker", lambda: None)
+    monkeypatch.setattr(controller, "_start_capture_worker", lambda: None)
+    updates = []
+    controller.update_ready.connect(updates.append)
+    controller.resume()
+    assert calls == ["pause", "bind", "resume"]
+    assert controller._active_live_token.generation > token.generation
+    assert updates[-1].capture_generation == controller._active_live_token.generation
+    assert controller._fatal_capture_session_id is None
+    controller._invalidate_live_token()
+
+
+@pytest.fixture
+def real_controller_lifecycle(tmp_path, monkeypatch):
+    from daguandan_bridge.domain.recognition import FastSignalResult, OpeningSignal, PlayRegionResult
+    from daguandan_bridge.live.orchestrator import LiveOrchestrator
+    from daguandan_bridge.live.recorder import InMemorySessionRecorder
+    from daguandan_bridge.live.reducer import LiveReducer
+    from daguandan_bridge.live.session_store import InMemoryLiveSessionStore
+    _app()
+    created, sources, worker_starts, calls, updates = [], [], [], [], []
+    hand = tuple(f"{rank}{suit}" for rank in ("2", "3", "4", "5", "6", "7") for suit in "SHCD") + ("8S", "8H", "8C")
+    class Recognition:
+        def recognize_opening_signal(self, image):
+            return OpeningSignal(False, None, None, False)
+        def recognize_fast_signals(self, image, expected_player, *, allow_pass=True):
+            return FastSignalResult(expected_player, None, False, False, False)
+        def recognize_play_region(self, image, player, *, wild_rank, allow_pass=True):
+            return PlayRegionResult(player, (), False, 0., (), (), source="lifecycle-test")
+    recognition = Recognition()
+    def open_source(profile_name):
+        source = _SourceStub()
+        sources.append(source)
+        return source
+    capture = SimpleNamespace(profiles_root=tmp_path, open_live_source=open_source)
+    class Factory:
+        fail_bind = False
+        def start_session(self, *, round_level, hand, lead_player, recognition_strategy, on_update):
+            profile = f"lifecycle{len(created)}"
+            (tmp_path / profile).mkdir()
+            store = InMemoryLiveSessionStore(tmp_path, profile)
+            core = LiveOrchestrator(
+                reducer=LiveReducer(store.session_id), store=store,
+                recorder=InMemorySessionRecorder(store.directory), recognition_service=recognition,
+                advisor=None, minimum_free_bytes=0, settle_ms=0, processing_clock_ms=lambda: 1100,
+                on_update=on_update,
+            )
+            initial = core.start(round_level=round_level, hand=hand, lead_player=lead_player, monotonic_ms=900)
+            created.append(core)
+            binder, resume = core.bind_capture_generation, core.resume
+            def watched_bind(generation):
+                assert controller._active_live_token.generation == generation
+                calls.append(("bind", generation))
+                if self.fail_bind:
+                    raise RuntimeError("binding failed")
+                return binder(generation)
+            def watched_resume(**kwargs):
+                calls.append(("resume", controller._active_live_token.generation))
+                return resume(**kwargs)
+            core.bind_capture_generation, core.resume = watched_bind, watched_resume
+            return SimpleNamespace(orchestrator=core, source=open_source("test"), initial_update=initial)
+    factory = Factory()
+    controller = LiveAssistantController(capture, recognition_service=recognition,
+                                         advisor=object(), session_factory=factory)
+    monkeypatch.setattr(controller, "_start_danzero_warmup", lambda: None)
+    monkeypatch.setattr(controller, "_start_analysis_worker", lambda: worker_starts.append("analysis"))
+    monkeypatch.setattr(controller, "_start_capture_worker", lambda: worker_starts.append("capture"))
+    controller.update_ready.connect(updates.append)
+    yield SimpleNamespace(controller=controller, factory=factory, cores=created, sources=sources,
+                          workers=worker_starts, calls=calls, updates=updates, hand=hand)
+    controller._invalidate_live_token()
+    controller.orchestrator = None
+    for core in created:
+        core.finish()
+    for source in sources:
+        source.close()
+    _app().processEvents()
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+@pytest.mark.parametrize("lead_player", [None, "right"])
+def test_real_core_start_binds_before_capture_and_waiting_lead_notices(real_controller_lifecycle, lead_player):
+    rig = real_controller_lifecycle
+    assert rig.controller.start_session(round_level="2", hand=rig.hand, lead_player=lead_player)
+    token, core = rig.controller._active_live_token, rig.cores[-1]
+    assert rig.calls == [("bind", token.generation)]
+    assert rig.workers == ["analysis", "capture"]
+    assert rig.updates[-1].capture_generation == token.generation > 0
+    assert rig.updates[-1].status == ("waiting_lead" if lead_player is None else "running")
+    core._notify_update_listener()
+    _app().processEvents()
+    assert rig.updates[-1].capture_generation == token.generation
+    if lead_player is None:
+        frame = SimpleNamespace(image=np.zeros((32, 64, 3), np.uint8))
+        update = rig.controller._analyze_live_frame(token, _AnalysisFrameTask(token, frame, 1, 1100))
+        assert update.status == "waiting_lead"
+        assert update.capture_generation == token.generation
+
+
+def test_start_session_preloads_live_dependencies_before_construction_warmup_and_workers(real_controller_lifecycle, monkeypatch):
+    from daguandan_bridge.gui import live_controller as module
+
+    rig = real_controller_lifecycle
+    order = []
+    monkeypatch.setattr(module, "preload_live_worker_dependencies", lambda: order.append("preload"))
+    original_start = rig.factory.start_session
+    rig.factory.start_session = lambda **kwargs: order.append("construct") or original_start(**kwargs)
+    monkeypatch.setattr(rig.controller, "_start_danzero_warmup", lambda: order.append("warmup"))
+    monkeypatch.setattr(rig.controller, "_start_analysis_worker", lambda: order.append("analysis"))
+    monkeypatch.setattr(rig.controller, "_start_capture_worker", lambda: order.append("capture_worker"))
+
+    assert rig.controller.start_session(round_level="2", hand=rig.hand, lead_player="right")
+
+    assert order == ["preload", "warmup", "construct", "analysis", "capture_worker"]
+
+
+def test_start_session_preload_failure_does_not_start_session_or_workers(real_controller_lifecycle, monkeypatch):
+    from daguandan_bridge.gui import live_controller as module
+
+    rig = real_controller_lifecycle
+    errors = []
+    rig.controller.error.connect(errors.append)
+    monkeypatch.setattr(
+        module,
+        "preload_live_worker_dependencies",
+        lambda: (_ for _ in ()).throw(RuntimeError("import race guard failed")),
+    )
+
+    assert not rig.controller.start_session(round_level="2", hand=rig.hand, lead_player="right")
+
+    assert rig.cores == []
+    assert rig.sources == []
+    assert rig.workers == []
+    assert errors == ["实时依赖预加载失败：import race guard failed"]
+
+
+def test_start_listening_preloads_before_warmup_and_waiting_workers(tmp_path, monkeypatch):
+    from daguandan_bridge.gui import live_controller as module
+
+    _app()
+    order = []
+    controller = LiveAssistantController(_LockingCaptureServiceStub(tmp_path))
+    monkeypatch.setattr(module, "preload_live_worker_dependencies", lambda: order.append("preload"))
+    monkeypatch.setattr(controller, "_start_danzero_warmup", lambda: order.append("warmup"))
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: order.append("waiting_workers"))
+
+    assert controller.start_listening()
+
+    assert order == ["preload", "warmup", "waiting_workers"]
+
+
+def test_start_listening_preload_failure_does_not_start_waiting_workers(tmp_path, monkeypatch):
+    from daguandan_bridge.gui import live_controller as module
+
+    _app()
+    controller = LiveAssistantController(_LockingCaptureServiceStub(tmp_path))
+    errors = []
+    started = []
+    controller.error.connect(errors.append)
+    monkeypatch.setattr(
+        module,
+        "preload_live_worker_dependencies",
+        lambda: (_ for _ in ()).throw(RuntimeError("native import failed")),
+    )
+    monkeypatch.setattr(controller, "_start_danzero_warmup", lambda: started.append("warmup"))
+    monkeypatch.setattr(controller, "_start_waiting_workers", lambda: started.append("waiting"))
+
+    assert not controller.start_listening()
+
+    assert controller._listening_enabled is False
+    assert controller.orchestrator is None
+    assert controller._waiting_capture_worker is None
+    assert started == []
+    assert errors == ["实时依赖预加载失败：native import failed"]
+
+
+@pytest.mark.parametrize("lead_player", [None, "right"])
+def test_real_core_resume_activates_and_binds_before_resume_notices(real_controller_lifecycle, lead_player):
+    rig = real_controller_lifecycle
+    assert rig.controller.start_session(round_level="2", hand=rig.hand, lead_player=lead_player)
+    first = rig.controller._active_live_token
+    rig.controller.pause()
+    rig.calls.clear()
+    rig.workers.clear()
+    rig.controller.resume()
+    second = rig.controller._active_live_token
+    assert second.generation > first.generation
+    assert rig.calls == [("bind", second.generation), ("resume", second.generation)]
+    assert rig.updates[-1].capture_generation == second.generation
+    assert rig.updates[-1].status == ("waiting_lead" if lead_player is None else "running")
+    assert rig.workers == ["analysis", "capture"]
+    assert rig.sources[0].closed and not rig.sources[-1].closed
+    rig.cores[-1]._notify_update_listener()
+    _app().processEvents()
+    assert rig.updates[-1].capture_generation == second.generation
+
+
+def test_real_core_initial_bind_failure_invalidates_and_closes_without_workers(real_controller_lifecycle):
+    rig = real_controller_lifecycle
+    rig.factory.fail_bind = True
+    assert not rig.controller.start_session(round_level="2", hand=rig.hand, lead_player=None)
+    assert rig.controller.orchestrator is None
+    assert rig.controller._active_live_token is None
+    assert rig.controller._live_source is None
+    assert rig.workers == [] and rig.updates == []
+    assert rig.sources[-1].closed
+    assert rig.cores[-1].status == "sealed"
+
+
+@pytest.mark.parametrize("failure", ["bind", "resume_after_status_change", "wrong_bound_identity"])
+def test_real_core_failed_resume_cancels_token_and_leaves_source_closed(real_controller_lifecycle, failure):
+    rig = real_controller_lifecycle
+    assert rig.controller.start_session(round_level="2", hand=rig.hand, lead_player="right")
+    rig.controller.pause()
+    core = rig.cores[-1]
+    rig.workers.clear()
+    rig.updates.clear()
+    binder, resume = core.bind_capture_generation, core.resume
+    if failure == "bind":
+        rig.factory.fail_bind = True
+    elif failure == "wrong_bound_identity":
+        core.bind_capture_generation = lambda generation: replace(binder(generation), capture_generation=generation - 1)
+    else:
+        def failed_resume(**kwargs):
+            resume(**kwargs)
+            raise RuntimeError("resume publication failed")
+        core.resume = failed_resume
+    rig.controller.resume()
+    assert rig.controller._active_live_token is None
+    assert rig.controller._live_source is None
+    assert rig.sources[-1].closed
+    assert rig.workers == [] and rig.updates == []
+    assert core.status == "paused"
+    assert rig.controller._fatal_capture_session_id == core.snapshot.session_id
+
+
+def test_slow_recording_never_delays_analysis_admission_or_execution(
+    tmp_path, monkeypatch
+):
+    from daguandan_bridge.gui import live_controller as module
+    from daguandan_bridge.live.recorder import SessionRecorder
+    _app()
+    recording_entered, release_recording, analyzed = threading.Event(), threading.Event(), threading.Event()
+    frame = _preselection_frame()
+    recorder = SessionRecorder(tmp_path / "tail", size=(frame.image.shape[1], frame.image.shape[0]), fps=10)
+    class RaceOrchestrator(_TokenAnalysisOrchestrator):
+        needs_first_action_frames = False
+        def __init__(self):
+            super().__init__("tail")
+            self.recorder = recorder
+            self.recorded = []
+        def record_frame(self, image, *, monotonic_ms, wall_time):
+            self.recorded.append((image, monotonic_ms, wall_time))
+            recording_entered.set()
+            assert release_recording.wait(2)
+            return self.recorder.write_frame(image, monotonic_ms, wall_time)
+        def analyze_frame(self, image, *, monotonic_ms, trace_context):
+            analyzed.set()
+            return super().analyze_frame(image, monotonic_ms=monotonic_ms, trace_context=trace_context)
+    class FakeSignal:
+        def connect(self, callback):
+            pass
+    class ManualCaptureWorker:
+        def __init__(self, operation, interval):
+            self.operation = operation
+            self.frame_ready, self.error, self.finished = FakeSignal(), FakeSignal(), FakeSignal()
+            self.is_running = False
+        def start(self):
+            self.is_running = True
+    monkeypatch.setattr(module, "WorkerHandle", ManualCaptureWorker)
+    controller = _isolated_controller(tmp_path)
+    orchestrator = RaceOrchestrator()
+    controller.orchestrator = orchestrator
+    token = controller._activate_live_token(orchestrator)
+    controller._live_source = SimpleNamespace(capture=lambda: frame)
+    controller._start_recording_dispatcher(token)
+    controller._start_analysis_worker()
+    controller._start_capture_worker()
+    capture = threading.Thread(target=controller._capture_worker.operation)
+    recorder_closed = False
+    try:
+        capture.start()
+        assert recording_entered.wait(1)
+        assert controller._analysis_worker.stats["submitted"] == 1
+        assert analyzed.wait(1)
+        capture.join(1)
+        assert not capture.is_alive()
+        release_recording.set()
+        assert controller._recording_dispatcher.wait_idle(2)
+        controller._close_recording_dispatcher(token)
+        result = orchestrator.recorder.close()
+        recorder_closed = True
+        assert result.frame_count == 1
+        assert result.integrity["decodable_frame_count"] == 1
+        assert result.integrity["status"] == "PASS"
+        assert len(orchestrator.recorded) == 1
+        recorded_image, recorded_ms, recorded_wall = orchestrator.recorded[0]
+        assert recorded_image is not frame.image
+        assert np.array_equal(recorded_image, frame.image)
+        assert recorded_image.flags.writeable is False
+        assert recorded_ms == frame.captured_monotonic_ms
+        assert recorded_wall == frame.captured_at.isoformat()
+        timing = token.pipeline_timing.snapshot()
+        assert "recording_admission_wait" not in timing["stages"]
+        assert timing["counters"]["analysis_submitted"] == 1
+        assert timing["counters"]["recording_written"] == 1
+    finally:
+        release_recording.set()
+        capture.join(2)
+        controller._invalidate_live_token()
+        controller._close_recording_dispatcher(token)
+        controller._analysis_worker.stop(timeout=2)
+        controller._analysis_worker = None
+        controller._capture_worker = None
+        if not recorder_closed:
+            recorder.close()
 
 
 def test_controller_schedules_visible_non_pass_advice_once_per_request(tmp_path, monkeypatch):

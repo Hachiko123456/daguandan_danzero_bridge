@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import importlib
 from importlib import metadata
 import json
@@ -34,6 +35,12 @@ from .startup_diagnostics import current_startup_diagnostics, record_startup_eve
 DOCTOR_SCHEMA = "guandan.doctor/1"
 IMPORT_PROBE_SCHEMA = "guandan.doctor-import-probe/1"
 MINIMUM_FREE_BYTES = 512 * 1024 * 1024
+DEVELOPMENT_MARKER_FILENAME = "DEVELOPMENT_BUILD_NOT_FORMALLY_QUALIFIED.txt"
+_DEVELOPMENT_MARKER_TEXT = (
+    "This bundle was built from an explicitly allowed dirty working tree.\r\n"
+    "It is for isolated development validation only and is not a formally qualified release.\r\n"
+)
+_DIRTY_STRICT_ERROR = "strict release manifest source identity must be clean"
 MAX_DIAGNOSTIC_MESSAGE_CHARS = 500
 _BEARER_SECRET = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _KEY_VALUE_SECRET = re.compile(
@@ -635,6 +642,18 @@ def _build_integrity_check(bundle_root: Path, *, frozen: bool) -> dict[str, obje
             _sanitize_integrity_error(path, bundle_root)
             for path in verification.unexpected_files
         ]
+        development_dirty_warning = (
+            _verified_development_dirty_warning(
+                bundle_root,
+                manifest_path,
+                verification.errors,
+            )
+            if frozen
+            else ""
+        )
+        if development_dirty_warning:
+            errors = [error for error in errors if error != _DIRTY_STRICT_ERROR]
+            warnings.append(development_dirty_warning)
         # Runtime resources are copied to a writable generation.  Therefore a
         # profile/template/model difference inside a frozen package is package
         # corruption, even while the phase-one manifest schema still labels
@@ -644,7 +663,10 @@ def _build_integrity_check(bundle_root: Path, *, frozen: bool) -> dict[str, obje
                 f"immutable bundle resource changed: {difference}"
                 for difference in mutable_differences
             )
-        if errors or not verification.ok:
+        effective_ok = not errors and (
+            verification.ok or bool(development_dirty_warning)
+        )
+        if not effective_ok:
             status = "FAIL"
             summary = "Build manifest or an immutable file failed integrity verification"
         elif warnings or mutable_differences:
@@ -773,6 +795,57 @@ def _completed_stderr_summary(completed: object) -> str:
     else:
         text = str(raw or "")
     return _sanitize_diagnostic_text(text)
+
+
+def _verified_development_dirty_warning(
+    bundle_root: Path,
+    manifest_path: Path,
+    verification_errors: Sequence[str],
+) -> str:
+    """Accept only the dirty-source strict error from a hashed dev marker."""
+
+    if tuple(verification_errors) != (_DIRTY_STRICT_ERROR,):
+        return ""
+    marker = bundle_root / DEVELOPMENT_MARKER_FILENAME
+    try:
+        if marker.read_bytes() != _DEVELOPMENT_MARKER_TEXT.encode("utf-8"):
+            return ""
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    source = manifest.get("source")
+    bundle_tree = manifest.get("bundle_tree")
+    files = bundle_tree.get("files", ()) if isinstance(bundle_tree, dict) else ()
+    marker_entry = next(
+        (
+            item
+            for item in files
+            if isinstance(item, dict)
+            and item.get("path") == DEVELOPMENT_MARKER_FILENAME
+        ),
+        None,
+    )
+    if not isinstance(source, dict) or source.get("dirty") is not True:
+        return ""
+    if not isinstance(marker_entry, dict):
+        return ""
+    try:
+        marker_bytes = marker.read_bytes()
+    except OSError:
+        return ""
+    # Build manifests use ``bytes`` for bundle-tree entries (older hand-built
+    # fixtures used ``size``); accept only an integer from either spelling.
+    expected_size = marker_entry.get("bytes", marker_entry.get("size"))
+    expected_sha256 = marker_entry.get("sha256")
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size != len(marker_bytes)
+        or not isinstance(expected_sha256, str)
+        or hashlib.sha256(marker_bytes).hexdigest() != expected_sha256
+    ):
+        return ""
+    return "development build: dirty source was explicitly marked and hash-verified"
 
 
 def _storage_check(check_id: str, path: Path, *, must_exist: bool) -> dict[str, object]:

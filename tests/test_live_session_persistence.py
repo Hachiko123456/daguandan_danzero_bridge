@@ -17,7 +17,7 @@ from daguandan_bridge.infrastructure.live_session import (
     build_session_manifest,
 )
 from daguandan_bridge.live.recorder import InMemorySessionRecorder
-from daguandan_bridge.live.session_store import InMemoryLiveSessionStore, read_json_lines
+from daguandan_bridge.live.session_store import read_json_lines
 
 
 HAND = tuple(
@@ -139,7 +139,7 @@ def test_full_recording_mode_persists_listener_frames_without_an_initial_hand(tm
     ) == 1
 
 
-def test_disabled_recording_uses_memory_only_without_creating_sessions(tmp_path):
+def test_disabled_video_keeps_durable_rule_events_without_creating_media(tmp_path):
     profile = _profile(tmp_path, save_session_data=False)
     factory = DefaultLiveSessionFactory(
         _Capture(tmp_path),
@@ -155,7 +155,7 @@ def test_disabled_recording_uses_memory_only_without_creating_sessions(tmp_path)
         recognition_strategy="two_valid_streak",
     )
 
-    assert isinstance(constructed.orchestrator.store, InMemoryLiveSessionStore)
+    assert constructed.orchestrator.store.persistence_enabled is True
     assert isinstance(constructed.orchestrator.recorder, InMemorySessionRecorder)
     constructed.orchestrator.record_frame(
         np.zeros((32, 64, 3), dtype=np.uint8),
@@ -164,9 +164,10 @@ def test_disabled_recording_uses_memory_only_without_creating_sessions(tmp_path)
     )
     constructed.orchestrator.finish()
 
-    assert not (profile / "sessions").exists()
+    sessions = tuple((profile / "sessions").iterdir())
+    assert len(sessions) == 1
+    assert read_json_lines(sessions[0] / "timeline.jsonl")[0]["event_type"] == "initial_state_confirmed"
     assert not tuple(profile.rglob("*.avi"))
-    assert not tuple(profile.rglob("*.jsonl"))
 
 
 def test_live_session_is_created_only_after_initial_state_is_confirmed(tmp_path):

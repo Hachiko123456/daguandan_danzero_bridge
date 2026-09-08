@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from daguandan_bridge.capture_service import FrameSnapshot
 from daguandan_bridge.image_io import standardize_to_base
@@ -73,6 +74,49 @@ def test_opening_ring_is_bounded_and_reports_drop_metrics(tmp_path):
     assert metrics.latest_seq == 3
 
 
+def test_geometry_recovery_diagnostics_are_serialized_in_incident_chain(tmp_path):
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path,
+        max_age_seconds=10,
+        max_bytes=8 * 1024 * 1024,
+    )
+    monitor.begin(monotonic_ms=0)
+
+    monitor.observe_geometry_recovery(
+        result="recovered",
+        generation=7,
+        attempt_count=2,
+        details={
+            "old_rect": [10, 20, 1280, 764],
+            "new_rect": [30, 40, 1280, 764],
+            "change_types": ["move", "dpi"],
+            "old_dpi": 96,
+            "new_dpi": 144,
+            "capture_backend": "printwindow",
+            "stable_sample_count": 2,
+        },
+        reason="target window stable across consecutive samples",
+        monotonic_ms=1234,
+    )
+    assert monitor.flush(5)
+
+    incident_files = sorted(
+        (tmp_path / "opening" / "incidents").glob("*/incident.json")
+    )
+    assert len(incident_files) == 1
+    incident = json.loads(incident_files[0].read_text(encoding="utf-8"))
+    evidence = incident["evidence"]
+    assert incident["code"] == "OPENING-GEOMETRY-RECOVERY"
+    assert evidence["old_rect"] == [10, 20, 1280, 764]
+    assert evidence["new_rect"] == [30, 40, 1280, 764]
+    assert evidence["change_types"] == ["move", "dpi"]
+    assert evidence["capture_backend"] == "printwindow"
+    assert evidence["attempt_count"] == 2
+    assert evidence["result"] == "recovered"
+    assert evidence["generation"] == 7
+    monitor.close()
+
+
 def test_opening_timeout_is_deduplicated_and_exports_complete_evidence(tmp_path):
     now = [0]
     monitor = OpeningEvidenceMonitor(
@@ -102,7 +146,11 @@ def test_opening_timeout_is_deduplicated_and_exports_complete_evidence(tmp_path)
     assert evidence["frames"][0]["capture"]["backend"] == "printwindow"
     assert evidence["frames"][0]["capture"]["dpi"] == 120
     assert evidence["privacy"]["support_export_requires_explicit_image_opt_in"] is True
-    assert list(incident_files[0].parent.glob("frames/standardized_*.png"))
+    frame = evidence["frames"][0]
+    media_incident = incident_files[0].parent
+    if frame["media_status"] == "shared":
+        media_incident = media_incident.parent / frame["media_reference"]["incident_id"]
+    assert list(media_incident.glob("frames/standardized_*.png"))
     monitor.close()
 
 
@@ -366,3 +414,184 @@ def test_e007_png_actual_bytes_never_exceed_budget_or_leave_partial_files(tmp_pa
     assert not list(incident.rglob("*.png"))
     assert not any(path.name.endswith(".tmp") for path in incident.rglob("*"))
     monitor.close()
+
+
+def _incident_documents(root):
+    return [json.loads(path.read_text(encoding="utf-8"))
+            for path in (root / "opening" / "incidents").glob("*/incident.json")]
+
+
+@pytest.mark.parametrize("count", [0, 21])
+def test_incomplete_hand_is_one_failure_episode_until_real_recovery(tmp_path, count):
+    now = [0]
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path, field_timeout_seconds=1,
+        clock_ms=lambda: now[0], delivery_settle_seconds=0,
+    )
+    hand = tuple(f"{rank}{suit}" for rank in ("2", "3", "4", "5", "6", "7") for suit in "SHCD") + ("8S", "8H", "8C")
+    snapshot = _snapshot()
+    monitor.begin()
+    monitor.observe_page("table")
+    monitor.observe_frame(snapshot)
+    monitor.observe_recognition(snapshot, _result(level="5", hand=hand[:count]))
+    for _ in range(1000):
+        now[0] += 1000
+        monitor.observe_recognition(snapshot, _result(level="5", hand=hand[:count]))
+    assert monitor.flush(5)
+    failures = [doc for doc in _incident_documents(tmp_path) if doc["code"] == "OPENING-HAND-UNSTABLE"]
+    assert len(failures) == 1
+    assert failures[0]["episode"]["occurrence_count"] >= 1000
+    # All field failures share two physical files (raw + standardized) while
+    # each standalone incident still carries its own usable artifact paths.
+    media_files = list((tmp_path / "opening").rglob("*.png"))
+    assert len({(path.stat().st_dev, path.stat().st_ino) for path in media_files}) == 2
+    assert len(media_files) >= 4
+    for _ in range(2):
+        now[0] += 1
+        monitor.observe_recognition(snapshot, _result(level="5", hand=tuple(reversed(hand))))
+    now[0] += 1
+    monitor.observe_recognition(snapshot, _result(level="5", hand=hand[:count]))
+    now[0] += 1001
+    monitor.observe_recognition(snapshot, _result(level="5", hand=hand[:count]))
+    assert monitor.flush(5)
+    failures = [doc for doc in _incident_documents(tmp_path) if doc["code"] == "OPENING-HAND-UNSTABLE"]
+    assert len(failures) == 2
+    monitor.close()
+
+
+@pytest.mark.parametrize("page", ["settlement", "lobby", "unknown"])
+def test_non_table_listening_does_not_write_diagnostic_media_or_timeouts(tmp_path, page):
+    now = [0]
+    monitor = OpeningEvidenceMonitor(diagnostics_root=tmp_path, clock_ms=lambda: now[0])
+    monitor.begin()
+    monitor.observe_page(page)
+    snapshot = _snapshot()
+    for _ in range(1000):
+        now[0] += 2000
+        monitor.observe_frame(snapshot)
+        monitor.observe_anchor(snapshot, 0, required_score=0.8)
+        monitor.observe_recognition(snapshot, _result())
+    assert monitor.flush(5)
+    assert monitor.metrics().incidents_queued == 0
+    assert monitor.metrics().retained_bytes == 0
+    assert not list(tmp_path.rglob("*.png"))
+    assert not list(tmp_path.rglob("incident.json"))
+    monitor.close()
+
+
+def test_absent_recognition_timeout_does_not_fabricate_zero_cards(tmp_path):
+    now = [0]
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path, clock_ms=lambda: now[0],
+        field_timeout_seconds=1, delivery_settle_seconds=0,
+    )
+    monitor.begin()
+    snapshot = _snapshot()
+    monitor.observe_frame(snapshot)
+    monitor.observe_recognition(snapshot, _result(level="5", hand=("2S",)))
+    now[0] = 2000
+    monitor.observe_frame(_snapshot(100))
+    assert monitor.flush(5)
+    incident = next(doc for doc in _incident_documents(tmp_path) if doc["code"] == OPENING_HAND_COUNT_MISMATCH)
+    assert incident["evidence"]["actual_count"] is None
+    assert incident["evidence"]["observation_status"] == "unknown"
+    monitor.close()
+
+
+def test_default_incident_selects_three_frames_prioritizing_recognition(tmp_path):
+    monitor = OpeningEvidenceMonitor(diagnostics_root=tmp_path, delivery_settle_seconds=0)
+    monitor.begin()
+    recognized = _snapshot(90)
+    monitor.observe_frame(recognized)
+    monitor.observe_recognition(recognized, _result(level="5"))
+    for value in range(91, 99):
+        monitor.observe_frame(_snapshot(value))
+    assert monitor.emit_incident("OPENING-SELECT", field="test", reason="selection")
+    assert monitor.flush(5)
+    document = json.loads(next(tmp_path.rglob("opening_evidence.json")).read_text(encoding="utf-8"))
+    assert len(document["frames"]) == 3
+    assert recognized.evidence_frame_id in {frame["frame_id"] for frame in document["frames"]}
+    monitor.close()
+
+
+def test_global_media_quota_refuses_new_media_without_deleting_old_evidence(tmp_path):
+    first_root, second_root = tmp_path / "runs" / "first", tmp_path / "runs" / "second"
+    first = OpeningEvidenceMonitor(diagnostics_root=first_root, delivery_settle_seconds=0)
+    first.begin()
+    first.observe_frame(_snapshot(111))
+    first.emit_incident("OPENING-FIRST", field="test", reason="first")
+    assert first.flush(5)
+    first.close()
+    baseline = {path: path.read_bytes() for path in first_root.rglob("*") if path.is_file()}
+    total_bytes = sum(path.stat().st_size for path in first_root.rglob("*.png"))
+    second = OpeningEvidenceMonitor(
+        diagnostics_root=second_root, delivery_settle_seconds=0,
+        max_total_image_bytes=total_bytes,
+    )
+    second.begin()
+    second.observe_frame(_snapshot(112))
+    second.emit_incident("OPENING-SECOND", field="test", reason="second")
+    assert second.flush(5)
+    assert not list(second_root.rglob("*.png"))
+    assert list(second_root.rglob("incident.json"))
+    assert all(path.read_bytes() == content for path, content in baseline.items())
+    second.close()
+
+
+def test_run_media_and_text_and_incident_count_cannot_be_bypassed_by_unique_codes(tmp_path):
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path, max_run_image_bytes=350,
+        max_run_text_bytes=24000, max_run_incidents=3,
+        delivery_settle_seconds=0,
+    )
+    for index in range(100):
+        monitor.begin()
+        monitor.observe_frame(_snapshot(index + 1))
+        monitor.emit_incident(f"OPENING-UNIQUE-{index}", field="test", reason="quota")
+        assert monitor.flush(5)
+    assert len(_incident_documents(tmp_path)) <= 3
+    assert sum(path.stat().st_size for path in tmp_path.rglob("*.png")) <= 350
+    assert sum(path.stat().st_size for path in (tmp_path / "opening").rglob("*") if path.is_file() and path.suffix != ".png") <= 24000
+    assert monitor._suppressed_incidents >= 97
+    monitor.close()
+
+
+def test_slow_writer_has_memory_reserve_for_new_exact_recognition(tmp_path, monkeypatch):
+    from threading import Event
+
+    monitor = OpeningEvidenceMonitor(
+        diagnostics_root=tmp_path, max_bytes=4 * 128 * 72 * 3 * 2,
+        delivery_settle_seconds=0,
+    )
+    release = Event()
+    write = monitor._write_incident
+
+    def slow(*args):
+        release.wait(3)
+        return write(*args)
+
+    monkeypatch.setattr(monitor, "_write_incident", slow)
+    monitor.begin()
+    for value in range(1, 5):
+        monitor.observe_frame(_snapshot(value))
+    monitor.emit_incident("OPENING-SLOW", field="test", reason="queue pressure")
+    latest = _snapshot(9)
+    monitor.observe_frame(latest)
+    monitor.observe_recognition(latest, _result(level="5"))
+    assert monitor.metrics().retained_bytes <= monitor.max_bytes
+    assert any(record.snapshot is latest and record.recognition is not None for record in monitor._ring)
+    release.set()
+    assert monitor.flush(5)
+    monitor.close()
+
+
+def test_nonblocking_sink_forwards_page_before_frame(tmp_path):
+    monitor = OpeningEvidenceMonitor(diagnostics_root=tmp_path)
+    proxy = NonBlockingOpeningEvidenceSink(monitor)
+    proxy.begin()
+    proxy.observe_page("settlement")
+    proxy.observe_frame(_snapshot(0))
+    assert proxy.flush(5)
+    assert monitor.metrics().incidents_queued == 0
+    assert monitor.metrics().retained_frames == 0
+    proxy.close()

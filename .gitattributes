@@ -1,0 +1,6 @@
+# Release locks are byte-hashed; preserve each generator's exact line endings.
+requirements-release.in text eol=lf
+requirements-release.lock text eol=lf
+python_runtime.lock.json text eol=crlf
+release_toolchain.lock.json text eol=lf
+wheelhouse.lock.json text eol=lf

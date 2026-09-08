@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -16,12 +17,14 @@ from ..application.ports import (
     RecordingPort,
     SessionPersistencePort,
 )
-from ..advisor_strategy import load_profile_recording_mode
-from ..live.orchestrator import LiveOrchestrator
-from ..live.recorder import InMemorySessionRecorder, SessionRecorder
-from ..live.reducer import LiveReducer
-from ..live.session_store import InMemoryLiveSessionStore, LiveSessionStore
+from ..advisor_strategy import (
+    advisor_strategy_id, load_profile_advisor_strategy, load_profile_recording_mode,
+)
+from ..live.recorder import InMemorySessionRecorder
+from ..live.session_store import LiveSessionStore
 from ..runtime_identity import get_runtime_identity
+from .live_v2_composition import build_production_live_v2_runtime
+from .process_session_recorder import ProcessSessionRecorder
 
 
 @dataclass
@@ -64,6 +67,9 @@ class LiveSessionRecording:
         if self._closed:
             return
         recording = self.recorder.close()
+        update_metadata = getattr(self.store, "update_session_metadata", None)
+        if callable(update_metadata):
+            update_metadata({"recording_integrity": recording.integrity})
         self.store.seal(
             frame_count=recording.frame_count,
             dropped_frames=recording.dropped_frames,
@@ -94,7 +100,7 @@ class ListenerRecording:
         *,
         monotonic_ms: int,
         wall_time: str,
-    ) -> None:
+    ) -> object | None:
         if self._closed:
             return
         warning = self.recorder.write_frame(image, monotonic_ms, wall_time)
@@ -107,6 +113,7 @@ class ListenerRecording:
                     "details": warning.details,
                 }
             )
+        return warning
 
     def record_recognition(self, result: object) -> None:
         if self._closed:
@@ -132,6 +139,7 @@ class ListenerRecording:
                     "recording_phase": "ended_without_initial_state",
                     "initial_state_status": "unconfirmed",
                     "termination_reason": str(reason),
+                    "recording_integrity": recording.integrity,
                 }
             )
         self.store.seal(
@@ -163,6 +171,11 @@ class DefaultLiveSessionFactory:
         self.recognizer = recognizer
         self.advisor = advisor
         self.profile_name = profile_name
+        self.advisor_strategy = (
+            advisor_strategy_id(advisor)
+            if advisor is not None
+            else load_profile_advisor_strategy(capture.profiles_root, profile_name)
+        )
 
     def with_advisor(self, advisor: AdvicePort) -> "DefaultLiveSessionFactory":
         return DefaultLiveSessionFactory(
@@ -211,6 +224,7 @@ class DefaultLiveSessionFactory:
         store = LiveSessionStore(
             self.capture.profiles_root,
             self.profile_name,
+            automatic_log_delivery_enabled=True,
         )
         manifest = build_session_manifest(
             loaded.paths.profile_config_path,
@@ -227,10 +241,11 @@ class DefaultLiveSessionFactory:
         )
         store.start(manifest)
         try:
-            recorder = SessionRecorder(
+            recorder = ProcessSessionRecorder(
                 store.directory,
                 size=loaded.config.base_size,
                 fps=10,
+                max_video_bytes=self._remaining_video_allowance(loaded.paths.profile_config_path),
             )
         except Exception:
             store.seal(frame_count=0, dropped_frames=0)
@@ -249,13 +264,13 @@ class DefaultLiveSessionFactory:
     ) -> LiveSessionConstruction:
         source = None
         try:
-            orchestrator = LiveOrchestrator(
-                reducer=LiveReducer(recording.store.session_id),
+            orchestrator = build_production_live_v2_runtime(
                 store=recording.store,
                 recorder=recording.recorder,
-                recognition_service=self.recognizer,
-                advisor=self.advisor,
-                recognition_strategy=recognition_strategy,
+                recognizer=self.recognizer,
+                profiles_root=self.capture.profiles_root,
+                profile_name=self.profile_name,
+                advisor_backend=self.advisor_strategy,
                 on_update=on_update,
             )
             source = self.capture.open_live_source(self.profile_name)
@@ -285,20 +300,10 @@ class DefaultLiveSessionFactory:
             self.capture.profiles_root,
             self.profile_name,
         )
-        if recording_mode == "none":
-            store = InMemoryLiveSessionStore(
-                self.capture.profiles_root,
-                self.profile_name,
-            )
-            store.start({})
-            return LiveSessionRecording(
-                store=store,
-                recorder=InMemorySessionRecorder(store.directory),
-            )
-
         store = LiveSessionStore(
             self.capture.profiles_root,
             self.profile_name,
+            automatic_log_delivery_enabled=True,
         )
         manifest = build_session_manifest(
             loaded.paths.profile_config_path,
@@ -307,6 +312,8 @@ class DefaultLiveSessionFactory:
         manifest.update(
             {
                 "recognition_strategy": recognition_strategy,
+                "schema": "guandan.live-v2.session/1",
+                "runtime": "live_v2",
                 "recording_phase": "live",
                 "initial_state_status": "pending",
                 "recording_mode": recording_mode,
@@ -314,11 +321,17 @@ class DefaultLiveSessionFactory:
             }
         )
         store.start(manifest)
+        if recording_mode == "none":
+            return LiveSessionRecording(
+                store=store,
+                recorder=InMemorySessionRecorder(store.directory),
+            )
         try:
-            recorder = SessionRecorder(
+            recorder = ProcessSessionRecorder(
                 store.directory,
                 size=loaded.config.base_size,
                 fps=10,
+                max_video_bytes=self._remaining_video_allowance(loaded.paths.profile_config_path),
             )
         except Exception:
             store.seal(frame_count=0, dropped_frames=0)
@@ -328,12 +341,43 @@ class DefaultLiveSessionFactory:
             recorder=recorder,
         )
 
+    def _remaining_video_allowance(self, profile_config_path: Path) -> int:
+        """Budget video across this profile, without deleting any user recording.
+
+        Scan only on recorder creation, never on the capture hot path. Reparse
+        points are not followed. Existing generations/exports remain untouched.
+        """
+        config = json.loads(Path(profile_config_path).read_text(encoding="utf-8"))
+        limit = config.get("recording_max_total_bytes", 2 * 1024 ** 3)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("recording_max_total_bytes must be a non-negative integer")
+        root = Path(self.capture.profiles_root) / self.profile_name / "sessions"
+        used = 0
+        pending = [root] if root.exists() else []
+        while pending:
+            directory = pending.pop()
+            if directory.is_symlink() or directory.is_junction():
+                continue
+            for path in directory.iterdir():
+                if path.is_symlink() or path.is_junction():
+                    continue
+                if path.is_dir():
+                    pending.append(path)
+                elif path.suffix.lower() in {".avi", ".mp4", ".png", ".jpg", ".jpeg", ".bmp"}:
+                    used += path.stat().st_size
+        return max(0, limit - used)
+
     def _advisor_manifest(self) -> dict[str, object]:
         audit_info = getattr(self.advisor, "audit_info", None)
         if callable(audit_info):
-            return dict(audit_info())
+            result = dict(audit_info())
+            result["strategy_id"] = self.advisor_strategy
+            result["advisor_backend"] = self.advisor_strategy
+            return result
         return {
-            "backend": type(self.advisor).__name__ if self.advisor else "none",
+            "backend": self.advisor_strategy,
+            "strategy_id": self.advisor_strategy,
+            "advisor_backend": self.advisor_strategy,
             "standard_no_tribute": True,
         }
 

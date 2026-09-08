@@ -34,6 +34,7 @@ from .runtime_identity import get_runtime_identity
 from .resource_fingerprint import recognition_resource_identity
 from .startup_diagnostics import current_startup_diagnostics
 from .storage import atomic_write_json
+from .diagnostic_budget import DiagnosticBudget, assert_plain_path, is_reparse
 
 
 OPENING_EVIDENCE_SCHEMA = "guandan.opening-evidence/1"
@@ -43,6 +44,7 @@ RECOGNITION_TRACE_SCHEMA = "guandan.recognition-trace/1"
 OPENING_WINDOW_NOT_FOUND = "OPENING-WINDOW-NOT-FOUND"
 OPENING_WINDOW_MINIMIZED = "OPENING-WINDOW-MINIMIZED"
 OPENING_GEOMETRY_CHANGED = "OPENING-GEOMETRY-CHANGED"
+OPENING_GEOMETRY_RECOVERY = "OPENING-GEOMETRY-RECOVERY"
 OPENING_CAPTURE_BLACK_FRAME = "OPENING-CAPTURE-BLACK-FRAME"
 OPENING_CAPTURE_ERROR = "OPENING-CAPTURE-ERROR"
 OPENING_ANCHOR_TIMEOUT = "OPENING-ANCHOR-TIMEOUT"
@@ -84,6 +86,9 @@ class OpeningEvidenceMetrics:
     orphan_recognitions: int
     pending_snapshot_bytes: int
     incident_occurrences: int
+    suppressed_incidents: int = 0
+    media_budget_exhausted: int = 0
+    text_budget_exhausted: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -99,6 +104,9 @@ class OpeningEvidenceMetrics:
             "orphan_recognitions": self.orphan_recognitions,
             "pending_snapshot_bytes": self.pending_snapshot_bytes,
             "incident_occurrences": self.incident_occurrences,
+            "suppressed_incidents": self.suppressed_incidents,
+            "media_budget_exhausted": self.media_budget_exhausted,
+            "text_budget_exhausted": self.text_budget_exhausted,
         }
 
 
@@ -178,11 +186,19 @@ class OpeningEvidenceMonitor:
         profiles_root: Path | None = None,
         profile_name: str = "tencent_daguandan",
         max_age_seconds: float = 8.0,
-        max_bytes: int = 256 * 1024 * 1024,
+        max_bytes: int = 64 * 1024 * 1024,
         field_timeout_seconds: float = 8.0,
-        writer_queue_size: int = 16,
-        max_persisted_frames: int = 40,
-        max_persisted_image_bytes: int = 256 * 1024 * 1024,
+        writer_queue_size: int = 4,
+        max_persisted_frames: int = 3,
+        max_persisted_image_bytes: int = 16 * 1024 * 1024,
+        max_run_image_bytes: int = 64 * 1024 * 1024,
+        max_total_image_bytes: int = 512 * 1024 * 1024,
+        max_run_text_bytes: int = 8 * 1024 * 1024,
+        max_total_text_bytes: int = 64 * 1024 * 1024,
+        max_incident_text_bytes: int = 256 * 1024,
+        max_run_incidents: int = 128,
+        max_total_incidents: int = 1024,
+        diagnostics_runs_root: Path | None = None,
         delivery_settle_seconds: float = 0.5,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -200,6 +216,27 @@ class OpeningEvidenceMonitor:
         self.field_timeout_ms = max(1, int(field_timeout_seconds * 1000))
         self.max_persisted_frames = max(1, int(max_persisted_frames))
         self.max_persisted_image_bytes = max(1, int(max_persisted_image_bytes))
+        self.max_incident_text_bytes = max(1, int(max_incident_text_bytes))
+        self.max_run_incidents = max(1, int(max_run_incidents))
+        self._disk_budget = DiagnosticBudget(
+            self.root.parent,
+            runs_root=diagnostics_runs_root,
+            run_media_bytes=max_run_image_bytes,
+            total_media_bytes=max_total_image_bytes,
+            run_text_bytes=max_run_text_bytes,
+            total_text_bytes=max_total_text_bytes,
+            run_incidents=max_run_incidents,
+            total_incidents=max_total_incidents,
+        )
+        self._media_exhausted = False
+        self._text_exhausted = False
+        self._suppressed_incidents = 0
+        self._shared_media: dict[tuple[str, str], dict[str, object]] = {}
+        self._page = "unknown"
+        self._page_observed = False
+        self._table_phase_active = False
+        self._last_recognition_document: dict[str, object] | None = None
+        self._last_capture_metadata: dict[str, object] | None = None
         self.delivery_settle_seconds = max(0.0, float(delivery_settle_seconds))
         self._clock_ms = clock_ms or (lambda: monotonic_ns() // 1_000_000)
         self._ring: deque[_OpeningFrame] = deque()
@@ -256,6 +293,11 @@ class OpeningEvidenceMonitor:
                 self._levels.clear()
                 self._hands.clear()
                 self._anchor_ready = False
+                self._page = "unknown"
+                self._page_observed = False
+                self._table_phase_active = False
+                self._last_recognition_document = None
+                self._last_capture_metadata = None
                 self._clear_ring_locked()
                 self._frame_by_identity.clear()
                 self._frame_by_id.clear()
@@ -265,10 +307,60 @@ class OpeningEvidenceMonitor:
         except BaseException:
             return
 
+    def observe_page(self, page: str, *, monotonic_ms: int | None = None) -> None:
+        """Disarm screenshot/timeouts off-table; rearm only a new table phase.
+
+        Page classification is supplied by the live controller. Explicit unknown
+        disarms media without inventing a new-game boundary. Legacy callers that
+        do not supply page signals retain their previous diagnostic behavior.
+        """
+        try:
+            normalized = str(getattr(page, "value", page)).casefold()
+            if normalized not in {"table", "lobby", "settlement", "unknown"}:
+                normalized = "unknown"
+            now = int(monotonic_ms if monotonic_ms is not None else self._clock_ms())
+            with self._lock:
+                self._page = normalized
+                self._page_observed = True
+                if normalized != "table":
+                    if normalized in {"lobby", "settlement"}:
+                        self._table_phase_active = False
+                    self._listener_started_ms = None
+                    self._armed_ms = None
+                    self._field_blocked_since.clear()
+                    self._hands.clear()
+                    self._levels.clear()
+                    self._anchor_ready = False
+                    self._clear_ring_locked()
+                    self._frame_by_identity.clear()
+                    self._frame_by_id.clear()
+                    self._known_frame_inputs.clear()
+                elif not self._table_phase_active or self._listener_started_ms is None:
+                    new_phase = not self._table_phase_active
+                    self._table_phase_active = True
+                    self._listener_started_ms = now
+                    self._armed_ms = None
+                    self._field_blocked_since = {"table_anchor": now}
+                    if new_phase:
+                        self._dedup.clear()
+                        self._active_incident_ids.clear()
+        except BaseException:
+            return
+
     def observe_frame(self, snapshot: object, *, monotonic_ms: int | None = None) -> None:
         """Append one immutable capture reference in O(1), never encode it here."""
 
         try:
+            with self._lock:
+                if self._closed or (self._page_observed and self._page != "table"):
+                    return
+                metadata_only = self._media_exhausted or self._text_exhausted
+                if metadata_only:
+                    self._latest_seq += 1
+                    self._last_capture_metadata = _frame_metadata(snapshot)
+            if metadata_only:
+                self._emit_timeouts_if_due()
+                return
             now = int(monotonic_ms if monotonic_ms is not None else self._clock_ms())
             byte_size, metadata, black = _frame_capture_details(snapshot)
             with self._lock:
@@ -480,6 +572,8 @@ class OpeningEvidenceMonitor:
         try:
             now = self._clock_ms()
             with self._lock:
+                if self._page_observed and self._page != "table":
+                    return
                 item = self._correlated_frame_locked(snapshot)
                 if item is not None:
                     item.anchor_score = float(score)
@@ -506,22 +600,34 @@ class OpeningEvidenceMonitor:
         try:
             document = _recognition_document(result)
             level = str(document.get("round_level") or "")
-            hand = tuple(str(card) for card in document.get("my_hand", []))
+            hand = tuple(sorted(str(card) for card in document.get("my_hand", [])))
             now = self._clock_ms()
             with self._lock:
-                item, _recovered = self._restore_and_bind_recognition_locked(
-                    snapshot,
-                    document,
-                    trace,
-                    now=now,
-                )
-                if item is None:
+                if self._page_observed and self._page != "table":
+                    return
+                self._last_recognition_document = {
+                    key: document.get(key) for key in (
+                        "round_level", "hand_count", "current_player", "lead_player", "elapsed_ms",
+                    )
+                }
+                metadata_only = self._media_exhausted or self._text_exhausted
+                if metadata_only:
+                    item = None
+                else:
+                    item, _recovered = self._restore_and_bind_recognition_locked(
+                        snapshot, document, trace, now=now,
+                    )
+                if item is None and not metadata_only:
                     self._orphan_recognitions += 1
                 self._clear_error_stage_locked("recognition")
                 if level in RANKS:
                     self._levels.append(level)
                 if len(hand) == 27:
                     self._hands.append(hand)
+                else:
+                    # An incomplete hand is neither stability nor recovery.
+                    # Do not combine a pre-gap complete hand with a later one.
+                    self._hands.clear()
                 if self._armed_ms is None and (level in RANKS or bool(hand)):
                     self._armed_ms = now
                     if not self._anchor_ready:
@@ -549,7 +655,7 @@ class OpeningEvidenceMonitor:
                     self._resolve_episode_locked(
                         (OPENING_LEVEL_CONFLICT, "round_level")
                     )
-                if not hand_unstable:
+                if len(hand) == 27 and hand_stable:
                     self._resolve_episode_locked((OPENING_HAND_UNSTABLE, "my_hand"))
             trace_candidates = (
                 trace.get("candidates", ())
@@ -642,6 +748,9 @@ class OpeningEvidenceMonitor:
                 "error_type": type(error).__name__,
                 "source_error_code": source_code,
             }
+            details = getattr(error, "details", None)
+            if isinstance(details, Mapping):
+                evidence.update(_json_safe(dict(details)))
             with self._lock:
                 correlated = (
                     self._correlated_frame_locked(snapshot)
@@ -688,6 +797,35 @@ class OpeningEvidenceMonitor:
             pass
         return code
 
+    def observe_geometry_recovery(
+        self,
+        *,
+        result: str,
+        generation: int,
+        attempt_count: int,
+        details: Mapping[str, object] | None = None,
+        reason: str = "",
+        monotonic_ms: int | None = None,
+    ) -> None:
+        """Persist one auditable recovery outcome through the incident chain."""
+
+        normalized_result = str(result).strip().lower() or "unknown"
+        evidence = dict(details or {})
+        evidence.update(
+            {
+                "result": normalized_result,
+                "generation": int(generation),
+                "attempt_count": int(attempt_count),
+            }
+        )
+        self.emit_incident(
+            OPENING_GEOMETRY_RECOVERY,
+            field=f"geometry_recovery_{normalized_result}",
+            reason=str(reason or f"geometry recovery {normalized_result}"),
+            monotonic_ms=monotonic_ms,
+            evidence=evidence,
+        )
+
     def mark_session_started(self) -> None:
         """Stop opening timeouts; retained evidence remains exportable."""
 
@@ -722,13 +860,23 @@ class OpeningEvidenceMonitor:
             with self._lock:
                 if self._closed:
                     return False
+                if self._page_observed and self._page != "table":
+                    return False
                 if key in self._dedup:
                     incident_id = self._active_incident_ids.get(key)
                     if incident_id is not None:
                         self._occurrences_by_incident[incident_id] = (
-                            self._occurrences_by_incident.get(incident_id, 1) + 1
+                            min(2**63 - 1, self._occurrences_by_incident.get(incident_id, 1) + 1)
                         )
                         self._incident_occurrences += 1
+                    return False
+                if self._text_exhausted or self._incidents_queued >= self.max_run_incidents:
+                    self._text_exhausted = True
+                    self._clear_ring_locked()
+                    self._frame_by_identity.clear()
+                    self._frame_by_id.clear()
+                    self._known_frame_inputs.clear()
+                    self._suppressed_incidents = min(2**63 - 1, self._suppressed_incidents + 1)
                     return False
             if not self._writer_slots.acquire(blocking=False):
                 with self._lock:
@@ -744,9 +892,14 @@ class OpeningEvidenceMonitor:
                 self._active_incident_ids[key] = incident_id
                 self._occurrences_by_incident[incident_id] = 1
                 self._incident_occurrences += 1
-                records = tuple(self._ring)[-self.max_persisted_frames :]
+                records = self._select_incident_records_locked()
                 record_ids = self._retain_pending_records_locked(records)
                 metrics = self._metrics_locked().to_dict()
+                last_observation = {
+                    "recognition": dict(self._last_recognition_document or {}),
+                    "capture": dict(self._last_capture_metadata or {}),
+                    "latest_seq": self._latest_seq,
+                }
             payload = {
                 "schema": OPENING_INCIDENT_SCHEMA,
                 "incident_id": incident_id,
@@ -758,6 +911,7 @@ class OpeningEvidenceMonitor:
                 "wall_time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                 "evidence": _json_safe(dict(evidence or {})),
                 "episode": {"occurrence_count": 1},
+                "last_observation": last_observation,
                 "runtime_identity": get_runtime_identity(),
             }
             with self._lock:
@@ -791,6 +945,36 @@ class OpeningEvidenceMonitor:
                     pass
             return False
 
+    def _select_incident_records_locked(self) -> tuple[_OpeningFrame, ...]:
+        if self._media_exhausted:
+            return ()
+        # Preserve the exact completed/started recognition input ahead of the
+        # newest capture-only frames. Reserving writer memory leaves room for a
+        # subsequent recognition frame instead of pinning the entire ring.
+        priority = sorted(
+            self._ring,
+            key=lambda item: (
+                item.recognition is not None,
+                item.analysis.get("status") in {"started", "submitted"},
+                item.seq,
+            ),
+            reverse=True,
+        )
+        pending = sum(size for _count, size in self._pending_record_refs.values())
+        reserve = self.max_bytes // 2
+        selected: list[_OpeningFrame] = []
+        for record in priority:
+            if len(selected) >= self.max_persisted_frames:
+                break
+            extra = 0 if id(record) in self._pending_record_refs else record.byte_size
+            if pending + extra > reserve:
+                # A deliberately tiny test/custom ring can fit only one frame.
+                if pending or selected or record.byte_size > self.max_bytes:
+                    continue
+            selected.append(record)
+            pending += extra
+        return tuple(sorted(selected, key=lambda item: item.seq))
+
     def flush(self, timeout: float = 10.0) -> bool:
         try:
             deadline = monotonic_seconds() + max(0.0, float(timeout))
@@ -809,14 +993,16 @@ class OpeningEvidenceMonitor:
                 if monotonic_seconds() >= deadline:
                     return False
                 sleep(0.001)
-            self._sync_episode_occurrences()
+            self._sync_episode_occurrences(deadline=deadline)
             with self._lock:
                 return self._writer_failures == 0
         except BaseException:
             return False
 
     def close(self, timeout: float = 5.0) -> None:
-        deadline = monotonic_seconds() + max(0.0, float(timeout))
+        # Diagnostics are a fail-open sidecar, never a multi-second GUI shutdown
+        # dependency. Explicit flush() remains available for support exports.
+        deadline = monotonic_seconds() + min(0.25, max(0.0, float(timeout)))
         with self._lock:
             if self._closed:
                 return
@@ -849,6 +1035,9 @@ class OpeningEvidenceMonitor:
             orphan_recognitions=self._orphan_recognitions,
             pending_snapshot_bytes=self._pending_record_bytes,
             incident_occurrences=self._incident_occurrences,
+            suppressed_incidents=self._suppressed_incidents,
+            media_budget_exhausted=int(self._media_exhausted),
+            text_budget_exhausted=int(self._text_exhausted),
         )
 
     def _trim_locked(self, now_ms: int) -> None:
@@ -893,6 +1082,8 @@ class OpeningEvidenceMonitor:
     def _emit_timeouts_if_due(self, *, result: object | None = None) -> None:
         now = self._clock_ms()
         with self._lock:
+            if self._page_observed and self._page != "table":
+                return
             armed = self._armed_ms
             listener_started = self._listener_started_ms
             blocked = dict(self._field_blocked_since)
@@ -922,13 +1113,17 @@ class OpeningEvidenceMonitor:
                 monotonic_ms=now,
             )
         if now - blocked.get("hand_count", now) >= self.field_timeout_ms:
-            hand = tuple(getattr(result, "my_hand", ()) or ()) if result is not None else ()
+            hand = tuple(getattr(result, "my_hand", ()) or ()) if result is not None else None
             self.emit_incident(
                 OPENING_HAND_COUNT_MISMATCH,
                 field="my_hand",
                 reason="opening hand count did not equal 27 before timeout",
                 monotonic_ms=now,
-                evidence={"actual_count": len(hand), "required_count": 27},
+                evidence={
+                    "actual_count": len(hand) if hand is not None else None,
+                    "observation_status": "observed" if hand is not None else "unknown",
+                    "required_count": 27,
+                },
             )
         if now - blocked.get("hand_stability", now) >= self.field_timeout_ms:
             self.emit_incident(
@@ -1069,11 +1264,13 @@ class OpeningEvidenceMonitor:
                 )
                 self._retained_bytes = max(0, self._retained_bytes - byte_size)
 
-    def _sync_episode_occurrences(self) -> None:
+    def _sync_episode_occurrences(self, *, deadline: float | None = None) -> None:
         with self._lock:
             occurrences = dict(self._occurrences_by_incident)
         incidents_root = self.root / "incidents"
         for incident_id, count in occurrences.items():
+            if deadline is not None and monotonic_seconds() >= deadline:
+                return
             path = incidents_root / incident_id / "incident.json"
             if not path.is_file():
                 continue
@@ -1087,7 +1284,12 @@ class OpeningEvidenceMonitor:
                     continue
                 episode["occurrence_count"] = int(count)
                 document["episode"] = episode
-                atomic_write_json(path, document)
+                # Account for the atomic replacement's temporary copy too.
+                remaining = 0.2 if deadline is None else max(0.0, deadline - monotonic_seconds())
+                with self._disk_budget.transaction(timeout=min(0.2, remaining)) as allowance:
+                    if len(_document_bytes(document)) <= allowance.text_bytes:
+                        assert_plain_path(path)
+                        atomic_write_json(path, document)
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 with self._lock:
                     self._writer_failures += 1
@@ -1120,9 +1322,64 @@ class OpeningEvidenceMonitor:
         records: tuple[_OpeningFrame, ...],
         metrics: dict[str, int],
     ) -> None:
+        try:
+            self._write_incident_with_budget(incident_id, incident, records, metrics)
+        except TimeoutError:
+            # An incomplete quota scan grants no allowance. Do not repeatedly
+            # rescan a huge legacy tree on every bad frame; keep this run's
+            # sidecar metadata-only until the next launch/explicit cleanup.
+            with self._lock:
+                self._media_exhausted = self._text_exhausted = True
+                self._suppressed_incidents = min(2**63 - 1, self._suppressed_incidents + 1)
+                self._clear_ring_locked()
+                self._frame_by_identity.clear()
+                self._frame_by_id.clear()
+                self._known_frame_inputs.clear()
+
+    def _write_incident_with_budget(
+        self,
+        incident_id: str,
+        incident: dict[str, object],
+        records: tuple[_OpeningFrame, ...],
+        metrics: dict[str, int],
+    ) -> None:
         self._settle_analysis_delivery(records)
+        with self._disk_budget.transaction() as allowance:
+            with self._lock:
+                self._media_exhausted = allowance.media_bytes <= 0
+                if self._media_exhausted:
+                    self._clear_ring_locked()
+                    self._frame_by_identity.clear()
+                    self._frame_by_id.clear()
+                    self._known_frame_inputs.clear()
+                if allowance.incidents_remaining <= 0 or allowance.text_bytes < 2048:
+                    self._text_exhausted = True
+                    self._clear_ring_locked()
+                    self._frame_by_identity.clear()
+                    self._frame_by_id.clear()
+                    self._known_frame_inputs.clear()
+                    self._suppressed_incidents = min(2**63 - 1, self._suppressed_incidents + 1)
+                    return
+            self._publish_incident(
+                incident_id, incident, records, metrics,
+                image_limit=min(self.max_persisted_image_bytes, allowance.media_bytes),
+                text_limit=min(self.max_incident_text_bytes, allowance.text_bytes),
+            )
+
+    def _publish_incident(
+        self,
+        incident_id: str,
+        incident: dict[str, object],
+        records: tuple[_OpeningFrame, ...],
+        metrics: dict[str, int],
+        *,
+        image_limit: int,
+        text_limit: int,
+    ) -> None:
+        assert_plain_path(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
         incidents_root = self.root / "incidents"
+        assert_plain_path(incidents_root)
         incidents_root.mkdir(exist_ok=True)
         target = incidents_root / incident_id
         staging = incidents_root / f".{incident_id}.{uuid4().hex}.tmp"
@@ -1132,6 +1389,7 @@ class OpeningEvidenceMonitor:
             trace_lines: list[str] = []
             selected = records[-self.max_persisted_frames :]
             image_bytes = 0
+            shared_updates: dict[tuple[str, str], dict[str, object]] = {}
             for record in selected:
                 document = {
                     "frame_id": record.frame_id,
@@ -1160,11 +1418,33 @@ class OpeningEvidenceMonitor:
                             separators=(",", ":"),
                         )
                     )
-                bytes_written, artifacts = self._write_record_images(
-                    staging,
-                    record,
-                    remaining=max(0, self.max_persisted_image_bytes - image_bytes),
+                media_key = (
+                    str(record.frame_metadata.get("standardized_pixel_sha256", "")),
+                    str(record.frame_metadata.get("raw_pixel_sha256", "")),
                 )
+                shared = shared_updates.get(media_key) or self._shared_media.get(media_key)
+                if shared is not None:
+                    bytes_written, artifacts = self._link_shared_images(
+                        staging, record, shared, incident_id=incident_id,
+                        remaining=max(0, image_limit - image_bytes),
+                    )
+                    document["media_status"] = "hardlinked" if artifacts else "omitted_budget"
+                    document["shared_pixel_owner"] = {
+                        "incident_id": shared["incident_id"],
+                        "frame_id": shared["frame_id"],
+                    }
+                else:
+                    bytes_written, artifacts = self._write_record_images(
+                        staging, record, remaining=max(0, image_limit - image_bytes),
+                    )
+                    document["media_status"] = "stored" if artifacts else "omitted_budget"
+                    if artifacts:
+                        shared_updates[media_key] = {
+                            "incident_id": incident_id,
+                            "frame_id": record.frame_id,
+                            "reason": "identical_capture_pixels",
+                            "artifacts": artifacts,
+                        }
                 image_bytes += bytes_written
                 document["artifacts"] = artifacts
                 frame_documents.append(document)
@@ -1183,13 +1463,16 @@ class OpeningEvidenceMonitor:
                     "support_export_requires_explicit_image_opt_in": True,
                 },
                 "resource_identity": self._resource_identity(),
+                "storage": {
+                    "media_bytes": image_bytes,
+                    "media_limit": image_limit,
+                    "frame_limit": self.max_persisted_frames,
+                    "existing_evidence_deleted": False,
+                    "policy": "refuse_new_when_full",
+                },
                 "frames": frame_documents,
             }
-            atomic_write_json(staging / "incident.json", incident)
-            atomic_write_json(staging / "opening_evidence.json", evidence)
-            atomic_write_json(
-                staging / "repro.json",
-                {
+            repro = {
                     "schema": "guandan.repro-manifest/1",
                     "incident_id": incident_id,
                     "field": incident.get("field"),
@@ -1203,25 +1486,57 @@ class OpeningEvidenceMonitor:
                             "seq": item["seq"],
                             "monotonic_ms": item["monotonic_ms"],
                             "artifacts": item.get("artifacts", []),
+                            "media_status": item.get("media_status"),
+                            "media_reference": item.get("media_reference"),
                         }
                         for item in frame_documents
                     ],
-                },
-            )
-            (staging / "recognition_trace.jsonl").write_text(
-                "\n".join(trace_lines) + ("\n" if trace_lines else ""),
-                encoding="utf-8",
-            )
-            staging.replace(target)
-            atomic_write_json(
-                self.root / "latest.json",
-                {
+                }
+            latest = {
                     "schema": "guandan.opening-latest/1",
                     "incident_id": incident_id,
                     "relative_directory": f"incidents/{incident_id}",
                     "code": incident.get("code"),
-                },
-            )
+                }
+            documents = {
+                "incident.json": incident,
+                "opening_evidence.json": evidence,
+                "repro.json": repro,
+            }
+            encoded = {name: _document_bytes(value) for name, value in documents.items()}
+            traces = ("\n".join(trace_lines) + ("\n" if trace_lines else "")).encode("utf-8")
+            latest_bytes = _document_bytes(latest)
+            if sum(map(len, encoded.values())) + len(traces) + len(latest_bytes) > text_limit:
+                # Retain frame correlation and explicit truncation rather than
+                # letting a large template trace bypass the text quota.
+                traces = b""
+                for document in frame_documents:
+                    document["recognition"] = {
+                        key: value for key, value in dict(document.get("recognition") or {}).items()
+                        if key in {"hand_count", "round_level", "lead_player", "current_player"}
+                    }
+                evidence["resource_identity"] = {"status": "omitted_text_budget"}
+                repro["resource_identity"] = evidence["resource_identity"]
+                evidence["storage"]["text_status"] = "trace_and_details_omitted_budget"
+                incident["evidence"] = {"status": "omitted_text_budget"}
+                encoded = {name: _document_bytes(value) for name, value in documents.items()}
+            if sum(map(len, encoded.values())) + len(traces) + len(latest_bytes) > text_limit:
+                _remove_tree_best_effort(staging)
+                with self._lock:
+                    self._text_exhausted = True
+                    self._clear_ring_locked()
+                    self._frame_by_identity.clear()
+                    self._frame_by_id.clear()
+                    self._known_frame_inputs.clear()
+                    self._suppressed_incidents = min(2**63 - 1, self._suppressed_incidents + 1)
+                return
+            for name, content in encoded.items():
+                (staging / name).write_bytes(content)
+            (staging / "recognition_trace.jsonl").write_bytes(traces)
+            staging.replace(target)
+            # This file is a bounded pointer, not an append-only journal.
+            atomic_write_json(self.root / "latest.json", latest)
+            self._shared_media.update(shared_updates)
             with self._lock:
                 self._incidents_written += 1
         except BaseException:
@@ -1313,6 +1628,54 @@ class OpeningEvidenceMonitor:
                 )
         return written, artifacts
 
+    def _link_shared_images(
+        self,
+        staging: Path,
+        record: _OpeningFrame,
+        shared: Mapping[str, object],
+        *,
+        incident_id: str,
+        remaining: int,
+    ) -> tuple[int, list[dict[str, object]]]:
+        """Share physical PNG storage while each incident stays self-contained.
+
+        Budgets deliberately count hardlink sizes conservatively as logical
+        bytes. They can stop admission early, never allow more disk usage than
+        the configured limit. Unsupported filesystems get fresh bounded PNGs.
+        """
+        source_root = staging if shared.get("incident_id") == incident_id else (
+            self.root / "incidents" / str(shared["incident_id"])
+        )
+        written = 0
+        artifacts: list[dict[str, object]] = []
+        for original in shared.get("artifacts", []):
+            original = dict(original)
+            size = int(original.get("bytes", 0))
+            if size <= 0 or size > remaining - written:
+                continue
+            relative = Path(str(original["path"]))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            source = source_root / relative
+            name = str(original.get("field") or original["kind"])
+            output = Path("roi" if original["kind"] == "roi" else "frames") / f"{name}_{record.seq:06d}.png"
+            target = staging / output
+            try:
+                assert_plain_path(source)
+                if source.stat().st_size != size or hashlib.sha256(source.read_bytes()).hexdigest() != original["sha256"]:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(source, target)
+            except OSError:
+                continue
+            linked = dict(original)
+            linked.update(frame_id=record.frame_id, frame_seq=record.seq, path=output.as_posix())
+            artifacts.append(linked)
+            written += size
+        if not artifacts and remaining > 0:
+            return self._write_record_images(staging, record, remaining=remaining)
+        return written, artifacts
+
     def _opening_rois(
         self,
         image: np.ndarray,
@@ -1365,7 +1728,7 @@ class NonBlockingOpeningEvidenceSink:
     observable but always fail-open.
     """
 
-    def __init__(self, target: object, *, queue_size: int = 128) -> None:
+    def __init__(self, target: object, *, queue_size: int = 8) -> None:
         if queue_size <= 0:
             raise ValueError("evidence dispatch queue size must be positive")
         self.target = target
@@ -1408,6 +1771,9 @@ class NonBlockingOpeningEvidenceSink:
     def observe_anchor(self, snapshot: object, score: float, **kwargs: object) -> None:
         self._submit("observe_anchor", (snapshot, score), kwargs)
 
+    def observe_page(self, page: str, **kwargs: object) -> None:
+        self._submit("observe_page", (page,), kwargs)
+
     def observe_recognition(
         self,
         snapshot: object,
@@ -1419,6 +1785,9 @@ class NonBlockingOpeningEvidenceSink:
 
     def observe_failure(self, error: object, **kwargs: object) -> None:
         self._submit("observe_failure", (error,), kwargs)
+
+    def observe_geometry_recovery(self, **kwargs: object) -> None:
+        self._submit("observe_geometry_recovery", (), kwargs)
 
     def mark_session_started(self) -> None:
         self._submit("mark_session_started", (), {})
@@ -1437,7 +1806,7 @@ class NonBlockingOpeningEvidenceSink:
             return False
 
     def close(self, timeout: float = 5.0) -> None:
-        deadline = monotonic_seconds() + max(0.0, float(timeout))
+        deadline = monotonic_seconds() + min(0.25, max(0.0, float(timeout)))
         with self._lock:
             if self._closed:
                 return
@@ -1738,14 +2107,42 @@ def _json_safe(value: object) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str, allow_nan=False))
 
 
+def _document_bytes(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2, default=str, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _number(value: object, *, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _remove_tree_best_effort(root: Path) -> None:
     try:
-        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-            if path.is_file():
-                path.unlink(missing_ok=True)
-            elif path.is_dir():
-                path.rmdir()
-        root.rmdir()
+        root = Path(os.path.abspath(root))
+        if root.parent.name != "incidents" or not root.name.startswith(".OPEN-") or not root.name.endswith(".tmp"):
+            return
+        if not root.exists():
+            return
+        assert_plain_path(root)
+        directories = [root]
+        files: list[Path] = []
+        for parent in directories:
+            for path in parent.iterdir():
+                if is_reparse(path) or not path.is_relative_to(root):
+                    return
+                if path.is_dir():
+                    directories.append(path)
+                elif path.is_file():
+                    files.append(path)
+        for path in files:
+            assert_plain_path(path)
+            path.unlink(missing_ok=True)
+        for path in reversed(directories):
+            assert_plain_path(path)
+            path.rmdir()
     except OSError:
         return
 
@@ -1753,6 +2150,7 @@ def _remove_tree_best_effort(root: Path) -> None:
 __all__ = [
     "OPENING_EVIDENCE_SCHEMA",
     "OPENING_INCIDENT_SCHEMA",
+    "OPENING_GEOMETRY_RECOVERY",
     "OpeningEvidenceMetrics",
     "OpeningEvidenceMonitor",
     "NonBlockingOpeningEvidenceSink",

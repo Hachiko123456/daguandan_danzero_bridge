@@ -81,6 +81,8 @@ class LiveReducer:
         confidence: float,
         source: str,
         evidence_refs: Iterable[str] = (),
+        monotonic_ms: int | None = None,
+        wall_time: str | None = None,
     ) -> LiveEvent:
         seq = len(self._events) + 1
         before = self._revision
@@ -89,8 +91,16 @@ class LiveReducer:
             event_type=event_type,
             session_id=self.session_id,
             seq=seq,
-            monotonic_ms=monotonic_ns() // 1_000_000,
-            wall_time=datetime.now().astimezone().isoformat(),
+            monotonic_ms=(
+                monotonic_ns() // 1_000_000
+                if monotonic_ms is None
+                else int(monotonic_ms)
+            ),
+            wall_time=(
+                datetime.now().astimezone().isoformat()
+                if wall_time is None
+                else str(wall_time)
+            ),
             trick_id=max(1, self._trick_id),
             turn_id=max(1, self._turn_id),
             actor=actor,
@@ -111,6 +121,8 @@ class LiveReducer:
         confidence: float = 1.0,
         source: str = "manual_start",
         evidence_refs: Iterable[str] = (),
+        monotonic_ms: int | None = None,
+        wall_time: str | None = None,
     ) -> LiveEvent:
         if self._initialized or self._events:
             raise GameStateError("对局已经初始化")
@@ -133,6 +145,8 @@ class LiveReducer:
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
+            monotonic_ms=monotonic_ms,
+            wall_time=wall_time,
         )
         self.apply(event)
         return event
@@ -170,6 +184,8 @@ class LiveReducer:
         suit_options: Iterable[Iterable[str]] = (),
         integrity_warnings: Iterable[str] = (),
         action_metadata: dict[str, object] | None = None,
+        monotonic_ms: int | None = None,
+        wall_time: str | None = None,
     ) -> LiveEvent:
         self._require_expected_player(player)
         raw_cards = tuple(str(card) for card in cards)
@@ -201,6 +217,8 @@ class LiveReducer:
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
+            monotonic_ms=monotonic_ms,
+            wall_time=wall_time,
         )
         self.apply(event)
         return event
@@ -212,15 +230,24 @@ class LiveReducer:
         confidence: float = 1.0,
         source: str = "pass_template",
         evidence_refs: Iterable[str] = (),
+        integrity_warnings: Iterable[str] = (),
+        monotonic_ms: int | None = None,
+        wall_time: str | None = None,
     ) -> LiveEvent:
         self._require_expected_player(player)
+        payload: dict[str, object] = {"cards": [], "is_pass": True}
+        warnings = tuple(dict.fromkeys(str(item) for item in integrity_warnings if str(item)))
+        if warnings:
+            payload["integrity_warnings"] = list(warnings)
         event = self._new_event(
             "player_passed",
             actor=player,
-            payload={"cards": [], "is_pass": True},
+            payload=payload,
             confidence=confidence,
             source=source,
             evidence_refs=evidence_refs,
+            monotonic_ms=monotonic_ms,
+            wall_time=wall_time,
         )
         self.apply(event)
         return event
@@ -399,6 +426,11 @@ class LiveReducer:
                 "cards": list(correction.payload.get("cards", ())),
                 "is_pass": is_pass,
                 "suit_options": [],
+                **(
+                    {"move_semantics": correction.payload["move_semantics"]}
+                    if isinstance(correction.payload.get("move_semantics"), dict)
+                    else {}
+                ),
             },
             confidence=correction.confidence,
             source=correction.source,
@@ -662,6 +694,26 @@ class LiveReducer:
             self.session_id,
             wind_receiver_must_pass=self._wind_receiver_must_pass,
         )
+
+    def adopt_staged(self, staged: "LiveReducer") -> None:
+        """Install a fully validated same-session reducer without replaying it."""
+
+        if staged.session_id != self.session_id:
+            raise GameStateError("暂存 reducer 不属于当前对局")
+        self._events = list(staged._events)
+        self._round_level = staged._round_level
+        self._wild_rank = staged._wild_rank
+        self._current_player = staged._current_player
+        self._lead_player = staged._lead_player
+        self._my_hand = tuple(staged._my_hand)
+        self._trick_plays = list(staged._trick_plays)
+        self._play_history = list(staged._play_history)
+        self._remaining_cards = dict(staged._remaining_cards)
+        self._finished_seats = set(staged._finished_seats)
+        self._trick_id = staged._trick_id
+        self._turn_id = staged._turn_id
+        self._revision = staged._revision
+        self._initialized = staged._initialized
 
 
 def _action_metadata_from_payload(

@@ -1,0 +1,72 @@
+"""Stable public re-exports for live-v2 immutable contracts.
+
+The implementation is split by responsibility to keep each module reviewable.
+Importing from this facade remains supported for integration code.
+"""
+
+from .events import (
+    ActionCandidate,
+    ActionInterpretation,
+    ActionKind,
+    ActionSemantics,
+    AdviceOpportunity,
+    CandidateReason,
+    CommitReason,
+    CommitResult,
+    ConfirmationReason,
+    ConfirmedAction,
+    ConfirmedCorrection,
+    CorrectionCommand,
+    CorrectionReason,
+    EngineUpdate,
+    EngineUpdateReason,
+    EvidenceDropReason,
+    EvidenceOrigin,
+    GapPhase,
+    GapReason,
+    GapState,
+    OpportunityReason,
+    OpportunityStatus,
+    ProjectionReason,
+    ProjectionResult,
+    ScheduledItemKind,
+    SchedulingDropReason,
+)
+from .identity import FrameIdentity, Seat, StateVersion, VersionIdentity
+from .observations import ObservationKind, ObservationReason, SeatObservation
+
+__all__ = [
+    "ActionCandidate",
+    "ActionInterpretation",
+    "ActionKind",
+    "ActionSemantics",
+    "AdviceOpportunity",
+    "CandidateReason",
+    "CommitReason",
+    "CommitResult",
+    "ConfirmationReason",
+    "ConfirmedAction",
+    "ConfirmedCorrection",
+    "CorrectionCommand",
+    "CorrectionReason",
+    "EngineUpdate",
+    "EngineUpdateReason",
+    "EvidenceDropReason",
+    "EvidenceOrigin",
+    "FrameIdentity",
+    "GapPhase",
+    "GapReason",
+    "GapState",
+    "ObservationKind",
+    "ObservationReason",
+    "OpportunityReason",
+    "OpportunityStatus",
+    "ProjectionReason",
+    "ProjectionResult",
+    "ScheduledItemKind",
+    "SchedulingDropReason",
+    "Seat",
+    "SeatObservation",
+    "StateVersion",
+    "VersionIdentity",
+]

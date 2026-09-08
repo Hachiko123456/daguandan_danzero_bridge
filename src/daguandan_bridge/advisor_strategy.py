@@ -24,7 +24,7 @@ DEFAULT_SESSION_DATA_RECORDING_ENABLED = True
 RECORDING_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("none", "不保存"),
     ("game", "对局录制"),
-    ("all", "全程录制"),
+    ("all", "完整牌桌录制"),
 )
 DEFAULT_RECORDING_MODE = "game"
 _VALID_ADVISORS = {value for value, _label in ADVISOR_OPTIONS}
@@ -39,6 +39,15 @@ def normalize_advisor_strategy(value: object) -> str:
     if strategy not in _VALID_ADVISORS:
         raise ValueError(f"不支持的建议模型：{strategy}")
     return strategy
+
+
+def advisor_strategy_id(advisor: object) -> str:
+    """Return the explicit production backend advertised by an advisor."""
+
+    value = getattr(advisor, "strategy_id", None)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("建议模型缺少明确的 strategy_id")
+    return normalize_advisor_strategy(value)
 
 
 def load_profile_advisor_strategy(

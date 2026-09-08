@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_source.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     verify_source.add_argument("--expected", type=Path, required=True)
+    verify_source.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="development-only: require the captured dirty status to remain identical",
+    )
 
     verify = subparsers.add_parser("verify", help="verify files against a manifest")
     verify.add_argument("--bundle-root", type=Path, required=True)
@@ -144,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
             identity = verify_source_identity(
                 args.project_root,
                 expected,
-                require_clean=True,
+                require_clean=not args.allow_dirty,
             )
             print(
                 json.dumps(

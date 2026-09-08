@@ -4,13 +4,16 @@ import shutil
 import logging
 import hashlib
 import sys
+from copy import deepcopy
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import wraps
 from inspect import signature
+from math import isfinite
 from pathlib import Path
-from threading import Event, RLock
+from threading import Event, RLock, Timer
+from time import monotonic_ns
 from typing import Any, Callable, Literal
 
 import cv2
@@ -24,6 +27,14 @@ from ..application.ports import (
     SessionPersistencePort,
 )
 from ..domain.advice import LocalAdvice, StrategyExecutionTrace
+from ..domain.live_runtime import (
+    AdviceRequestKey,
+    LiveAdvice,
+    LiveStatus,
+    LiveUpdate,
+    ReviewCandidate,
+    ReviewRequest,
+)
 from ..domain.recognition import (
     PLAY_REGION_TO_SEAT,
     FastSignalResult,
@@ -63,21 +74,13 @@ from .recognition_strategy import (
 )
 from .models import LiveEvent, LiveSnapshot
 from .latest_worker import LatestOnlyWorker
+from .local_rule_hint import LocalRuleHint, LocalRuleHintTracker
 from .reducer import LiveReducer
 from .suit_correction import SuitCorrectionObservation, SuitCorrectionTracker
 from .turns import TURN_ORDER, next_active_seat, project_trick_turn
+from .turn_evidence import TurnEvidenceCache
 from .zone_lifecycle import ZoneDecision, ZoneFrameMetrics, ZoneLifecycle, ZonePhase
 
-
-LiveStatus = Literal[
-    "initializing",
-    "waiting_lead",
-    "running",
-    "review_required",
-    "paused",
-    "finalizing",
-    "sealed",
-]
 
 _MAX_ADVICE_STATE_VARIANTS = 32
 _MAX_SUIT_STATE_VARIANTS = 256
@@ -86,7 +89,7 @@ _VISUAL_FINISH_WITHHOLD_TEXT = "牌局历史不完整，暂停推荐"
 _TURN_DESYNCHRONIZED_REASON = "turn_desynchronized"
 _TURN_DESYNCHRONIZED_TEXT = "牌局历史存在缺口，暂停推荐和预选"
 _TURN_RECOVERY_WITHHOLD_REASON = "turn_recovery_pending"
-_TURN_RECOVERY_WITHHOLD_TEXT = "牌局历史待恢复，暂停推荐"
+_TURN_RECOVERY_WITHHOLD_TEXT = "正在补齐刚才的快速出牌，暂缓推荐"
 _PREVIOUS_ACTION_VERIFICATION_WITHHOLD_REASON = "previous_action_reread_pending"
 _PREVIOUS_ACTION_VERIFICATION_WITHHOLD_TEXT = "上一手牌面待复核，暂停推荐"
 _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS = 1_200
@@ -95,7 +98,14 @@ _HANDOFF_READABLE_CONFIRMATION_MS = 1_000
 # A local turn normally has about 15 seconds.  A delayed foreign action must
 # be given a substantial part of that budget before this turn is deferred, but
 # it must never turn a recoverable visual transition into a session-wide stop.
-_ADVICE_RECOVERY_TARGET_MS = 8_000
+_ADVICE_RECOVERY_TARGET_MS = 2_000
+# A placement signal can arrive after the active-seat decoration has already
+# moved to the wind receiver.  This is a bounded evidence window, not another
+# full turn-recovery cycle: if the PASS chain cannot be proved quickly, keep
+# the existing fail-closed behaviour and report the exact missing seat.
+_WIND_CATCH_RECOVERY_TARGET_MS = 1_800
+_CANNOT_BEAT_MIN_CONFIDENCE = 0.80
+_SELF_RESPONSE_PREFLIGHT_MAX_MS = 300
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -106,69 +116,6 @@ def _state_synchronized(method):
             return method(self, *args, **kwargs)
 
     return synchronized
-
-
-@dataclass(frozen=True)
-class ReviewCandidate:
-    candidate_id: str
-    cards: tuple[str, ...]
-    is_pass: bool
-    votes: int
-    confidence: float
-    valid: bool
-    rejected_reason: str = ""
-
-
-@dataclass(frozen=True)
-class ReviewRequest:
-    reason: str
-    player: Seat
-    candidates: tuple[ReviewCandidate, ...]
-    evidence_refs: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class LiveUpdate:
-    status: LiveStatus
-    snapshot: LiveSnapshot
-    event: LiveEvent | None = None
-    events: tuple[LiveEvent, ...] = ()
-    advice: object | None = None
-    review: ReviewRequest | None = None
-    fast_signals: FastSignalResult | None = None
-
-
-@dataclass(frozen=True)
-class AdviceRequestKey:
-    session_id: str
-    turn_id: int
-    state_revision: int
-
-    @property
-    def request_id(self) -> str:
-        return f"ADV-{self.turn_id:04d}-{self.state_revision:04d}"
-
-    @property
-    def decision_id(self) -> str:
-        return f"{self.session_id}:turn_{self.turn_id}:revision_{self.state_revision}"
-
-
-@dataclass(frozen=True)
-class LiveAdvice:
-    key: AdviceRequestKey
-    status: Literal["requested", "ready", "stale", "failed", "withheld"]
-    advice: LocalAdvice | None = None
-    visible: bool = False
-    error: str = ""
-    withhold_reason: str = ""
-    suit_uncertain: bool = False
-    variant_count: int = 1
-    advice_agrees_across_variants: bool = True
-    semantic_uncertain: bool = False
-    semantic_source_history_indices: tuple[int, ...] = ()
-    suit_variant_count: int = 1
-    suit_equivalence_class_count: int = 1
-    semantic_variant_count: int = 1
 
 
 @dataclass
@@ -214,6 +161,8 @@ class _TurnOwnershipWindow:
     turn_recovery_active_player: Seat | None = None
     turn_recovery_active_streak: int = 0
     turn_recovery_owner_return_streak: int = 0
+    turn_recovery_owner_seen: bool = False
+    turn_recovery_owner_departed: bool = False
     turn_recovery_pass_marker_streaks: dict[Seat, int] = field(
         default_factory=dict
     )
@@ -226,6 +175,62 @@ class _TurnOwnershipWindow:
     turn_recovery_local_started_ms: int | None = None
     turn_recovery_local_deadline_ms: int | None = None
     turn_recovery_target_exceeded: bool = False
+    turn_recovery_failed: bool = False
+    turn_recovery_failure_reason: str = ""
+    turn_recovery_processing_started_ms: int | None = None
+    turn_recovery_deadline_expired: bool = False
+    turn_recovery_deadline_identity: tuple[object, ...] = ()
+    evidence_epoch: tuple[object, ...] = ()
+    last_fast_capture_ms: int | None = None
+    last_fast_capture_seq: int | None = None
+    created_capture_ms: int = 0
+    turn_recovery_cycle_signature: tuple[tuple[object, ...], ...] | None = None
+    turn_recovery_cycle_streak: int = 0
+    turn_recovery_cycle_first_ms: int | None = None
+    turn_recovery_cycle_last_ms: int | None = None
+    turn_recovery_cycle_missing_player: Seat | None = None
+    turn_recovery_cycle_imported_pre_vote: bool = False
+    pre_recovery_chain_signature: tuple[tuple[object, ...], ...] | None = None
+    pre_recovery_chain_ms: int | None = None
+    pre_recovery_chain_seq: int | None = None
+    pre_recovery_chain_generation: int | None = None
+    pre_recovery_chain_epoch: tuple[object, ...] = ()
+    pre_recovery_chain_response_identity: tuple[object, ...] = ()
+    terminal_action_chain_signature: tuple[object, ...] | None = None
+    terminal_action_chain_streak: int = 0
+    terminal_action_chain_first_ms: int | None = None
+    terminal_action_chain_last_ms: int | None = None
+    terminal_action_chain_last_seq: int | None = None
+    terminal_action_chain_captures: int = 0
+    terminal_action_chain_epoch: tuple[int, int] | None = None
+    terminal_action_chain_badge_player: Seat | None = None
+    terminal_action_chain_badge_placement: str | None = None
+    terminal_action_chain_badge_ms: int | None = None
+    # A visual finish can move the table to the wind receiver before the
+    # reducer has seen the finishing trick's PASS chain.  Keep this mode
+    # separate from the ordinary eight-second foreign-action recovery.
+    wind_catch_pass_recovery_failed: bool = False
+    wind_catch_pass_recovery_failure_reason: str = ""
+    wind_catch_pass_recovery_advice_event_id: str | None = None
+    # Distinct captures of "要不起" confirm a suggestion, never a game action.
+    cannot_beat_streak: int = 0
+    cannot_beat_signature: tuple[object, ...] | None = None
+    cannot_beat_confidence: float = 0.0
+    cannot_beat_last_capture_ms: int | None = None
+    surface_generation_baseline: dict[Seat, int] = field(default_factory=dict)
+    pass_marker_baseline: frozenset[Seat] = frozenset()
+    surface_baseline_frames: dict[Seat, np.ndarray] = field(default_factory=dict)
+    surface_baseline_full_frame: np.ndarray | None = None
+    surface_baseline_candidates: dict[Seat, tuple[object, ...]] = field(
+        default_factory=dict
+    )
+    surface_baseline_captured: bool = False
+    temporal_active_player: Seat | None = None
+    temporal_active_streak: int = 0
+    temporal_confirmed_actives: list[Seat] = field(default_factory=list)
+    temporal_pass_marker_streaks: dict[Seat, int] = field(default_factory=dict)
+    temporal_confirmed_passes: set[Seat] = field(default_factory=set)
+    temporal_pass_seen_absent: set[Seat] = field(default_factory=set)
     sample_allowed: bool = False
     crossing_active_player: Seat | None = None
     crossing_active_streak: int = 0
@@ -234,6 +239,11 @@ class _TurnOwnershipWindow:
     disposition: str = "unseen"
     provisional_samples: list[RecognitionSample] = field(default_factory=list)
     handoff_samples: list[RecognitionSample] = field(default_factory=list)
+    self_static_handoff_signature: tuple[object, ...] | None = None
+    self_static_handoff_last_capture: tuple[int, int] | None = None
+    self_static_handoff_streak: int = 0
+    self_static_handoff_reads: int = 0
+    self_static_handoff_pass_streak: int = 0
     # This is deliberately a separate, pass-only recovery state.  Unlike an
     # authenticated owner handoff it never makes a card ROI sample eligible
     # for consensus.
@@ -244,6 +254,7 @@ class _TurnOwnershipWindow:
     unseen_direct_next_pass_edge_seen: bool = False
     unseen_direct_next_pass_marker_streak: int = 0
     unseen_direct_next_pass_marker_player: Seat | None = None
+    unseen_direct_next_pass_last_capture_ms: int | None = None
     # The active-seat template can disappear for a transition frame.  Retain
     # only a *new* expected-seat PASS edge seen in that unknown interval so it
     # can be confirmed once the direct next seat becomes readable.
@@ -258,6 +269,8 @@ class _TurnOwnershipWindow:
     wind_catch_pass_recovery_detected_ms: int | None = None
     wind_catch_pass_recovery_deadline_ms: int | None = None
     wind_catch_pass_recovery_marker_streak: int = 0
+    wind_catch_pass_recovery_marker_visible: bool = False
+    wind_catch_pass_recovery_marker_edge_seen: bool = False
     # The PASS surface may flash for one frame while the wind receiver's next
     # play is already visible but the active-seat decoration still lags.  This
     # recovery is intentionally stricter than timer handoff: it needs that
@@ -298,6 +311,7 @@ class _PreviousActionVerification:
     opened_monotonic_ms: int | None = None
     last_probe_monotonic_ms: int | None = None
     advice_withheld: bool = False
+    processing_opened_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -544,6 +558,7 @@ class LiveOrchestrator:
         lead_stable_frames: int = 3,
         recognition_strategy: str | RecognitionStrategy = RecognitionStrategy.TWO_VALID_STREAK,
         on_update: Callable[[LiveUpdate], None] | None = None,
+        processing_clock_ms: Callable[[], int] | None = None,
     ) -> None:
         if burst_sample_limit < 3:
             raise ValueError("突发读取至少需要 3 帧")
@@ -561,6 +576,24 @@ class LiveOrchestrator:
         self.lead_stable_frames = max(2, int(lead_stable_frames))
         self.recognition_strategy = coerce_recognition_strategy(recognition_strategy)
         self._update_listener = on_update
+        self._processing_clock_ms = processing_clock_ms or (lambda: monotonic_ns() // 1_000_000)
+        self._publication_lock = RLock()
+        self._update_sequence = 0
+        self._last_published_update: LiveUpdate | None = None
+        self._deadline_timer: Timer | None = None
+        self._verification_timer: Timer | None = None
+        self._capture_sequence = 0
+        self._capture_generation = 0
+        self._local_hint_tracker = LocalRuleHintTracker()
+        self._local_rule_hint: LocalRuleHint | None = None
+        self._turn_evidence = TurnEvidenceCache()
+        self._response_controls_last_capture: tuple[int, int] | None = None
+        self._response_controls_visible: bool | None = None
+        self._response_controls_absent_identity: tuple[object, ...] = ()
+        self._response_controls_edge_identity: tuple[object, ...] = ()
+        self._response_controls_edge_ms: int | None = None
+        self._response_controls_edge_processing_ms: int | None = None
+        self._response_controls_streak = 0
         self.consensus = BurstConsensus(min_votes=3)
         self._state_lock = RLock()
         self.status: LiveStatus = "initializing"
@@ -581,10 +614,13 @@ class LiveOrchestrator:
         self._published_sequence = 0
         self._advice_lock = RLock()
         self._requested_advice: set[AdviceRequestKey] = set()
+        self._pending_model_advice: set[AdviceRequestKey] = set()
         self._decision_id_by_revision: dict[int, str] = {}
         self._advice_completion_events: dict[AdviceRequestKey, Event] = {}
         self._self_turn_corroborated = False
         self.latest_advice: LiveAdvice | None = None
+        self._button_advice_key: AdviceRequestKey | None = None
+        self._button_advice_event: LiveEvent | None = None
         self._advice_worker: LatestOnlyWorker | None = None
         self._review_count = 0
         self._advice_requested_at_ms: dict[AdviceRequestKey, int] = {}
@@ -594,6 +630,11 @@ class LiveOrchestrator:
         self._advice_withhold_finish_event_id: str | None = None
         self._advice_suspended_reason: str | None = None
         self._advice_suspended_turn_key: tuple[str, int, int, Seat] | None = None
+        self._self_response_preflight_key: AdviceRequestKey | None = None
+        self._self_response_preflight_seen_turn: tuple[str, int] | None = None
+        self._self_response_preflight_started_ms: int | None = None
+        self._self_response_preflight_deadline_ms: int | None = None
+        self._self_response_preflight_timer: Timer | None = None
         self._accept_advice_results = True
         self._status_before_pause: LiveStatus | None = None
         self._analysis_epoch = 0
@@ -622,10 +663,21 @@ class LiveOrchestrator:
         # so a just-created turn can tell a new direct-next PASS from a stale
         # decoration, regardless of which seat owns that turn.
         self._last_pass_marker_players: frozenset[Seat] = frozenset()
+        self._capture_pass_baseline_pending = False
+        self._surface_fingerprint_by_seat: dict[Seat, np.ndarray] = {}
+        self._surface_generation_by_seat: dict[Seat, int] = {
+            seat: 0 for seat in TURN_ORDER
+        }
+        self._surface_last_change_ms_by_seat: dict[Seat, int] = {}
         self._desynchronized_turn_key: tuple[str, int, int, Seat] | None = None
         self._game_end_detected = False
         self._finish_order: list[Seat] = []
         self._placement_streaks: dict[Seat, tuple[str, int]] = {}
+        # A second-place badge can lead the final two card surfaces by one
+        # frame. Retain only the two bounded, same-source reads needed to
+        # prove that exact adjacent terminal pair; the badge itself is never
+        # action evidence.
+        self._terminal_pair_pending: tuple[int, int, int, int, tuple[str, ...], tuple[str, ...], int] | None = None
         # A left-side read may improve only a previously obscured left action.
         # It is deliberately kept outside the reducer history.  The same
         # result must be observed twice before it becomes a visual correction.
@@ -641,6 +693,7 @@ class LiveOrchestrator:
         self._pending_previous_action_retirements: list[
             tuple[str, _PreviousActionVerification]
         ] = []
+        self.automatic_log_delivery_result: dict[str, object] | None = None
         if advisor is not None:
             self._advice_worker = LatestOnlyWorker(
                 self._run_advice,
@@ -694,6 +747,8 @@ class LiveOrchestrator:
         hand: tuple[str, ...],
         lead_player: Seat | None,
         monotonic_ms: int,
+        wall_time: str | None = None,
+        historical_scan: bool = False,
     ) -> LiveUpdate:
         if self.status != "initializing":
             raise RuntimeError("实时对局已经启动")
@@ -708,13 +763,19 @@ class LiveOrchestrator:
         self._game_end_detected = False
         self._finish_order = []
         self._placement_streaks.clear()
+        self._terminal_pair_pending = None
         self._advice_withhold_reason = None
         self._advice_withhold_revision = None
         self._advice_withhold_finish_event_id = None
         self._advice_suspended_reason = None
         self._advice_suspended_turn_key = None
+        self._clear_self_response_preflight()
+        self._self_response_preflight_seen_turn = None
         self._turn_ownership_window = None
         self._last_pass_marker_players = frozenset()
+        self._surface_fingerprint_by_seat.clear()
+        self._surface_generation_by_seat = {seat: 0 for seat in TURN_ORDER}
+        self._surface_last_change_ms_by_seat.clear()
         self._desynchronized_turn_key = None
         self._previous_action_verifications.clear()
         self._pending_previous_action_retirements.clear()
@@ -726,6 +787,8 @@ class LiveOrchestrator:
             hand=hand,
             lead_player=lead_player,
             source="manual_start_with_initial_metadata",
+            monotonic_ms=monotonic_ms,
+            wall_time=wall_time,
         )
         event = self._publish_event(event)
         if lead_player is None:
@@ -740,7 +803,7 @@ class LiveOrchestrator:
         self.status = "running"
         self._first_action_pending = True
         self._self_lead_controls_seen = False
-        self._self_lead_controls_cleared = lead_player != "self"
+        self._self_lead_controls_cleared = lead_player != "self" or historical_scan
         self._activate_zone(int(monotonic_ms))
         turn_started = self._append_lifecycle_event(
             "turn_started",
@@ -778,9 +841,10 @@ class LiveOrchestrator:
     ) -> RecorderWarning | None:
         with self._state_lock:
             status = self.status
+            terminal_seen = self._game_end_detected
         if status == "sealed":
             raise RuntimeError("对局已经结束")
-        if status == "finalizing":
+        if status == "finalizing" or terminal_seen:
             return None
         warning = self.recorder.write_frame(frame, monotonic_ms, wall_time)
         if warning is not None:
@@ -798,11 +862,21 @@ class LiveOrchestrator:
     ) -> LiveUpdate:
         round_finished = False
         terminal_expected: Seat = "self"
+        historical_scan = bool(
+            (trace_context or {}).get("historical_scan", False)
+        )
         with self._state_lock:
             if self.status == "sealed":
                 raise RuntimeError("对局已经结束")
+            incoming_context = dict(trace_context or {})
+            incoming_generation = incoming_context.get("capture_generation", self._capture_generation)
+            if type(incoming_generation) is not int or incoming_generation < self._capture_generation:
+                return self._update()
+            if incoming_generation > self._capture_generation:
+                self.bind_capture_generation(incoming_generation)
             self._last_monotonic_ms = int(monotonic_ms)
-            self._recognition_trace_context = dict(trace_context or {})
+            self._recognition_trace_context = incoming_context
+            self._capture_sequence += 1
             if self.status == "waiting_lead":
                 job_key = self._analysis_job_key()
             elif self.status != "running":
@@ -875,6 +949,7 @@ class LiveOrchestrator:
         with self._state_lock:
             if not self._analysis_job_is_current(job_key):
                 return self._update()
+            self._observe_local_rule_hint(fast, monotonic_ms, frame_size=(frame.shape[1], frame.shape[0]))
             placement_events = self._apply_visual_placements(
                 fast,
                 defer_player=expected,
@@ -883,7 +958,7 @@ class LiveOrchestrator:
                 self._analysis_epoch += 1
                 self._clear_burst()
                 self._activate_zone(monotonic_ms)
-                self._request_advice_if_needed()
+                self._request_advice_after_fast_signal(fast, monotonic_ms)
                 return self._update(
                     event=placement_events[-1],
                     events=placement_events,
@@ -901,8 +976,46 @@ class LiveOrchestrator:
             if fast.super_double_visible:
                 self._clear_burst()
                 return self._update(fast_signals=fast)
+            self._track_response_control_edge(fast, monotonic_ms)
+            cannot_beat = self._advance_cannot_beat_confirmation(
+                fast,
+                monotonic_ms,
+            )
+            if cannot_beat is not None:
+                return self._update(
+                    event=cannot_beat.event,
+                    events=cannot_beat.events,
+                    fast_signals=fast,
+                )
+            self._resolve_self_response_preflight_from_fast(
+                fast,
+                monotonic_ms,
+            )
+            owner_window = self._ensure_turn_ownership_window()
+            if (
+                owner_window is not None
+                and owner_window.cannot_beat_streak
+                and self._self_response_preflight_key is not None
+            ):
+                # The first safe frame is deliberately confirmation-only.  Do
+                # not expose a slower advisor result or enter card recognition
+                # while the dedicated local PASS control is being verified.
+                return self._update(fast_signals=fast)
             self._apply_fast_signal(fast)
-            if self._self_lead_waiting_for_action(expected, fast):
+            self._update_surface_generations(frame, monotonic_ms)
+            terminal_chain = self._reconcile_terminal_action_chain(
+                frame, fast, monotonic_ms,
+            )
+            if terminal_chain is not None:
+                return self._update(
+                    event=terminal_chain[-1] if terminal_chain else None,
+                    events=terminal_chain,
+                    fast_signals=fast,
+                )
+            if (
+                not historical_scan
+                and self._self_lead_waiting_for_action(expected, fast)
+            ):
                 self._reset_waiting_self_lead(
                     monotonic_ms,
                     frame=frame,
@@ -945,13 +1058,17 @@ class LiveOrchestrator:
                     content_changed=True,
                 )
             decision = self._zone.observe(current_metrics)
-            ownership_resolution = self._observe_turn_ownership(
-                expected,
-                fast,
-                monotonic_ms,
-                frame=frame,
-                metrics=current_metrics,
-                decision=decision,
+            ownership_resolution = (
+                None
+                if historical_scan and self._first_action_pending
+                else self._observe_turn_ownership(
+                    expected,
+                    fast,
+                    monotonic_ms,
+                    frame=frame,
+                    metrics=current_metrics,
+                    decision=decision,
+                )
             )
             if ownership_resolution is not None:
                 return self._update(
@@ -962,6 +1079,8 @@ class LiveOrchestrator:
             if self._desynchronized_turn_key == self._turn_ownership_key():
                 return self._update(fast_signals=fast)
             owner_window = self._ensure_turn_ownership_window()
+            if owner_window is not None and self._check_recovery_deadline(owner_window):
+                return self._update(fast_signals=fast)
             turn_recovery_pending = bool(
                 owner_window is not None and owner_window.turn_recovery_pending
             )
@@ -1303,6 +1422,15 @@ class LiveOrchestrator:
     ) -> LiveUpdate:
         event = self.reducer.confirm_lead_player(lead)
         event = self._publish_event(event)
+        update_metadata = getattr(self.store, "update_session_metadata", None)
+        if callable(update_metadata):
+            update_metadata(
+                {
+                    "lead_player": lead,
+                    "lead_player_confirmed_at": event.wall_time,
+                    "lead_player_event_id": event.event_id,
+                }
+            )
         self.status = "running"
         self._lead_auto_confirmed_from_marker = bool(auto_confirmed_from_marker)
         turn_started = self._append_lifecycle_event(
@@ -1554,7 +1682,7 @@ class LiveOrchestrator:
         self._clear_first_action_candidates()
         self._activate_zone(int(monotonic_ms))
         turn_started = self._append_current_turn_started()
-        self._request_advice_if_needed()
+        self._request_advice_if_needed(bypass_response_preflight=True)
         events = (event, *outcomes) + ((turn_started,) if turn_started else ())
         return self._update(event=event, events=events)
 
@@ -1677,8 +1805,268 @@ class LiveOrchestrator:
         self.latest_review = None
         self._clear_burst()
         self._activate_zone(self._last_monotonic_ms)
-        self._request_advice_if_needed()
+        self._request_advice_if_needed(bypass_response_preflight=True)
         return self._update(event=event)
+
+    @_state_synchronized
+    def bind_capture_generation(self, generation: int) -> LiveUpdate:
+        """Bind an activated capture token BEFORE resume or waiting-lead work.
+
+        This does not resume, alter cards/history, or clear a history gate.
+        It retires all old-source visual evidence and returns a versioned
+        update owned by the new generation. Equal generations are idempotent.
+        """
+        if type(generation) is not int or generation <= 0 or generation < self._capture_generation:
+            raise ValueError("capture generation must be a positive nondecreasing integer")
+        if self.status in {"finalizing", "sealed"}:
+            raise RuntimeError("cannot bind capture while finalizing or sealed")
+        if generation == self._capture_generation:
+            return self._update()
+        old = self._turn_ownership_window
+        unresolved = self._button_recovery_pending(old)
+        with self._publication_lock:
+            self._capture_generation = generation
+            self._analysis_epoch += 1
+        if old is not None:
+            self._clear_recovery_deadline(old)
+        self._clear_current_cannot_beat_confirmation()
+        self._clear_self_response_preflight()
+        self._clear_burst()
+        self._clear_first_action_candidates()
+        self._self_turn_corroborated = False
+        if self.latest_advice is not None:
+            self.latest_advice = replace(self.latest_advice, visible=False)
+        self._baseline_by_seat.clear()
+        self._previous_by_seat.clear()
+        self._content_prev_by_seat.clear()
+        self._surface_fingerprint_by_seat.clear()
+        self._surface_generation_by_seat = {seat: 0 for seat in TURN_ORDER}
+        self._surface_last_change_ms_by_seat.clear()
+        self._last_pass_marker_players = frozenset()
+        self._capture_pass_baseline_pending = True
+        self._lead_candidate = None
+        self._lead_candidate_frames = 0
+        self._lead_confirmation_frame = None
+        self._lead_stability_frames.clear()
+        self._suit_correction_tracker = SuitCorrectionTracker()
+        self._previous_action_verifications.clear()
+        self._pending_previous_action_retirements.clear()
+        self._zone = None
+        key = self._turn_ownership_key()
+        fresh = None if key is None else _TurnOwnershipWindow(
+            key=key, expected_player=key[-1],
+            evidence_epoch=(*key, self._analysis_epoch, generation),
+            created_capture_ms=self._last_monotonic_ms,
+            turn_recovery_pending=bool(unresolved),
+            turn_recovery_detected_ms=(old.turn_recovery_detected_ms or self._last_monotonic_ms) if unresolved and old is not None else None,
+            turn_recovery_failed=bool(old is not None and (old.turn_recovery_failed or old.wind_catch_pass_recovery_failed)),
+            turn_recovery_failure_reason=(old.turn_recovery_failure_reason or old.wind_catch_pass_recovery_failure_reason) if old is not None else "",
+        )
+        with self._publication_lock:
+            self._turn_ownership_window = fresh
+        return self._update()
+
+    @staticmethod
+    def _clear_terminal_action_chain(window: _TurnOwnershipWindow | None) -> None:
+        if window is None:
+            return
+        window.terminal_action_chain_signature = None
+        window.terminal_action_chain_streak = 0
+        window.terminal_action_chain_first_ms = None
+        window.terminal_action_chain_last_ms = None
+        window.terminal_action_chain_last_seq = None
+        window.terminal_action_chain_captures = 0
+        window.terminal_action_chain_epoch = None
+        window.terminal_action_chain_badge_player = None
+        window.terminal_action_chain_badge_placement = None
+        window.terminal_action_chain_badge_ms = None
+
+    def _reconcile_terminal_action_chain(
+        self, frame: np.ndarray, fast: FastSignalResult, monotonic_ms: int,
+    ) -> tuple[LiveEvent, ...] | None:
+        """Prove the complete action chain before accepting a placement badge.
+
+        The badge only opens a bounded read window. Each actual card action
+        needs its own unconsumed before-image and two distinct full-chain reads.
+        """
+        window = self._ensure_turn_ownership_window()
+        if window is None:
+            return None
+        epoch = (self._capture_generation, self._analysis_epoch)
+        if window.terminal_action_chain_epoch != epoch:
+            self._clear_terminal_action_chain(window)
+        snapshot = self.snapshot
+        now = int(monotonic_ms)
+        placement_names = ("head", "second", "third")
+        expected_placement = (
+            placement_names[len(self._finish_order)]
+            if len(self._finish_order) < len(placement_names)
+            else None
+        )
+        placement_signals = tuple(getattr(fast, "placements", ()))
+        valid_badges = [
+            signal
+            for signal in placement_signals
+            if (
+                expected_placement is not None
+                and signal.player in TURN_ORDER
+                and signal.player not in snapshot.finished_seats
+                and snapshot.remaining_cards.get(signal.player, 0) > 0
+                and str(signal.placement).strip().lower() == expected_placement
+            )
+        ]
+        if len(valid_badges) > 1:
+            self._clear_terminal_action_chain(window)
+            return ()
+        badge_player: Seat | None = None
+        badge_placement: str | None = None
+        if len(valid_badges) == 1:
+            badge_player = valid_badges[0].player
+            badge_placement = str(valid_badges[0].placement).strip().lower()
+        elif (
+            not placement_signals
+            and window.terminal_action_chain_badge_player in TURN_ORDER
+            and window.terminal_action_chain_badge_placement == expected_placement
+            and window.terminal_action_chain_badge_ms is not None
+            and now - window.terminal_action_chain_badge_ms <= 2_000
+            and window.terminal_action_chain_badge_player not in snapshot.finished_seats
+            and snapshot.remaining_cards.get(window.terminal_action_chain_badge_player, 0) > 0
+        ):
+            badge_player = window.terminal_action_chain_badge_player
+            badge_placement = window.terminal_action_chain_badge_placement
+        else:
+            if placement_signals:
+                self._clear_terminal_action_chain(window)
+                if all(
+                    signal.player in TURN_ORDER
+                    and (
+                        signal.player in snapshot.finished_seats
+                        or snapshot.remaining_cards.get(signal.player, 0) <= 0
+                    )
+                    for signal in placement_signals
+                ):
+                    return None
+                return ()
+            return None
+
+        if snapshot.current_player not in TURN_ORDER or badge_player not in TURN_ORDER:
+            self._clear_terminal_action_chain(window)
+            return None
+
+        path: list[Seat] = []
+        player = snapshot.current_player
+        try:
+            for _ in range(3):
+                if player in snapshot.finished_seats:
+                    self._clear_terminal_action_chain(window)
+                    return None
+                path.append(player)
+                if player == badge_player:
+                    break
+                player = next_active_seat(player, snapshot.finished_seats)
+            else:
+                self._clear_terminal_action_chain(window)
+                return ()
+        except GameStateError:
+            self._clear_terminal_action_chain(window)
+            return None
+        if not path or path[-1] != badge_player:
+            self._clear_terminal_action_chain(window)
+            return ()
+
+        if window.terminal_action_chain_first_ms is None:
+            window.terminal_action_chain_first_ms = now
+            window.terminal_action_chain_epoch = epoch
+            window.terminal_action_chain_badge_player = badge_player
+            window.terminal_action_chain_badge_placement = badge_placement
+            window.terminal_action_chain_badge_ms = now
+        elif (
+            window.terminal_action_chain_badge_player != badge_player
+            or window.terminal_action_chain_badge_placement != badge_placement
+        ):
+            self._clear_terminal_action_chain(window)
+            return ()
+        elif len(valid_badges) == 1:
+            window.terminal_action_chain_badge_ms = now
+        if (now - window.terminal_action_chain_first_ms > 2_000
+                or window.terminal_action_chain_captures >= 4):
+            return ()
+        sequence = self._recognition_trace_context.get("capture_seq", self._capture_sequence)
+        if (type(sequence) is not int
+                or window.terminal_action_chain_last_ms is not None
+                and now <= window.terminal_action_chain_last_ms
+                or window.terminal_action_chain_last_seq is not None
+                and sequence <= window.terminal_action_chain_last_seq):
+            return ()
+        window.terminal_action_chain_last_ms = now
+        window.terminal_action_chain_last_seq = sequence
+        window.terminal_action_chain_captures += 1
+        self._capture_turn_surface_baseline(window, frame, fast)
+        preview = self.reducer.clone_empty()
+        scanned: list[tuple[Seat, ConsensusResult]] = []
+        metrics = ZoneFrameMetrics(now, True, 0.0, False, False)
+        try:
+            for event in self.reducer.events:
+                preview.apply(event)
+            for player in path:
+                if preview.snapshot().current_player != player:
+                    break
+                observation = self._recognize_play_region(
+                    frame, player, wild_rank=snapshot.wild_rank, allow_pass=False,
+                )
+                candidate = self._turn_recovery_cycle_candidate(
+                    preview, observation, metrics=metrics, fast=fast,
+                )
+                if (candidate is None or candidate.is_pass or not candidate.cards
+                        or not self._turn_recovery_non_pass_is_fresh(
+                            window, player, candidate, frame, observation)):
+                    break
+                self._apply_preview_consensus(preview, candidate)
+                scanned.append((player, candidate))
+        except (GameStateError, cv2.error, IndexError, OSError, RuntimeError, ValueError):
+            scanned.clear()
+        preview_snapshot = preview.snapshot()
+        if (len(scanned) != len(path)
+                or badge_player not in preview_snapshot.finished_seats
+                or preview_snapshot.remaining_cards.get(badge_player) != 0):
+            window.terminal_action_chain_signature = None
+            window.terminal_action_chain_streak = 0
+            return ()
+        signature = (
+            badge_player,
+            badge_placement,
+            tuple(
+                self._turn_recovery_candidate_signature(player, candidate)
+                for player, candidate in scanned
+            ),
+        )
+        if signature == window.terminal_action_chain_signature:
+            window.terminal_action_chain_streak += 1
+        else:
+            window.terminal_action_chain_signature = signature
+            window.terminal_action_chain_streak = 1
+        if window.terminal_action_chain_streak < 2:
+            return ()
+        actions, before_snapshots, after_snapshots = self._commit_recovery_action_batch(
+            tuple(scanned), now,
+            allow_terminal=preview_snapshot.current_player is None,
+            expected_current_player=preview_snapshot.current_player,
+        )
+        events = list(actions)
+        self._clear_terminal_action_chain(window)
+        for action, before, after in zip(actions, before_snapshots, after_snapshots):
+            self._advance_previous_action_verifications(action, after=after)
+            events.extend(self._append_action_outcomes(
+                before, after, trigger_action_event_id=action.event_id,
+                trigger_actor=action.actor,
+            ))
+        if self.snapshot.current_player is not None:
+            self._activate_zone(now)
+            turn_started = self._append_current_turn_started()
+            if turn_started is not None:
+                events.append(turn_started)
+            self._request_advice_after_fast_signal(fast, now)
+        return tuple(events)
 
     @_state_synchronized
     def pause(self) -> LiveUpdate:
@@ -1688,6 +2076,8 @@ class LiveOrchestrator:
             self._analysis_epoch += 1
             self._clear_burst()
             self._clear_first_action_candidates()
+            self._clear_current_cannot_beat_confirmation()
+            self._clear_self_response_preflight()
             self._zone = None
             self._append_lifecycle_event("session_paused", {})
         return self._update()
@@ -1701,6 +2091,7 @@ class LiveOrchestrator:
         self._analysis_epoch += 1
         if self.status == "running":
             self._activate_zone(monotonic_ms)
+            self._request_advice_if_needed()
         self._append_lifecycle_event("session_resumed", {})
         return self._update()
 
@@ -1711,6 +2102,8 @@ class LiveOrchestrator:
         self.status = "finalizing"
         self._analysis_epoch += 1
         self._accept_advice_results = False
+        self._clear_current_cannot_beat_confirmation()
+        self._clear_self_response_preflight()
         self._zone = None
         self._clear_burst()
         self._clear_first_action_candidates()
@@ -1797,7 +2190,9 @@ class LiveOrchestrator:
 
     @_state_synchronized
     def start_self_advice(self) -> AdviceRequestKey | None:
-        return self._request_advice_if_needed()
+        return self._request_advice_if_needed(
+            bypass_response_preflight=True
+        )
 
     def wait_for_advice(
         self,
@@ -1846,12 +2241,20 @@ class LiveOrchestrator:
             self.status = "finalizing"
             self._analysis_epoch += 1
             self._accept_advice_results = False
+            self._clear_current_cannot_beat_confirmation()
+            self._clear_self_response_preflight()
             self._append_lifecycle_event("session_finalizing", {})
         if self._advice_worker is not None:
             self._advice_worker.stop(timeout=5.0)
         with self._state_lock:
-            health_report = self._build_seal_health_audit()
             recording = self.recorder.close()
+            health_report = self._build_seal_health_audit(recording.integrity)
+            update_metadata = getattr(self.store, "update_session_metadata", None)
+            if callable(update_metadata):
+                try:
+                    update_metadata({"recording_integrity": recording.integrity})
+                except Exception:
+                    _LOGGER.warning("录像完整性写入会话清单失败", exc_info=True)
             self.store.seal(
                 frame_count=recording.frame_count,
                 dropped_frames=recording.dropped_frames,
@@ -1875,6 +2278,10 @@ class LiveOrchestrator:
                     )
                 except Exception:
                     _LOGGER.warning("封局后健康报告写入失败", exc_info=True)
+            if bool(
+                getattr(self.store, "automatic_log_delivery_enabled", False)
+            ):
+                self.automatic_log_delivery_result = self._deliver_automatic_log()
             self.status = "sealed"
             self._zone = None
             self._clear_burst()
@@ -1892,10 +2299,43 @@ class LiveOrchestrator:
                 _LOGGER.warning("FableDan 训练数据待确认文件创建失败", exc_info=True)
         return update
 
-    def _build_seal_health_audit(self) -> dict[str, object]:
+    def _deliver_automatic_log(self) -> dict[str, object]:
+        recorder = getattr(self.store, "record_automatic_log_delivery", None)
+        try:
+            from ..automatic_log_delivery import export_automatic_session_log
+
+            result = export_automatic_session_log(self.store.directory)
+            document = result.to_dict()
+        except Exception as exc:
+            _LOGGER.warning("自动对局日志导出失败", exc_info=True)
+            document = {
+                "schema": "guandan.auto-log-delivery/1",
+                "status": "FAIL",
+                "session_id": self.snapshot.session_id,
+                "output_directory": None,
+                "diagnostic_zip_path": None,
+                "include_media": False,
+                "used_fallback": False,
+                "error": str(exc),
+            }
+        if callable(recorder):
+            try:
+                recorder(document)
+            except Exception:
+                _LOGGER.warning("自动日志交付证据写入失败", exc_info=True)
+        return document
+
+    def _build_seal_health_audit(
+        self,
+        recording_integrity: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         """Compute facts before close; persistence happens strictly post-seal."""
         try:
-            return audit_session_health(self.snapshot, self._all_events)
+            return audit_session_health(
+                self.snapshot,
+                self._all_events,
+                recording_integrity=recording_integrity,
+            )
         except Exception:
             # Health auditing is evidence-only.  A full disk or malformed
             # diagnostic sink must never leave a genuine game unsealed.
@@ -2001,6 +2441,21 @@ class LiveOrchestrator:
             self._baseline_by_seat.pop(player, None)
             self._previous_by_seat.pop(player, None)
             self._content_prev_by_seat.pop(player, None)
+            anchor_roi = self._turn_evidence.before_roi(
+                int(monotonic_ms), generation=self._capture_generation, seat=player,
+            )
+            anchor = None if anchor_roi is not None else self._turn_evidence.before(
+                int(monotonic_ms), generation=self._capture_generation, seat=player,
+            )
+            if anchor_roi is not None or anchor is not None:
+                try:
+                    prior = anchor_roi.frame if anchor_roi is not None else self._play_roi(anchor.frame, player)
+                    gray = cv2.GaussianBlur(cv2.cvtColor(prior, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+                    self._baseline_by_seat[player] = gray.copy()
+                    self._previous_by_seat[player] = gray.copy()
+                    self._content_prev_by_seat[player] = self._content_fingerprint_from_roi(prior)
+                except (cv2.error, IndexError, ValueError):
+                    pass
         spec = strategy_spec(self.recognition_strategy)
         self._zone = ZoneLifecycle(
             expected_player=player,
@@ -2036,8 +2491,16 @@ class LiveOrchestrator:
             return None
         window = self._turn_ownership_window
         if window is None or window.key != key:
-            window = _TurnOwnershipWindow(key=key, expected_player=key[-1])
-            self._turn_ownership_window = window
+            window = _TurnOwnershipWindow(
+                key=key,
+                expected_player=key[-1],
+                surface_generation_baseline=dict(self._surface_generation_by_seat),
+                pass_marker_baseline=frozenset(self._last_pass_marker_players),
+                evidence_epoch=(*key, self._analysis_epoch),
+                created_capture_ms=self._last_monotonic_ms,
+            )
+            with self._publication_lock:
+                self._turn_ownership_window = window
         return window
 
     def _is_self_lead_handoff(
@@ -2070,6 +2533,7 @@ class LiveOrchestrator:
         active: Seat,
         monotonic_ms: int,
     ) -> None:
+        self._clear_self_static_handoff(window)
         self._clear_unseen_direct_next_pass(window)
         self._clear_crossed_handoff_recovery(window)
         self._clear_wind_catch_pass_recovery(window)
@@ -2169,10 +2633,13 @@ class LiveOrchestrator:
     ) -> dict[str, object]:
         return {
             "pending": window.wind_catch_pass_recovery_pending,
+            "failed": window.wind_catch_pass_recovery_failed,
+            "failure_reason": window.wind_catch_pass_recovery_failure_reason,
             "receiver": window.wind_catch_pass_recovery_receiver,
             "detected_ms": window.wind_catch_pass_recovery_detected_ms,
             "deadline_ms": window.wind_catch_pass_recovery_deadline_ms,
             "marker_streak": window.wind_catch_pass_recovery_marker_streak,
+            "marker_edge_seen": window.wind_catch_pass_recovery_marker_edge_seen,
             "receiver_play_streak": window.wind_catch_receiver_play_streak,
             "receiver_play": (
                 list(window.wind_catch_receiver_play.cards)
@@ -2190,8 +2657,116 @@ class LiveOrchestrator:
         window.wind_catch_pass_recovery_detected_ms = None
         window.wind_catch_pass_recovery_deadline_ms = None
         window.wind_catch_pass_recovery_marker_streak = 0
+        window.wind_catch_pass_recovery_marker_visible = False
+        window.wind_catch_pass_recovery_marker_edge_seen = False
         window.wind_catch_receiver_play = None
         window.wind_catch_receiver_play_streak = 0
+
+    def _withhold_advice_for_wind_catch_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        *,
+        failed: bool = False,
+    ) -> None:
+        """Publish one precise, bounded wind-catch status for this revision."""
+
+        snapshot = self.snapshot
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        expected_text = {
+            "right": "右家",
+            "opposite": "对家",
+            "left": "左家",
+            "self": "自己",
+        }.get(window.expected_player, "上一位玩家")
+        error = (
+            f"未能确认接风前{expected_text}的不出，继续暂缓推荐"
+            if failed
+            else f"正在确认接风前{expected_text}的不出，暂缓推荐"
+        )
+        self.latest_advice = LiveAdvice(
+            key=key,
+            status="withheld",
+            error=error,
+            withhold_reason="wind_catch_pass_recovery_pending",
+        )
+        if window.wind_catch_pass_recovery_advice_event_id is not None:
+            return
+        self.store.append_advice(
+            {
+                "request_id": key.request_id,
+                "status": "withheld",
+                "reason": "wind_catch_pass_recovery_pending",
+                "expected_player": window.expected_player,
+                "wind_receiver": window.wind_catch_pass_recovery_receiver,
+                "turn_id": key.turn_id,
+                "state_revision": key.state_revision,
+                "recovery_target_ms": _WIND_CATCH_RECOVERY_TARGET_MS,
+                **self._advisor_identity(),
+            }
+        )
+        event = self._append_advice_event(
+            "advice_withheld",
+            {
+                "request_id": key.request_id,
+                "reason": "wind_catch_pass_recovery_pending",
+                "expected_player": window.expected_player,
+                "wind_receiver": window.wind_catch_pass_recovery_receiver,
+                "state_revision": key.state_revision,
+                "recovery_target_ms": _WIND_CATCH_RECOVERY_TARGET_MS,
+            },
+            confidence=0.0,
+        )
+        window.wind_catch_pass_recovery_advice_event_id = event.event_id
+
+    def _fail_wind_catch_pass_recovery(
+        self,
+        window: _TurnOwnershipWindow,
+        *,
+        reason: str,
+        monotonic_ms: int,
+    ) -> None:
+        """End one short wind proof attempt without starting generic recovery."""
+
+        window.wind_catch_pass_recovery_pending = False
+        window.wind_catch_pass_recovery_failed = True
+        window.wind_catch_pass_recovery_failure_reason = str(reason)
+        window.disposition = "wind_catch_pass_recovery_failed"
+        window.handoff_block_reason = str(reason)
+        window.handoff_last_block_reason = str(reason)
+        window.handoff_deadline_kind = "wind_catch_pass"
+        window.sample_allowed = False
+        self._withhold_advice_for_wind_catch_recovery(window, failed=True)
+        self._append_lifecycle_event(
+            "wind_catch_pass_recovery_failed",
+            {
+                "reason": str(reason),
+                "expected_player": window.expected_player,
+                "wind_receiver": window.wind_catch_pass_recovery_receiver,
+                "elapsed_ms": (
+                    0
+                    if window.wind_catch_pass_recovery_detected_ms is None
+                    else max(
+                        0,
+                        int(monotonic_ms)
+                        - window.wind_catch_pass_recovery_detected_ms,
+                    )
+                ),
+                "target_ms": _WIND_CATCH_RECOVERY_TARGET_MS,
+            },
+            actor=window.expected_player,
+            confidence=0.0,
+            source="wind_catch_pass_recovery",
+        )
+        self._append_recognition_trace(
+            window=window,
+            outcome="wind_catch_pass_recovery_failed",
+            deadline_kind="wind_catch_pass",
+            reason=reason,
+        )
 
     @staticmethod
     def _crossed_handoff_recovery_telemetry(
@@ -2231,6 +2806,15 @@ class LiveOrchestrator:
             "local_started_ms": window.turn_recovery_local_started_ms,
             "local_deadline_ms": window.turn_recovery_local_deadline_ms,
             "target_exceeded": window.turn_recovery_target_exceeded,
+            "cycle_streak": window.turn_recovery_cycle_streak,
+            "cycle_first_ms": window.turn_recovery_cycle_first_ms,
+            "cycle_last_ms": window.turn_recovery_cycle_last_ms,
+            "missing_player": window.turn_recovery_cycle_missing_player,
+            "confirmed_actives": list(window.temporal_confirmed_actives),
+            "confirmed_passes": sorted(
+                window.temporal_confirmed_passes,
+                key=TURN_ORDER.index,
+            ),
         }
 
     def _begin_turn_recovery(
@@ -2245,6 +2829,23 @@ class LiveOrchestrator:
 
         if window.turn_recovery_pending:
             return
+        pre_signature: tuple[tuple[object, ...], ...] | None = None
+        pre_ms: int | None = None
+        sequence = self._recognition_trace_context.get("capture_seq", self._capture_sequence)
+        if (
+            reason == "self_turn_before_expected_action_confirmed"
+            and window.pre_recovery_chain_signature is not None
+            and window.pre_recovery_chain_generation == self._capture_generation
+            and window.pre_recovery_chain_epoch == window.evidence_epoch
+            and window.pre_recovery_chain_response_identity == self._response_identity()
+            and type(sequence) is int
+            and type(window.pre_recovery_chain_seq) is int
+            and window.pre_recovery_chain_seq < sequence
+            and type(window.pre_recovery_chain_ms) is int
+            and window.created_capture_ms <= window.pre_recovery_chain_ms < int(monotonic_ms)
+        ):
+            pre_signature = window.pre_recovery_chain_signature
+            pre_ms = window.pre_recovery_chain_ms
         self._clear_crossed_handoff_recovery(window)
         self._clear_unseen_direct_next_pass(window)
         window.turn_recovery_pending = True
@@ -2252,12 +2853,27 @@ class LiveOrchestrator:
         window.turn_recovery_active_player = fast.active_player
         window.turn_recovery_active_streak = 0
         window.turn_recovery_owner_return_streak = 0
+        window.turn_recovery_owner_seen = window.expected_player in window.temporal_confirmed_actives
+        window.turn_recovery_owner_departed = window.turn_recovery_owner_seen and fast.active_player != window.expected_player
         window.turn_recovery_pass_marker_streaks.clear()
         window.turn_recovery_advice_withheld = False
         window.turn_recovery_advice_event_id = None
         window.turn_recovery_local_started_ms = None
         window.turn_recovery_local_deadline_ms = None
         window.turn_recovery_target_exceeded = False
+        window.turn_recovery_cycle_signature = None
+        window.turn_recovery_cycle_streak = 0
+        window.turn_recovery_cycle_first_ms = None
+        window.turn_recovery_cycle_last_ms = None
+        window.turn_recovery_cycle_missing_player = None
+        window.turn_recovery_cycle_imported_pre_vote = False
+        if pre_signature is not None and pre_ms is not None:
+            window.turn_recovery_cycle_signature = pre_signature
+            window.turn_recovery_cycle_streak = 1
+            window.turn_recovery_cycle_first_ms = pre_ms
+            window.turn_recovery_cycle_last_ms = pre_ms
+            window.turn_recovery_cycle_imported_pre_vote = True
+        self._clear_pre_recovery_chain_candidate(window)
         window.disposition = "turn_recovery_pending"
         window.handoff_block_reason = reason
         window.handoff_last_block_reason = reason
@@ -2374,6 +2990,7 @@ class LiveOrchestrator:
         if window.turn_recovery_local_started_ms is None:
             window.turn_recovery_local_started_ms = now
             window.turn_recovery_local_deadline_ms = now + _ADVICE_RECOVERY_TARGET_MS
+            self._arm_recovery_deadline(window)
 
         snapshot = self.snapshot
         key = AdviceRequestKey(
@@ -2422,35 +3039,144 @@ class LiveOrchestrator:
             and now >= deadline_ms
             and not window.turn_recovery_target_exceeded
         ):
-            # This is audit/UI information only.  Do not set the global
-            # desynchronization latch: visual repair must continue, and a
-            # later complete revision can still safely request FableDan.
-            window.turn_recovery_target_exceeded = True
-            self.store.append_advice(
-                {
-                    "request_id": key.request_id,
-                    "status": "withheld",
-                    "reason": _TURN_RECOVERY_WITHHOLD_REASON,
-                    "outcome": "recovery_target_exceeded",
-                    "elapsed_ms": now - window.turn_recovery_local_started_ms,
-                    "target_ms": _ADVICE_RECOVERY_TARGET_MS,
-                    "turn_id": key.turn_id,
-                    "state_revision": key.state_revision,
-                    **self._advisor_identity(),
-                }
-            )
-            self._append_advice_event(
-                "advice_recovery_target_exceeded",
-                {
-                    "request_id": key.request_id,
-                    "expected_player": window.expected_player,
-                    "active_player": window.active_player,
-                    "elapsed_ms": now - window.turn_recovery_local_started_ms,
-                    "target_ms": _ADVICE_RECOVERY_TARGET_MS,
-                    "state_revision": key.state_revision,
-                },
-                confidence=0.0,
-            )
+            self._fail_turn_recovery(window, "local_response_deadline")
+            return
+
+    def _recovery_blocked_advice(self, window: _TurnOwnershipWindow) -> LiveAdvice:
+        snapshot = self.snapshot
+        seat = window.turn_recovery_cycle_missing_player or window.expected_player
+        seat_text = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}[seat]
+        missing = "首出" if not snapshot.trick_plays else "动作"
+        return LiveAdvice(
+            key=AdviceRequestKey(snapshot.session_id, snapshot.turn_id, snapshot.revision),
+            status="withheld", error=f"缺少{seat_text}{missing}，请先手动出牌",
+            withhold_reason=("turn_recovery_expired" if window.turn_recovery_failure_reason in {
+                "owner_returned_before_missing_action", "capture_evidence_window_expired"
+            } else "turn_recovery_budget_exceeded"),
+        )
+
+    def _arm_recovery_deadline(self, window: _TurnOwnershipWindow) -> None:
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
+        window.turn_recovery_processing_started_ms = self._processing_clock_ms()
+        snapshot = self.snapshot
+        blocked = self._recovery_blocked_advice(window)
+        generation = self._capture_generation
+        epoch = self._analysis_epoch
+        key = window.key
+        identity = (key, generation, epoch)
+        window.turn_recovery_deadline_identity = identity
+
+        def expired() -> None:
+            # Publication is independently serialized from expensive analysis.
+            # The same sequence/generation contract as normal updates prevents
+            # a delayed timer notice from replacing a newer ready state.
+            with self._publication_lock:
+                if (self._turn_ownership_window is not window or self.status != "running"
+                        or self._capture_generation != generation or self._analysis_epoch != epoch
+                        or window.key != key or window.turn_recovery_deadline_identity != identity):
+                    return
+                window.turn_recovery_deadline_expired = True
+                listener = self._update_listener
+                if listener is not None:
+                    self._update_sequence += 1
+                    notice = LiveUpdate(
+                        status="running", snapshot=snapshot, advice=blocked,
+                        capture_generation=generation, update_sequence=self._update_sequence,
+                        block_reason=blocked.withhold_reason,
+                        missing_player=window.turn_recovery_cycle_missing_player or window.expected_player,
+                        missing_action_kind="action" if snapshot.trick_plays else "lead",
+                        local_rule_hint=self._local_hint_tracker.current(
+                            session_id=snapshot.session_id, capture_generation=generation,
+                            now_ms=self._processing_clock_ms(),
+                        ),
+                    )
+            if listener is not None:
+                listener(notice)
+            with self._state_lock:
+                if (self._turn_ownership_window is window and self.status == "running"
+                        and self._capture_generation == generation and self._analysis_epoch == epoch
+                        and window.key == key and window.turn_recovery_deadline_identity == identity):
+                    self._fail_turn_recovery(window, "local_response_deadline")
+                    self._notify_update_listener()
+                elif window.turn_recovery_deadline_identity == identity:
+                    # The notice may already be queued, but its sequence and
+                    # generation let consumers reject it. Clear only this old
+                    # timer's flag; never poison a replacement source/window.
+                    self._clear_recovery_deadline(window)
+
+        timer = Timer(_ADVICE_RECOVERY_TARGET_MS / 1000, expired)
+        timer.daemon = True
+        self._deadline_timer = timer
+        timer.start()
+
+    def _fail_turn_recovery(self, window: _TurnOwnershipWindow, reason: str) -> None:
+        if window.turn_recovery_failed:
+            return
+        window.turn_recovery_failed = True
+        window.turn_recovery_failure_reason = reason
+        window.turn_recovery_target_exceeded = True
+        window.turn_recovery_pending = True
+        window.sample_allowed = False
+        window.disposition = "turn_recovery_failed"
+        window.temporal_confirmed_passes.clear()
+        window.temporal_confirmed_actives.clear()
+        window.handoff_samples.clear()
+        window.turn_recovery_cycle_signature = None
+        window.turn_recovery_cycle_streak = 0
+        self._clear_burst()
+        self.latest_advice = self._recovery_blocked_advice(window)
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
+            self._deadline_timer = None
+        started = window.turn_recovery_processing_started_ms
+        self._append_advice_event("advice_recovery_failed", {
+            "reason": reason, "expected_player": window.expected_player,
+            "missing_player": window.turn_recovery_cycle_missing_player or window.expected_player,
+            "response_budget_ms": _ADVICE_RECOVERY_TARGET_MS,
+            "processing_elapsed_ms": None if started is None else self._processing_clock_ms() - started,
+            "capture_detected_ms": window.turn_recovery_detected_ms,
+            "capture_closed_ms": self._last_monotonic_ms,
+        }, confidence=0.0)
+
+    def _clear_recovery_deadline(self, window: _TurnOwnershipWindow) -> None:
+        if self._turn_ownership_window is window and self._deadline_timer is not None:
+            self._deadline_timer.cancel()
+            self._deadline_timer = None
+        window.turn_recovery_deadline_expired = False
+        window.turn_recovery_deadline_identity = ()
+        window.turn_recovery_processing_started_ms = None
+        window.turn_recovery_local_started_ms = None
+        window.turn_recovery_local_deadline_ms = None
+
+    def _check_recovery_deadline(self, window: _TurnOwnershipWindow) -> bool:
+        identity = (window.key, self._capture_generation, self._analysis_epoch)
+        if window.turn_recovery_deadline_identity != identity and (
+            window.turn_recovery_deadline_identity or window.turn_recovery_deadline_expired
+            or window.turn_recovery_processing_started_ms is not None
+        ):
+            self._clear_recovery_deadline(window)
+        started = window.turn_recovery_processing_started_ms
+        if window.turn_recovery_deadline_expired or (
+            started is not None and self._processing_clock_ms() - started >= _ADVICE_RECOVERY_TARGET_MS
+        ):
+            self._fail_turn_recovery(window, "local_response_deadline")
+        return window.turn_recovery_failed
+
+    @_state_synchronized
+    def poll_deadlines(self) -> LiveUpdate:
+        """Resolve real-time response deadlines without requiring new frames."""
+        window = self._turn_ownership_window
+        if self.status == "running" and window is not None:
+            self._check_recovery_deadline(window)
+            target = self._previous_action_verification_target(self.snapshot)
+            if target is not None and target.processing_opened_ms is not None and (
+                self._processing_clock_ms() - target.processing_opened_ms >= _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS
+            ):
+                self._expire_previous_action_verification(
+                    target, monotonic_ms=(target.opened_monotonic_ms or 0) + _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS,
+                )
+        return self._update()
 
     def _advance_turn_recovery(
         self,
@@ -2461,13 +3187,51 @@ class LiveOrchestrator:
         metrics: ZoneFrameMetrics,
         decision: ZoneDecision,
         frame: np.ndarray | None = None,
+        rollback_window_state: dict[str, object] | None = None,
     ) -> _OwnershipResolution | None:
         """Collect delayed evidence until the missed owner's next action."""
+
+        if self._check_recovery_deadline(window):
+            return None
 
         active = fast.active_player
         window.active_player = active
         window.sample_allowed = False
+        if active == window.expected_player and not window.turn_recovery_owner_seen:
+            window.turn_recovery_owner_seen = True
+        elif active in TURN_ORDER and active != window.expected_player and window.turn_recovery_owner_seen:
+            window.turn_recovery_owner_departed = True
+        returned_to_self = bool(
+            fast.self_action_buttons_visible or fast.active_player == "self"
+        )
+        if returned_to_self and frame is None and window.turn_recovery_processing_started_ms is None:
+            self._withhold_advice_for_turn_recovery(window, monotonic_ms)
+        if frame is not None and returned_to_self:
+            recovered = self._recover_turn_recovery_cycle(
+                window,
+                frame,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                rollback_window_state=rollback_window_state,
+            )
+            if recovered is not None:
+                event, events = recovered
+                return _OwnershipResolution(event, events)
+            self._withhold_advice_for_turn_recovery(window, monotonic_ms)
+            window.disposition = "turn_recovery_cycle_collecting"
+            missing = window.turn_recovery_cycle_missing_player
+            window.handoff_block_reason = (
+                f"missing_recovery_surface:{missing}"
+                if missing is not None
+                else "waiting_for_two_matching_recovery_frames"
+            )
+            window.handoff_last_block_reason = window.handoff_block_reason
+            return None
         if active == window.expected_player:
+            if not window.turn_recovery_owner_departed:
+                window.disposition = "turn_recovery_initial_owner"
+                return None
             window.turn_recovery_owner_return_streak += 1
             window.disposition = "turn_recovery_owner_returned"
             window.handoff_block_reason = "expected_player_acted_again_before_recovery"
@@ -2475,27 +3239,7 @@ class LiveOrchestrator:
             window.handoff_deadline_kind = "owner_next_turn"
             if window.turn_recovery_owner_return_streak < 2:
                 return None
-            # Local controls mean every intervening seat still exposes its
-            # latest card/PASS surface.  Reconstruct that cycle before
-            # declaring a gap; no timer-skin classification chooses actions.
-            if frame is not None:
-                recovered = self._recover_turn_recovery_cycle(
-                    window,
-                    frame,
-                    fast,
-                    monotonic_ms,
-                    metrics=metrics,
-                )
-                if recovered is not None:
-                    event, events = recovered
-                    return _OwnershipResolution(event, events)
-            if (
-                self.snapshot.current_player == "self"
-                or fast.self_action_buttons_visible
-            ):
-                self._withhold_advice_for_turn_recovery(window, monotonic_ms)
-            # Evidence may remain undecided, but it must not globally latch
-            # the session while visual repair is still possible.
+            self._fail_turn_recovery(window, "owner_returned_before_missing_action")
             return None
 
         window.turn_recovery_owner_return_streak = 0
@@ -2551,6 +3295,8 @@ class LiveOrchestrator:
             or not window.turn_recovery_pending
             or result.status != "confirmed"
             or window.turn_recovery_active_streak < 2
+            or window.turn_recovery_failed
+            or window.turn_recovery_deadline_expired
         ):
             return False
         required_passes = self._turn_recovery_passes_after_action(
@@ -2570,7 +3316,7 @@ class LiveOrchestrator:
         window: _TurnOwnershipWindow | None,
         result: ConsensusResult,
     ) -> bool:
-        """Keep a confirmed expected-ROI play across a fast active-seat jump."""
+        """Keep only timestamped, same-epoch evidence from before recovery."""
 
         if (
             window is None
@@ -2580,6 +3326,10 @@ class LiveOrchestrator:
             or result.is_pass
             or result.vote_count < 2
             or len(window.handoff_samples) < 2
+            or not window.evidence_epoch
+            or window.turn_recovery_detected_ms is None
+            or window.turn_recovery_failed
+            or window.turn_recovery_deadline_expired
         ):
             return False
         expected_cards, _options = canonical_candidate(
@@ -2587,7 +3337,24 @@ class LiveOrchestrator:
             result.suit_options,
             is_pass=False,
         )
-        for sample in window.handoff_samples[-2:]:
+        samples = window.handoff_samples[-2:]
+        if (
+            any(type(sample.capture_seq) is not int or sample.capture_seq <= 0 for sample in samples)
+            or any(type(sample.captured_ms) is not int for sample in samples)
+            or samples[0].capture_seq >= samples[1].capture_seq
+            or samples[0].captured_ms >= samples[1].captured_ms
+        ):
+            return False
+        for sample in samples:
+            if (
+                sample.captured_ms is None
+                or sample.action_epoch != window.evidence_epoch
+                or not window.handoff_detected_ms <= sample.captured_ms
+                <= window.turn_recovery_detected_ms
+                or window.turn_recovery_detected_ms - sample.captured_ms
+                > _HANDOFF_READABLE_CONFIRMATION_MS
+            ):
+                return False
             cards, _sample_options = canonical_candidate(
                 sample.cards,
                 sample.suit_options,
@@ -2650,6 +3417,496 @@ class LiveOrchestrator:
         )
 
     @staticmethod
+    def _turn_recovery_candidate_signature(
+        player: Seat,
+        result: ConsensusResult,
+    ) -> tuple[object, ...]:
+        cards, suit_options = canonical_candidate(
+            result.resolved_cards or result.cards,
+            result.suit_options,
+            is_pass=result.is_pass,
+        )
+        return (
+            player,
+            bool(result.is_pass),
+            tuple(cards),
+            tuple(tuple(options) for options in suit_options),
+        )
+
+    def _capture_turn_surface_baseline(
+        self,
+        window: _TurnOwnershipWindow,
+        frame: np.ndarray,
+        fast: FastSignalResult,
+    ) -> None:
+        """Bind the recovery baseline to the captured turn surface.
+
+        This method intentionally does not invoke targeted card recognition.
+        Baseline capture happens before the normal expected-seat recognition
+        path and must therefore be observational only: consuming a queued
+        recognition result here can steal the first real action sample (and
+        makes the recovery decision depend on an extra, synthetic read).
+        Freshness is established from the immutable pixel baseline below;
+        when a later candidate is available its own recognized signature is
+        compared against that baseline and the bounded two-frame consensus
+        still provides the semantic gate.
+        """
+
+        if window.surface_baseline_captured:
+            return
+        anchor = self._turn_evidence.before(
+            window.created_capture_ms,
+            generation=self._capture_generation,
+            seat=window.expected_player,
+        )
+        window.surface_baseline_full_frame = (
+            anchor.frame.copy()
+            if anchor is not None and anchor.frame.shape == frame.shape
+            else None
+        )
+        for player in TURN_ORDER:
+            try:
+                seat_anchor = self._turn_evidence.before_roi(
+                    window.created_capture_ms,
+                    generation=self._capture_generation,
+                    seat=player,
+                )
+                if seat_anchor is not None:
+                    baseline_roi = seat_anchor.frame
+                else:
+                    full_anchor = self._turn_evidence.before(
+                        window.created_capture_ms,
+                        generation=self._capture_generation,
+                        seat=player,
+                    )
+                    baseline_roi = self._play_roi(
+                        full_anchor.frame if full_anchor is not None and full_anchor.frame.shape == frame.shape else frame,
+                        player,
+                    )
+                window.surface_baseline_frames[player] = baseline_roi.copy()
+            except (cv2.error, IndexError, OSError, RuntimeError, ValueError):
+                window.surface_baseline_frames.pop(player, None)
+            # Candidate baselines are populated only from evidence that was
+            # already read by the normal pipeline.  Do not perform an
+            # additional recognition call merely to initialize this cache.
+            window.surface_baseline_candidates.setdefault(player, ())
+        visible = self._pass_marker_players(fast)
+        window.temporal_pass_seen_absent.update(
+            seat for seat in TURN_ORDER if seat not in visible
+        )
+        window.surface_baseline_captured = True
+
+    def _observe_temporal_recovery_evidence(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+    ) -> None:
+        active = fast.active_player
+        if active in TURN_ORDER:
+            if active == window.temporal_active_player:
+                window.temporal_active_streak += 1
+            else:
+                window.temporal_active_player = active
+                window.temporal_active_streak = 1
+            if (
+                window.temporal_active_streak == 2
+                and (
+                    not window.temporal_confirmed_actives
+                    or window.temporal_confirmed_actives[-1] != active
+                )
+            ):
+                window.temporal_confirmed_actives.append(active)
+                del window.temporal_confirmed_actives[:-8]
+        visible = self._pass_marker_players(fast)
+        for player in TURN_ORDER:
+            if player not in visible:
+                window.temporal_pass_seen_absent.add(player)
+                window.temporal_pass_marker_streaks[player] = 0
+                continue
+            if player not in window.temporal_pass_seen_absent:
+                continue
+            streak = window.temporal_pass_marker_streaks.get(player, 0) + 1
+            window.temporal_pass_marker_streaks[player] = streak
+            if streak >= 2:
+                window.temporal_confirmed_passes.add(player)
+
+    def _turn_recovery_non_pass_is_fresh(
+        self,
+        window: _TurnOwnershipWindow,
+        player: Seat,
+        result: ConsensusResult,
+        frame: np.ndarray,
+        observation: PlayRegionResult,
+    ) -> bool:
+        expected_cards, _options = canonical_candidate(
+            result.resolved_cards or result.cards,
+            result.suit_options,
+            is_pass=False,
+        )
+        current_signature = (
+            tuple(expected_cards),
+            tuple(tuple(item) for item in _options),
+        )
+        baseline_signature = window.surface_baseline_candidates.get(player, ())
+        if baseline_signature and baseline_signature == current_signature:
+            return False
+
+        # Matching recognition results are not a freshness signal.  The
+        # expected-seat burst may simply be rereading the same stale card
+        # surface (the exact failure mode this recovery path is intended to
+        # prevent).  Always require a change on the bound visual surface
+        # below; the outer recovery loop supplies the independent two-frame
+        # semantic confirmation.
+        boxes = [
+            annotation.box
+            for annotation in observation.annotations
+            if annotation.category == "play"
+        ]
+        before = window.surface_baseline_frames.get(player)
+        after = self._play_roi(frame, player)
+        if before is not None:
+            if before.shape != after.shape or before.size == 0:
+                return False
+            relative_box = self._play_roi_relative_box(frame, player, boxes)
+            if relative_box is not None:
+                left, top, right, bottom = relative_box
+                localized_before = before[top:bottom, left:right]
+                localized_after = after[top:bottom, left:right]
+                if (
+                    localized_before.shape == localized_after.shape
+                    and localized_before.size > 0
+                    and self._turn_recovery_surface_changed(localized_before, localized_after)
+                ):
+                    return True
+            return self._turn_recovery_surface_changed(before, after)
+
+        baseline_frame = window.surface_baseline_full_frame
+        if boxes and player == window.expected_player and baseline_frame is not None and baseline_frame.shape == frame.shape:
+            left = max(0, min(box[0] for box in boxes) - 3)
+            top = max(0, min(box[1] for box in boxes) - 3)
+            right = min(frame.shape[1], max(box[0] + box[2] for box in boxes) + 3)
+            bottom = min(frame.shape[0], max(box[1] + box[3] for box in boxes) + 3)
+            before = baseline_frame[top:bottom, left:right]
+            after = frame[top:bottom, left:right]
+        else:
+            return False
+        if before is None or before.shape != after.shape or before.size == 0:
+            return False
+        return self._turn_recovery_surface_changed(before, after)
+
+    def _play_roi_relative_box(
+        self,
+        frame: np.ndarray,
+        player: Seat,
+        boxes: list[tuple[int, int, int, int]],
+    ) -> tuple[int, int, int, int] | None:
+        if not boxes:
+            return None
+        annotation_service = getattr(self.recognition_service, "annotation_service", None)
+        list_regions = getattr(annotation_service, "list_regions", None)
+        if not callable(list_regions):
+            return None
+        try:
+            region_name = next(
+                name
+                for name, mapped_seat in PLAY_REGION_TO_SEAT.items()
+                if mapped_seat == player
+            )
+            region = next(
+                item for item in list_regions() if getattr(item, "name", None) == region_name
+            )
+            ratio_box = getattr(region, "ratio_box", None)
+            if not isinstance(ratio_box, (tuple, list)) or len(ratio_box) != 4:
+                return None
+            height, width = frame.shape[:2]
+            roi_left = round(float(ratio_box[0]) * width)
+            roi_top = round(float(ratio_box[1]) * height)
+            roi_width = max(1, round(float(ratio_box[2]) * width))
+            roi_height = max(1, round(float(ratio_box[3]) * height))
+        except (StopIteration, TypeError, ValueError):
+            return None
+        try:
+            roi = self._play_roi(frame, player)
+        except (cv2.error, IndexError, OSError, RuntimeError, ValueError):
+            return None
+        if roi.shape[:2] != (roi_height, roi_width):
+            return None
+        left = max(0, min(box[0] for box in boxes) - 3 - roi_left)
+        top = max(0, min(box[1] for box in boxes) - 3 - roi_top)
+        right = min(roi_width, max(box[0] + box[2] for box in boxes) + 3 - roi_left)
+        bottom = min(roi_height, max(box[1] + box[3] for box in boxes) + 3 - roi_top)
+        if right <= left or bottom <= top:
+            return None
+        return int(left), int(top), int(right), int(bottom)
+
+    def _turn_recovery_surface_changed(
+        self,
+        before: np.ndarray,
+        after: np.ndarray,
+    ) -> bool:
+        if before.shape != after.shape or before.size == 0:
+            return False
+        before_gray = cv2.GaussianBlur(
+            cv2.cvtColor(before, cv2.COLOR_BGR2GRAY),
+            (5, 5),
+            0,
+        )
+        after_gray = cv2.GaussianBlur(
+            cv2.cvtColor(after, cv2.COLOR_BGR2GRAY),
+            (5, 5),
+            0,
+        )
+        difference = cv2.absdiff(before_gray, after_gray)
+        changed_fraction = float(np.mean(difference >= 12))
+        changed_mean = float(np.mean(difference)) / 255.0
+        if changed_fraction >= 0.02 and changed_mean >= 0.006:
+            return True
+        before_fingerprint = self._content_fingerprint_from_roi(before)
+        after_fingerprint = self._content_fingerprint_from_roi(after)
+        if before_fingerprint.shape != after_fingerprint.shape:
+            return False
+        fingerprint_delta = float(
+            np.mean(
+                np.abs(
+                    before_fingerprint.astype(np.int16)
+                    - after_fingerprint.astype(np.int16)
+                )
+            )
+            / 255.0
+        )
+        return bool(fingerprint_delta >= self._RECOVERY_CONTENT_CHANGE_THRESHOLD)
+
+    def _scan_turn_recovery_cycle(
+        self,
+        window: _TurnOwnershipWindow,
+        frame: np.ndarray,
+        fast: FastSignalResult,
+        *,
+        metrics: ZoneFrameMetrics,
+    ) -> tuple[tuple[Seat, ConsensusResult], ...] | None:
+        """Preview at most three fresh, sequential foreign actions back to self."""
+
+        if self.snapshot.current_player == "self":
+            return ()
+        temporal = self._temporal_turn_recovery_cycle(
+            window,
+            frame,
+            fast,
+            metrics=metrics,
+        )
+        if temporal is not None:
+            return temporal
+        preview = self.reducer.clone_empty()
+        try:
+            for event in self.reducer.events:
+                preview.apply(event)
+        except GameStateError:
+            return None
+
+        recovered: list[tuple[Seat, ConsensusResult]] = []
+        for index in range(len(TURN_ORDER) - 1):
+            player = preview.snapshot().current_player
+            if player == "self":
+                return tuple(recovered)
+            if player is None:
+                window.turn_recovery_cycle_missing_player = None
+                return None
+            try:
+                observation = self._recognize_play_region(
+                    frame,
+                    player,
+                    wild_rank=preview.snapshot().wild_rank,
+                    allow_pass=True,
+                )
+            except (cv2.error, IndexError, OSError, RuntimeError, ValueError):
+                window.turn_recovery_cycle_missing_player = player
+                return None
+            candidate = self._turn_recovery_cycle_candidate(
+                preview,
+                observation,
+                metrics=metrics,
+                fast=fast,
+            )
+            if candidate is None:
+                window.turn_recovery_cycle_missing_player = player
+                return None
+            if not candidate.is_pass:
+                # Every non-PASS, not just the first, needs its own bound
+                # unconsumed pixel baseline. Two complete distinct captures
+                # are still required by the outer atomic-cycle gate.
+                if (index > 0 and not (fast.active_player == "self" and fast.self_action_buttons_visible)) or not self._turn_recovery_non_pass_is_fresh(
+                    window, player, candidate, frame, observation,
+                ):
+                    window.turn_recovery_cycle_missing_player = player
+                    return None
+            if candidate.is_pass and (
+                not self._matching_pass_marker(fast, player)
+                or (player in window.pass_marker_baseline and not (
+                    # An initial badge is stale only until this SAME window
+                    # proves its absence and two new distinct marker frames.
+                    # Keeping the immutable initial baseline as a permanent
+                    # veto lost frame624's correctly recognized badge-clear.
+                    player in window.temporal_pass_seen_absent
+                    and player in window.temporal_confirmed_passes
+                    and window.temporal_pass_marker_streaks.get(player, 0) >= 2
+                ))
+            ):
+                window.turn_recovery_cycle_missing_player = player
+                return None
+            self._apply_preview_consensus(preview, candidate)
+            recovered.append((player, candidate))
+
+        if preview.snapshot().current_player == "self":
+            return tuple(recovered)
+        window.turn_recovery_cycle_missing_player = preview.snapshot().current_player
+        return None
+
+    def _temporal_turn_recovery_cycle(
+        self,
+        window: _TurnOwnershipWindow,
+        frame: np.ndarray,
+        fast: FastSignalResult,
+        *,
+        metrics: ZoneFrameMetrics,
+    ) -> tuple[tuple[Seat, ConsensusResult], ...] | None:
+        """Rebuild a fast all-PASS response cycle from bounded transition edges."""
+
+        if not fast.self_action_buttons_visible or fast.active_player != "self":
+            return None
+        snapshot = self.snapshot
+        player = snapshot.current_player
+        required: list[Seat] = []
+        for _ in range(len(TURN_ORDER)):
+            if player is None:
+                return None
+            required.append(player)
+            if player == "self":
+                break
+            player = next_active_seat(player, snapshot.finished_seats)
+        if not required or required[-1] != "self" or len(required) < 2:
+            return None
+        active_sequence_confirmed = self._contains_active_subsequence(
+            window.temporal_confirmed_actives,
+            tuple(required),
+        )
+        identity = self._response_identity()
+        final_seat_controls_handoff = (
+            len(required) == 2
+            and required[-1] == "self"
+            and self._response_controls_streak >= 2
+            and self._response_controls_absent_identity == identity
+            and self._response_controls_edge_identity == identity
+        )
+        if not active_sequence_confirmed and not final_seat_controls_handoff:
+            return None
+
+        preview = self.reducer.clone_empty()
+        try:
+            for event in self.reducer.events:
+                preview.apply(event)
+        except GameStateError:
+            return None
+        recovered: list[tuple[Seat, ConsensusResult]] = []
+        external = required[:-1]
+        for index, seat in enumerate(external):
+            derived = False
+            if seat not in window.temporal_confirmed_passes:
+                if index != len(external) - 1:
+                    window.turn_recovery_cycle_missing_player = seat
+                    return None
+                if not all(
+                    prior in window.temporal_confirmed_passes
+                    for prior in external[:index]
+                ):
+                    window.turn_recovery_cycle_missing_player = seat
+                    return None
+                if self._fresh_legal_nonpass_visible(
+                    window,
+                    preview,
+                    frame,
+                    fast,
+                    metrics,
+                    seat,
+                ):
+                    window.turn_recovery_cycle_missing_player = seat
+                    return None
+                derived = True
+            candidate = ConsensusResult(
+                status="confirmed",
+                cards=(),
+                is_pass=True,
+                confidence=0.82 if derived else 0.99,
+                source=(
+                    "turn_recovery_derived_pass_from_active_transition"
+                    if derived
+                    else "turn_recovery_temporal_pass_marker"
+                ),
+                vote_count=2,
+                candidates=(),
+                integrity_warnings=(
+                    ("derived_pass_from_confirmed_active_transition",)
+                    if derived
+                    else ()
+                ),
+            )
+            try:
+                self._apply_preview_consensus(preview, candidate)
+            except GameStateError:
+                window.turn_recovery_cycle_missing_player = seat
+                return None
+            recovered.append((seat, candidate))
+        if preview.snapshot().current_player != "self":
+            return None
+        return tuple(recovered)
+
+    @staticmethod
+    def _contains_active_subsequence(
+        observed: list[Seat],
+        required: tuple[Seat, ...],
+    ) -> bool:
+        width = len(required)
+        return any(
+            tuple(observed[index : index + width]) == required
+            for index in range(max(0, len(observed) - width + 1))
+        )
+
+    def _fresh_legal_nonpass_visible(
+        self, window: _TurnOwnershipWindow, preview: LiveReducer, frame: np.ndarray,
+        fast: FastSignalResult, metrics: ZoneFrameMetrics, seat: Seat,
+    ) -> bool:
+        # Compatibility predicate: unknown is a veto, never evidence of PASS.
+        return self._pass_inference_surface_state(window, preview, frame, fast, metrics, seat) != "empty"
+
+    def _pass_inference_surface_state(
+        self, window: _TurnOwnershipWindow, preview: LiveReducer, frame: np.ndarray,
+        fast: FastSignalResult, metrics: ZoneFrameMetrics, seat: Seat,
+    ) -> Literal["empty", "visible_nonpass", "unknown"]:
+        """Distinguish proven stable emptiness from weak/unreadable new cards."""
+        if fast.effect_visible or metrics.effect_visible:
+            return "unknown"
+        try:
+            observation = self._recognize_play_region(
+                frame, seat, wild_rank=preview.snapshot().wild_rank, allow_pass=False,
+            )
+        except (cv2.error, IndexError, OSError, RuntimeError, ValueError):
+            return "unknown"
+        # A golden-skin joker at score .67 is still a visible card surface.
+        # Failure to admit it as a formal action cannot manufacture a PASS.
+        if observation.cards:
+            return "visible_nonpass"
+        try:
+            before = window.surface_baseline_frames.get(seat)
+            after = self._play_roi(frame, seat)
+            if before is None or before.shape != after.shape or before.size == 0:
+                return "unknown"
+            before_gray = cv2.GaussianBlur(cv2.cvtColor(before, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+            after_gray = cv2.GaussianBlur(cv2.cvtColor(after, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+            difference = cv2.absdiff(before_gray, after_gray)
+            changed = bool(float(np.mean(difference >= 12)) >= .02 and float(np.mean(difference)) / 255.0 >= .006)
+        except (cv2.error, IndexError, OSError, RuntimeError, ValueError):
+            return "unknown"
+        return "unknown" if changed else "empty"
+    @staticmethod
     def _apply_preview_consensus(
         preview: LiveReducer,
         result: ConsensusResult,
@@ -2671,7 +3928,96 @@ class LiveOrchestrator:
             confidence=result.confidence,
             source=result.source,
             suit_options=(() if cards != result.cards else result.suit_options),
+            integrity_warnings=result.integrity_warnings,
         )
+
+    def _stage_recovery_action(
+        self,
+        staged: LiveReducer,
+        candidate: ConsensusResult,
+        index: int,
+    ) -> LiveEvent:
+        """Fault-injectable isolated action staging; never touches live state."""
+
+        del index
+        self._apply_preview_consensus(staged, candidate)
+        return staged.events[-1]
+
+    def _commit_recovery_action_batch(
+        self,
+        scanned: tuple[tuple[Seat, ConsensusResult], ...],
+        monotonic_ms: int,
+        *,
+        allow_terminal: bool = False,
+        expected_current_player: Seat | None = "self",
+    ) -> tuple[tuple[LiveEvent, ...], tuple[LiveSnapshot, ...], tuple[LiveSnapshot, ...]]:
+        """Persist and install a whole validated chain as one formal transaction."""
+
+        staged = self.reducer.clone_empty()
+        for event in self.reducer.events:
+            staged.apply(event)
+        staged_actions: list[LiveEvent] = []
+        before_snapshots: list[LiveSnapshot] = []
+        after_snapshots: list[LiveSnapshot] = []
+        for index, (_player, candidate) in enumerate(scanned, start=1):
+            staged_source = (
+                candidate.source
+                if "derived_pass" in candidate.source
+                else "turn_recovery_cycle_pass_marker"
+                if candidate.is_pass
+                else "turn_recovery_cycle_play_region"
+            )
+            confirmed = replace(
+                candidate,
+                vote_count=max(2, candidate.vote_count),
+                source=staged_source,
+            )
+            before_snapshots.append(staged.snapshot())
+            staged_actions.append(
+                self._stage_recovery_action(staged, confirmed, index)
+            )
+            after_snapshots.append(staged.snapshot())
+        if staged.snapshot().current_player != expected_current_player:
+            raise RuntimeError("整轮容错暂存后的行动座位不匹配")
+        if staged.snapshot().current_player is None and not allow_terminal:
+            raise RuntimeError("整轮容错暂存后的行动座位不匹配")
+
+        published_items: list[LiveEvent] = []
+        for index, (event, (_seat, candidate)) in enumerate(
+            zip(staged_actions, scanned),
+            start=1,
+        ):
+            payload = dict(event.payload)
+            if candidate.integrity_warnings:
+                payload["integrity_warnings"] = list(candidate.integrity_warnings)
+            published_items.append(
+                replace(
+                    event,
+                    seq=self._published_sequence + index,
+                    monotonic_ms=int(monotonic_ms),
+                    payload=payload,
+                )
+            )
+        published = tuple(published_items)
+        finalized = self.reducer.clone_empty()
+        for event in self.reducer.events:
+            finalized.apply(event)
+        for event in published:
+            finalized.apply(event)
+        append_batch = getattr(self.store, "append_event_batch", None)
+        if not callable(append_batch):
+            raise RuntimeError("当前会话存储不支持原子动作 batch")
+        # The canonical JSONL commit happens before the no-fail reducer state
+        # adoption. A failed disk transaction therefore leaves live semantics
+        # and every in-memory sidecar untouched.
+        append_batch(published)
+        self.reducer.adopt_staged(finalized)
+        for event in published:
+            if event.actor is not None:
+                self._turn_evidence.mark_consumed(event.actor, event.monotonic_ms)
+        self._published_sequence += len(published)
+        self._all_events.extend(published)
+        return published, tuple(before_snapshots), tuple(after_snapshots)
 
     def _recover_turn_recovery_cycle(
         self,
@@ -2681,109 +4027,152 @@ class LiveOrchestrator:
         monotonic_ms: int,
         *,
         metrics: ZoneFrameMetrics,
+        rollback_window_state: dict[str, object] | None = None,
     ) -> tuple[LiveEvent, tuple[LiveEvent, ...]] | None:
         """Repair a complete visible response cycle before local advice."""
 
         if (
-            window.expected_player != "self"
-            or not fast.self_action_buttons_visible
+            not (fast.self_action_buttons_visible or fast.active_player == "self")
             or window.turn_recovery_detected_ms is None
-            or int(monotonic_ms) - window.turn_recovery_detected_ms < 500
         ):
             return None
-        expected_action = self._decide_timeout_candidate(metrics, fast)
-        if expected_action is None or expected_action.status != "confirmed":
+        if window.turn_recovery_cycle_last_ms is not None and int(monotonic_ms) <= window.turn_recovery_cycle_last_ms:
             return None
-        preview = self._turn_recovery_preview_reducer(expected_action)
-        if preview is None:
-            return None
-
-        recovered: list[ConsensusResult] = []
-        try:
-            for _ in range(len(TURN_ORDER) - 1):
-                player = preview.snapshot().current_player
-                if player == window.expected_player:
-                    break
-                if player is None:
-                    return None
-                observation = self._recognize_play_region(
-                    frame,
-                    player,
-                    wild_rank=preview.snapshot().wild_rank,
-                    allow_pass=True,
-                )
-                candidate = self._turn_recovery_cycle_candidate(
-                    preview,
-                    observation,
-                    metrics=metrics,
-                    fast=fast,
-                )
-                if candidate is None:
-                    return None
-                self._apply_preview_consensus(preview, candidate)
-                recovered.append(candidate)
-        except (cv2.error, GameStateError, OSError, RuntimeError, ValueError):
-            return None
-
-        if preview.snapshot().current_player != window.expected_player:
-            return None
-
-        first_event, first_events = self._commit_consensus(
-            expected_action,
-            monotonic_ms,
-            fast=fast,
-            suppress_turn_side_effects=True,
+        window_state_before = deepcopy(
+            rollback_window_state
+            if rollback_window_state is not None
+            else window.__dict__
         )
-        events: list[LiveEvent] = [*first_events]
-        last_event = first_event
-        for candidate in recovered:
-            event, action_events = self._commit_consensus(
-                candidate,
-                monotonic_ms,
-                fast=fast,
-                suppress_turn_side_effects=True,
+        scanned = self._scan_turn_recovery_cycle(
+            window,
+            frame,
+            fast,
+            metrics=metrics,
+        )
+        if self._check_recovery_deadline(window):
+            return None
+        if not scanned:
+            window.turn_recovery_cycle_signature = None
+            window.turn_recovery_cycle_streak = 0
+            window.turn_recovery_cycle_first_ms = None
+            window.turn_recovery_cycle_imported_pre_vote = False
+            return None
+        signature = tuple(
+            self._turn_recovery_candidate_signature(player, candidate)
+            for player, candidate in scanned
+        )
+        now = int(monotonic_ms)
+        if signature == window.turn_recovery_cycle_signature:
+            window.turn_recovery_cycle_streak += 1
+            window.turn_recovery_cycle_imported_pre_vote = False
+        else:
+            if window.turn_recovery_cycle_imported_pre_vote:
+                window.turn_recovery_cycle_imported_pre_vote = False
+                window.turn_recovery_cycle_signature = signature
+                window.turn_recovery_cycle_streak = 1
+                window.turn_recovery_cycle_first_ms = now
+                window.turn_recovery_cycle_last_ms = now
+                return None
+            window.turn_recovery_cycle_signature = signature
+            window.turn_recovery_cycle_streak = 1
+            window.turn_recovery_cycle_first_ms = now
+        window.turn_recovery_cycle_last_ms = now
+        temporal_chain_confirmed = all(
+            candidate.vote_count >= 2
+            and candidate.source.startswith("turn_recovery_")
+            and (
+                "temporal_pass_marker" in candidate.source
+                or "derived_pass" in candidate.source
             )
-            events.extend(action_events)
-            last_event = event
+            for _player, candidate in scanned
+        )
+        if window.turn_recovery_cycle_streak < (1 if temporal_chain_confirmed else 2):
+            return None
 
-        if self.snapshot.current_player != window.expected_player:
-            raise RuntimeError("整轮容错恢复后的行动座位不匹配")
+        try:
+            published_actions, before_snapshots, after_snapshots = (
+                self._commit_recovery_action_batch(scanned, monotonic_ms)
+            )
+        except BaseException:
+            window.__dict__.clear()
+            window.__dict__.update(window_state_before)
+            raise
+
+        events: list[LiveEvent] = list(published_actions)
+        for action, after in zip(published_actions, after_snapshots):
+            try:
+                self._advance_previous_action_verifications(action, after=after)
+            except Exception:
+                _LOGGER.warning("快速恢复后的相邻动作复核更新失败", exc_info=True)
+        for action, before, after in zip(
+            published_actions,
+            before_snapshots,
+            after_snapshots,
+        ):
+            try:
+                events.extend(
+                    self._append_action_outcomes(
+                        before,
+                        after,
+                        trigger_action_event_id=action.event_id,
+                        trigger_actor=action.actor,
+                    )
+                )
+            except Exception:
+                _LOGGER.warning("快速恢复后的动作结果事件写入失败", exc_info=True)
         self._activate_zone(monotonic_ms)
-        recovery_event = self._append_lifecycle_event(
-            "turn_recovery_cycle_recovered",
-            {
-                "action_event_id": first_event.event_id,
-                "action_player": first_event.actor,
-                "recovered_actions": [
-                    {
-                        "player": event.actor,
-                        "cards": list(event.payload.get("cards", ())),
-                        "is_pass": bool(event.payload.get("is_pass", False)),
-                        "source": event.source,
-                    }
-                    for event in events
-                    if event.event_type in {"player_played", "player_passed"}
-                    and event.event_id != first_event.event_id
-                ],
-                "action_vote_count": expected_action.vote_count,
-                "recovery_surface": "local_controls_visible",
-            },
-            actor=first_event.actor,
-            confidence=expected_action.confidence,
-            source="turn_recovery_cycle",
-        )
-        self._append_recognition_trace(
-            window=window,
-            outcome="turn_recovery_cycle_recovered",
-            strategy_result=expected_action,
-            fallback=True,
-            reason="local_controls_visible_cycle_scan",
-            commit_attempted=True,
-            commit_event_id=last_event.event_id,
-        )
-        turn_started = self._append_current_turn_started()
-        self._request_advice_if_needed()
-        events.extend((recovery_event, *((turn_started,) if turn_started else ())))
+        first_event = published_actions[0]
+        last_event = published_actions[-1]
+        try:
+            recovery_event = self._append_lifecycle_event(
+                "turn_recovery_cycle_recovered",
+                {
+                    "action_event_id": first_event.event_id,
+                    "action_player": first_event.actor,
+                    "recovered_actions": [
+                        {
+                            "player": event.actor,
+                            "cards": list(event.payload.get("cards", ())),
+                            "is_pass": bool(event.payload.get("is_pass", False)),
+                            "source": event.source,
+                        }
+                        for event in published_actions
+                        if event.event_id != first_event.event_id
+                    ],
+                    "action_vote_count": 2,
+                    "recovery_surface": "two_frame_atomic_cycle",
+                    "recovery_elapsed_ms": (
+                        0
+                        if window.turn_recovery_cycle_first_ms is None
+                        else now - window.turn_recovery_cycle_first_ms
+                    ),
+                },
+                actor=first_event.actor,
+                confidence=min(candidate.confidence for _player, candidate in scanned),
+                source="turn_recovery_cycle",
+            )
+            events.append(recovery_event)
+        except Exception:
+            _LOGGER.warning("快速恢复生命周期事件写入失败", exc_info=True)
+        try:
+            self._append_recognition_trace(
+                window=window,
+                outcome="turn_recovery_cycle_recovered",
+                strategy_result=scanned[0][1],
+                fallback=True,
+                reason="two_frame_atomic_cycle_scan",
+                commit_attempted=True,
+                commit_event_id=last_event.event_id,
+            )
+        except Exception:
+            _LOGGER.warning("快速恢复识别 trace 写入失败", exc_info=True)
+        try:
+            turn_started = self._append_current_turn_started()
+            if turn_started is not None:
+                events.append(turn_started)
+            self._request_advice_after_fast_signal(fast, monotonic_ms)
+        except Exception:
+            _LOGGER.warning("快速恢复后的建议请求失败", exc_info=True)
         return last_event, tuple(events)
 
     def _restart_turn_recovery_zone(self, monotonic_ms: int) -> None:
@@ -3281,6 +4670,11 @@ class LiveOrchestrator:
             marker_visible
             and not window.unseen_direct_next_pass_marker_visible
         )
+        if window.unseen_direct_next_pass_last_capture_ms is not None and (
+            int(monotonic_ms) <= window.unseen_direct_next_pass_last_capture_ms
+        ):
+            return None
+        window.unseen_direct_next_pass_last_capture_ms = int(monotonic_ms)
         window.unseen_direct_next_pass_marker_visible = marker_visible
         if fresh_edge:
             window.unseen_direct_next_pass_edge_seen = True
@@ -3346,6 +4740,8 @@ class LiveOrchestrator:
         """
 
         expected = window.expected_player
+        if window.wind_catch_pass_recovery_failed:
+            return False
         receiver = self.reducer.wind_receiver_after_current_pass(expected)
         return bool(receiver is not None and fast.active_player == receiver)
 
@@ -3361,11 +4757,21 @@ class LiveOrchestrator:
         if receiver is None:
             return
         self._clear_wind_catch_pass_recovery(window)
+        # A newly proven wind projection supersedes generic foreign-active
+        # recovery for the same immutable turn.  Retain visual evidence but
+        # retire its eight-second advice timer before starting the short path.
+        window.turn_recovery_pending = False
+        window.turn_recovery_local_started_ms = None
+        window.turn_recovery_local_deadline_ms = None
+        window.turn_recovery_target_exceeded = False
+        window.wind_catch_pass_recovery_failed = False
+        window.wind_catch_pass_recovery_failure_reason = ""
+        window.wind_catch_pass_recovery_advice_event_id = None
         window.wind_catch_pass_recovery_pending = True
         window.wind_catch_pass_recovery_receiver = receiver
         window.wind_catch_pass_recovery_detected_ms = int(monotonic_ms)
-        window.wind_catch_pass_recovery_deadline_ms = self._handoff_global_deadline_ms(
-            monotonic_ms
+        window.wind_catch_pass_recovery_deadline_ms = (
+            int(monotonic_ms) + _WIND_CATCH_RECOVERY_TARGET_MS
         )
         window.disposition = "wind_catch_pass_recovery"
         window.handoff_block_reason = "waiting_for_wind_catch_pass_marker"
@@ -3379,6 +4785,7 @@ class LiveOrchestrator:
         window.provisional_samples.clear()
         window.handoff_samples.clear()
         self._last_sample_ms = None
+        self._withhold_advice_for_wind_catch_recovery(window)
 
     def _advance_wind_catch_pass_recovery(
         self,
@@ -3394,46 +4801,24 @@ class LiveOrchestrator:
         now = int(monotonic_ms)
         deadline_ms = window.wind_catch_pass_recovery_deadline_ms
         if deadline_ms is not None and now >= deadline_ms:
-            window.disposition = "wind_catch_pass_recovery_deadline_expired"
-            window.handoff_block_reason = "wind_catch_pass_marker_deadline"
-            window.handoff_last_block_reason = window.handoff_block_reason
-            window.handoff_deadline_kind = "wind_catch_pass"
-            self._begin_turn_recovery(
+            self._fail_wind_catch_pass_recovery(
                 window,
-                fast,
-                monotonic_ms,
-                reason=window.handoff_block_reason,
+                reason="wind_catch_pass_marker_deadline",
+                monotonic_ms=monotonic_ms,
             )
-            return self._advance_turn_recovery(
-                window,
-                fast,
-                monotonic_ms,
-                metrics=metrics,
-                decision=decision,
-            )
+            return None
 
         receiver = window.wind_catch_pass_recovery_receiver
         still_expected = self.reducer.wind_receiver_after_current_pass(
             window.expected_player
         )
         if receiver is None or fast.active_player != receiver or still_expected != receiver:
-            window.disposition = "wind_catch_pass_recovery_active_changed"
-            window.handoff_block_reason = "wind_catch_receiver_changed"
-            window.handoff_last_block_reason = window.handoff_block_reason
-            window.handoff_deadline_kind = "seat_cross"
-            self._begin_turn_recovery(
+            self._fail_wind_catch_pass_recovery(
                 window,
-                fast,
-                monotonic_ms,
-                reason=window.handoff_block_reason,
+                reason="wind_catch_receiver_changed",
+                monotonic_ms=monotonic_ms,
             )
-            return self._advance_turn_recovery(
-                window,
-                fast,
-                monotonic_ms,
-                metrics=metrics,
-                decision=decision,
-            )
+            return None
 
         readable = bool(
             decision.collect_sample
@@ -3459,14 +4844,30 @@ class LiveOrchestrator:
             )
             return None
 
-        if self._matching_expected_pass_marker(fast, window.expected_player):
+        marker_visible = self._matching_expected_pass_marker(
+            fast,
+            window.expected_player,
+        )
+        fresh_edge = bool(
+            marker_visible
+            and not window.wind_catch_pass_recovery_marker_visible
+            and window.expected_player in window.temporal_pass_seen_absent
+        )
+        window.wind_catch_pass_recovery_marker_visible = marker_visible
+        if fresh_edge:
+            window.wind_catch_pass_recovery_marker_edge_seen = True
+            window.wind_catch_pass_recovery_marker_streak = 1
+        elif marker_visible and window.wind_catch_pass_recovery_marker_edge_seen:
             window.wind_catch_pass_recovery_marker_streak += 1
-        else:
+        elif not marker_visible:
             window.wind_catch_pass_recovery_marker_streak = 0
         window.disposition = "wind_catch_pass_recovery"
         window.handoff_block_reason = ""
         window.sample_allowed = False
-        if window.wind_catch_pass_recovery_marker_streak >= 2:
+        if (
+            window.wind_catch_pass_recovery_marker_edge_seen
+            and window.wind_catch_pass_recovery_marker_streak >= 2
+        ):
             marker_pass = ConsensusResult(
                 status="confirmed",
                 cards=(),
@@ -3496,7 +4897,13 @@ class LiveOrchestrator:
             window=window,
             outcome="wind_catch_pass_recovery_pending",
             deadline_kind="wind_catch_pass",
-            reason="waiting_for_second_pass_marker",
+            reason=(
+                "fresh_pass_marker_edge"
+                if fresh_edge
+                else "waiting_for_second_pass_marker"
+                if window.wind_catch_pass_recovery_marker_edge_seen
+                else "waiting_for_fresh_pass_marker_edge"
+            ),
         )
         return None
 
@@ -3624,7 +5031,7 @@ class LiveOrchestrator:
         )
         self._clear_wind_catch_pass_recovery(window)
         turn_started = self._append_current_turn_started()
-        self._request_advice_if_needed()
+        self._request_advice_after_fast_signal(fast, monotonic_ms)
         events = [*pass_events, *play_events]
         if turn_started is not None:
             events.append(turn_started)
@@ -3879,6 +5286,275 @@ class LiveOrchestrator:
         self._notify_update_listener()
         return event
 
+    def _response_identity(self) -> tuple[object, ...]:
+        snapshot = self.snapshot
+        last_play = next((event for event in reversed(self.reducer.events)
+                          if event.event_type in {"player_played", "manual_confirmed_event"}
+                          and not event.payload.get("is_pass", False)), None)
+        table_play = next((play for play in reversed(snapshot.trick_plays) if not play.is_pass), None)
+        # A normal intervening PASS invalidates an analysis job, but it does
+        # not start a different response to the table. Keep hidden-control
+        # evidence across those seat transitions. A new play/trick/source or
+        # a corrected table/round still owns a different control lifecycle.
+        return (snapshot.session_id, snapshot.trick_id,
+                last_play.event_id if last_play is not None else None,
+                tuple(table_play.cards) if table_play is not None else (),
+                snapshot.round_level, self._capture_generation)
+
+    def _track_response_control_edge(self, fast: FastSignalResult, monotonic_ms: int) -> None:
+        """Track an actual hidden->visible local-control edge across seat windows."""
+        sequence = self._recognition_trace_context.get("capture_seq", self._capture_sequence)
+        if type(sequence) is not int or sequence <= 0:
+            return
+        stamp = (int(monotonic_ms), sequence)
+        previous = self._response_controls_last_capture
+        if previous is not None and (stamp[0] <= previous[0] or stamp[1] <= previous[1]):
+            return
+        self._response_controls_last_capture = stamp
+        identity = self._response_identity()
+        # An animation hiding controls is not proof of a new control edge.
+        if fast.effect_visible:
+            self._response_controls_streak = 0
+            return
+        visible = bool(fast.self_action_buttons_visible)
+        if not visible:
+            self._response_controls_absent_identity = identity
+            self._response_controls_edge_identity = ()
+            self._response_controls_edge_ms = None
+            self._response_controls_edge_processing_ms = None
+            self._response_controls_streak = 0
+        elif (self._response_controls_visible is False
+              and self._response_controls_absent_identity == identity
+              and fast.active_player == "self"):
+            self._response_controls_edge_identity = identity
+            self._response_controls_edge_ms = stamp[0]
+            self._response_controls_edge_processing_ms = self._processing_clock_ms()
+            self._response_controls_streak = 1
+        elif (self._response_controls_edge_identity == identity
+              and fast.active_player == "self"):
+            self._response_controls_streak += 1
+        else:
+            self._response_controls_streak = 0
+        self._response_controls_visible = visible
+
+    def _new_self_response_controls_confirmed(
+        self,
+        window: _TurnOwnershipWindow,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+    ) -> bool:
+        """Require a fresh two-capture control lifecycle for foreign recovery."""
+        identity = self._response_identity()
+        edge_ms = self._response_controls_edge_ms
+        return bool(
+            fast.active_player == "self"
+            and fast.self_action_buttons_visible
+            and not fast.effect_visible
+            and self._response_controls_visible is True
+            and self._response_controls_absent_identity == identity
+            and self._response_controls_edge_identity == identity
+            and self._response_controls_streak >= 2
+            and edge_ms is not None
+            and window.created_capture_ms <= edge_ms <= int(monotonic_ms)
+        )
+
+    @staticmethod
+    def _clear_pre_recovery_chain_candidate(
+        window: _TurnOwnershipWindow | None,
+    ) -> None:
+        if window is None:
+            return
+        window.pre_recovery_chain_signature = None
+        window.pre_recovery_chain_ms = None
+        window.pre_recovery_chain_seq = None
+        window.pre_recovery_chain_generation = None
+        window.pre_recovery_chain_epoch = ()
+        window.pre_recovery_chain_response_identity = ()
+
+    def _remember_pre_recovery_chain_candidate(
+        self,
+        window: _TurnOwnershipWindow,
+        frame: np.ndarray,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+        *,
+        metrics: ZoneFrameMetrics,
+    ) -> None:
+        """Save the first fresh self-control frame as a full-chain pre-vote."""
+
+        identity = self._response_identity()
+        sequence = self._recognition_trace_context.get("capture_seq", self._capture_sequence)
+        edge_ms = self._response_controls_edge_ms
+        if (
+            window.expected_player == "self"
+            or fast.effect_visible
+            or fast.active_player != "self"
+            or not fast.self_action_buttons_visible
+            or self._response_controls_absent_identity != identity
+            or self._response_controls_edge_identity != identity
+        ):
+            self._clear_pre_recovery_chain_candidate(window)
+            return
+        if self._response_controls_streak != 1:
+            return
+        if (
+            type(sequence) is not int
+            or sequence <= 0
+            or edge_ms != int(monotonic_ms)
+            or not window.created_capture_ms <= edge_ms
+        ):
+            self._clear_pre_recovery_chain_candidate(window)
+            return
+        scanned = self._scan_turn_recovery_cycle(
+            window,
+            frame,
+            fast,
+            metrics=metrics,
+        )
+        if not scanned:
+            self._clear_pre_recovery_chain_candidate(window)
+            return
+        window.pre_recovery_chain_signature = tuple(
+            self._turn_recovery_candidate_signature(player, candidate)
+            for player, candidate in scanned
+        )
+        window.pre_recovery_chain_ms = int(monotonic_ms)
+        window.pre_recovery_chain_seq = sequence
+        window.pre_recovery_chain_generation = self._capture_generation
+        window.pre_recovery_chain_epoch = window.evidence_epoch
+        window.pre_recovery_chain_response_identity = identity
+
+    def _recover_last_pass_from_new_controls(
+        self, window: _TurnOwnershipWindow, frame: np.ndarray, fast: FastSignalResult,
+        monotonic_ms: int, metrics: ZoneFrameMetrics,
+    ) -> _OwnershipResolution | None:
+        """Repair only the last response when its short badge-clear was missed.
+
+        A prior formal PASS plus a NEW self-control edge in this exact table
+        response can prove a sparse last-seat handoff. A baseline badge by
+        itself, a reused edge, a new lead or visible legal cards cannot.
+        """
+        snapshot = self.snapshot
+        last = snapshot.play_history[-1] if snapshot.play_history else None
+        edge_ms = self._response_controls_edge_ms
+        if (window.expected_player != "left" or not snapshot.trick_plays
+                or not self._is_direct_next_active("left", "self")
+                or last is None or not last.is_pass or last.player != "opposite"
+                or fast.active_player != "self" or not fast.self_action_buttons_visible
+                or fast.effect_visible or metrics.effect_visible
+                or not self._matching_pass_marker(fast, "left")
+                or self._response_controls_edge_identity != self._response_identity()
+                or self._response_controls_streak < 2 or edge_ms is None
+                or not window.created_capture_ms <= edge_ms <= int(monotonic_ms)
+                or int(monotonic_ms) - edge_ms > _ADVICE_RECOVERY_TARGET_MS):
+            return None
+        try:
+            observation = self._recognize_play_region(
+                frame, "left", wild_rank=snapshot.wild_rank, allow_pass=False,
+            )
+        except (cv2.error, OSError, RuntimeError, ValueError):
+            return None
+        # Even an unproven-but-legal card surface blocks PASS inference. This
+        # is deliberately stricter than accepting the cards as a real play.
+        if observation.cards:
+            return None
+        if self._check_recovery_deadline(window) or (
+            self._response_controls_edge_processing_ms is None
+            or self._processing_clock_ms() - self._response_controls_edge_processing_ms >= _ADVICE_RECOVERY_TARGET_MS
+        ):
+            return None
+        result = ConsensusResult(
+            status="confirmed", cards=(), is_pass=True, confidence=.82,
+            source="last_response_pass_from_new_self_controls", vote_count=2,
+            candidates=(), integrity_warnings=("derived_pass_from_new_self_controls",),
+        )
+        self._response_controls_edge_identity = ()
+        self._response_controls_streak = 0
+        event, events = self._commit_consensus(result, monotonic_ms, fast=fast)
+        return _OwnershipResolution(event, events)
+
+    @staticmethod
+    def _clear_self_static_handoff(window: _TurnOwnershipWindow) -> None:
+        window.self_static_handoff_signature = None
+        window.self_static_handoff_last_capture = None
+        window.self_static_handoff_streak = 0
+        window.self_static_handoff_reads = 0
+        window.self_static_handoff_pass_streak = 0
+
+    def _probe_self_static_handoff(
+        self, window: _TurnOwnershipWindow, frame: np.ndarray, fast: FastSignalResult,
+        monotonic_ms: int, metrics: ZoneFrameMetrics,
+    ) -> _OwnershipResolution | None:
+        """Read a bounded, authenticated self handoff even if motion stayed low.
+
+        White-on-white card replacements (e.g. old 7D -> small joker) can
+        remain below whole-ROI occupancy thresholds. Cleared controls and the
+        immediate legal successor authorize a probe, not an action. Own-hand
+        membership, localized freshness and two distinct reads still decide.
+        """
+        started = window.handoff_detected_ms
+        sequence = self._recognition_trace_context.get("capture_seq", self._capture_sequence)
+        stamp = (int(monotonic_ms), sequence)
+        previous = window.self_static_handoff_last_capture
+        snapshot = self.snapshot
+        successor = next_active_seat("self", snapshot.finished_seats)
+        crossed_active = next_active_seat(successor, snapshot.finished_seats)
+        crossed = bool(
+            fast.active_player == crossed_active
+            and successor != "self" and crossed_active != "self"
+            and self._matching_pass_marker(fast, successor)
+            and successor not in window.pass_marker_baseline
+            and successor in window.temporal_pass_seen_absent
+            and window.self_static_handoff_streak >= 1
+        )
+        if (window.expected_player != "self" or not window.authenticated
+                or not (self._is_direct_next_active("self", fast.active_player) or crossed)
+                or fast.self_action_buttons_visible or fast.effect_visible or metrics.effect_visible
+                or self._matching_pass_marker(fast, "self") or self._is_first_action_turn("self")
+                or started is None or not 0 <= stamp[0] - started <= _HANDOFF_READABLE_CONFIRMATION_MS
+                or window.self_static_handoff_reads >= 4
+                or type(sequence) is not int or sequence <= 0
+                or previous is not None and (stamp[0] <= previous[0] or stamp[1] <= previous[1])):
+            window.self_static_handoff_pass_streak = 0
+            return None
+        window.self_static_handoff_last_capture = stamp
+        window.self_static_handoff_reads += 1
+        window.self_static_handoff_pass_streak = window.self_static_handoff_pass_streak + 1 if crossed else 0
+        try:
+            observation = self._recognize_play_region(frame, "self", wild_rank=self.snapshot.wild_rank, allow_pass=False)
+        except (cv2.error, OSError, RuntimeError, ValueError):
+            window.self_static_handoff_streak = 0
+            return None
+        candidate = self._turn_recovery_cycle_candidate(self.reducer, observation, metrics=metrics, fast=fast)
+        if (candidate is None or candidate.is_pass or not candidate.cards
+                or not self._turn_recovery_non_pass_is_fresh(window, "self", candidate, frame, observation)):
+            window.self_static_handoff_signature = None
+            window.self_static_handoff_streak = 0
+            return None
+        identity = (window.evidence_epoch, successor, self._turn_recovery_candidate_signature("self", candidate))
+        window.self_static_handoff_streak = window.self_static_handoff_streak + 1 if identity == window.self_static_handoff_signature else 1
+        window.self_static_handoff_signature = identity
+        if window.self_static_handoff_streak < 2 or crossed and window.self_static_handoff_pass_streak < 2:
+            self._append_recognition_trace(window=window, outcome="self_static_handoff_probe",
+                strategy_result=candidate, reason="waiting_for_second_fresh_known_hand_read")
+            return None
+        if self._check_recovery_deadline(window):
+            return None
+        result = replace(candidate, vote_count=2, source="self_static_handoff_known_hand")
+        if crossed:
+            window.crossed_handoff_recovery_pending = True
+            window.crossed_handoff_recovery_pass_player = successor
+            window.crossed_handoff_recovery_active_player = fast.active_player
+            window.crossing_active_streak = window.self_static_handoff_pass_streak
+            window.crossed_handoff_recovery_pass_marker_streak = window.self_static_handoff_pass_streak
+            event, events = self._commit_crossed_handoff_recovery(result, monotonic_ms, fast=fast)
+        else:
+            event, events = self._commit_consensus(result, monotonic_ms, fast=fast)
+        self._append_recognition_trace(window=window, outcome="self_static_handoff_recovered",
+            strategy_result=result, reason="two_fresh_known_hand_reads_after_direct_handoff",
+            commit_attempted=True, commit_event_id=event.event_id)
+        return _OwnershipResolution(event, events)
+
     def _observe_turn_ownership(
         self,
         expected: Seat,
@@ -3894,6 +5570,23 @@ class LiveOrchestrator:
         window = self._ensure_turn_ownership_window()
         if window is None or window.expected_player != expected:
             return None
+        if self._check_recovery_deadline(window):
+            return None
+        frame_window_state = deepcopy(window.__dict__)
+        capture_seq = self._recognition_trace_context.get("capture_seq", self._capture_sequence)
+        if (type(capture_seq) is not int or capture_seq <= 0
+                or window.last_fast_capture_ms is not None and int(monotonic_ms) <= window.last_fast_capture_ms
+                or window.last_fast_capture_seq is not None and capture_seq <= window.last_fast_capture_seq):
+            window.sample_allowed = False
+            return None
+        window.last_fast_capture_ms = int(monotonic_ms)
+        window.last_fast_capture_seq = capture_seq
+        if self._capture_pass_baseline_pending:
+            self._last_pass_marker_players = self._pass_marker_players(fast)
+            window.pass_marker_baseline = self._last_pass_marker_players
+            self._capture_pass_baseline_pending = False
+        self._capture_turn_surface_baseline(window, frame, fast)
+        self._observe_temporal_recovery_evidence(window, fast)
         active = fast.active_player
         previous_pass_marker_players = self._last_pass_marker_players
         self._last_pass_marker_players = self._pass_marker_players(fast)
@@ -3907,6 +5600,50 @@ class LiveOrchestrator:
         window.active_player = active
         window.sample_allowed = False
         direct_next = self._is_direct_next_active(expected, active)
+        if (expected == "self" and not direct_next and window.self_static_handoff_streak
+                and not window.turn_recovery_pending):
+            crossed_self_handoff = self._probe_self_static_handoff(window, frame, fast, monotonic_ms, metrics)
+            if crossed_self_handoff is not None:
+                return crossed_self_handoff
+            if window.self_static_handoff_pass_streak:
+                window.disposition = "self_static_crossed_handoff_collecting"
+                window.sample_allowed = False
+                return None
+        # A late visual placement can prove that the current trick leader has
+        # finished only after the timer has already jumped to their partner.
+        # Ask the reducer first whether the expected PASS would close that wind
+        # catch.  This narrow path must precede generic foreign-active recovery
+        # or the same revision waits through an unrelated eight-second cycle.
+        if window.wind_catch_pass_recovery_pending:
+            return self._advance_wind_catch_pass_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+        if self._can_start_wind_catch_pass_recovery(window, fast):
+            self._begin_wind_catch_pass_recovery(window, fast, monotonic_ms)
+            return self._advance_wind_catch_pass_recovery(
+                window,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+                decision=decision,
+            )
+        if (
+            window.wind_catch_pass_recovery_failed
+            and self.reducer.wind_receiver_after_current_pass(expected)
+            == window.wind_catch_pass_recovery_receiver
+        ):
+            # The one bounded attempt for this immutable revision has ended.
+            # Preserve fail-closed state, but do not repeatedly enter generic
+            # recovery and consume another local turn budget.
+            window.sample_allowed = False
+            return None
+        last_pass = self._recover_last_pass_from_new_controls(window, frame, fast, monotonic_ms, metrics)
+        if last_pass is not None:
+            return last_pass
         if window.turn_recovery_pending:
             return self._advance_turn_recovery(
                 window,
@@ -3915,10 +5652,43 @@ class LiveOrchestrator:
                 metrics=metrics,
                 decision=decision,
                 frame=frame,
+                rollback_window_state=frame_window_state,
             )
-        if expected != "self" and (
-            (active == "self" and not direct_next)
-            or fast.self_action_buttons_visible
+        # A normal direct successor with a fresh seat-bound PASS is not a
+        # lost-history incident.  Its narrow two-capture path must precede
+        # the broad "self controls appeared" recovery branch.
+        if window.unseen_direct_next_pass_pending and (direct_next or active is None):
+            return self._advance_unseen_direct_next_pass(
+                window, fast, monotonic_ms, metrics=metrics, decision=decision,
+                active_is_direct_next=direct_next,
+            )
+        if self._can_start_unseen_direct_next_pass(window, expected, active):
+            marker_baseline_visible = (
+                False if window.expected_pass_marker_edge_while_active_unknown
+                else previous_expected_pass_marker_visible
+                if window.disposition == "owner_provisional"
+                else expected in previous_pass_marker_players
+            )
+            self._begin_unseen_direct_next_pass(
+                window, fast, monotonic_ms,
+                marker_baseline_visible=marker_baseline_visible,
+            )
+            return self._advance_unseen_direct_next_pass(
+                window, fast, monotonic_ms, metrics=metrics, decision=decision,
+                active_is_direct_next=True,
+            )
+        if expected != "self":
+            self._remember_pre_recovery_chain_candidate(
+                window,
+                frame,
+                fast,
+                monotonic_ms,
+                metrics=metrics,
+            )
+        if expected != "self" and self._new_self_response_controls_confirmed(
+            window,
+            fast,
+            monotonic_ms,
         ):
             self._begin_turn_recovery(
                 window,
@@ -3932,6 +5702,8 @@ class LiveOrchestrator:
                 monotonic_ms,
                 metrics=metrics,
                 decision=decision,
+                frame=frame,
+                rollback_window_state=frame_window_state,
             )
         # The visual PASS edge can precede a stale expected-player highlight.
         # Probe only the reducer-proven wind receiver before the normal
@@ -3947,6 +5719,8 @@ class LiveOrchestrator:
         if receiver_play_recovery is not None:
             return receiver_play_recovery
         if active == expected:
+            if window.self_static_handoff_reads:
+                self._clear_self_static_handoff(window)
             if window.wind_catch_receiver_play_streak:
                 # Do not mix a stale owner-highlight ROI into the receiver
                 # recovery burst.  The next frame either confirms the same
@@ -3972,28 +5746,6 @@ class LiveOrchestrator:
             return None
         window.owner_active_streak = 0
         self_lead_handoff = self._is_self_lead_handoff(expected, active)
-
-        # A finished leader's partner becomes the visible active seat as soon
-        # as the final opponent clicks PASS.  Recover that one action before
-        # generic foreign-active handling; the reducer has already proved the
-        # exact wind transition and this branch still needs two marker frames.
-        if window.wind_catch_pass_recovery_pending:
-            return self._advance_wind_catch_pass_recovery(
-                window,
-                fast,
-                monotonic_ms,
-                metrics=metrics,
-                decision=decision,
-            )
-        if self._can_start_wind_catch_pass_recovery(window, fast):
-            self._begin_wind_catch_pass_recovery(window, fast, monotonic_ms)
-            return self._advance_wind_catch_pass_recovery(
-                window,
-                fast,
-                monotonic_ms,
-                metrics=metrics,
-                decision=decision,
-            )
 
         # A pass can be recovered before the new owner is ever observed, but
         # only on this initial direct-next frame.  This branch is intentionally
@@ -4086,6 +5838,10 @@ class LiveOrchestrator:
                 and decision.phase == ZonePhase.BURST_READ
                 and not fast.effect_visible
             )
+            if not readable:
+                self_handoff = self._probe_self_static_handoff(window, frame, fast, monotonic_ms, metrics)
+                if self_handoff is not None:
+                    return self_handoff
             ownership_event = self._advance_direct_handoff(
                 window,
                 fast,
@@ -4161,11 +5917,41 @@ class LiveOrchestrator:
             # the intervening seat-bound PASS chain; if the evidence cannot be
             # reconstructed before the expected player acts again, turn
             # recovery itself escalates to a real history gap.
+            if (
+                active == "self"
+                and fast.self_action_buttons_visible
+                and self._response_controls_streak == 1
+                and window.pre_recovery_chain_signature is not None
+            ):
+                window.disposition = "self_controls_pre_recovery_chain_pending"
+                window.handoff_block_reason = "waiting_for_confirmed_self_controls_recovery"
+                window.handoff_last_block_reason = window.handoff_block_reason
+                window.sample_allowed = False
+                return None
             self._begin_turn_recovery(
                 window,
                 fast,
                 monotonic_ms,
                 reason="active_player_crossed_handoff",
+            )
+            response_identity = self._response_identity()
+            controls_edge_ms = self._response_controls_edge_ms
+            controls_edge_is_current = bool(
+                fast.active_player == "self"
+                and fast.self_action_buttons_visible
+                and not fast.effect_visible
+                and self._response_controls_visible is True
+                and self._response_controls_absent_identity == response_identity
+                and self._response_controls_edge_identity == response_identity
+                and self._response_controls_streak >= 1
+                and controls_edge_ms is not None
+                and window.created_capture_ms <= controls_edge_ms <= int(monotonic_ms)
+                and int(monotonic_ms) - controls_edge_ms <= _ADVICE_RECOVERY_TARGET_MS
+            )
+            entry_frame = (
+                frame
+                if not fast.self_action_buttons_visible or controls_edge_is_current
+                else None
             )
             return self._advance_turn_recovery(
                 window,
@@ -4173,6 +5959,10 @@ class LiveOrchestrator:
                 monotonic_ms,
                 metrics=metrics,
                 decision=decision,
+                frame=entry_frame,
+                rollback_window_state=(
+                    frame_window_state if entry_frame is not None else None
+                ),
             )
         if active is None:
             if (
@@ -4204,6 +5994,29 @@ class LiveOrchestrator:
             window.disposition = (
                 "owner_active_unknown"
                 if readable_expected_roi
+                else "isolated_active_unknown"
+            )
+            window.sample_allowed = readable_expected_roi
+            return None
+        if expected != "self" and active == "self":
+            # The last local action's controls/highlight can persist while
+            # this foreign player is still taking their normal turn. The
+            # confirmed hidden->visible self-control edge is handled above;
+            # real direct/crossed handoffs and seat-bound PASS evidence also
+            # have their own earlier paths. Do not let the generic mismatch
+            # counter turn an unproved local template into a recovery clock.
+            window.crossing_active_player = None
+            window.crossing_active_streak = 0
+            window.crossing_non_owner_streak = 0
+            readable_expected_roi = bool(
+                decision.collect_sample
+                and decision.phase == ZonePhase.BURST_READ
+                and not fast.effect_visible
+                and not metrics.effect_visible
+                and not expected_pass_marker_visible
+            )
+            window.disposition = (
+                "owner_active_unknown" if readable_expected_roi
                 else "isolated_active_unknown"
             )
             window.sample_allowed = readable_expected_roi
@@ -4276,15 +6089,46 @@ class LiveOrchestrator:
                 verification.followup_event_id = event.event_id
                 verification.state = "open"
                 verification.opened_monotonic_ms = self._last_monotonic_ms
+                verification.processing_opened_ms = self._processing_clock_ms()
+                self._arm_verification_deadline(verification)
 
         if event.event_type == "player_passed" or bool(event.payload.get("is_pass", False)):
             return
         if after.current_player is None:
             return
+        cards = tuple(str(card) for card in event.payload.get("cards", ()))
+        options = tuple(event.payload.get("suit_options", ()))
+        risky = bool(
+            event.confidence < 0.80
+            or any(is_unknown_suit_card(card) for card in cards)
+            or any(len(option) > 1 for option in options)
+            or f"{after.wild_rank}H" in cards
+            or event.payload.get("integrity_warnings")
+        )
+        if not risky:
+            return
         self._previous_action_verifications[event.event_id] = _PreviousActionVerification(
             target=event,
             expected_followup_actor=after.current_player,
         )
+
+    def _arm_verification_deadline(self, target: _PreviousActionVerification) -> None:
+        if self._verification_timer is not None:
+            self._verification_timer.cancel()
+
+        def expired() -> None:
+            with self._state_lock:
+                if self.status != "running" or self._previous_action_verification_target(self.snapshot) is not target:
+                    return
+                self._expire_previous_action_verification(
+                    target, monotonic_ms=(target.opened_monotonic_ms or 0) + _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS,
+                )
+                self._notify_update_listener()
+
+        timer = Timer(_PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS / 1000, expired)
+        timer.daemon = True
+        self._verification_timer = timer
+        timer.start()
 
     def _previous_action_verification_target(
         self,
@@ -4342,6 +6186,12 @@ class LiveOrchestrator:
 
         if target is None or target.state != "open":
             return None
+        if target.processing_opened_ms is not None and (
+            self._processing_clock_ms() - target.processing_opened_ms >= _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS
+        ):
+            return self._expire_previous_action_verification(
+                target, monotonic_ms=(target.opened_monotonic_ms or 0) + _PREVIOUS_ACTION_VERIFICATION_TIMEOUT_MS,
+            )
         valid_distinct_result = bool(
             result is not None
             and not result.is_pass
@@ -4421,7 +6271,7 @@ class LiveOrchestrator:
                 confidence=result.confidence,
                 source=source,
             )
-            self._request_advice_if_needed()
+            self._request_advice_if_needed(bypass_response_preflight=True)
             return event
 
         before = self.reducer.snapshot()
@@ -4449,7 +6299,7 @@ class LiveOrchestrator:
         self._analysis_epoch += 1
         self._clear_burst()
         self._activate_zone(monotonic_ms)
-        self._request_advice_if_needed()
+        self._request_advice_if_needed(bypass_response_preflight=True)
         return published
 
     def _expire_previous_action_verification(
@@ -4489,7 +6339,7 @@ class LiveOrchestrator:
             confidence=0.0,
             source="previous_action_verification_timeout",
         )
-        self._request_advice_if_needed()
+        self._request_advice_if_needed(bypass_response_preflight=True)
         return event
 
     def _withhold_advice_for_previous_action_verification(
@@ -4833,17 +6683,187 @@ class LiveOrchestrator:
         self._advice_withhold_finish_event_id = None
         return True
 
-    def _request_advice_if_needed(self) -> AdviceRequestKey | None:
+    @staticmethod
+    def _is_self_response_turn(snapshot: LiveSnapshot) -> bool:
+        return bool(
+            snapshot.current_player == "self"
+            and any(
+                not play.is_pass and bool(play.cards)
+                for play in snapshot.trick_plays
+            )
+        )
+
+    def _ownership_recovery_is_pending(self) -> bool:
+        window = self._turn_ownership_window
+        return bool(
+            window is not None
+            and (
+                window.turn_recovery_pending
+                or window.crossed_handoff_recovery_pending
+                or window.unseen_direct_next_pass_pending
+                or window.wind_catch_pass_recovery_pending
+                or window.wind_catch_pass_recovery_failed
+                or window.handoff_detected_ms is not None
+            )
+        )
+
+    def _clear_self_response_preflight(self) -> None:
+        timer = self._self_response_preflight_timer
+        self._self_response_preflight_timer = None
+        if timer is not None:
+            timer.cancel()
+        self._self_response_preflight_key = None
+        self._self_response_preflight_started_ms = None
+        self._self_response_preflight_deadline_ms = None
+
+    def _arm_self_response_preflight(
+        self,
+        key: AdviceRequestKey,
+    ) -> None:
+        if self._self_response_preflight_key == key:
+            return
+        self._clear_self_response_preflight()
+        started_ms = int(self._last_monotonic_ms)
+        self._self_response_preflight_key = key
+        self._self_response_preflight_started_ms = started_ms
+        self._self_response_preflight_deadline_ms = (
+            started_ms + _SELF_RESPONSE_PREFLIGHT_MAX_MS
+        )
+        timer = Timer(
+            _SELF_RESPONSE_PREFLIGHT_MAX_MS / 1_000.0,
+            self._expire_self_response_preflight,
+            args=(key,),
+        )
+        timer.daemon = True
+        self._self_response_preflight_timer = timer
+        timer.start()
+
+    def _expire_self_response_preflight(self, key: AdviceRequestKey) -> None:
+        """Release advice even when capture drops every preflight frame."""
+
+        with self._state_lock:
+            if (
+                self.status != "running"
+                or self._self_response_preflight_key != key
+                or self._advice_suspended_reason is not None
+            ):
+                return
+            snapshot = self.snapshot
+            current_key = AdviceRequestKey(
+                snapshot.session_id,
+                snapshot.turn_id,
+                snapshot.revision,
+            )
+            if current_key != key or snapshot.current_player != "self":
+                self._clear_self_response_preflight()
+                return
+            self._release_self_response_preflight(key)
+            requested = self._request_advice_if_needed(
+                bypass_response_preflight=True
+            )
+            if requested is not None:
+                self._notify_update_listener()
+
+    def _release_self_response_preflight(
+        self,
+        key: AdviceRequestKey,
+    ) -> None:
+        if self._self_response_preflight_key != key:
+            return
+        self._clear_self_response_preflight()
+
+    def _self_response_preflight_is_expired(
+        self,
+        monotonic_ms: int,
+    ) -> bool:
+        deadline = self._self_response_preflight_deadline_ms
+        return bool(deadline is not None and int(monotonic_ms) >= deadline)
+
+    def _resolve_self_response_preflight_from_fast(
+        self,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+    ) -> None:
+        """Let the first safe fast frame choose button PASS or FableDan."""
+
+        snapshot = self.snapshot
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        if self._self_response_preflight_key != key:
+            return
+        if self._self_response_preflight_is_expired(monotonic_ms):
+            self._release_self_response_preflight(key)
+            self._request_advice_if_needed(bypass_response_preflight=True)
+            return
+        control_valid, _confidence, _box = self._parse_cannot_beat_control(fast)
+        cannot_beat_candidate = bool(
+            getattr(fast, "cannot_beat_visible", False)
+            and control_valid
+            and fast.active_player in (None, "self")
+            and fast.self_action_buttons_visible
+            and not fast.effect_visible
+        )
+        if cannot_beat_candidate:
+            return
+        if (
+            fast.active_player != "self"
+            and not fast.self_action_buttons_visible
+        ):
+            return
+        self._release_self_response_preflight(key)
+        self._request_advice_if_needed(bypass_response_preflight=True)
+
+    def _request_advice_after_fast_signal(
+        self,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+    ) -> AdviceRequestKey | None:
+        """Schedule advice or consume the known first-frame button result."""
+
+        requested = self._request_advice_if_needed()
+        # The frame that completed the preceding action is already the first
+        # observable frame of the new self response turn.  Seed the two-frame
+        # button confirmation now so a normal capture cadence does not require
+        # an unnecessary third frame.
+        window = self._ensure_turn_ownership_window()
+        if window is not None and window.cannot_beat_streak == 0:
+            self._advance_cannot_beat_confirmation(fast, monotonic_ms)
+        self._resolve_self_response_preflight_from_fast(fast, monotonic_ms)
+        snapshot = self.snapshot
+        key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        return key if key in self._requested_advice else requested
+
+    @_state_synchronized
+    def _request_advice_if_needed(
+        self,
+        *,
+        bypass_response_preflight: bool = False,
+    ) -> AdviceRequestKey | None:
+        snapshot = self.snapshot
+        key = AdviceRequestKey(snapshot.session_id, snapshot.turn_id, snapshot.revision)
+        if self._button_advice_key is not None and self._button_advice_key != key:
+            self._invalidate_button_advice()
         if self._advice_suspended_reason is not None:
+            self._invalidate_button_advice()
             return None
         if self.advisor is None or self.status != "running":
+            if self.status != "running":
+                self._invalidate_button_advice()
             return None
-        snapshot = self.snapshot
         if (
             snapshot.current_player != "self"
             or "self" in snapshot.finished_seats
             or not snapshot.my_hand
         ):
+            self._invalidate_button_advice()
+            self._clear_self_response_preflight()
             return None
         key = AdviceRequestKey(
             snapshot.session_id,
@@ -4851,9 +6871,26 @@ class LiveOrchestrator:
             snapshot.revision,
         )
         with self._advice_lock:
+            response_turn = (snapshot.session_id, snapshot.turn_id)
+            first_request_for_response_turn = bool(
+                self._is_self_response_turn(snapshot)
+                and self._self_response_preflight_seen_turn != response_turn
+            )
+            if (
+                self._self_response_preflight_key is not None
+                and self._self_response_preflight_key != key
+            ):
+                self._clear_self_response_preflight()
+            if (
+                not bypass_response_preflight
+                and self._self_response_preflight_key == key
+            ):
+                return None
             if self._withhold_advice_for_previous_action_verification(snapshot, key):
+                self._invalidate_button_advice()
                 return None
             if not self._clear_advice_withhold_if_reconstructed(snapshot):
+                self._invalidate_button_advice()
                 # The placement path emits the single audit record.  Repeated
                 # frames must be inert: no AdviceJob, FableDan trace, or
                 # duplicate withheld event is permitted for this revision.
@@ -4864,13 +6901,36 @@ class LiveOrchestrator:
                     withhold_reason=_VISUAL_FINISH_WITHHOLD_REASON,
                 )
                 return None
+            if self._button_recovery_pending(self._turn_ownership_window):
+                self._invalidate_button_advice()
+                window = self._turn_ownership_window
+                self.latest_advice = self._recovery_blocked_advice(window) if window is not None and window.turn_recovery_failed else LiveAdvice(
+                    key=key, status="withheld", error=_TURN_RECOVERY_WITHHOLD_TEXT,
+                    withhold_reason=_TURN_RECOVERY_WITHHOLD_REASON,
+                )
+                return None
+            if self._button_advice_key == key:
+                return key
+            if (
+                not bypass_response_preflight
+                and first_request_for_response_turn
+                and self._desynchronized_turn_key != self._turn_ownership_key(snapshot)
+            ):
+                self._arm_self_response_preflight(key)
+                self._self_response_preflight_seen_turn = response_turn
+                return None
+            if bypass_response_preflight and first_request_for_response_turn:
+                self._self_response_preflight_seen_turn = response_turn
             if key in self._requested_advice:
+                if self._is_self_response_turn(snapshot):
+                    self._self_response_preflight_seen_turn = response_turn
                 return key
             state = self.reducer.to_guandan_state()
             self._decision_id_by_revision[key.state_revision] = key.decision_id
             self._requested_advice.add(key)
+            self._pending_model_advice.add(key)
             self._advice_completion_events[key] = Event()
-            self._advice_requested_at_ms[key] = self._last_monotonic_ms
+            self._advice_requested_at_ms[key] = self._processing_clock_ms()
             self.latest_advice = LiveAdvice(key=key, status="requested")
             self.store.append_advice(
                 {
@@ -4905,6 +6965,8 @@ class LiveOrchestrator:
             worker = self._advice_worker
             assert worker is not None
             worker.submit(_AdviceJob(key, state))
+            if self._is_self_response_turn(snapshot):
+                self._self_response_preflight_seen_turn = response_turn
             return key
 
     def _run_advice(self, job: _AdviceJob) -> _AdviceCompletion:
@@ -5423,10 +7485,48 @@ class LiveOrchestrator:
     @_state_synchronized
     def _complete_advice_job(self, completion: _AdviceCompletion) -> None:
         key = completion.key
+        self._pending_model_advice.discard(key)
         if not self._accept_advice_results:
             self._signal_advice_completion(key)
             return
+        if self.status != "running":
+            self._requested_advice.discard(key)
+            if self.latest_advice is not None and self.latest_advice.key == key:
+                self.latest_advice = replace(self.latest_advice, status="stale", visible=False)
+            self._signal_advice_completion(key)
+            return
         with self._advice_lock:
+            snapshot = self.snapshot
+            current_key = AdviceRequestKey(snapshot.session_id, snapshot.turn_id, snapshot.revision)
+            if key == current_key:
+                if self._withhold_advice_for_previous_action_verification(snapshot, key):
+                    self._invalidate_button_advice()
+                    self._requested_advice.discard(key)
+                    self._signal_advice_completion(key)
+                    return
+                if self._button_recovery_pending(self._turn_ownership_window):
+                    self._invalidate_button_advice()
+                    self._requested_advice.discard(key)
+                    window = self._turn_ownership_window
+                    self.latest_advice = self._recovery_blocked_advice(window) if window is not None and window.turn_recovery_failed else LiveAdvice(
+                        key=key, status="withheld", error=_TURN_RECOVERY_WITHHOLD_TEXT,
+                        withhold_reason=_TURN_RECOVERY_WITHHOLD_REASON,
+                    )
+                    self._signal_advice_completion(key)
+                    return
+            if self._button_advice_key == key:
+                # A late model result cannot overwrite an independently proven
+                # local button suggestion.  No player action has occurred yet.
+                self.store.append_advice({
+                    "request_id": key.request_id,
+                    "status": "stale",
+                    "discard_reason": "button_advice_preferred",
+                    "turn_id": key.turn_id,
+                    "state_revision": key.state_revision,
+                })
+                self._signal_advice_completion(key)
+                self._requested_advice.discard(key)
+                return
             snapshot = self.snapshot
             current_key = AdviceRequestKey(
                 snapshot.session_id,
@@ -5695,6 +7795,8 @@ class LiveOrchestrator:
             else "advice request cancelled while stopping"
         )
         with self._advice_lock:
+            self._pending_model_advice.discard(key)
+            self._requested_advice.discard(key)
             self.store.append_advice(
                 {
                     "request_id": key.request_id,
@@ -5718,21 +7820,21 @@ class LiveOrchestrator:
                     "discard_reason": reason,
                 }
             )
-            self._append_advice_event(
-                "advice_stale" if status == "stale" else "advice_cancelled",
-                {
-                    "request_id": key.request_id,
-                    "turn_id": key.turn_id,
-                    "state_revision": key.state_revision,
-                    "discard_reason": reason,
-                },
-            )
-            if self.latest_advice is not None and self.latest_advice.key == key:
-                self.latest_advice = LiveAdvice(
-                    key=key,
-                    status="stale",
-                    error=error,
-                )
+            if (self.latest_advice is not None and self.latest_advice.key == key
+                    and self._button_advice_key != key):
+                self.latest_advice = LiveAdvice(key=key, status="stale", error=error)
+        # Timer expiry and state transitions acquire state before advice.  Do
+        # not invert that order while the worker records a discarded request:
+        # constructing this audit event snapshots reducer state.
+        self._append_advice_event(
+            "advice_stale" if status == "stale" else "advice_cancelled",
+            {
+                "request_id": key.request_id,
+                "turn_id": key.turn_id,
+                "state_revision": key.state_revision,
+                "discard_reason": reason,
+            },
+        )
         self._signal_advice_completion(key)
 
     def _notify_update_listener(self) -> None:
@@ -5742,11 +7844,351 @@ class LiveOrchestrator:
         if listener is not None:
             listener(self._update())
 
+    def preview_controls(
+        self, fast: FastSignalResult, *, captured_ms: int, capture_generation: int,
+        frame_size: tuple[int, int],
+    ) -> LiveUpdate | None:
+        """Publish only fresh local controls without acquiring the analysis lock.
+
+        A controller may call this before blocking recording/card work. It
+        neither changes canonical turn state nor admits a model request.
+        """
+        with self._publication_lock:
+            base = self._last_published_update
+            if base is None or self.status != "running":
+                return None
+            if type(capture_generation) is not int or capture_generation < self._capture_generation:
+                self._local_hint_tracker.reset()
+                self._local_rule_hint = None
+                return None
+            previous = self._local_rule_hint
+            hint = self._local_hint_tracker.observe(
+                fast, session_id=self.reducer.session_id, capture_generation=capture_generation,
+                captured_ms=captured_ms, now_ms=self._processing_clock_ms(),
+                running=self.status == "running", unobstructed=not bool(self._advice_suspended_reason),
+                frame_size=frame_size,
+            )
+            self._local_rule_hint = hint
+            if hint == previous:
+                return None
+            self._update_sequence += 1
+            update = replace(
+                base, advice=None, event=None, events=(), fast_signals=fast,
+                local_rule_hint=hint, capture_generation=capture_generation,
+                update_sequence=self._update_sequence,
+            )
+            listener = self._update_listener
+        if listener is not None:
+            listener(update)
+        return update
+
+    def processing_now_ms(self) -> int:
+        """Expose the real processing clock for controller timing, not capture age."""
+        return self._processing_clock_ms()
+
+    def _observe_local_rule_hint(
+        self, fast: FastSignalResult, captured_ms: int, *, frame_size: tuple[int, int] | None = None,
+    ) -> None:
+        generation = self._recognition_trace_context.get("capture_generation", self._capture_generation)
+        if type(generation) is not int or generation < 0:
+            with self._publication_lock:
+                self._local_hint_tracker.reset()
+                self._local_rule_hint = None
+            self._notify_update_listener()
+            return
+        if generation != self._capture_generation:
+            self._turn_evidence.clear()
+            self._reset_response_control_evidence()
+            window = self._turn_ownership_window
+            if window is not None:
+                self._clear_recovery_deadline(window)
+                window.last_fast_capture_ms = None
+                window.last_fast_capture_seq = None
+                window.temporal_confirmed_actives.clear()
+                window.temporal_confirmed_passes.clear()
+                window.handoff_samples.clear()
+                window.evidence_epoch = (*window.key, self._analysis_epoch, generation)
+        with self._publication_lock:
+            self._capture_generation = generation
+            previous = self._local_rule_hint
+            hint = self._local_hint_tracker.observe(
+                fast, session_id=self.reducer.session_id, capture_generation=generation,
+                captured_ms=int(captured_ms), now_ms=self._processing_clock_ms(),
+                running=self.status == "running",
+                unobstructed=not bool(self._advice_suspended_reason), frame_size=frame_size,
+            )
+            self._local_rule_hint = hint
+        if hint != previous and self._update_listener is not None:
+            self._update_listener(self._update(fast_signals=fast))
+
+    def _cancel_response_deadlines(self) -> None:
+        for name in ("_deadline_timer", "_verification_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.cancel()
+                setattr(self, name, None)
+        self._local_hint_tracker.reset()
+        self._local_rule_hint = None
+        self._turn_evidence.clear()
+        self._reset_response_control_evidence()
+
+    def _reset_response_control_evidence(self) -> None:
+        self._response_controls_last_capture = None
+        self._response_controls_visible = None
+        self._response_controls_absent_identity = ()
+        self._response_controls_edge_identity = ()
+        self._response_controls_edge_ms = None
+        self._response_controls_edge_processing_ms = None
+        self._response_controls_streak = 0
+
+    def _consume_response_control_edge_after_self_action(self) -> None:
+        """A formal self action ends the current local-control lifecycle."""
+
+        visible = self._response_controls_visible
+        self._response_controls_absent_identity = ()
+        self._response_controls_edge_identity = ()
+        self._response_controls_edge_ms = None
+        self._response_controls_edge_processing_ms = None
+        self._response_controls_streak = 0
+        if visible is True:
+            # Lingering buttons after our own committed action are the visible
+            # baseline for the next response, not a reusable hidden->visible
+            # edge.  A future foreign recovery must first observe absence and
+            # then two new visible captures under the new response identity.
+            self._response_controls_visible = True
+        self._clear_pre_recovery_chain_candidate(self._turn_ownership_window)
+
     def _signal_advice_completion(self, key: AdviceRequestKey) -> None:
         with self._advice_lock:
             event = self._advice_completion_events.get(key)
         if event is not None:
             event.set()
+
+    @staticmethod
+    def _clear_cannot_beat_confirmation(window: _TurnOwnershipWindow) -> None:
+        window.cannot_beat_streak = 0
+        window.cannot_beat_signature = None
+        window.cannot_beat_confidence = 0.0
+        window.cannot_beat_last_capture_ms = None
+
+    def _clear_current_cannot_beat_confirmation(self) -> None:
+        self._cancel_response_deadlines()
+        window = self._turn_ownership_window
+        if window is not None:
+            self._clear_cannot_beat_confirmation(window)
+        self._invalidate_button_advice()
+
+    def _invalidate_button_advice(self) -> None:
+        key, self._button_advice_key = self._button_advice_key, None
+        self._button_advice_event = None
+        if (key is not None and self.latest_advice is not None
+                and self.latest_advice.key == key
+                and self.latest_advice.advice is not None
+                and self.latest_advice.advice.strategy == "button_cannot_beat"):
+            if key in self._pending_model_advice:
+                self.latest_advice = LiveAdvice(key=key, status="requested")
+            else:
+                self._requested_advice.discard(key)
+                self.latest_advice = replace(self.latest_advice, status="stale", visible=False)
+
+    @staticmethod
+    def _button_recovery_pending(window: _TurnOwnershipWindow | None) -> bool:
+        return bool(window is not None and (
+            window.turn_recovery_pending
+            or window.crossed_handoff_recovery_pending
+            or window.unseen_direct_next_pass_pending
+            or window.wind_catch_pass_recovery_pending
+            or window.wind_catch_pass_recovery_failed
+            or window.handoff_detected_ms is not None
+        ))
+
+    @staticmethod
+    def _parse_cannot_beat_control(
+        fast: FastSignalResult,
+    ) -> tuple[bool, float, tuple[int, int, int, int] | None]:
+        """Validate plugin-provided numeric evidence before using it as a vote."""
+        raw_confidence = getattr(fast, "cannot_beat_confidence", 0.0)
+        try:
+            confidence = float(raw_confidence or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return False, 0.0, None
+        if (isinstance(raw_confidence, bool) or not isfinite(confidence)
+                or not _CANNOT_BEAT_MIN_CONFIDENCE <= confidence <= 1.0):
+            return False, 0.0, None
+        raw_box = getattr(fast, "cannot_beat_box", None)
+        if raw_box is None:
+            return True, confidence, None
+        if not isinstance(raw_box, (tuple, list)) or len(raw_box) != 4:
+            return False, confidence, None
+        try:
+            values = tuple(float(value) for value in raw_box)
+            if any(isinstance(value, bool) for value in raw_box) or not all(
+                isfinite(value) and value.is_integer() and 0 <= value <= 2**31 - 1
+                for value in values
+            ):
+                return False, confidence, None
+            box = (int(values[0]), int(values[1]), int(values[2]), int(values[3]))
+        except (TypeError, ValueError, OverflowError):
+            return False, confidence, None
+        return box[2] > 0 and box[3] > 0, confidence, box
+
+    def _advance_cannot_beat_confirmation(
+        self,
+        fast: FastSignalResult,
+        monotonic_ms: int,
+    ) -> _OwnershipResolution | None:
+        """Suggest PASS from a stable local control, never manufacture an action.
+
+        ``cannot_beat`` is a rules-level UI control, but it is still visual
+        evidence.  A single frame, a foreign turn, an opening lead, animation,
+        or any recovery/history-gap state resets the candidate.  Newer
+        recognizers provide a box and score; compatibility plug-ins can omit
+        them and still require the same two stable boolean frames.
+        """
+
+        window = self._ensure_turn_ownership_window()
+        if window is None:
+            self._invalidate_button_advice()
+            return None
+        snapshot = self.snapshot
+        current_key = AdviceRequestKey(
+            snapshot.session_id,
+            snapshot.turn_id,
+            snapshot.revision,
+        )
+        if self._button_advice_key is not None and self._button_advice_key != current_key:
+            self._invalidate_button_advice()
+        preflight_expired = bool(
+            self._self_response_preflight_key == current_key
+            and self._self_response_preflight_is_expired(monotonic_ms)
+        )
+        visible = bool(getattr(fast, "cannot_beat_visible", False))
+        control_valid, confidence, box = self._parse_cannot_beat_control(fast)
+        recovery_pending = self._button_recovery_pending(window)
+        previous_action_pending = (
+            self._previous_action_verification_target(snapshot) is not None
+        )
+        safe = bool(
+            visible
+            and control_valid
+            and snapshot.current_player == "self"
+            and fast.active_player in (None, "self")
+            and fast.self_action_buttons_visible
+            and bool(snapshot.trick_plays)
+            and not self._first_action_pending
+            and not fast.effect_visible
+            and not recovery_pending
+            and not previous_action_pending
+            and self._advice_withhold_reason is None
+            and self._advice_suspended_reason is None
+            and self._desynchronized_turn_key != self._turn_ownership_key(snapshot)
+            and not preflight_expired
+        )
+        if not safe:
+            previously_confirmed = self._button_advice_key is not None
+            last_capture_ms = window.cannot_beat_last_capture_ms
+            self._clear_cannot_beat_confirmation(window)
+            if last_capture_ms is not None or (visible and snapshot.current_player == "self"):
+                window.cannot_beat_last_capture_ms = max(
+                    int(monotonic_ms),
+                    last_capture_ms if last_capture_ms is not None else int(monotonic_ms),
+                )
+            self._invalidate_button_advice()
+            if (previously_confirmed and not recovery_pending and not previous_action_pending
+                    and fast.active_player in (None, "self") and not fast.effect_visible):
+                self._request_advice_if_needed(bypass_response_preflight=True)
+            return None
+
+        if (self._button_advice_key == current_key
+                and self._button_advice_event is not None):
+            return _OwnershipResolution(self._button_advice_event, ())
+
+        captured_ms = int(monotonic_ms)
+        if (window.cannot_beat_last_capture_ms is not None
+                and captured_ms <= window.cannot_beat_last_capture_ms):
+            return None
+        window.cannot_beat_last_capture_ms = captured_ms
+
+        signature: tuple[object, ...] = (
+            "button_cannot_beat",
+            *(box if box is not None else ("legacy-no-box",)),
+        )
+        previous_signature = window.cannot_beat_signature
+        stable_signature = signature == previous_signature
+        if (
+            not stable_signature
+            and box is not None
+            and previous_signature is not None
+            and len(previous_signature) == 5
+            and previous_signature[0] == "button_cannot_beat"
+        ):
+            try:
+                previous_box = tuple(int(value) for value in previous_signature[1:])
+            except (TypeError, ValueError, OverflowError):
+                previous_box = ()
+            stable_signature = bool(
+                len(previous_box) == 4
+                and max(abs(before - after) for before, after in zip(previous_box, box))
+                <= 3
+            )
+        if stable_signature:
+            window.cannot_beat_streak += 1
+            window.cannot_beat_signature = signature
+            window.cannot_beat_confidence = min(
+                window.cannot_beat_confidence,
+                confidence,
+            )
+        else:
+            window.cannot_beat_signature = signature
+            window.cannot_beat_streak = 1
+            window.cannot_beat_confidence = confidence
+        if window.cannot_beat_streak < 2:
+            return None
+
+        self._clear_self_response_preflight()
+        self._self_response_preflight_seen_turn = (snapshot.session_id, snapshot.turn_id)
+        model_requested_for_state = current_key in self._advice_requested_at_ms
+        self._button_advice_key = current_key
+        if current_key not in self._pending_model_advice:
+            self._requested_advice.discard(current_key)
+        self._self_turn_corroborated = True
+        self.latest_advice = LiveAdvice(
+            key=current_key,
+            status="ready",
+            visible=True,
+            advice=LocalAdvice(
+                strategy="button_cannot_beat", cards=(), play_type="PASS",
+                is_pass=True, state_revision=snapshot.revision, elapsed_ms=0.0,
+                request_id=current_key.request_id,
+                engine_input={
+                    "source": "button_cannot_beat",
+                    "model_required": False,
+                    "model_call_skipped_for_button": True,
+                    "model_requested_for_state": model_requested_for_state,
+                },
+            ),
+        )
+        payload = {
+            "request_id": current_key.request_id,
+            "turn_id": current_key.turn_id,
+            "state_revision": current_key.state_revision,
+            "advisor_strategy": "button_cannot_beat",
+            "advisor_name": "按钮判定",
+            "source": "button_cannot_beat",
+            "model_required": False,
+            "model_call_skipped_for_button": True,
+            "model_requested_for_state": model_requested_for_state,
+            "is_pass": True,
+            "action_committed": False,
+            "confirmation_frames": window.cannot_beat_streak,
+        }
+        self.store.append_advice({**payload, "status": "button_ready"})
+        event = self._append_advice_event(
+            "button_advice_ready", payload, confidence=window.cannot_beat_confidence
+        )
+        self._button_advice_event = event
+        self._signal_advice_completion(current_key)
+        return _OwnershipResolution(event, (event,))
 
     def _apply_fast_signal(self, fast: FastSignalResult) -> None:
         if self.snapshot.current_player != "self":
@@ -5836,6 +8278,10 @@ class LiveOrchestrator:
             )
             self.store.append_event(published)
             self._all_events.append(published)
+            if published.actor is not None and published.event_type in {"player_played", "player_passed", "manual_confirmed_event"}:
+                self._turn_evidence.mark_consumed(published.actor, published.monotonic_ms)
+                if published.actor == "self":
+                    self._consume_response_control_edge_after_self_action()
             return published
 
     def _publish_action_with_outcomes(
@@ -6088,6 +8534,17 @@ class LiveOrchestrator:
                 # record the same placement without a history gap.
                 self._placement_streaks.pop(player, None)
                 continue
+            if (
+                fast.active_player == player
+                and self.reducer.snapshot().remaining_cards.get(player, 0) > 0
+            ):
+                # A rank badge is placement evidence, not proof of the card
+                # action that emptied this hand.  If that same player is still
+                # shown as active, keep canonical card counts and finished
+                # state tied to a committed play/manual event instead of
+                # letting the badge hide a missing terminal action.
+                self._placement_streaks.pop(player, None)
+                continue
             placement = str(signal.placement).strip().lower()
             expected_placement = (
                 placement_sequence[len(self._finish_order)]
@@ -6231,7 +8688,7 @@ class LiveOrchestrator:
         if requested_at is not None:
             self._advice_visible_latency_ms = max(
                 0,
-                self._last_monotonic_ms - requested_at,
+                self._processing_clock_ms() - requested_at,
             )
 
     def _append_sample(
@@ -6253,6 +8710,12 @@ class LiveOrchestrator:
             evidence_ref=observation_id,
             suit_options=result.suit_options,
             post_hand=result.post_hand,
+            captured_ms=int(monotonic_ms),
+            capture_seq=self._recognition_trace_context.get("capture_seq", self._capture_sequence),
+            action_epoch=(
+                self._turn_ownership_window.evidence_epoch
+                if self._turn_ownership_window is not None else ()
+            ),
         )
         owner_window = self._ensure_turn_ownership_window()
         owner_disposition = (
@@ -6382,8 +8845,6 @@ class LiveOrchestrator:
                 "direct_next_handoff",
                 "crossed_handoff_recovery",
             }:
-                owner_window.handoff_samples.append(sample)
-            elif owner_disposition == "turn_recovery":
                 owner_window.handoff_samples.append(sample)
         elif provisional_owner_sample:
             owner_window.provisional_samples.append(sample)
@@ -6739,6 +9200,7 @@ class LiveOrchestrator:
             ),
             integrity_warnings=tuple(dict.fromkeys(integrity_warnings)),
             action_metadata=action_metadata,
+            monotonic_ms=monotonic_ms,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
         self._first_action_pending = False
@@ -6756,7 +9218,10 @@ class LiveOrchestrator:
         if suppress_turn_side_effects:
             return event, (event, *outcomes)
         turn_started = self._append_current_turn_started()
-        self._request_advice_if_needed()
+        if fast is not None:
+            self._request_advice_after_fast_signal(fast, monotonic_ms)
+        else:
+            self._request_advice_if_needed(bypass_response_preflight=True)
         events = (event, *outcomes) + ((turn_started,) if turn_started else ())
         return event, events
 
@@ -6835,7 +9300,7 @@ class LiveOrchestrator:
             commit_event_id=pass_event.event_id,
         )
         turn_started = self._append_current_turn_started()
-        self._request_advice_if_needed()
+        self._request_advice_after_fast_signal(fast, monotonic_ms)
         events = (
             *play_events,
             pass_event,
@@ -6931,7 +9396,7 @@ class LiveOrchestrator:
             commit_event_id=last_action_event.event_id,
         )
         turn_started = self._append_current_turn_started()
-        self._request_advice_if_needed()
+        self._request_advice_after_fast_signal(fast, monotonic_ms)
         events.extend((recovery_event, *((turn_started,) if turn_started else ())))
         return last_action_event, tuple(events)
 
@@ -6947,13 +9412,23 @@ class LiveOrchestrator:
         suit_options: tuple[tuple[str, ...], ...] = (),
         integrity_warnings: tuple[str, ...] = (),
         action_metadata: dict[str, object] | None = None,
+        monotonic_ms: int | None = None,
     ) -> LiveEvent:
+        source_wall_time = self._recognition_trace_context.get("source_wall_time")
+        if source_wall_time is not None:
+            try:
+                datetime.fromisoformat(str(source_wall_time))
+            except ValueError:
+                source_wall_time = None
         if is_pass:
             event = self.reducer.record_pass(
                 player,
                 confidence=confidence,
                 source=source,
                 evidence_refs=evidence_refs,
+                integrity_warnings=integrity_warnings,
+                monotonic_ms=monotonic_ms,
+                wall_time=source_wall_time,
             )
         else:
             event = self.reducer.record_play(
@@ -6965,6 +9440,8 @@ class LiveOrchestrator:
                 suit_options=suit_options,
                 integrity_warnings=integrity_warnings,
                 action_metadata=action_metadata,
+                monotonic_ms=monotonic_ms,
+                wall_time=source_wall_time,
             )
         self._advance_previous_action_verifications(
             event,
@@ -7096,6 +9573,10 @@ class LiveOrchestrator:
         return value
 
     _CONTENT_CHANGE_THRESHOLD = 0.02
+    # A single compact card occupies only a small fraction of the seat ROI.
+    # User frame 200 -> 216 measures about 0.0055, so recovery freshness uses
+    # a narrower threshold while retaining two-frame card/PASS/rule gates.
+    _RECOVERY_CONTENT_CHANGE_THRESHOLD = 0.004
 
     def _content_fingerprint(
         self,
@@ -7104,6 +9585,10 @@ class LiveOrchestrator:
     ) -> np.ndarray:
         """把该玩家的出牌区域降采样为灰度指纹，用于内容变化判定。"""
         roi = self._play_roi(frame, player)
+        return self._content_fingerprint_from_roi(roi)
+
+    @staticmethod
+    def _content_fingerprint_from_roi(roi: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         height, width = gray.shape[:2]
         target_width = 32
@@ -7112,6 +9597,44 @@ class LiveOrchestrator:
             gray,
             (target_width, target_height),
             interpolation=cv2.INTER_AREA,
+        )
+
+    def _update_surface_generations(
+        self,
+        frame: np.ndarray,
+        monotonic_ms: int,
+    ) -> None:
+        """Track play-ROI changes independently from active-seat templates."""
+
+        seat_rois: dict[Seat, np.ndarray] = {}
+        for player in TURN_ORDER:
+            try:
+                seat_rois[player] = self._play_roi(frame, player)
+                fingerprint = self._content_fingerprint(frame, player)
+            except (cv2.error, RuntimeError, ValueError):
+                continue
+            previous = self._surface_fingerprint_by_seat.get(player)
+            if previous is not None and previous.shape == fingerprint.shape:
+                delta = float(
+                    np.mean(
+                        np.abs(
+                            fingerprint.astype(np.int16)
+                            - previous.astype(np.int16)
+                        )
+                    )
+                    / 255.0
+                )
+                if delta >= self._RECOVERY_CONTENT_CHANGE_THRESHOLD:
+                    self._surface_generation_by_seat[player] = (
+                        self._surface_generation_by_seat.get(player, 0) + 1
+                    )
+                    self._surface_last_change_ms_by_seat[player] = int(monotonic_ms)
+            self._surface_fingerprint_by_seat[player] = fingerprint
+        self._turn_evidence.observe(
+            frame,
+            captured_ms=int(monotonic_ms),
+            generation=self._capture_generation,
+            seat_rois=seat_rois,
         )
 
     def _extract_metrics(
@@ -7201,12 +9724,26 @@ class LiveOrchestrator:
     ) -> LiveUpdate:
         if event is not None and not events:
             events = (event,)
-        return LiveUpdate(
-            status=self.status,
-            snapshot=self.snapshot,
-            event=event,
-            events=events,
-            advice=self.latest_advice,
-            review=review if review is not None else self.latest_review,
-            fast_signals=fast_signals,
-        )
+        # Never acquire state after the publication lock: control-preview and
+        # watchdog publishers must remain independent of slow analysis.
+        snapshot = self.snapshot
+        advice = self.latest_advice
+        window = self._turn_ownership_window
+        failed = bool(window is not None and window.turn_recovery_failed)
+        with self._publication_lock:
+            self._update_sequence += 1
+            update = LiveUpdate(
+                status=self.status, snapshot=snapshot, event=event, events=events,
+                advice=advice, review=review if review is not None else self.latest_review,
+                fast_signals=fast_signals,
+                local_rule_hint=self._local_hint_tracker.current(
+                    session_id=snapshot.session_id, capture_generation=self._capture_generation,
+                    now_ms=self._processing_clock_ms(),
+                ) if self.status == "running" else None,
+                capture_generation=self._capture_generation, update_sequence=self._update_sequence,
+                block_reason=advice.withhold_reason if advice is not None and advice.status == "withheld" else "",
+                missing_player=(window.turn_recovery_cycle_missing_player or window.expected_player) if failed else None,
+                missing_action_kind=("action" if snapshot.trick_plays else "lead") if failed else "",
+            )
+            self._last_published_update = update
+        return update

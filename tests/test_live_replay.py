@@ -15,6 +15,7 @@ from daguandan_bridge.live.replay import (
     EventReplayer,
     VideoReplaySource,
     _stable_visual_initial_state,
+    _event_to_turn_data,
     compare_timelines,
     replay_truth_through_live_advisor,
     replay_video_through_live_pipeline,
@@ -283,6 +284,8 @@ def test_video_replay_uses_index_timestamps_and_reports_missing_frames(tmp_path)
     short_source = VideoReplaySource(short_path, recording.index_path)
     assert len(list(short_source.frames())) == 1
     assert short_source.warnings[0].reason == "missing_video_frames"
+    assert "缺失尾部 2 帧" in short_source.warnings[0].details
+    assert "不使用恢复帧伪造完整回放" in short_source.warnings[0].details
 
 
 def _timeline_event(turn_id, cards, *, confidence=0.9, monotonic_ms=100):
@@ -565,3 +568,142 @@ def test_truth_log_video_replay_uses_manual_baseline(tmp_path):
 
     assert result.identical_turn_ids == (3,)
     assert result.changed == ()
+
+
+
+def _make_replay_session(tmp_path, *, lead="self", frame_count=3, valid_wall_time=True):
+    store = LiveSessionStore(tmp_path, "tencent_daguandan", session_id="scan-session")
+    store.start({"target_fps": 10})
+    reducer = LiveReducer("scan-session")
+    initial = reducer.confirm_initial_state(
+        round_level="2",
+        hand=HAND,
+        lead_player=lead,
+    )
+    store.append_event(initial)
+    recorder = SessionRecorder(store.directory, size=(64, 32), fps=10)
+    for index in range(frame_count):
+        wall = (
+            f"2026-08-16T12:54:{index:02d}+08:00"
+            if valid_wall_time
+            else f"t{index}"
+        )
+        recorder.write_frame(np.zeros((32, 64, 3), np.uint8), index * 100, wall)
+    recording = recorder.close()
+    store.seal(frame_count=recording.frame_count, dropped_frames=recording.dropped_frames)
+    return store
+
+
+def test_historical_scan_uses_saved_lead_and_does_not_wait_for_opening_marker(tmp_path):
+    store = _make_replay_session(tmp_path, lead="self", frame_count=3)
+    opening_calls = 0
+
+    class Recognition:
+        def recognize_opening_signal(self, _frame):
+            nonlocal opening_calls
+            opening_calls += 1
+            raise AssertionError("historical scan must not enter visual opening")
+
+        def recognize_fast_signals(self, _frame, expected_player):
+            return FastSignalResult(
+                expected_player=expected_player,
+                active_player="self",
+                pass_visible=False,
+                self_action_buttons_visible=True,
+                effect_visible=False,
+            )
+
+    result = replay_video_through_live_pipeline(
+        store.directory,
+        Recognition(),
+        use_live_pipeline=True,
+        use_saved_baseline=True,
+    )
+
+    assert result.frame_count == 3
+    assert result.status == "partial"
+    assert "terminal" in result.status_reason
+    assert opening_calls == 0
+
+
+def test_historical_scan_full_video_without_closed_action_chain_is_partial(tmp_path):
+    store = _make_replay_session(tmp_path, lead="right", frame_count=4)
+
+    class Recognition:
+        def recognize_fast_signals(self, _frame, expected_player):
+            return FastSignalResult(
+                expected_player=expected_player,
+                active_player=expected_player,
+                pass_visible=False,
+                self_action_buttons_visible=False,
+                effect_visible=False,
+            )
+
+    result = replay_video_through_live_pipeline(
+        store.directory,
+        Recognition(),
+        use_live_pipeline=True,
+        use_saved_baseline=True,
+    )
+
+    assert result.frame_count == 4
+    assert result.completed is False
+    assert result.status == "partial"
+    assert "action chain" in result.status_reason
+
+
+def test_replay_pass_audit_marks_purely_derived_pass_unreliable():
+    event = LiveEvent(
+        event_id="EVT-1",
+        event_type="player_passed",
+        session_id="scan",
+        seq=1,
+        monotonic_ms=100,
+        wall_time="2026-08-16T12:54:00+08:00",
+        trick_id=1,
+        turn_id=1,
+        actor="right",
+        payload={
+            "cards": [],
+            "is_pass": True,
+            "integrity_warnings": ["derived_pass_from_confirmed_active_transition"],
+        },
+        confidence=0.82,
+        source="turn_recovery_derived_pass_from_active_transition",
+        state_revision_before=1,
+        state_revision_after=2,
+    )
+
+    data = _event_to_turn_data(event, 7, None)
+
+    assert data["pass_audit"] == "inferred"
+    assert data["reliable"] is False
+    assert data["evidence_refs"] == []
+
+
+def test_replay_action_events_use_recorded_wall_time_when_valid(tmp_path):
+    store = _make_replay_session(tmp_path, lead="self", frame_count=1)
+    # The initial state is created through the same source-time-aware path in
+    # the pipeline; this test also guards that invalid test fixture timestamps
+    # are not passed into the reducer.
+    class Recognition:
+        def recognize_fast_signals(self, _frame, expected_player):
+            return FastSignalResult(
+                expected_player=expected_player,
+                active_player="self",
+                pass_visible=False,
+                self_action_buttons_visible=True,
+                effect_visible=False,
+            )
+
+    result = replay_video_through_live_pipeline(
+        store.directory,
+        Recognition(),
+        use_live_pipeline=True,
+        use_saved_baseline=True,
+        output_root=tmp_path / "scan-output",
+    )
+    timeline = result.artifact_paths["timeline.jsonl"]
+    events = list(read_json_lines(timeline))
+    initial = next(event for event in events if event["event_type"] == "initial_state_confirmed")
+    assert initial["wall_time"] == "2026-08-16T12:54:00+08:00"

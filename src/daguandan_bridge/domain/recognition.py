@@ -88,6 +88,16 @@ class FastSignalResult:
     super_double_visible: bool = False
     game_end_control: str | None = None
     placements: tuple[PlacementSignal, ...] = ()
+    # ``cannot_beat`` is a local-action hint only.  It is deliberately kept
+    # separate from ``pass_visible``: the former is a button on the local
+    # action bar, while the latter is a persistent seat-bound marker.  The
+    # live state machine must still corroborate this signal across frames
+    # before committing a PASS event.  These fields are appended after the
+    # legacy defaults so existing positional constructors retain their
+    # original meaning.
+    cannot_beat_visible: bool = False
+    cannot_beat_confidence: float = 0.0
+    cannot_beat_box: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)

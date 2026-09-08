@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, replace
 import hashlib
+from math import isfinite
 from pathlib import Path
 from threading import RLock, local
 from time import perf_counter
@@ -26,6 +27,7 @@ from .domain.recognition import (
 )
 from .image_io import read_image_unicode
 from .models import Box
+from .opening_gate import ListeningPageSignal
 from .template_service import TemplateService
 
 
@@ -126,6 +128,9 @@ class ScreenshotRecognitionService:
     # stronger, clearly better match than ordinary transient status markers.
     _FIRST_PLAY_THRESHOLD = 0.80
     _FIRST_PLAY_MIN_MARGIN = 0.08
+    # Narrow seat-local padding accommodates a marker touching an old ROI.
+    # Apply at runtime so imported user profiles receive the same correction.
+    _FIRST_PLAY_SEARCH_MARGIN = 20
     # The table anchor is solely a listener/recording gate.  It deliberately
     # has a stricter score than ordinary UI glyphs, but it is a one-frame
     # readiness signal rather than a three-frame card-recognition consensus.
@@ -648,6 +653,29 @@ class ScreenshotRecognitionService:
         )
         return lead
 
+    def recognize_listening_page(self, image: np.ndarray | Path) -> ListeningPageSignal:
+        """Classify before expensive hand recognition or persistent recording."""
+        source_image = self._source_image(image)
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        buttons, _, _, annotations = self._recognize_buttons_in_regions(
+            source_image,
+            (regions.get("button_actions"), regions.get("game_end_controls")),
+            self._templates(),
+        )
+        reliable = tuple(
+            item.label for item in annotations if item.confidence >= 0.80
+        )
+        anchor = self.recognize_table_anchor(source_image)
+        terminal = set(reliable) & {"change_table", "continue_game"}
+        actions = set(reliable) & {"play_cards", "pass", "cannot_beat", "double", "super_double"}
+        if terminal and not actions and (len(terminal) == 2 or anchor < self._TABLE_ANCHOR_THRESHOLD):
+            stage = "settlement"
+        elif anchor >= self._TABLE_ANCHOR_THRESHOLD and not terminal:
+            stage = "table"
+        else:
+            stage = "unknown"
+        return ListeningPageSignal(stage, anchor, tuple(buttons))
+
     def recognize_opening_signal(self, image: np.ndarray | Path) -> OpeningSignal:
         """Collect the opening-only signals without deciding who leads.
 
@@ -719,6 +747,101 @@ class ScreenshotRecognitionService:
         )
         return bool(set(buttons) & {"super_double", "double"})
 
+    def recognize_local_controls(self, image: np.ndarray | Path) -> FastSignalResult:
+        """Read a visual-only local hint, never other seats or card groups.
+
+        Kept separate from canonical fast signals: expected-self effect/timer
+        evidence must not replace expected-other PASS/placement semantics.
+        Button/status thresholds and strict ROI clipping are unchanged.
+        """
+        source_image = self._source_image(image)
+        height, width = source_image.shape[:2]
+        regions = {region.name: region for region in self.annotation_service.list_regions()}
+        required_regions = ("timer_self", "button_actions", "game_end_controls", "my_play")
+        if any(
+            name not in regions
+            or not AnnotationService._box_for_image(regions[name], source_image).fits_within((width, height))
+            for name in required_regions
+        ):
+            # A missing/out-of-frame exclusion ROI is not proof that animation
+            # or settlement controls are absent. Decline the optional hint.
+            return FastSignalResult(
+                expected_player="self", active_player=None, pass_visible=False,
+                self_action_buttons_visible=False, effect_visible=False,
+            )
+        relevant_labels = {
+            "cannot_beat", "play_cards", "hint", "pass", "double", "super_double",
+            "continue_game", "change_table",
+        }
+        templates = tuple(
+            (raw, template) for raw, template in self._templates()
+            if raw.get("kind") in {"timer", "effect"}
+            or (raw.get("kind") == "button" and raw.get("label") in relevant_labels)
+        )
+        active, _, _, _ = self._recognize_status(
+            source_image, regions.get("timer_self"), templates,
+            kind="timer", label="active", threshold=self._STATUS_THRESHOLD,
+        )
+        if not active:
+            # No independent local turn evidence: revoke immediately without
+            # spending time on buttons/effects that cannot authorize a hint.
+            return FastSignalResult(
+                expected_player="self", active_player=None, pass_visible=False,
+                self_action_buttons_visible=False, effect_visible=False,
+            )
+        action_templates = tuple(
+            (raw, template) for raw, template in templates
+            if raw.get("kind") == "button" and raw.get("label") not in {"continue_game", "change_table"}
+        )
+        buttons, _, _, annotations = self._recognize_buttons(
+            source_image, regions.get("button_actions"), action_templates,
+        )
+        if "cannot_beat" not in buttons:
+            return FastSignalResult(
+                expected_player="self", active_player="self", pass_visible=False,
+                self_action_buttons_visible=bool(set(buttons) & {"play_cards", "hint", "pass"}),
+                effect_visible=False,
+                super_double_visible=bool(set(buttons) & {"double", "super_double"}),
+            )
+        terminal_templates = tuple(
+            (raw, template) for raw, template in templates
+            if raw.get("kind") == "button" and raw.get("label") in {"continue_game", "change_table"}
+        )
+        terminal, _, _, _ = self._recognize_buttons_in_regions(
+            source_image, (regions.get("button_actions"), regions.get("game_end_controls")),
+            terminal_templates,
+        )
+        effects = self._matches_for_region(
+            source_image, regions.get("my_play"), templates,
+            predicate=lambda raw: raw.get("kind") == "effect",
+            threshold=self._STATUS_THRESHOLD, limit=1,
+            search_margin=(self._EFFECT_SEARCH_MARGIN_X, self._EFFECT_SEARCH_MARGIN_Y),
+        )
+        cannot = max(
+            (item for item in annotations if item.label == "cannot_beat"),
+            key=lambda item: item.confidence, default=None,
+        )
+        box = cannot.box if cannot is not None else None
+        valid_box = bool(
+            isinstance(box, (tuple, list)) and len(box) == 4
+            and all(type(value) is int for value in box)
+            and 0 <= box[0] < width and 0 <= box[1] < height
+            and 0 < box[2] <= width - box[0] and 0 < box[3] <= height - box[1]
+        )
+        confidence = float(cannot.confidence) if cannot is not None else 0.0
+        reliable_control = bool(valid_box and isfinite(confidence) and 0 <= confidence <= 1)
+        return FastSignalResult(
+            expected_player="self", active_player="self" if active else None,
+            pass_visible=False,
+            self_action_buttons_visible=bool(set(buttons) & {"play_cards", "hint", "pass", "cannot_beat"}),
+            effect_visible=bool(effects),
+            super_double_visible=bool(set(buttons) & {"double", "super_double"}),
+            game_end_control=next((name for name in ("continue_game", "change_table") if name in terminal), None),
+            cannot_beat_visible=reliable_control and "cannot_beat" in buttons,
+            cannot_beat_confidence=confidence if reliable_control else 0.0,
+            cannot_beat_box=tuple(box) if reliable_control else None,
+        )
+
     def recognize_fast_signals(
         self,
         image: np.ndarray | Path,
@@ -753,10 +876,38 @@ class ScreenshotRecognitionService:
                 if marker_visible:
                     pass_marker_players.append(player)
         pass_visible = expected_player in pass_marker_players
-        buttons, _, _, _ = self._recognize_buttons_in_regions(
+        (
+            buttons,
+            button_score,
+            _,
+            button_annotations,
+        ) = self._recognize_buttons_in_regions(
             source_image,
             (regions.get("button_actions"), regions.get("game_end_controls")),
             templates,
+        )
+        cannot_beat_annotations = tuple(
+            annotation
+            for annotation in button_annotations
+            if annotation.label == "cannot_beat"
+        )
+        cannot_beat_annotation = max(
+            cannot_beat_annotations,
+            key=lambda annotation: annotation.confidence,
+            default=None,
+        )
+        cannot_beat_visible = "cannot_beat" in buttons
+        # ``button_score`` is retained as a compatibility fallback for test
+        # doubles and older integrations that only return labels.  The real
+        # recognizer always supplies the per-button annotation, so this path
+        # does not weaken production confidence or lose the matched box.
+        cannot_beat_confidence = (
+            cannot_beat_annotation.confidence
+            if cannot_beat_annotation is not None
+            else (button_score if cannot_beat_visible else 0.0)
+        )
+        cannot_beat_box = (
+            cannot_beat_annotation.box if cannot_beat_annotation is not None else None
         )
         game_end_control = next(
             (
@@ -792,8 +943,13 @@ class ScreenshotRecognitionService:
             expected_player=expected_player,
             active_player=active_player,
             pass_visible=pass_visible,
-            self_action_buttons_visible=expected_player == "self" and bool(buttons),
+            self_action_buttons_visible=bool(
+                set(buttons) & {"play_cards", "hint", "pass", "cannot_beat"}
+            ),
             effect_visible=bool(effects),
+            cannot_beat_visible=cannot_beat_visible,
+            cannot_beat_confidence=cannot_beat_confidence,
+            cannot_beat_box=cannot_beat_box,
             pass_marker_player=expected_player if pass_visible else None,
             pass_marker_players=tuple(pass_marker_players),
             super_double_visible="super_double" in buttons,
@@ -929,6 +1085,11 @@ class ScreenshotRecognitionService:
                 kind=kind,
                 label=label,
                 threshold=threshold,
+                search_margin=(
+                    (round(image.shape[1] / 1280 * self._FIRST_PLAY_SEARCH_MARGIN),
+                     round(image.shape[0] / 720 * self._FIRST_PLAY_SEARCH_MARGIN))
+                    if prefix == "first_play" else (0, 0)
+                ),
             )
             if match[0] and match[3] is not None:
                 candidates.append((seat, match[3]))
@@ -968,6 +1129,7 @@ class ScreenshotRecognitionService:
         label: str,
         kind: str = "status",
         threshold: float | None = None,
+        search_margin: tuple[int, int] = (0, 0),
     ) -> tuple[bool, float, str, _TemplateMatch | None]:
         matches = self._matches_for_region(
             image,
@@ -982,6 +1144,7 @@ class ScreenshotRecognitionService:
                 else self._STATUS_THRESHOLD
             ),
             limit=1,
+            search_margin=search_margin,
         )
         if not matches:
             return False, 0.0, "", None
@@ -1035,6 +1198,8 @@ class ScreenshotRecognitionService:
         )
         rank_matches = self._deduplicate(rank_matches)
         joker_matches = self._deduplicate(joker_matches)
+        joker_matches = self._confirm_big_joker_words(image, joker_matches, templates)
+        joker_matches = self._confirm_small_joker_words(image, joker_matches, templates)
         suit_source_roles = set(source_roles)
         if wild_rank is not None:
             suit_source_roles.add("level")
@@ -1254,6 +1419,79 @@ class ScreenshotRecognitionService:
             ),
             tuple(item.suit_options for item in cards),
         )
+
+    def _confirm_big_joker_words(
+        self, image: np.ndarray, matches: list[_TemplateMatch],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...],
+    ) -> list[_TemplateMatch]:
+        """Retain the proven golden-big path using only big-Joker templates."""
+        return self._confirm_joker_word_matches(image, matches, templates, label="big_joker")
+
+    def _confirm_small_joker_words(
+        self, image: np.ndarray, matches: list[_TemplateMatch],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...],
+    ) -> list[_TemplateMatch]:
+        """Confirm blue-skin small Jokers from their own black-word template."""
+        return self._confirm_joker_word_matches(image, matches, templates, label="small_joker")
+
+    def _confirm_joker_word_matches(
+        self, image: np.ndarray, matches: list[_TemplateMatch],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...], *, label: str,
+    ) -> list[_TemplateMatch]:
+        """Confirm an existing weak play-Joker from its matching-label word.
+
+        Card skins change the illustration/background colour while the
+        five-letter JOKER column remains legible. This is an additional measured
+        template correlation, not a score multiplier or a lower action gate.
+        Require the original colour-vetted whole/partial-face candidate first;
+        never discover new cards or use a big-Joker template for a small one.
+        """
+        if label not in {"big_joker", "small_joker"}:
+            raise ValueError("word confirmation requires a Joker label")
+        by_source = {
+            f"template:{raw.get('file', '')}": template
+            for raw, template in templates
+            if raw.get("kind") == "rank" and raw.get("label") == label
+            and raw.get("source_role") == "play"
+        }
+        confirmed: list[_TemplateMatch] = []
+        for match in matches:
+            template = by_source.get(match.source)
+            if (match.label != label or match.source_role != "play"
+                    or not self._JOKER_RANK_THRESHOLD <= match.score < .80
+                    or template is None or template.ndim != 3):
+                confirmed.append(match)
+                continue
+            height, width = template.shape[:2]
+            # Ratios address the full five-letter column of existing 108px
+            # play templates, excluding the card border (a nondiscriminative
+            # 10px border alone also matches an ordinary 6D above 0.80).
+            x, y = round(height * .074), round(height * .037)
+            word_width, word_height = round(height * .185), height - 2 * y
+            if height < 80 or word_width < 16 or x + word_width > width:
+                confirmed.append(match)
+                continue
+            word = template[y:y + word_height, x:x + word_width]
+            left, top = max(0, match.x + x - 2), max(0, match.y + y - 2)
+            right = min(image.shape[1], match.x + x + word_width + 2)
+            bottom = min(image.shape[0], match.y + y + word_height + 2)
+            candidate = image[top:bottom, left:right]
+            if candidate.shape[0] < word_height or candidate.shape[1] < word_width:
+                confirmed.append(match)
+                continue
+            scores = cv2.matchTemplate(
+                cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY),
+                cv2.cvtColor(word, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED,
+            )
+            _, score, _, location = cv2.minMaxLoc(scores)
+            px, py = location
+            actual_word = candidate[py:py + word_height, px:px + word_width]
+            if score >= .80 and self._joker_colors_compatible(word, actual_word):
+                # Red and black Jokers share typography; retain the existing
+                # red-vs-black gate instead of trusting grayscale alone.
+                match = replace(match, score=float(score), source=f"{match.source}+full-joker-word")
+            confirmed.append(match)
+        return confirmed
 
     @staticmethod
     def _limit_deck_copies(

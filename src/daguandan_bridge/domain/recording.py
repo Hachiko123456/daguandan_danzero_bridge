@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -34,6 +34,7 @@ class RecordingResult:
     frame_count: int
     dropped_frames: int
     incident_media_failures: tuple[IncidentMediaFailure, ...] = ()
+    integrity: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

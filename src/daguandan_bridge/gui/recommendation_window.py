@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from time import monotonic_ns
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal, QTimer
 from PySide6.QtGui import QCloseEvent, QGuiApplication
@@ -17,8 +18,12 @@ from qfluentwidgets import (
 
 from ..advisor_strategy import ADVISOR_OPTIONS
 from ..live.display_text import compact_cards_text, live_status_text, seat_text
-from ..live.orchestrator import LiveAdvice, LiveUpdate
+from ..domain.live_runtime import LiveAdvice, LiveUpdate
 from .single_image_danzero_page import CardBadge
+from .compact_view_state import (
+    CompactUpdateGate, CompactViewState, advice_matches_snapshot,
+    project_compact_view,
+)
 
 
 _PLAY_TYPE_LABELS = {
@@ -42,6 +47,9 @@ _TRICK_SEATS = (
 )
 
 _PREVIOUS_ACTION_REREAD_PENDING = "previous_action_reread_pending"
+_TURN_RECOVERY_PENDING = "turn_recovery_pending"
+_WIND_CATCH_PASS_RECOVERY_PENDING = "wind_catch_pass_recovery_pending"
+_CANNOT_BEAT_MIN_CONFIDENCE = 0.80
 _TRANSIENT_WITHHOLD_DELAY_MS = 500
 
 
@@ -167,6 +175,13 @@ class RecommendationFloatWindow(QWidget):
         self._transient_withhold_timer.timeout.connect(
             self._show_delayed_transient_withhold
         )
+        self._update_gate = CompactUpdateGate()
+        self._view_state: CompactViewState | None = None
+        self._latest_update: object | None = None
+        self._fault_identity: tuple[str, int] | None = None
+        self._hint_expiry_timer = QTimer(self)
+        self._hint_expiry_timer.setSingleShot(True)
+        self._hint_expiry_timer.timeout.connect(self._expire_local_hint)
         self.setObjectName("recommendationFloatWindow")
         self.setWindowTitle(f"{self._advisor_display_name()} 极简推荐")
         self.setWindowFlags(
@@ -208,13 +223,16 @@ class RecommendationFloatWindow(QWidget):
         self.cards_host.hide()
         card_layout.addWidget(self.cards_host)
 
-        self.detail_label = CaptionLabel("完整助手在后台运行")
+        self.detail_label = CaptionLabel("")
         self.detail_label.setWordWrap(True)
+        self.detail_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         card_layout.addWidget(self.detail_label)
         root.addWidget(self.card, 1)
 
         actions = QHBoxLayout()
-        self.capture_label = CaptionLabel("采集方式：等待连接")
+        self.capture_label = CaptionLabel("")
         actions.addWidget(self.capture_label, 1)
         self.open_button = PushButton("打开完整助手")
         self.open_button.clicked.connect(self.open_full_assistant_requested.emit)
@@ -231,12 +249,24 @@ class RecommendationFloatWindow(QWidget):
         error_signal = getattr(self.runtime, "error", None)
         if error_signal is not None:
             error_signal.connect(self.show_error)
+        live_fault = getattr(self.runtime, "live_fault", None)
+        if live_fault is not None:
+            live_fault.connect(self.apply_live_fault)
         preselection_signal = getattr(self.runtime, "preselection_result", None)
         if preselection_signal is not None:
             preselection_signal.connect(self.apply_preselection_result)
         latest = getattr(self.runtime, "latest_preselection_result", None)
         if latest is not None:
             self.apply_preselection_result(latest)
+        listening_status = getattr(self.runtime, "listening_status", None)
+        if listening_status is not None:
+            listening_status.connect(self.apply_listening_status)
+        log_delivery_status = getattr(self.runtime, "log_delivery_status", None)
+        if log_delivery_status is not None:
+            log_delivery_status.connect(self.apply_log_delivery_status)
+        recording_status = getattr(self.runtime, "recording_status", None)
+        if recording_status is not None:
+            recording_status.connect(self.apply_recording_status)
 
     def _apply_theme(self, *_args) -> None:
         if isDarkTheme():
@@ -258,172 +288,172 @@ class RecommendationFloatWindow(QWidget):
         self.trick_strip.apply_palette(dark=isDarkTheme(), accent=accent)
 
     def apply_update(self, update: LiveUpdate) -> None:
-        advisor_name = self._advisor_display_name()
-        self.setWindowTitle(f"{advisor_name} 极简推荐")
-        player = getattr(update.snapshot, "current_player", None)
+        orchestrator = getattr(self.runtime, "orchestrator", None)
+        expected_session = str(getattr(getattr(orchestrator, "snapshot", None), "session_id", "") or "")
+        if not self._update_gate.accept(update, expected_session_id=expected_session):
+            return
+        current_identity = (self._update_gate.session_id, self._update_gate.generation)
+        if self._fault_identity is not None:
+            if self._fault_identity == current_identity and update.status == "running":
+                return  # A fatal worker failure needs a new capture generation.
+            if self._fault_identity != current_identity:
+                self._fault_identity = None
+        self._latest_update = update
+        self.setWindowTitle(f"{self._advisor_display_name()} 极简推荐")
         self.trick_strip.set_snapshot(update.snapshot, update.status)
-        raw = update.advice
-        terminal_event = getattr(getattr(update, "event", None), "event_type", None)
-        terminal_events = tuple(getattr(update, "events", ()) or ())
-        is_terminal = (
-            update.status in {"finalizing", "sealed"}
-            or (update.status == "running" and player is None)
-            or terminal_event == "game_end_detected"
-            or any(
-                getattr(event, "event_type", None) == "game_end_detected"
-                for event in terminal_events
-            )
-        )
-        if is_terminal:
-            self._clear_transient_withhold()
-            self.suggestion_label.setText("本局已结束")
-            self.detail_label.setText("已确认终局，正在封存本局记录")
-            self._render_cards(())
-            return
-        if update.status == "paused":
-            self._clear_transient_withhold()
-            self.suggestion_label.setText("识别已暂停")
-            self.detail_label.setText("请排除窗口遮挡后，在完整助手中点击继续")
-            self._render_cards(())
-            return
-        if isinstance(raw, LiveAdvice) and raw.status == "withheld":
-            if raw.withhold_reason == _PREVIOUS_ACTION_REREAD_PENDING:
-                self._show_transient_withhold(raw)
-                return
-            self._clear_transient_withhold()
-            self.suggestion_label.setText("牌局历史不完整，暂停推荐")
-            self.detail_label.setText(raw.error or "请在完整助手中补正缺失动作后再继续")
-            self._render_cards(())
-            return
-        self._clear_transient_withhold()
-        if update.status == "running" and player != "self":
-            self.suggestion_label.setText("等待自己回合")
-            self.detail_label.setText(f"当前轮到{seat_text(player, unknown='其他玩家')}")
-            self._render_cards(())
-            return
-        if not isinstance(raw, LiveAdvice):
-            self.suggestion_label.setText("等待建议")
-            self.detail_label.setText("确认轮到自己后才显示推荐")
-            self._render_cards(())
-            return
-        if raw.status == "failed":
-            self.suggestion_label.setText("建议计算失败")
-            self.detail_label.setText(raw.error or "请打开完整助手查看原因")
-            self._render_cards(())
-            return
-        if raw.status == "requested":
-            self.suggestion_label.setText("正在计算建议")
-            self.detail_label.setText(f"{advisor_name} 正在使用最新手牌")
-            self._render_cards(())
-            return
-        if raw.status != "ready" or raw.advice is None:
-            self.suggestion_label.setText("等待建议")
-            self.detail_label.setText("推荐已失效或尚未准备完成")
-            self._render_cards(())
-            return
-        # The orchestrator may finish model inference before it has
-        # corroborated that the local player may act.  Never show or act on
-        # that draft recommendation in this companion window.
-        if not raw.visible:
-            self.suggestion_label.setText("正在确认自己回合")
-            self.detail_label.setText("确认轮到自己后才显示并预选推荐牌")
-            self._render_cards(())
-            return
-        if raw.key.request_id == self._last_request_id:
-            return
-        self._last_request_id = raw.key.request_id
-        advice = raw.advice
-        if advice.is_pass:
-            self.suggestion_label.setText("不出")
-        else:
-            play_type = _PLAY_TYPE_LABELS.get(advice.play_type, "出牌")
-            self.suggestion_label.setText(f"出牌 · {play_type}")
-        self._render_cards(tuple(advice.cards))
-        details = [f"耗时 {advice.elapsed_ms:.0f} ms"]
-        engine_input = advice.engine_input
-        decision = (
-            engine_input.get("decision")
-            if isinstance(engine_input, dict) and engine_input.get("debug") is True
-            else None
-        )
-        if isinstance(decision, dict):
-            best_q = decision.get("best_q")
-            q_gap = decision.get("q_gap")
-            if isinstance(best_q, (int, float)):
-                details.append(f"Q值 {float(best_q):.4f}")
-            if isinstance(q_gap, (int, float)):
-                details.append(f"Q-gap {float(q_gap):.4f}")
-        if raw.suit_uncertain:
-            agreement = "各花色分支建议一致" if raw.advice_agrees_across_variants else "花色分支建议有差异"
-            details.append(agreement)
-        preselection = self._preselection_by_request_id.get(raw.key.request_id)
-        if preselection is not None:
-            detail = str(getattr(preselection, "detail", "") or "")
-            if detail:
-                details.append(detail)
-        self.detail_label.setText(" · ".join(details))
+        now_ms = monotonic_ns() // 1_000_000
+        state = project_compact_view(update, now_ms=now_ms)
+        self._render_view(state)
+        if state.kind == "local_rule_hint":
+            hint = getattr(update, "local_rule_hint", None)
+            self._hint_expiry_timer.start(max(1, int(hint.expires_ms) - now_ms + 1))
 
-    def _show_transient_withhold(self, advice: LiveAdvice) -> None:
-        """Keep a short adjacent-reread guard from looking like lost history."""
-
-        request_id = advice.key.request_id
-        if request_id == self._transient_withhold_request_id:
-            return
+    def _render_view(self, state: CompactViewState) -> None:
         self._clear_transient_withhold()
-        self._transient_withhold_request_id = request_id
-        self.suggestion_label.setText("正在更新建议")
-        self.detail_label.setText(advice.error or "正在核验上一手牌面")
-        self._render_cards(())
-        self._transient_withhold_timer.start(_TRANSIENT_WITHHOLD_DELAY_MS)
+        self._hint_expiry_timer.stop()
+        # The *entire* rendered state is the cache key. A request can safely
+        # become ready again after an intervening hold without changing ID.
+        if state == self._view_state:
+            return
+        self._view_state = state
+        self._last_request_id = state.request_id
+        self.suggestion_label.setText(state.title)
+        self.detail_label.setText(state.detail)
+        self.detail_label.setVisible(bool(state.detail))
+        self._render_cards(state.cards)
+
+    def _expire_local_hint(self) -> None:
+        if self._view_state is not None and self._view_state.kind == "local_rule_hint":
+            # No new capture arrived: do not resurrect a model result from
+            # before this visual control lifecycle when its hint expires.
+            self._render_view(CompactViewState("waiting", "等待建议"))
+
+    @staticmethod
+    def _advice_matches_snapshot(advice: LiveAdvice, snapshot: object) -> bool:
+        return advice_matches_snapshot(advice, snapshot)
 
     def _show_delayed_transient_withhold(self) -> None:
-        if not self._transient_withhold_request_id:
-            return
-        self.suggestion_label.setText("正在复核上一手牌面")
-        self.detail_label.setText("复核完成后将自动更新推荐")
-        self._render_cards(())
+        # Kept as an inert slot for previously queued timers. Internal reread
+        # phases no longer schedule callbacks that compete with recommendations.
+        self._clear_transient_withhold()
 
     def _clear_transient_withhold(self) -> None:
         self._transient_withhold_timer.stop()
         self._transient_withhold_request_id = ""
 
     def apply_preselection_result(self, result: object) -> None:
-        request_id = str(getattr(result, "request_id", "") or "")
-        if not request_id:
-            return
-        self._preselection_by_request_id[request_id] = result
-        if request_id != self._last_request_id:
-            return
-        detail = str(getattr(result, "detail", "") or "")
-        if detail:
-            current = self.detail_label.text()
-            self.detail_label.setText(
-                " · ".join(item for item in (current, detail) if item)
-            )
+        # Results have no session/generation identity. Never let old callbacks
+        # mutate advice or append unbounded success messages to compact detail.
+        # The complete assistant retains execution diagnostics and failures.
+        return
 
     def _advisor_display_name(self) -> str:
         strategy = str(getattr(self.runtime, "advisor_strategy", "") or "")
         return dict(ADVISOR_OPTIONS).get(strategy, "建议模型")
 
     def apply_frame(self, snapshot: object) -> None:
-        frame = getattr(snapshot, "frame", None)
-        backend = str(getattr(frame, "backend", "") or "")
-        if not backend or backend == self._backend:
-            return
-        self._backend = backend
-        if backend == "printwindow":
-            self.capture_label.setText("后台窗口采集 · 前台遮挡不入帧")
-        elif backend in {"screen", "gdi_screen"}:
-            self.capture_label.setText("屏幕采集 · 遮挡保护已启用")
-        else:
-            self.capture_label.setText(f"采集方式：{backend}")
+        # Backend/ROI/capture telemetry belongs to the complete assistant.
+        return
+
+    def _has_live_view(self) -> bool:
+        return bool(
+            getattr(self.runtime, "orchestrator", None) is not None
+            or (self._update_gate.session_id and not self._update_gate.terminal)
+        )
 
     def show_error(self, message: str) -> None:
+        # Untagged error strings can arrive from an old export/capture worker.
+        # During a live session, only versioned LiveUpdate may change safety
+        # state. The controller already emits its paused/failed update first.
+        if self._has_live_view():
+            return
         text = str(message)
         if "遮挡" in text or "屏幕采集已暂停" in text:
-            self.suggestion_label.setText("窗口遮挡，已暂停")
-            self.detail_label.setText("移动浮窗或缩小游戏窗口，确保不覆盖牌桌后再继续")
-            self._render_cards(())
+            self._render_view(CompactViewState("paused", "窗口遮挡，已暂停", "请移开遮挡后点击继续"))
+
+    def apply_live_fault(self, fault: object) -> None:
+        """Fail closed for authenticated fatal worker failures.
+
+        Controller emits this if creating the normal paused/error LiveUpdate
+        itself fails. Required fields: session_id, capture_generation, kind
+        (capture/analysis/occluded). Untagged error strings remain diagnostic.
+        Recovery must activate a fresh capture generation before cards return.
+        """
+        if not isinstance(fault, dict):
+            return
+        session_id = str(fault.get("session_id", "") or "")
+        generation = fault.get("capture_generation")
+        if not session_id or not isinstance(generation, int):
+            return
+        if (session_id, generation) != (self._update_gate.session_id, self._update_gate.generation):
+            return
+        sequence = fault.get("update_sequence")
+        if isinstance(sequence, int) and sequence > 0 and sequence <= self._update_gate.update_sequence:
+            return
+        if isinstance(sequence, int) and sequence > 0:
+            self._update_gate.update_sequence = sequence
+        self._fault_identity = (session_id, generation)
+        kind = str(fault.get("kind", ""))
+        detail = {
+            "capture": "画面采集失败，请重新连接牌桌",
+            "analysis": "识别失败，请重新连接牌桌",
+            "occluded": "请移开遮挡后点击继续",
+        }.get(kind, "识别已停止，请重新连接牌桌")
+        self._render_view(CompactViewState("paused", "识别已暂停", detail))
+
+    def apply_listening_status(self, status: object) -> None:
+        if not isinstance(status, dict):
+            return
+        generation = status.get("generation")
+        if isinstance(generation, int):
+            latest = max(getattr(self, "_listening_generation", -1), self._update_gate.generation)
+            if generation < latest:
+                return
+            self._listening_generation = generation
+        if self._has_live_view():
+            return
+        state = str(status.get("state", "") or "")
+        if state == "listening":
+            self._update_gate.begin_listening()
+            self._latest_update = None
+            self._render_view(CompactViewState("listening", "等待开局"))
+        elif state == "opening":
+            phase = str(status.get("phase", "") or "")
+            title = "等待开局" if phase in {"unknown", "lobby", "settlement", "waiting_table"} else "确认开局中…"
+            self._render_view(CompactViewState("opening", title))
+        elif state == "recovering":
+            self._render_view(CompactViewState("recovering", "重新连接中…"))
+        elif state == "recovered":
+            self._render_view(CompactViewState("listening", "等待开局"))
+        elif state == "failed":
+            self._render_view(CompactViewState("failed", "监听已停止", "请打开完整助手重新连接牌桌"))
+
+    def apply_recording_status(self, value: object) -> None:
+        if isinstance(value, dict) and value.get("reason") == "recording_capacity_reached":
+            self._recording_capacity_notice = str(value.get("message", ""))
+            self.capture_label.setText("录像已达容量上限 · 识别和推荐继续")
+
+    def apply_log_delivery_status(self, value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        # Export can finish after the next game starts and these messages
+        # historically carry no reliable generation. They never own the main
+        # recommendation area, even if there is currently no live game.
+        session_id = str(value.get("session_id", "") or "")
+        if self._has_live_view():
+            return
+        if session_id and self._update_gate.session_id and session_id != self._update_gate.session_id:
+            return
+        status = str(value.get("status", "") or "").upper()
+        notices = {
+            "PASS": "日志已保存", "SUCCESS": "日志已保存",
+            "FAIL": "日志保存失败，请打开完整助手", "FAILURE": "日志保存失败，请打开完整助手",
+            "RUNNING": "日志整理中", "LOADING": "日志整理中",
+            "DISABLED": "未保存对局日志",
+        }
+        notice = notices.get(status)
+        if notice:
+            self.capture_label.setText(notice)
 
     def _render_cards(self, cards: tuple[str, ...]) -> None:
         while self.cards_layout.count():

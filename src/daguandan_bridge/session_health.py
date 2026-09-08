@@ -12,6 +12,7 @@ SESSION_HEALTH_SCHEMA = "guandan.session-health/1"
 PREMATURE_GAME_END = "HEALTH-PREMATURE-GAME-END"
 FINISHED_SEATS_INCONSISTENT = "HEALTH-FINISHED-SEATS-INCONSISTENT"
 ACTION_CHAIN_INCONSISTENT = "HEALTH-ACTION-CHAIN-INCONSISTENT"
+RECORDING_INCOMPLETE = "HEALTH-RECORDING-INCOMPLETE"
 
 _SEATS: tuple[Seat, ...] = ("self", "right", "opposite", "left")
 
@@ -31,7 +32,12 @@ class SessionHealthIssue:
         }
 
 
-def audit_session_health(snapshot: object, events: Iterable[object]) -> dict[str, object]:
+def audit_session_health(
+    snapshot: object,
+    events: Iterable[object],
+    *,
+    recording_integrity: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Report only contradictions that can be proven from the final facts.
 
     The audit never rewrites or suppresses a timeline event.  In particular,
@@ -51,6 +57,26 @@ def audit_session_health(snapshot: object, events: Iterable[object]) -> dict[str
     remaining = _remaining_cards(snapshot)
     finished = frozenset(str(value) for value in getattr(snapshot, "finished_seats", ()) or ())
     issues: list[SessionHealthIssue] = []
+
+    recording_status = str((recording_integrity or {}).get("status", "")).upper()
+    if recording_integrity and recording_status in {"FAIL", "PARTIAL"}:
+        issues.append(
+            SessionHealthIssue(
+                RECORDING_INCOMPLETE,
+                    "recorded frame index cannot be fully decoded",
+                {
+                    "writer_frame_count": recording_integrity.get("writer_frame_count"),
+                    "indexed_frame_count": recording_integrity.get("indexed_frame_count"),
+                    "decodable_frame_count": recording_integrity.get("decodable_frame_count"),
+                    "last_decodable_frame_index": recording_integrity.get(
+                        "last_decodable_frame_index"
+                    ),
+                    "issues": list(recording_integrity.get("issues", ()) or ()),
+                    "status": recording_status,
+                    "tail_recovery": recording_integrity.get("tail_recovery"),
+                },
+            )
+        )
 
     if terminal is not None and remaining:
         zero_seats = sorted(seat for seat, count in remaining.items() if count == 0)
@@ -118,6 +144,8 @@ def audit_session_health(snapshot: object, events: Iterable[object]) -> dict[str
                 "remaining": remaining[seat],
                 "cards_played": cards_played[seat],
                 "expected_total": remaining[seat] + cards_played[seat],
+                "expected_initial_total": 27,
+                "missing_cards": 27 - (remaining[seat] + cards_played[seat]),
             }
             for seat in _SEATS
             if seat in remaining and remaining[seat] + cards_played[seat] != 27
@@ -164,6 +192,7 @@ __all__ = [
     "ACTION_CHAIN_INCONSISTENT",
     "FINISHED_SEATS_INCONSISTENT",
     "PREMATURE_GAME_END",
+    "RECORDING_INCOMPLETE",
     "SESSION_HEALTH_SCHEMA",
     "SessionHealthIssue",
     "audit_session_health",

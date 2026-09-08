@@ -73,7 +73,9 @@ def test_annotation_page_uses_chinese_dropdowns_and_removes_source_field():
         == "按钮区域"
     )
     assert config.region_table.item(0, 0).text() == "左侧首出牌提示"
-    assert config.region_table.item(0, 1).text() == "[125, 185, 130, 110]"
+    first_box = AnnotationService().list_regions()[0].abs_box
+    expected_coordinates = [first_box.x, first_box.y, first_box.w, first_box.h]
+    assert config.region_table.item(0, 1).text() == str(expected_coordinates)
 
     config.close()
     page.close()
@@ -399,7 +401,12 @@ def test_region_mode_hides_template_editor_and_shows_selected_region_coordinates
     assert [
         page.region_coordinate_table.item(0, column).text()
         for column in range(1, 5)
-    ] == ["125", "185", "130", "110"]
+    ] == [str(value) for value in (
+        AnnotationService(root).list_regions()[0].abs_box.x,
+        AnnotationService(root).list_regions()[0].abs_box.y,
+        AnnotationService(root).list_regions()[0].abs_box.w,
+        AnnotationService(root).list_regions()[0].abs_box.h,
+    )]
 
     page.region_config_page.close()
     page.close()

@@ -60,6 +60,10 @@ class RecognitionSample:
     # Kept as a compatibility field for old logs.  It is no longer used to
     # confirm or reject an action.
     post_hand: tuple[str, ...] = ()
+    # Missing capture provenance is never proof of pre-recovery evidence.
+    captured_ms: int | None = None
+    capture_seq: int | None = None
+    action_epoch: tuple[object, ...] = ()
 
 
 @dataclass(frozen=True)

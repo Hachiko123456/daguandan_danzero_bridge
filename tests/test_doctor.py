@@ -507,3 +507,32 @@ def test_native_probe_crash_without_payload_has_sanitized_stderr_and_logical_id(
     encoded = json.dumps(result, ensure_ascii=False)
     assert "Alice" not in encoded
     assert "abc.def.secret" not in encoded
+
+
+def test_frozen_doctor_warns_for_hash_verified_dirty_development_bundle(tmp_path):
+    root = tmp_path / "bundle"
+    root.mkdir()
+    marker = root / "DEVELOPMENT_BUILD_NOT_FORMALLY_QUALIFIED.txt"
+    marker.write_text(
+        "This bundle was built from an explicitly allowed dirty working tree.\r\n"
+        "It is for isolated development validation only and is not a formally qualified release.\r\n",
+        encoding="utf-8",
+        newline="",
+    )
+    manifest_path = _write_valid_build_manifest(root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source"]["dirty"] = True
+    manifest["source"]["status_sha256"] = "f" * 64
+    from daguandan_bridge.build_manifest import compute_build_id
+
+    manifest["build_id"] = compute_build_id(manifest)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    check = doctor._build_integrity_check(root, frozen=True)
+
+    assert check["status"] == "WARN"
+    assert check["evidence"]["errors"] == []
+    assert any(
+        "development build" in item
+        for item in check["evidence"]["warnings"]
+    )

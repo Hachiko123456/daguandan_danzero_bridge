@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import math
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -24,6 +26,8 @@ class CaptureWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        deadline = time.monotonic()
+        previous_interval = float(self.interval_sec)
         try:
             while not self._stop_event.is_set():
                 try:
@@ -34,7 +38,20 @@ class CaptureWorker(QObject):
                 if self._stop_event.is_set():
                     break
                 self.frame_ready.emit(value)
-                if self._stop_event.wait(self.interval_sec):
+                interval = float(self.interval_sec)
+                if not math.isfinite(interval) or interval <= 0:
+                    raise ValueError("capture interval must be finite and positive")
+                now = time.monotonic()
+                if interval != previous_interval:
+                    # Listening may change between the table and the lobby.
+                    deadline = now + interval
+                    previous_interval = interval
+                else:
+                    deadline += interval
+                    if deadline <= now:
+                        # Skip missed ticks; never burst through an overdue FIFO.
+                        deadline += (math.floor((now - deadline) / interval) + 1) * interval
+                if self._stop_event.wait(max(0.0, deadline - now)):
                     break
         finally:
             self.finished.emit()

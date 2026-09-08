@@ -16,6 +16,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 import cv2
@@ -29,18 +30,31 @@ from ..live.session_store import read_json_lines
 from ..models import ClientRect, TargetWindow
 from ..storage import append_json_line, atomic_write_json
 from ..window_capture import (
+    find_screen_occluders,
     find_target_window,
     get_client_rect_on_screen,
     get_window_dpi,
 )
 from .shadow_live_replay import summarize_advice_lifecycle
+from .live_v2_e2e_acceptance import (
+    audit_live_v2_runtime,
+    evaluate_window_opportunities,
+)
 
 
 _ACTION_TYPES = frozenset(
     {"player_played", "player_passed", "manual_confirmed_event"}
 )
 _TERMINAL_ADVICE = frozenset(
-    {"ready", "failed", "stale", "withheld", "timeout", "cancelled"}
+    {
+        "ready",
+        "local_pass",
+        "failed",
+        "stale",
+        "withheld",
+        "timeout",
+        "cancelled",
+    }
 )
 _DEFAULT_SCENARIOS = (
     "initial_capture",
@@ -80,6 +94,7 @@ class WindowE2EValidationConfig:
     run_kind: str = "source"
     scenarios: tuple[str, ...] = _DEFAULT_SCENARIOS
     max_frames: int | None = None
+    development_fragment: bool = False
     simulator_time_scale: float = 1.0
     run_timeout_sec: float = 3600.0
     drain_timeout_sec: float = 60.0
@@ -93,6 +108,8 @@ class WindowE2EValidationConfig:
     required_dpis: tuple[int, ...] = (96, 120)
     optional_dpis: tuple[int, ...] = (144,)
     capture_interval_sec: float = 0.02
+    full_chain_expected_action_count: int | None = None
+    full_chain_expected_remaining_cards: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         if not (self.session / "video" / "game.avi").is_file():
@@ -109,12 +126,37 @@ class WindowE2EValidationConfig:
             raise ValueError("simulator_time_scale must be positive")
         if self.max_frames is not None and self.max_frames <= 0:
             raise ValueError("max_frames must be positive")
+        if self.development_fragment and (
+            self.run_kind != "source" or self.max_frames is None
+        ):
+            raise ValueError(
+                "development_fragment requires a source run with explicit max_frames"
+            )
+        if self.development_fragment and "full_chain" not in self.scenarios:
+            raise ValueError("development_fragment requires the full_chain scenario")
         if self.baseline_summary is not None and not self.baseline_summary.is_file():
             raise ValueError(f"baseline summary does not exist: {self.baseline_summary}")
         if min(self.run_timeout_sec, self.drain_timeout_sec, self.command_timeout_sec) <= 0:
             raise ValueError("validation timeouts must be positive")
         if not math.isfinite(self.capture_interval_sec) or self.capture_interval_sec <= 0:
             raise ValueError("capture_interval_sec must be positive")
+        if (
+            self.full_chain_expected_action_count is not None
+            and self.full_chain_expected_action_count <= 0
+        ):
+            raise ValueError("full_chain_expected_action_count must be positive")
+        if self.full_chain_expected_remaining_cards is not None:
+            invalid = {
+                seat: count
+                for seat, count in self.full_chain_expected_remaining_cards.items()
+                if seat not in {"self", "right", "opposite", "left"}
+                or count < 0
+                or count > 27
+            }
+            if invalid:
+                raise ValueError(
+                    f"invalid full_chain_expected_remaining_cards: {invalid}"
+                )
         unknown = set(self.scenarios) - set(_DEFAULT_SCENARIOS)
         if unknown:
             raise ValueError(f"unknown window E2E scenarios: {sorted(unknown)}")
@@ -133,6 +175,17 @@ class WindowE2EValidationConfig:
         baseline = raw.get("baseline_summary")
         checkpoint = raw.get("danzero_checkpoint_source")
         executable = raw.get("executable_path")
+        full_chain_target = raw.get("full_chain", {})
+        if not isinstance(full_chain_target, dict):
+            full_chain_target = {}
+        expected_action_count = raw.get(
+            "full_chain_expected_action_count",
+            full_chain_target.get("expected_action_count"),
+        )
+        expected_remaining = raw.get(
+            "full_chain_expected_remaining_cards",
+            full_chain_target.get("expected_remaining_cards"),
+        )
         return cls(
             session=_resolve(raw["session"], base),
             output=_resolve(raw["output"], base),
@@ -152,6 +205,7 @@ class WindowE2EValidationConfig:
             max_frames=(
                 int(raw["max_frames"]) if raw.get("max_frames") is not None else None
             ),
+            development_fragment=bool(raw.get("development_fragment", False)),
             simulator_time_scale=float(raw.get("simulator_time_scale", 1.0)),
             run_timeout_sec=float(raw.get("run_timeout_sec", 3600.0)),
             drain_timeout_sec=float(raw.get("drain_timeout_sec", 60.0)),
@@ -171,6 +225,16 @@ class WindowE2EValidationConfig:
             required_dpis=tuple(int(item) for item in raw.get("required_dpis", (96, 120))),
             optional_dpis=tuple(int(item) for item in raw.get("optional_dpis", (144,))),
             capture_interval_sec=float(raw.get("capture_interval_sec", 0.02)),
+            full_chain_expected_action_count=(
+                int(expected_action_count)
+                if expected_action_count is not None
+                else None
+            ),
+            full_chain_expected_remaining_cards=(
+                _normalize_remaining_cards(expected_remaining)
+                if expected_remaining is not None
+                else None
+            ),
         )
 
     @property
@@ -178,7 +242,8 @@ class WindowE2EValidationConfig:
         """Whether this run is allowed to claim phase-three acceptance."""
 
         return bool(
-            self.baseline_summary is not None
+            not self.development_fragment
+            and self.baseline_summary is not None
             and self.max_frames is None
             and math.isclose(self.simulator_time_scale, 1.0, abs_tol=1e-9)
             and set(self.scenarios) == set(_DEFAULT_SCENARIOS)
@@ -255,6 +320,150 @@ class SimulatorControlClient:
                 return last
             time.sleep(0.02)
         raise TimeoutError(f"timed out waiting for {description}; last_status={last}")
+
+
+class _TrackingCaptureService(CaptureService):
+    """Count persistent-source handoffs without changing capture behavior."""
+
+    def __init__(self, profiles_root: Path) -> None:
+        super().__init__(profiles_root)
+        self.live_source_open_count = 0
+
+    def open_live_source(self, profile_name: str):
+        self.live_source_open_count += 1
+        return super().open_live_source(profile_name)
+
+
+class _RecoveryProbeRecognizer:
+    """Cheap opening recognizer used only to exercise controller recovery."""
+
+    @staticmethod
+    def recognize(_image: object, *, allow_unknown_suit: bool = False) -> object:
+        del allow_unknown_suit
+        return SimpleNamespace(
+            my_hand=(),
+            round_level="",
+            wild_rank="",
+            lead_player=None,
+            current_player=None,
+            buttons=(),
+            events=(),
+            diagnostics=("geometry recovery probe",),
+        )
+
+    @staticmethod
+    def recognize_table_anchor(_image: object) -> float:
+        return 1.0
+
+
+class _ScenarioEvidenceError(RuntimeError):
+    """Carry runtime evidence through the scenario runner's error boundary."""
+
+    def __init__(self, error: Exception, details: dict[str, object]):
+        self.summary_error = f"{type(error).__name__}: {error}"
+        self.scenario_details = details
+        super().__init__(self.summary_error)
+
+
+class _SimulatorTopmostFixture:
+    """Temporarily pin only an IPC/PID/HWND-verified owned simulator."""
+
+    def __init__(self, status: dict[str, object], expected_hwnd: int | None, *, window_api: Any = None, process_api: Any = None):
+        self.hwnd = int(status.get("hwnd", 0) or 0)
+        self.pid = int(status.get("pid", 0) or 0)
+        self.title = str(status.get("window_title", ""))
+        if not expected_hwnd or self.hwnd != int(expected_hwnd) or self.pid <= 0:
+            raise RuntimeError("temporary simulator fixture requires matching expected HWND and IPC PID")
+        if window_api is None:
+            import win32gui
+            window_api = win32gui
+        if process_api is None:
+            import win32process
+            process_api = win32process
+        self.windows, self.processes = window_api, process_api
+        self.was_topmost: bool | None = None
+        self.restored = False
+
+    def _verify_owner(self) -> None:
+        if not self.windows.IsWindow(self.hwnd):
+            raise RuntimeError("owned simulator HWND is no longer valid")
+        actual_pid = int(self.processes.GetWindowThreadProcessId(self.hwnd)[1])
+        if actual_pid != self.pid or self.windows.GetWindowText(self.hwnd) != self.title:
+            raise RuntimeError("owned simulator identity changed; refusing native window mutation")
+
+    def reassert(self) -> None:
+        self._verify_owner()
+        # NOSIZE | NOMOVE | NOACTIVATE: preserve geometry and user focus.
+        self.windows.SetWindowPos(self.hwnd, -1, 0, 0, 0, 0, 0x0013)
+
+    def __enter__(self):
+        self._verify_owner()
+        self.was_topmost = bool(self.windows.GetWindowLong(self.hwnd, -20) & 0x0008)
+        try:
+            self.reassert()
+        except Exception as exc:
+            try:
+                self._restore()
+            except Exception as restore_exc:
+                raise _ScenarioEvidenceError(restore_exc, {"fixture_acquire_error": f"{type(exc).__name__}: {exc}", "window_fixture": self.evidence()}) from exc
+            raise
+        return self
+
+    def _restore(self) -> None:
+        if self.was_topmost is None:
+            return
+        self._verify_owner()
+        self.windows.SetWindowPos(self.hwnd, -1 if self.was_topmost else -2, 0, 0, 0, 0, 0x0013)
+        actual = bool(self.windows.GetWindowLong(self.hwnd, -20) & 0x0008)
+        if actual != self.was_topmost:
+            raise RuntimeError("owned simulator original topmost state was not restored")
+        self.restored = True
+
+    def __exit__(self, error_type, error, traceback):
+        try:
+            self._restore()
+        except Exception as exc:
+            raise _ScenarioEvidenceError(exc, {
+                "window_fixture": self.evidence(),
+                "fixture_primary_error": f"{type(error).__name__}: {error}" if error else None,
+            }) from error
+        if isinstance(error, _ScenarioEvidenceError):
+            error.scenario_details["window_fixture"] = self.evidence()
+        return False
+
+    def evidence(self) -> dict[str, object]:
+        return {"hwnd": self.hwnd, "pid": self.pid, "original_topmost": self.was_topmost,
+                "temporary_topmost": True, "original_topmost_restored": self.restored,
+                "user_windows_modified": False}
+
+
+def _controller_probe_state(controller: object) -> dict[str, object]:
+    orchestrator = getattr(controller, "orchestrator", None)
+    waiting = getattr(controller, "_waiting_capture_worker", None)
+    return {
+        "listening_enabled": bool(getattr(controller, "_listening_enabled", False)),
+        "orchestrator_present": orchestrator is not None,
+        "orchestrator_status": getattr(orchestrator, "status", None),
+        "pending_auto_session": getattr(controller, "_pending_auto_session", None) is not None,
+        "waiting_worker_running": bool(getattr(waiting, "is_running", False)),
+        "waiting_generation": getattr(controller, "_waiting_generation", None),
+        "geometry_recovery_active": bool(getattr(controller, "_geometry_recovery_active", False)),
+    }
+
+
+def _simulator_visibility(status: dict[str, object]) -> dict[str, object]:
+    """Read real geometry/Z order without bypassing capture protections."""
+    target = TargetWindow(int(status.get("hwnd", 0) or 0), str(status.get("window_title", "")))
+    try:
+        rect = get_client_rect_on_screen(target)
+        blockers = find_screen_occluders(target, rect)
+    except Exception as exc:
+        return {"visible_unoccluded": False, "error": f"{type(exc).__name__}: {exc}", "error_code": str(getattr(exc, "code", "")), "blockers": []}
+    return {
+        "visible_unoccluded": not blockers, "error": None,
+        "client_rect": _rect_dict(rect),
+        "blockers": [{"hwnd": item.hwnd, "title": item.title} for item in blockers],
+    }
 
 
 def perceptual_hash(image: np.ndarray) -> str:
@@ -435,7 +644,7 @@ class WindowE2EValidator:
                 reference_checkpoint=self._reference_checkpoint(),
             )
             atomic_write_json(self.output / "resource_manifest.json", resource_manifest)
-            capture = CaptureService(self.runtime_profiles_root)
+            capture = _TrackingCaptureService(self.runtime_profiles_root)
             for name in self.config.scenarios:
                 if name == "full_chain":
                     runtime = self._record_scenario(name, self._run_full_chain)
@@ -500,6 +709,7 @@ class WindowE2EValidator:
             "execution_ok": execution_ok,
             "acceptance_eligible": self.config.acceptance_eligible,
             "acceptance_passed": acceptance_passed,
+            "development_fragment": self.config.development_fragment,
             "scenarios": self.scenario_results,
             "runtime": runtime,
             "resources": {
@@ -594,8 +804,9 @@ class WindowE2EValidator:
             result = {"passed": bool(result.get("passed")), **result}
         except Exception as exc:
             result = {
+                **getattr(exc, "scenario_details", {}),
                 "passed": False,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": getattr(exc, "summary_error", f"{type(exc).__name__}: {exc}"),
             }
             self.errors.append(f"scenario {name}: {result['error']}")
         result["elapsed_ms"] = (time.perf_counter() - started) * 1000.0
@@ -630,83 +841,203 @@ class WindowE2EValidator:
     def _move_recovery(self, service: CaptureService) -> dict[str, object]:
         status = self.control.command("reset")
         rect = dict(status["client_rect"])  # type: ignore[arg-type]
-        source = service.open_live_source(self.config.profile_name)
-        source.capture()
-        moved = self.control.command(
-            "move",
-            {"left": int(rect["left"]) + 80, "top": int(rect["top"]) + 50},
-        )
-        interrupted = _capture_is_interrupted(source)
-        source.close()
-        restored = self.control.command(
-            "move", {"left": int(rect["left"]), "top": int(rect["top"])}
-        )
-        reopened = service.open_live_source(self.config.profile_name)
         try:
-            recovered = _capture_succeeds(reopened)
+            result = self._controller_geometry_recovery(
+                service,
+                command="move",
+                arguments={
+                    "left": int(rect["left"]) + 80,
+                    "top": int(rect["top"]) + 50,
+                },
+            )
         finally:
-            reopened.close()
-        return {
-            "passed": interrupted and recovered,
-            "old_source_interrupted": interrupted,
-            "reopened_source_captured": recovered,
-            "moved_status": moved,
-            "restored_status": restored,
-        }
+            restored = self.control.command(
+                "move", {"left": int(rect["left"]), "top": int(rect["top"])}
+            )
+        return {**result, "restored_status": restored}
 
     def _resize_recovery(self, service: CaptureService) -> dict[str, object]:
         self.control.command("reset")
-        source = service.open_live_source(self.config.profile_name)
-        source.capture()
-        resized = self.control.command(
-            "resize_client", {"width": 1100, "height": 700}
+        result = self._controller_geometry_recovery(
+            service,
+            command="resize_client",
+            arguments={"width": 1100, "height": 700},
         )
-        interrupted = _capture_is_interrupted(source)
-        source.close()
-        locked = service.lock_target_client_size(self.config.profile_name)
-        reopened = service.open_live_source(self.config.profile_name)
-        try:
-            recovered = _capture_succeeds(reopened)
-        finally:
-            reopened.close()
-        return {
-            "passed": interrupted
-            and recovered
-            and (locked.width, locked.height) == (1280, 764),
-            "old_source_interrupted": interrupted,
-            "resized_status": resized,
-            "locked_client_rect": _rect_dict(locked),
-            "reopened_source_captured": recovered,
-        }
+        final_status = self.control.wait_for(
+            lambda row: isinstance(row.get("client_rect"), dict)
+            and row["client_rect"].get("width") == 1280  # type: ignore[index,union-attr]
+            and row["client_rect"].get("height") == 764,  # type: ignore[index,union-attr]
+            "controller restored canonical client size",
+        )
+        return {**result, "final_status": final_status}
 
     def _minimize_recovery(self, service: CaptureService) -> dict[str, object]:
         self.control.command("reset")
-        source = service.open_live_source(self.config.profile_name)
-        source.capture()
-        minimized = self.control.command("minimize")
-        interrupted = _capture_is_interrupted(source)
-        source.close()
-        self.control.command("restore")
-        restored = self.control.wait_for(
-            lambda row: isinstance(row.get("client_rect"), dict),
-            "restored simulator geometry",
-        )
-        service.lock_target_client_size(self.config.profile_name)
-        reopened = service.open_live_source(self.config.profile_name)
         try:
-            recovered = _capture_succeeds(reopened)
+            result = self._controller_geometry_recovery(
+                service,
+                command="minimize",
+                arguments={},
+            )
         finally:
-            reopened.close()
-        return {
-            "passed": interrupted and recovered,
-            "old_source_interrupted": interrupted,
-            "minimized_status": minimized,
-            "restored_status": restored,
-            "reopened_source_captured": recovered,
-        }
+            restored = self.control.command("restore")
+        return {**result, "restored_status": restored}
+
+    def _controller_geometry_recovery(
+        self,
+        service: CaptureService,
+        *,
+        command: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        with self._simulator_topmost_fixture() as fixture:
+            result = self._controller_geometry_recovery_visible(service, command=command, arguments=arguments, fixture=fixture)
+        return {**result, "window_fixture": fixture.evidence()}
+
+    def _controller_geometry_recovery_visible(
+        self, service: CaptureService, *, command: str,
+        arguments: dict[str, object], fixture: _SimulatorTopmostFixture,
+    ) -> dict[str, object]:
+        # Reset both Qt state and native Z order before the stimulus. A native
+        # controller restore does not itself reset the simulator fixture.
+        environment_preflight = self._restore_simulator_visibility(fixture)
+        dependencies = build_live_controller_dependencies(
+            profile_name=self.config.profile_name,
+            capture=service,
+            advisor_strategy="fabledan",
+        )
+        controller = LiveAssistantController(
+            dependencies.capture,
+            profile_name=self.config.profile_name,
+            recognition_service=_RecoveryProbeRecognizer(),
+            advisor=dependencies.advisor,
+            session_factory=dependencies.session_factory,
+            capture_interval_sec=self.config.capture_interval_sec,
+        )
+        controller._danzero_warmup_complete = True
+        try:
+            controller.update_ready.disconnect(controller._schedule_hand_preselection)
+        except Exception:
+            pass
+        statuses: list[dict[str, object]] = []
+        errors: list[str] = []
+        frames: list[FrameSnapshot] = []
+        controller.listening_status.connect(
+            lambda value: statuses.append({
+                **dict(value), "observed_monotonic_ms": int(time.monotonic() * 1000),
+                "controller_state": _controller_probe_state(controller),
+            })
+            if isinstance(value, dict)
+            else None
+        )
+        controller.error.connect(errors.append)
+        controller.frame_ready.connect(
+            lambda value: frames.append(value)
+            if isinstance(value, FrameSnapshot)
+            else None
+        )
+        opened_before = int(getattr(service, "live_source_open_count", 0))
+        changed_status: dict[str, object] = {}
+        before_change: dict[str, object] = {}
+        try:
+            if not controller.start_listening():
+                raise RuntimeError("LiveAssistantController rejected continuous listening")
+            self._wait_for_controller(
+                lambda: bool(frames),
+                "controller first listening frame",
+            )
+            opened_before_change = int(
+                getattr(service, "live_source_open_count", opened_before)
+            )
+            frame_count_before_change = len(frames)
+            before_change = _controller_probe_state(controller)
+            if before_change["orchestrator_present"] or before_change["pending_auto_session"]:
+                raise RuntimeError("geometry scenario precondition requires waiting mode without a session")
+            changed_status = self.control.command(command, arguments)
+            self._wait_for_controller(
+                lambda: any(row.get("state") == "recovering" for row in statuses),
+                "controller geometry recovering status",
+            )
+            self._wait_for_controller(
+                lambda: any(row.get("state") == "recovered" for row in statuses),
+                "controller geometry recovered status",
+            )
+            frame_count_at_recovered = len(frames)
+            self._wait_for_controller(
+                lambda: len(frames) > frame_count_at_recovered,
+                "post-recovery capture worker frame",
+            )
+            post_recovery_frame_observed = len(frames) > frame_count_at_recovered
+            opened_after_recovery = int(
+                getattr(service, "live_source_open_count", opened_before_change)
+            )
+            controller_path_ok = bool(
+                controller._listening_enabled
+                and controller.orchestrator is None
+                and controller._waiting_source is not None
+                and opened_after_recovery > opened_before_change
+                and post_recovery_frame_observed
+            )
+            return {
+                "passed": controller_path_ok and not errors,
+                "environment_preflight": environment_preflight,
+                "controller_path": "LiveAssistantController.start_listening",
+                "manual_source_reopen": False,
+                "recovering_observed": any(
+                    row.get("state") == "recovering" for row in statuses
+                ),
+                "recovered_observed": any(
+                    row.get("state") == "recovered" for row in statuses
+                ),
+                "listening_enabled_after_recovery": controller._listening_enabled,
+                "new_source_takeover": opened_after_recovery > opened_before_change,
+                "post_recovery_frame_observed": post_recovery_frame_observed,
+                "frame_count_before_change": frame_count_before_change,
+                "frame_count_at_recovered": frame_count_at_recovered,
+                "frame_count_after_recovery": len(frames),
+                "source_open_count_before": opened_before_change,
+                "source_open_count_after": opened_after_recovery,
+                "status_transitions": statuses,
+                "controller_before_change": before_change,
+                "controller_after_recovery": _controller_probe_state(controller),
+                "changed_status": changed_status,
+                "errors": errors,
+            }
+        except Exception as exc:
+            raise _ScenarioEvidenceError(exc, {
+                "environment_preflight": environment_preflight,
+                "controller_path": "LiveAssistantController.start_listening",
+                "manual_source_reopen": False, "status_transitions": statuses,
+                "controller_before_change": before_change,
+                "controller_at_failure": _controller_probe_state(controller),
+                "changed_status": changed_status,
+                "simulator_status_at_failure": self.control.status(),
+                "frame_count_at_failure": len(frames), "errors": errors,
+            }) from exc
+        finally:
+            controller.shutdown()
+
+    def _wait_for_controller(
+        self,
+        predicate: Callable[[], bool],
+        description: str,
+    ) -> None:
+        deadline = time.monotonic() + self.config.command_timeout_sec
+        while time.monotonic() < deadline:
+            self._pump()
+            if predicate():
+                return
+            time.sleep(0.02)
+        raise TimeoutError(f"timed out waiting for {description}")
 
     def _occlusion(self) -> dict[str, object]:
+        with self._simulator_topmost_fixture() as fixture:
+            result = self._occlusion_visible(fixture)
+        return {**result, "window_fixture": fixture.evidence()}
+
+    def _occlusion_visible(self, fixture: _SimulatorTopmostFixture | None = None) -> dict[str, object]:
         self.control.command("reset")
+        environment_preflight = self._restore_simulator_visibility(fixture)
         services = {
             backend: CaptureService(self._backend_profile(backend))
             for backend in ("printwindow", "screen", "gdi_screen")
@@ -733,19 +1064,26 @@ class WindowE2EValidator:
             for backend in ("screen", "gdi_screen"):
                 source = services[backend].open_live_source(self.config.profile_name)
                 try:
-                    interrupted = _capture_is_interrupted(source)
+                    probe = _capture_probe(source)
                 finally:
                     source.close()
-                results[backend] = {"occlusion_interrupted": interrupted}
+                results[backend] = {
+                    "occlusion_interrupted": probe.get("error_code") == "CAPTURE-OCCLUDED",
+                    "occluded_capture": probe,
+                }
         finally:
             self.control.command("occlude", {"visible": False})
+        # Hiding our occluder may activate another desktop window. Raise only
+        # the owned simulator and check native Z order before reopening.
+        restored_visibility = self._restore_simulator_visibility(fixture)
         for backend in ("screen", "gdi_screen"):
             reopened = services[backend].open_live_source(self.config.profile_name)
             try:
-                recovered = _capture_succeeds(reopened)
+                probe = _capture_probe(reopened)
             finally:
                 reopened.close()
-            results[backend]["reopened_source_captured"] = recovered  # type: ignore[index]
+            results[backend]["reopened_source_captured"] = probe["captured"]  # type: ignore[index]
+            results[backend]["reopened_capture"] = probe  # type: ignore[index]
         passed = bool(
             results["printwindow"]["capture_kept"]  # type: ignore[index]
             and results["printwindow"]["pixel_similarity"]["passed"]  # type: ignore[index]
@@ -755,7 +1093,27 @@ class WindowE2EValidator:
                 for name in ("screen", "gdi_screen")
             )
         )
-        return {"passed": passed, "backends": results, "occluded_status": occluded}
+        return {"passed": passed, "backends": results, "occluded_status": occluded,
+                "environment_preflight": environment_preflight, "restored_visibility": restored_visibility}
+
+    def _simulator_topmost_fixture(self) -> _SimulatorTopmostFixture:
+        status = self.control.status()
+        self._assert_target(status)
+        return _SimulatorTopmostFixture(status, self.config.expected_hwnd)
+
+    def _restore_simulator_visibility(self, fixture: _SimulatorTopmostFixture | None = None) -> dict[str, object]:
+        status = self.control.command("restore")
+        self._assert_target(status)
+        if fixture is not None:
+            fixture.reassert()
+        visibility = _simulator_visibility(status)
+        evidence = {"simulator_status": status, "native_visibility": visibility}
+        if not visibility["visible_unoccluded"]:
+            raise _ScenarioEvidenceError(
+                RuntimeError("simulator fixture is not visible and unoccluded after its restore command"),
+                {"environment_precondition": evidence},
+            )
+        return evidence
 
     def _backend_profile(self, backend: str) -> Path:
         profiles_root = self.output / "scenario_profiles" / backend
@@ -882,9 +1240,15 @@ class WindowE2EValidator:
             if not isinstance(value, FrameSnapshot):
                 return
             frame_count += 1
+            simulator_frame = self.control.status().get("current_frame_index")
             append_json_line(
                 frame_log,
-                {"capture_seq": frame_count, **_snapshot_metadata(value)},
+                {
+                    "capture_seq": frame_count,
+                    "source_frame_index": simulator_frame,
+                    "captured_monotonic_ms": value.captured_monotonic_ms,
+                    **_snapshot_metadata(value),
+                },
             )
 
         def on_update(value: object) -> None:
@@ -900,6 +1264,12 @@ class WindowE2EValidator:
             if advice_status:
                 advice_statuses[str(advice_status)] += 1
             snapshot = getattr(value, "snapshot", None)
+            hint = getattr(value, "local_rule_hint", None)
+            local_pass = bool(
+                hint is not None
+                and getattr(hint, "is_pass", False)
+                and getattr(hint, "source", "") == "button_cannot_beat"
+            )
             semantic = getattr(snapshot, "semantic_dict", None)
             if callable(semantic):
                 last_snapshot = semantic()
@@ -912,6 +1282,14 @@ class WindowE2EValidator:
                     "advice_status": advice_status,
                     "revision": getattr(snapshot, "revision", None),
                     "turn_id": getattr(snapshot, "turn_id", None),
+                    "observed_monotonic_ms": int(time.monotonic() * 1000),
+                    "local_pass_response": local_pass,
+                    "local_pass_evidence_id": (
+                        f"cannot-beat:{getattr(hint, 'capture_generation', '')}:"
+                        f"{getattr(hint, 'action_epoch', '')}:"
+                        f"{getattr(hint, 'confirmed_ms', '')}"
+                        if local_pass else ""
+                    ),
                 },
             )
 
@@ -934,6 +1312,7 @@ class WindowE2EValidator:
             }
         orchestrator = controller.orchestrator
         runtime_directory = Path(orchestrator.store.directory)  # type: ignore[union-attr]
+        runtime_audit = audit_live_v2_runtime(orchestrator, runtime_directory)
         advisor_info = _advisor_info(dependencies.advisor)
         rule_engine_probe = _rule_engine_probe()
         analysis_worker = None
@@ -980,7 +1359,35 @@ class WindowE2EValidator:
             drained=advice_drained,
         )
         actual_actions = _action_signatures(runtime_directory / "timeline.jsonl")
+        opportunity_acceptance = evaluate_window_opportunities(
+            source_session=self.config.session,
+            runtime_directory=runtime_directory,
+            capture_log=frame_log,
+            update_log=update_log,
+            qualification_required=self.config.acceptance_eligible,
+            max_source_frame=(
+                self.config.max_frames if self.config.development_fragment else None
+            ),
+        )
         baseline = self._baseline_comparison(actual_actions)
+        business_health = _full_chain_business_health(
+            self.config,
+            runtime_directory,
+            actual_actions,
+            last_snapshot,
+            baseline,
+        )
+        fragment_acceptance = (
+            _development_fragment_acceptance(
+                self.config.session,
+                int(self.config.max_frames),
+                actual_actions,
+                last_snapshot,
+                opportunity_acceptance,
+            )
+            if self.config.development_fragment and self.config.max_frames is not None
+            else {"development_fragment": False}
+        )
         baseline_gate = bool(
             baseline.get("available") and baseline.get("actions_identical")
             if self.config.acceptance_eligible
@@ -1007,27 +1414,48 @@ class WindowE2EValidator:
                 if thread is not threading.current_thread()
             ],
         }
-        terminal_count = sum(
-            int(count)
-            for status_name, count in advice.get("terminal_counts", {}).items()
-            if status_name in _TERMINAL_ADVICE
+        advisor_terminal = _advice_lifecycle_terminal(advice)
+        if self.config.development_fragment:
+            opportunity_gate = bool(
+                opportunity_acceptance.get("available")
+                and opportunity_acceptance.get("passed")
+            )
+        else:
+            opportunity_gate = bool(
+                opportunity_acceptance.get("passed")
+                if opportunity_acceptance.get("available")
+                else not self.config.acceptance_eligible
+            )
+        execution_gate = _full_chain_execution_gate(
+            development_fragment=self.config.development_fragment,
+            common_checks={
+                "no_errors": not errors,
+                "simulator_eof": simulator.get("state") == "eof",
+                "captured_frames": frame_count > 0,
+                "frame_target_reached": (
+                    int(simulator.get("current_frame_index", -1))
+                    >= frame_target - 1
+                ),
+                "analysis_drained": analysis_drained,
+                "advice_drained": advice_drained,
+                "finish_completed": finish_completed,
+                "runtime_audit": bool(runtime_audit.get("passed")),
+                "opportunity_responses": opportunity_gate,
+                "rule_engine_probe": bool(rule_engine_probe.get("passed")),
+                "capture_worker_stopped": bool(
+                    thread_state["capture_worker_stopped"]
+                ),
+                "analysis_worker_stopped": bool(
+                    thread_state["analysis_worker_stopped"]
+                ),
+            },
+            fragment_prefix_passed=bool(fragment_acceptance.get("passed")),
+            advisor_terminal=advisor_terminal,
+            has_actions=len(actual_actions) > 0,
+            business_health_passed=bool(business_health.get("passed")),
+            baseline_passed=baseline_gate,
         )
-        advisor_terminal = terminal_count == int(advice.get("requested", 0))
-        passed = bool(
-            not errors
-            and simulator.get("state") == "eof"
-            and frame_count > 0
-            and int(simulator.get("current_frame_index", -1)) >= frame_target - 1
-            and analysis_drained
-            and advice_drained
-            and finish_completed
-            and advisor_terminal
-            and bool(rule_engine_probe.get("passed"))
-            and len(actual_actions) > 0
-            and thread_state["capture_worker_stopped"]
-            and thread_state["analysis_worker_stopped"]
-            and baseline_gate
-        )
+        passed = bool(execution_gate["passed"])
         return {
             "passed": passed,
             "executed": True,
@@ -1042,9 +1470,14 @@ class WindowE2EValidator:
             "analysis_worker": analysis_stats,
             "thread_and_drain": thread_state,
             "advice": advice,
+            "opportunity_acceptance": opportunity_acceptance,
+            "runtime_audit": runtime_audit,
             "advisor": advisor_info,
             "rule_engine_probe": rule_engine_probe,
             "baseline_comparison": baseline,
+            "business_health": business_health,
+            "fragment_prefix_acceptance": fragment_acceptance,
+            "execution_gate": execution_gate,
             "confirmed_action_count": len(actual_actions),
             "final_snapshot": last_snapshot,
             "runtime_directory": str(runtime_directory),
@@ -1069,6 +1502,7 @@ class WindowE2EValidator:
                 "summary": str(path),
             }
         expected = _action_signatures(timeline)
+        expected_remaining = _remaining_cards_from_summary_or_timeline(raw, timeline)
         first = None
         for index in range(max(len(expected), len(actual))):
             left = expected[index] if index < len(expected) else None
@@ -1082,6 +1516,7 @@ class WindowE2EValidator:
             "expected_action_count": len(expected),
             "actual_action_count": len(actual),
             "actions_identical": expected == actual,
+            "expected_remaining_cards": expected_remaining,
             "first_divergence": first,
         }
 
@@ -1148,7 +1583,11 @@ def run_window_e2e_validation(config_path: Path | str) -> int:
         output.mkdir(parents=True, exist_ok=True)
         failure = {
             "schema": "guandan.window-e2e-summary/1",
+            "run_kind": config.run_kind,
             "execution_ok": False,
+            "acceptance_eligible": False,
+            "acceptance_passed": False,
+            "development_fragment": config.development_fragment,
             "errors": [f"{type(exc).__name__}: {exc}"],
         }
         atomic_write_json(output / "summary.json", failure)
@@ -1221,11 +1660,19 @@ def _capture_is_interrupted(source: Any) -> bool:
 
 
 def _capture_succeeds(source: Any) -> bool:
+    return bool(_capture_probe(source)["captured"])
+
+
+def _capture_probe(source: Any) -> dict[str, object]:
     try:
         source.capture()
-    except Exception:
-        return False
-    return True
+    except Exception as exc:
+        return {
+            "captured": False, "error": f"{type(exc).__name__}: {exc}",
+            "error_code": str(getattr(exc, "code", "")),
+            "details": dict(getattr(exc, "details", {}) or {}),
+        }
+    return {"captured": True, "error": None, "error_code": None, "details": {}}
 
 
 def _snapshot_metadata(snapshot: FrameSnapshot) -> dict[str, object]:
@@ -1270,6 +1717,338 @@ def _initial_state(session: Path) -> dict[str, object]:
             "lead_player": lead if lead in {"self", "right", "opposite", "left"} else None,
         }
     raise ValueError("source timeline lacks initial_state_confirmed")
+
+
+def _normalize_remaining_cards(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for seat in ("self", "right", "opposite", "left"):
+        try:
+            count = int(value[seat])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= count <= 27:
+            result[seat] = count
+    return result
+
+
+def _timeline_final_remaining_cards(path: Path) -> dict[str, int]:
+    remaining: dict[str, int] = {}
+    for event in read_json_lines(path):
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if event.get("event_type") == "game_end_detected":
+            candidate = _normalize_remaining_cards(payload.get("remaining_cards"))
+            if candidate:
+                remaining = candidate
+    return remaining
+
+
+def _remaining_cards_from_summary_or_timeline(
+    summary: dict[str, object],
+    timeline: Path,
+) -> dict[str, int]:
+    snapshot = summary.get("final_snapshot")
+    if isinstance(snapshot, dict):
+        remaining = _normalize_remaining_cards(snapshot.get("remaining_cards"))
+        if remaining:
+            return remaining
+    return _timeline_final_remaining_cards(timeline)
+
+
+def _full_chain_execution_gate(
+    *,
+    development_fragment: bool,
+    common_checks: dict[str, bool],
+    fragment_prefix_passed: bool,
+    advisor_terminal: bool,
+    has_actions: bool,
+    business_health_passed: bool,
+    baseline_passed: bool,
+) -> dict[str, object]:
+    """Select fragment-only versus formal full-chain completion checks."""
+
+    if development_fragment:
+        mode_checks = {"fragment_prefix": fragment_prefix_passed}
+        skipped = (
+            "advisor_terminal",
+            "terminal_business_health",
+            "full_action_chain",
+            "phase_two_baseline",
+        )
+    else:
+        mode_checks = {
+            "advisor_terminal": advisor_terminal,
+            "has_actions": has_actions,
+            "terminal_business_health": business_health_passed,
+            "phase_two_baseline": baseline_passed,
+        }
+        skipped = ()
+    checks = {**common_checks, **mode_checks}
+    return {
+        "passed": all(checks.values()),
+        "development_fragment": development_fragment,
+        "qualification_eligible": False if development_fragment else None,
+        "checks": checks,
+        "skipped_formal_checks": list(skipped),
+    }
+
+
+def _advice_lifecycle_terminal(advice: dict[str, object]) -> bool:
+    counts = advice.get("terminal_counts", {})
+    if not isinstance(counts, dict):
+        return False
+    terminal_count = sum(
+        int(count)
+        for status_name, count in counts.items()
+        if status_name in _TERMINAL_ADVICE
+    )
+    return terminal_count == int(advice.get("requested", 0))
+
+
+def _development_fragment_acceptance(
+    source_session: Path,
+    max_source_frame: int,
+    actual_actions: list[dict[str, object]],
+    final_snapshot: dict[str, object] | None,
+    opportunity_acceptance: dict[str, object],
+) -> dict[str, object]:
+    """Compare a bounded source replay with its trusted historical prefix."""
+
+    try:
+        raw = json.loads(
+            (Path(source_session) / "truth_log.json").read_text(encoding="utf-8")
+        )
+        turns = raw.get("turns", ())
+        if not isinstance(turns, list):
+            raise ValueError("truth_log turns must be an array")
+        expected_actions: list[dict[str, object]] = []
+        for position, turn in enumerate(turns):
+            if not isinstance(turn, dict):
+                break
+            frames = _truth_evidence_frames(turn)
+            if not frames or any(frame > max_source_frame for frame in frames):
+                break
+            cards = turn.get("cards", ())
+            if isinstance(cards, str):
+                cards = (cards,)
+            expected_actions.append(
+                {
+                    "actor": turn.get("actor"),
+                    "is_pass": bool(turn.get("is_pass", False)),
+                    "cards": [str(card) for card in cards or ()],
+                    "turn_id": turn.get("turn_id", position + 1),
+                }
+            )
+        if not expected_actions:
+            raise ValueError("truth_log has no complete action in the requested frame window")
+        initial = raw.get("initial_state", {})
+        initial_hand = initial.get("my_hand", ()) if isinstance(initial, dict) else ()
+        starting_self = (
+            len(initial_hand)
+            if isinstance(initial_hand, list) and initial_hand
+            else 27
+        )
+        expected_remaining = {
+            "self": starting_self,
+            "right": 27,
+            "opposite": 27,
+            "left": 27,
+        }
+        for action in expected_actions:
+            actor = str(action.get("actor", ""))
+            if actor in expected_remaining and not action.get("is_pass"):
+                expected_remaining[actor] -= len(action.get("cards", ()))
+    except Exception as exc:
+        return {
+            "development_fragment": True,
+            "available": False,
+            "passed": False,
+            "max_source_frame": max_source_frame,
+            "prefix_expected_count": 0,
+            "prefix_actual_count": len(actual_actions),
+            "first_divergence": {
+                "kind": "truth_prefix",
+                "expected": "readable complete truth action prefix",
+                "actual": f"{type(exc).__name__}: {exc}",
+            },
+        }
+
+    first: dict[str, object] | None = None
+    for index in range(max(len(expected_actions), len(actual_actions))):
+        expected = expected_actions[index] if index < len(expected_actions) else None
+        actual = actual_actions[index] if index < len(actual_actions) else None
+        if expected != actual:
+            first = {
+                "kind": "action",
+                "position": index + 1,
+                "expected": expected,
+                "actual": actual,
+            }
+            break
+    actions_identical = expected_actions == actual_actions
+    actual_remaining = _normalize_remaining_cards(
+        final_snapshot.get("remaining_cards")
+        if isinstance(final_snapshot, dict)
+        else None
+    )
+    remaining_ok = actual_remaining == expected_remaining
+    if first is None and not remaining_ok:
+        seat = next(
+            seat
+            for seat in ("self", "right", "opposite", "left")
+            if actual_remaining.get(seat) != expected_remaining[seat]
+        )
+        first = {
+            "kind": "remaining_cards",
+            "seat": seat,
+            "expected": expected_remaining[seat],
+            "actual": actual_remaining.get(seat),
+        }
+    opportunity_ok = bool(
+        opportunity_acceptance.get("available")
+        and opportunity_acceptance.get("passed")
+    )
+    if first is None and not opportunity_ok:
+        opportunity_first = opportunity_acceptance.get("first_divergence")
+        if isinstance(opportunity_first, dict):
+            first = opportunity_first
+        else:
+            first = {
+                "kind": "opportunity_response",
+                "expected": "all determinable prefix opportunities answered on time",
+                "actual": opportunity_acceptance.get("reason", "opportunity gate failed"),
+            }
+    return {
+        "development_fragment": True,
+        "qualification_eligible": False,
+        "available": True,
+        "passed": bool(actions_identical and remaining_ok and opportunity_ok),
+        "max_source_frame": max_source_frame,
+        "prefix_expected_count": len(expected_actions),
+        "prefix_actual_count": len(actual_actions),
+        "expected_last_turn_id": expected_actions[-1]["turn_id"],
+        "actions_identical": actions_identical,
+        "expected_remaining_cards": expected_remaining,
+        "actual_remaining_cards": actual_remaining,
+        "remaining_cards_ok": remaining_ok,
+        "opportunity_responses_ok": opportunity_ok,
+        "opportunity_prefix_expected_count": _opportunity_prefix_expected_count(
+            opportunity_acceptance
+        ),
+        "opportunity_prefix_actual_count": opportunity_acceptance.get(
+            "prefix_actual_count", 0
+        ),
+        "first_divergence": first,
+    }
+
+
+def _truth_evidence_frames(turn: dict[str, object]) -> tuple[int, ...]:
+    evidence = turn.get("evidence")
+    if isinstance(evidence, dict):
+        frames = evidence.get("frame_indices")
+        if isinstance(frames, list):
+            return tuple(int(frame) for frame in frames)
+    frame = turn.get("frame_index")
+    return () if frame is None else (int(frame),)
+
+
+def _opportunity_prefix_expected_count(value: dict[str, object]) -> object:
+    explicit = value.get("prefix_expected_count")
+    if explicit is not None:
+        return explicit
+    denominators = value.get("denominators")
+    return (
+        denominators.get("determinable_opportunities", 0)
+        if isinstance(denominators, dict)
+        else 0
+    )
+
+
+def _session_health_audit(runtime_directory: Path) -> dict[str, object]:
+    path = runtime_directory / "health_audit.json"
+    if not path.is_file():
+        return {
+            "available": False,
+            "passed": False,
+            "path": str(path),
+            "status": "MISSING",
+            "issues": [],
+            "reason": "sealed session health_audit.json is missing",
+        }
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "available": False,
+            "passed": False,
+            "path": str(path),
+            "status": "UNREADABLE",
+            "issues": [],
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(raw, dict):
+        return {
+            "available": False,
+            "passed": False,
+            "path": str(path),
+            "status": "INVALID",
+            "issues": [],
+            "reason": "health audit is not a JSON object",
+        }
+    status = str(raw.get("status", "")).upper()
+    issues = list(raw.get("issues", ()) or ())
+    return {
+        "available": True,
+        "passed": status == "PASS" and not issues,
+        "path": str(path),
+        "status": status,
+        "issues": issues,
+    }
+
+
+def _full_chain_business_health(
+    config: WindowE2EValidationConfig,
+    runtime_directory: Path,
+    actual_actions: list[dict[str, object]],
+    final_snapshot: dict[str, object] | None,
+    baseline: dict[str, object],
+) -> dict[str, object]:
+    health = _session_health_audit(runtime_directory)
+    expected_action_count = config.full_chain_expected_action_count
+    if expected_action_count is None and baseline.get("available"):
+        raw_count = baseline.get("expected_action_count")
+        if raw_count is not None:
+            expected_action_count = int(raw_count)
+    expected_remaining = config.full_chain_expected_remaining_cards
+    if expected_remaining is None and baseline.get("available"):
+        expected_remaining = _normalize_remaining_cards(
+            baseline.get("expected_remaining_cards")
+        ) or None
+    actual_remaining = _normalize_remaining_cards(
+        final_snapshot.get("remaining_cards") if isinstance(final_snapshot, dict) else None
+    )
+    action_count_ok = bool(
+        expected_action_count is None or len(actual_actions) == expected_action_count
+    )
+    remaining_ok = bool(
+        expected_remaining is None
+        or bool(expected_remaining)
+        and actual_remaining == expected_remaining
+    )
+    passed = bool(health.get("passed") and action_count_ok and remaining_ok)
+    return {
+        "passed": passed,
+        "health_audit": health,
+        "actual_action_count": len(actual_actions),
+        "expected_action_count": expected_action_count,
+        "action_count_ok": action_count_ok,
+        "actual_remaining_cards": actual_remaining,
+        "expected_remaining_cards": expected_remaining,
+        "remaining_cards_ok": remaining_ok,
+    }
 
 
 def _action_signatures(path: Path) -> list[dict[str, object]]:
@@ -1339,6 +2118,7 @@ def _summary_markdown(summary: dict[str, object]) -> str:
         f"- 执行结果：{'PASS' if summary.get('execution_ok') else 'FAIL'}",
         f"- 正式验收资格：{summary.get('acceptance_eligible', False)}",
         f"- 正式验收结果：{'PASS' if summary.get('acceptance_passed') else 'NOT_PASS'}",
+        f"- 开发历史片段：{summary.get('development_fragment', False)}",
         f"- 运行类型：{summary.get('run_kind', 'unknown')}",
         f"- HWND：{summary.get('observed_hwnd', 'N/A')}",
         "",

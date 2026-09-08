@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic_ns
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 
 from .config import PROFILES_ROOT
@@ -18,6 +18,7 @@ from .window_capture import (
     find_screen_occluders,
     find_target_window,
     get_client_rect_on_screen,
+    get_window_dpi,
     resize_target_client,
 )
 
@@ -45,9 +46,59 @@ class LoadedProfile:
 class LiveCaptureInterrupted(RuntimeError):
     """A persistent source can no longer guarantee aligned window frames."""
 
-    def __init__(self, message: str, *, code: str = "CAPTURE-BACKEND-FAILED") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "CAPTURE-BACKEND-FAILED",
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = str(code)
+        self.details = dict(details or {})
+
+
+def _rect_payload(rect: object | None) -> list[int] | None:
+    if rect is None:
+        return None
+    try:
+        return [
+            int(getattr(rect, "left")),
+            int(getattr(rect, "top")),
+            int(getattr(rect, "width")),
+            int(getattr(rect, "height")),
+        ]
+    except (TypeError, ValueError):
+        return None
+
+
+def _geometry_change_types(
+    old_rect: object,
+    new_rect: object,
+    *,
+    old_dpi: int,
+    new_dpi: int,
+) -> list[str]:
+    changes: list[str] = []
+    if (
+        getattr(old_rect, "left", None),
+        getattr(old_rect, "top", None),
+    ) != (
+        getattr(new_rect, "left", None),
+        getattr(new_rect, "top", None),
+    ):
+        changes.append("move")
+    if (
+        getattr(old_rect, "width", None),
+        getattr(old_rect, "height", None),
+    ) != (
+        getattr(new_rect, "width", None),
+        getattr(new_rect, "height", None),
+    ):
+        changes.append("resize")
+    if int(old_dpi) != int(new_dpi):
+        changes.append("dpi")
+    return changes or ["geometry"]
 
 
 class LiveCaptureSource:
@@ -56,24 +107,53 @@ class LiveCaptureSource:
         self.target = find_target_window(loaded.config.window_title_keywords)
         self.window_lookup_count = 1
         self._initial_rect = get_client_rect_on_screen(self.target)
+        self._initial_dpi = get_window_dpi(self.target)
         self._screen_capture = LazyMssCapture()
+        self._last_backend: str | None = None
         self._closed = False
+
+    def diagnostic_state(self) -> dict[str, object]:
+        return {
+            "rect": _rect_payload(self._initial_rect),
+            "dpi": int(self._initial_dpi),
+            "backend": self._last_backend,
+            "window_title": self.target.title,
+            "hwnd": int(self.target.hwnd),
+        }
 
     def capture(self) -> FrameSnapshot:
         if self._closed:
             raise RuntimeError("持续采集源已经关闭")
         try:
             current_rect = get_client_rect_on_screen(self.target)
-            if current_rect != self._initial_rect:
+            current_dpi = get_window_dpi(self.target)
+            if current_rect != self._initial_rect or current_dpi != self._initial_dpi:
+                change_types = _geometry_change_types(
+                    self._initial_rect,
+                    current_rect,
+                    old_dpi=self._initial_dpi,
+                    new_dpi=current_dpi,
+                )
                 raise LiveCaptureInterrupted(
                     "target window geometry changed; reopen live capture source",
                     code="GEOMETRY-CHANGED",
+                    details={
+                        "old_rect": _rect_payload(self._initial_rect),
+                        "new_rect": _rect_payload(current_rect),
+                        "old_dpi": int(self._initial_dpi),
+                        "new_dpi": int(current_dpi),
+                        "change_types": change_types,
+                        "capture_backend": self._last_backend,
+                        "window_title": self.target.title,
+                        "hwnd": int(self.target.hwnd),
+                    },
                 )
             frame = capture_standardized_client_frame(
                 self.target,
                 self._screen_capture,
                 self.loaded.config,
             )
+            self._last_backend = str(frame.backend)
             if backend_uses_visible_screen(frame.backend):
                 blockers = find_screen_occluders(self.target, current_rect)
                 if blockers:
@@ -89,9 +169,27 @@ class LiveCaptureSource:
         except LiveCaptureInterrupted:
             raise
         except TargetWindowError as exc:
+            source_code = str(getattr(exc, "code", "CAPTURE-BACKEND-FAILED"))
+            change_types = (
+                ["minimized"]
+                if source_code == "WINDOW-MINIMIZED"
+                else ["geometry"]
+                if source_code == "GEOMETRY-CHANGED"
+                else []
+            )
             raise LiveCaptureInterrupted(
                 str(exc),
-                code=str(getattr(exc, "code", "CAPTURE-BACKEND-FAILED")),
+                code=source_code,
+                details={
+                    "old_rect": _rect_payload(self._initial_rect),
+                    "new_rect": None,
+                    "old_dpi": int(self._initial_dpi),
+                    "new_dpi": None,
+                    "change_types": change_types,
+                    "capture_backend": self._last_backend,
+                    "window_title": self.target.title,
+                    "hwnd": int(self.target.hwnd),
+                },
             ) from exc
         return FrameSnapshot(frame)
 

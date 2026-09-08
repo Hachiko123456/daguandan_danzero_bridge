@@ -30,6 +30,8 @@ class FakeRuntime(QObject):
     frame_ready = Signal(object)
     error = Signal(str)
     session_finished = Signal(object)
+    listening_status = Signal(object)
+    log_delivery_status = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -43,6 +45,9 @@ class FakeRuntime(QObject):
         self.confirmed_candidate_id = None
         self.manual_action = None
         self.correction = None
+        self.full_diagnostic_requests = 0
+        self.opened_log_directory = None
+        self.open_log_requests = 0
 
     def recognize_initial(self):
         pass
@@ -82,6 +87,16 @@ class FakeRuntime(QObject):
     def finish(self):
         pass
 
+    def request_full_diagnostic_export(self):
+        self.full_diagnostic_requests += 1
+
+    def open_automatic_log_directory(self):
+        self.opened_log_directory = "C:/logs"
+        return self.opened_log_directory
+
+    def request_open_automatic_log_directory(self):
+        self.open_log_requests += 1
+
     def set_session_data_recording_enabled(self, enabled):
         self.session_data_recording_enabled = bool(enabled)
         self.session_data_recording_updates.append(bool(enabled))
@@ -99,6 +114,20 @@ def _app():
     return QApplication.instance() or QApplication([])
 
 
+def _cannot_beat_fast(**overrides) -> FastSignalResult:
+    values = {
+        "expected_player": "self",
+        "active_player": "self",
+        "pass_visible": False,
+        "self_action_buttons_visible": True,
+        "effect_visible": False,
+        "cannot_beat_visible": True,
+        "cannot_beat_confidence": 0.99,
+    }
+    values.update(overrides)
+    return FastSignalResult(**values)
+
+
 def _recognition(hand):
     return SimpleNamespace(
         round_level="2",
@@ -108,6 +137,129 @@ def _recognition(hand):
         my_hand=hand,
         diagnostics=(),
     )
+
+
+def test_full_assistant_intro_describes_staged_hand_and_lead_confirmation():
+    from PySide6.QtWidgets import QLabel
+    _app()
+    page = LiveAssistantPage(FakeRuntime())
+    texts = [label.text() for label in page.findChildren(QLabel)]
+    assert any("确认起手牌和首出信息后自动开始" in text for text in texts)
+    assert not any("稳定识别两次相同" in text for text in texts)
+
+
+def test_full_assistant_log_controls_show_loading_success_and_failure():
+    app = _app()
+    runtime = FakeRuntime()
+    page = LiveAssistantPage(runtime)
+
+    page.export_full_diagnostic_button.click()
+    assert runtime.full_diagnostic_requests == 1
+    assert page.export_full_diagnostic_button.isEnabled() is False
+
+    runtime.log_delivery_status.emit(
+        {
+            "status": "PASS",
+            "include_media": True,
+            "diagnostic_zip_path": "C:/logs/full.zip",
+        }
+    )
+    app.processEvents()
+    assert page.export_full_diagnostic_button.isEnabled() is True
+    assert "C:/logs/full.zip" in page.log_delivery_status.text()
+
+    runtime.log_delivery_status.emit(
+        {"status": "FAIL", "include_media": True, "error": "disk full"}
+    )
+    app.processEvents()
+    assert "disk full" in page.log_delivery_status.text()
+
+    page.open_log_directory_button.click()
+    assert runtime.open_log_requests == 1
+    assert page.open_log_directory_button.isEnabled() is False
+    runtime.log_delivery_status.emit(
+        {
+            "status": "PASS",
+            "action": "open_directory",
+            "output_directory": "C:/logs",
+        }
+    )
+    app.processEvents()
+    assert page.open_log_directory_button.isEnabled() is True
+    assert "C:/logs" in page.log_delivery_status.text()
+
+
+def test_full_assistant_disables_log_actions_when_recording_is_disabled():
+    app = _app()
+    runtime = FakeRuntime()
+    page = LiveAssistantPage(runtime)
+
+    index = page.recording_mode_combo.findData("none")
+    assert index >= 0
+    page.recording_mode_combo.setCurrentIndex(index)
+    app.processEvents()
+
+    assert page.open_log_directory_button.isEnabled() is False
+    assert page.export_full_diagnostic_button.isEnabled() is False
+    assert "日志功能不可用" in page.log_delivery_status.text()
+
+    runtime.log_delivery_status.emit({"status": "DISABLED"})
+    app.processEvents()
+    assert page.export_full_diagnostic_button.isEnabled() is False
+
+
+def test_full_assistant_clears_only_geometry_terminal_error_on_restart():
+    app = _app()
+    runtime = FakeRuntime()
+    page = LiveAssistantPage(runtime)
+
+    runtime.listening_status.emit(
+        {
+            "state": "failed",
+            "message": "监听已停止，请打开完整助手",
+            "reason": "窗口持续抖动",
+        }
+    )
+    app.processEvents()
+    assert page.error_status.text() == "错误：窗口持续抖动"
+
+    runtime.listening_status.emit(
+        {
+            "state": "listening",
+            "message": "持续监听页面中",
+        }
+    )
+    app.processEvents()
+    assert page.initialization_status.text() == "持续监听页面中"
+    assert page.error_status.text() == ""
+
+    runtime.listening_status.emit(
+        {
+            "state": "recovering",
+            "message": "牌桌窗口发生变化，正在重新连接",
+        }
+    )
+    app.processEvents()
+    assert page.initialization_status.text() == "牌桌窗口发生变化，正在重新连接"
+    assert page.error_status.text() == ""
+
+    runtime.listening_status.emit(
+        {
+            "state": "recovered",
+            "message": "牌桌窗口已重新连接，继续监听",
+        }
+    )
+    app.processEvents()
+    assert page.initialization_status.text() == "牌桌窗口已重新连接，继续监听"
+    assert page.error_status.text() == ""
+
+    page.show_error("模板资源仍然不可用")
+    runtime.listening_status.emit(
+        {"state": "listening", "message": "持续监听页面中"}
+    )
+    app.processEvents()
+    assert page.error_status.text() == "错误：模板资源仍然不可用"
+    page.shutdown()
 
 
 def test_live_page_requires_exactly_27_cards_before_start():
@@ -298,6 +450,214 @@ def test_live_page_shows_super_double_decision_state():
 
     assert page.live_status.text() == "状态：正在决定是否加倍"
     assert "加倍按钮显示期间不进行首出或出牌识别" in page.turn_status.text()
+    page.close()
+
+
+def test_live_page_shows_provisional_cannot_beat_status_for_one_frame():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    update = LiveUpdate(
+        status="running",
+        snapshot=SimpleNamespace(current_player="self", trick_id=1, turn_id=2),
+        fast_signals=_cannot_beat_fast(),
+    )
+
+    page.apply_update(update)
+    app.processEvents()
+
+    assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
+    assert "单帧信号不会直接提交动作" in page.turn_status.text()
+    page.close()
+
+
+def test_live_page_cannot_beat_candidate_hides_stale_ready_advice():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    old_advice = LiveAdvice(
+        key=AdviceRequestKey("session", 7, 8),
+        status="ready",
+        visible=True,
+        advice=LocalAdvice(
+            strategy="test",
+            cards=("3S",),
+            play_type="Single",
+            is_pass=False,
+            state_revision=8,
+            elapsed_ms=12.0,
+            request_id="ADV-0007-0008",
+            engine_input={
+                "debug": True,
+                "decision": {
+                    "best_action_text": "3S",
+                    "best_q": 1.0,
+                    "q_gap": 0.2,
+                    "candidates": [],
+                },
+            },
+            timings={},
+        ),
+    )
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(
+                current_player="self",
+                trick_id=1,
+                turn_id=7,
+                revision=8,
+            ),
+            advice=old_advice,
+        )
+    )
+    app.processEvents()
+    assert not page.fabledan_debug_card.isHidden()
+
+    current_snapshot = SimpleNamespace(
+        current_player="self",
+        trick_id=1,
+        turn_id=8,
+        revision=9,
+    )
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=current_snapshot,
+            advice=old_advice,
+            fast_signals=_cannot_beat_fast(),
+        )
+    )
+    app.processEvents()
+
+    assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
+    assert page.fabledan_debug_card.isHidden()
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=current_snapshot,
+            advice=old_advice,
+            fast_signals=_cannot_beat_fast(cannot_beat_visible=False),
+        )
+    )
+    app.processEvents()
+
+    assert page.live_status.text() == "状态：运行中"
+    assert page.fabledan_debug_card.isHidden()
+    page.close()
+
+
+def test_live_page_rejects_unsafe_cannot_beat_candidates_and_clears_status():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    snapshot = SimpleNamespace(current_player="self", trick_id=1, turn_id=2)
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            fast_signals=_cannot_beat_fast(),
+        )
+    )
+    app.processEvents()
+    assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
+
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=snapshot,
+            fast_signals=_cannot_beat_fast(active_player=None),
+        )
+    )
+    app.processEvents()
+    assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
+
+    unsafe_signals = (
+        _cannot_beat_fast(cannot_beat_confidence=0.79),
+        _cannot_beat_fast(active_player="right"),
+        _cannot_beat_fast(effect_visible=True),
+        _cannot_beat_fast(self_action_buttons_visible=False),
+        _cannot_beat_fast(cannot_beat_visible=False),
+    )
+    for signal in unsafe_signals:
+        page.apply_update(
+            LiveUpdate(
+                status="running",
+                snapshot=snapshot,
+                fast_signals=signal,
+            )
+        )
+        app.processEvents()
+        assert page.live_status.text() == "状态：运行中"
+        assert "要不起" not in page.turn_status.text()
+    page.close()
+
+
+def test_live_page_recovery_status_wins_over_cannot_beat_candidate():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self", trick_id=1, turn_id=2),
+            advice=LiveAdvice(
+                key=AdviceRequestKey("session", 2, 2),
+                status="withheld",
+                withhold_reason="turn_recovery_pending",
+                error="正在补齐刚才的快速出牌，暂缓推荐",
+            ),
+            fast_signals=_cannot_beat_fast(),
+        )
+    )
+    app.processEvents()
+
+    assert page.live_status.text() == "状态：正在补齐刚才的快速出牌"
+    assert "要不起" not in page.live_status.text()
+    page.close()
+
+
+def test_live_page_labels_wind_catch_recovery_as_temporary_state():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self", trick_id=1, turn_id=2),
+            advice=LiveAdvice(
+                key=AdviceRequestKey("session", 2, 3),
+                status="withheld",
+                withhold_reason="wind_catch_pass_recovery_pending",
+                error="等待接风前最后一个不出",
+            ),
+            fast_signals=_cannot_beat_fast(),
+        )
+    )
+    app.processEvents()
+
+    assert page.live_status.text() == "状态：正在确认接风前的不出"
+    assert "历史不完整" not in page.live_status.text()
+    page.close()
+
+
+def test_live_page_reserves_confirmed_history_gap_text_for_terminal_withhold():
+    app = _app()
+    page = LiveAssistantPage(FakeRuntime())
+    page.apply_update(
+        LiveUpdate(
+            status="running",
+            snapshot=SimpleNamespace(current_player="self", trick_id=1, turn_id=2),
+            advice=LiveAdvice(
+                key=AdviceRequestKey("session", 2, 4),
+                status="withheld",
+                withhold_reason="visual_finish_without_complete_history",
+                error="牌局历史不完整，暂停推荐",
+            ),
+            fast_signals=_cannot_beat_fast(),
+        )
+    )
+    app.processEvents()
+
+    assert page.live_status.text() == "状态：已确认牌局历史存在缺口"
     page.close()
 
 

@@ -98,6 +98,11 @@ class VisualPipelineReplayResult:
     advice_withheld: int = 0
     advice_statuses: dict[str, int] = field(default_factory=dict)
     artifact_paths: dict[str, Path] = field(default_factory=dict)
+    # ``completed`` is retained for API compatibility. ``status`` carries
+    # the safety decision for scan consumers.
+    status: str = "complete"
+    status_reason: str = ""
+    untrusted_pass_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -454,6 +459,21 @@ def _event_to_turn_data(
         and expected.is_pass == is_pass
         and _cards_match(expected.cards, cards)
     )
+    integrity_warnings = tuple(
+        str(item)
+        for item in event.payload.get("integrity_warnings", ())
+        if str(item)
+    )
+    if not is_pass:
+        pass_audit = "not_applicable"
+    elif "derived_pass" in event.source or any(
+        "derived_pass" in warning for warning in integrity_warnings
+    ):
+        pass_audit = "inferred"
+    elif "recovery" in event.source or "marker" in event.source:
+        pass_audit = "recovered_with_marker"
+    else:
+        pass_audit = "direct_visual"
     return {
         "kind": "action",
         "event_id": event.event_id,
@@ -467,6 +487,11 @@ def _event_to_turn_data(
         "recognized_pass": is_pass,
         "confidence": round(float(event.confidence), 4),
         "matched": matched,
+        "source": event.source,
+        "evidence_refs": list(event.evidence_refs),
+        "integrity_warnings": list(integrity_warnings),
+        "pass_audit": pass_audit,
+        "reliable": not is_pass or pass_audit != "inferred",
     }
 
 
@@ -623,10 +648,12 @@ class VideoReplaySource:
                     continue
                 ok, frame = capture.read()
                 if not ok:
+                    missing_count = max(0, len(records) - decoded_count)
                     warnings.append(
                         ReplayWarning(
                             "missing_video_frames",
-                            f"索引有 {len(records)} 帧，视频仅解码出 {decoded_count} 帧",
+                            f"索引有 {len(records)} 帧，视频仅解码出 {decoded_count} 帧；"
+                            f"缺失尾部 {missing_count} 帧（不使用恢复帧伪造完整回放）",
                         )
                     )
                     break
@@ -693,6 +720,7 @@ def replay_video_through_live_pipeline(
     persist_frame_log: bool = True,
     advisor: Any | None = None,
     advice_timeout_sec: float = 60.0,
+    use_saved_baseline: bool = False,
 ) -> VisualPipelineReplayResult:
     """Run timestamped recorded frames through the production live pipeline.
 
@@ -774,6 +802,17 @@ def replay_video_through_live_pipeline(
         hand = tuple(str(card) for card in initial.payload.get("hand", ()))
         round_level = str(initial.payload.get("round_level", ""))
         lead_player = initial.payload.get("lead_player")
+        if lead_player not in {"self", "right", "opposite", "left"}:
+            confirmed_lead = next(
+                (
+                    event.payload.get("lead_player", event.actor)
+                    for event in expected_events
+                    if event.event_type == "lead_player_confirmed"
+                ),
+                None,
+            )
+            if confirmed_lead in {"self", "right", "opposite", "left"}:
+                lead_player = confirmed_lead
         video_path = session / "video" / "game.avi"
         frame_index_path = session / "video" / "frame_index.jsonl"
     if not use_live_pipeline and lead_player not in {"self", "right", "opposite", "left"}:
@@ -820,6 +859,9 @@ def replay_video_through_live_pipeline(
     waited_advice_requests: set[str] = set()
     advice_statuses: Counter[str] = Counter()
     runtime_artifacts: dict[str, Path] = {}
+    untrusted_pass_count = 0
+    pipeline_status_before_finish = "initializing"
+    terminal_detected = False
 
     with tempfile.TemporaryDirectory(prefix="daguandan-visual-replay-") as temp:
         root = Path(temp)
@@ -844,9 +886,13 @@ def replay_video_through_live_pipeline(
             # phase as a new live game.  The saved timeline remains the
             # comparison baseline only; it is not permitted to pre-fill who
             # leads this replay.
-            lead_player=None if use_live_pipeline else lead_player,
+            lead_player=lead_player if use_saved_baseline else (
+                None if use_live_pipeline else lead_player
+            ),
             # 必须与录像时间线对齐，保证区域生命周期从首帧开始计时。
             monotonic_ms=int(first_record.monotonic_ms),
+            wall_time=first_record.wall_time,
+            historical_scan=use_saved_baseline,
         )
         try:
             for record, frame in chain(prefetched_frames, frames):
@@ -859,6 +905,10 @@ def replay_video_through_live_pipeline(
                 update = runner.analyze_frame(
                     frame,
                     monotonic_ms=record.monotonic_ms,
+                    trace_context={
+                        "source_wall_time": record.wall_time,
+                        "historical_scan": use_saved_baseline,
+                    },
                 )
                 raw_advice = getattr(update, "advice", None)
                 advice_key = getattr(raw_advice, "key", None)
@@ -922,13 +972,14 @@ def replay_video_through_live_pipeline(
                     }
                     for event in update_events:
                         if event.event_type in _ACTION_TYPES:
-                            on_turn(
-                                _event_to_turn_data(
-                                    event,
-                                    record.frame_index,
-                                    truth_log,
-                                )
+                            turn_data = _event_to_turn_data(
+                                event,
+                                record.frame_index,
+                                truth_log,
                             )
+                            if turn_data["pass_audit"] == "inferred":
+                                untrusted_pass_count += 1
+                            on_turn(turn_data)
                             continue
                         if event.event_type not in {
                             "suit_corrected",
@@ -966,6 +1017,11 @@ def replay_video_through_live_pipeline(
             close_frames = getattr(frames, "close", None)
             if close_frames is not None:
                 close_frames()
+            pipeline_status_before_finish = str(runner.status)
+            terminal_detected = bool(
+                getattr(runner, "_game_end_detected", False)
+                or runner.snapshot.current_player is None
+            )
             event_count_before_finish = len(runner.events)
             runner.finish()
             final_events = runner.events[event_count_before_finish:]
@@ -1036,6 +1092,28 @@ def replay_video_through_live_pipeline(
             ],
         },
     )
+    frame_integrity_issue = any(
+        warning.reason in {"missing_video_frames", "extra_video_frames"}
+        for warning in video_source.warnings
+    )
+    if frame_integrity_issue:
+        scan_status = "blocked"
+        scan_reason = "video frame index does not match decoded video"
+    elif pipeline_status_before_finish in {"review_required", "waiting_lead"}:
+        scan_status = "blocked"
+        scan_reason = f"pipeline ended in {pipeline_status_before_finish}"
+    elif untrusted_pass_count:
+        scan_status = "partial"
+        scan_reason = f"{untrusted_pass_count} pass actions lack sufficient evidence"
+    elif frame_count != indexed_frame_count:
+        scan_status = "partial"
+        scan_reason = f"processed {frame_count}/{indexed_frame_count} frames"
+    elif use_saved_baseline and not terminal_detected:
+        scan_status = "partial"
+        scan_reason = "all frames processed but action chain did not reach a terminal state"
+    else:
+        scan_status = "complete"
+        scan_reason = "all frames processed and action chain reached a terminal state"
     return VisualPipelineReplayResult(
         output_path=output,
         comparison_path=comparison_path,
@@ -1046,13 +1124,7 @@ def replay_video_through_live_pipeline(
         processed_turn_count=sum(
             event.event_type in _ACTION_TYPES for event in actual_events
         ),
-        completed=(
-            frame_count == indexed_frame_count
-            and not any(
-                warning.reason in {"missing_video_frames", "extra_video_frames"}
-                for warning in video_source.warnings
-            )
-        ),
+        completed=scan_status == "complete",
         advice_requested=int(advice_statuses.get("requested", 0)),
         advice_ready=int(advice_statuses.get("ready", 0)),
         advice_failed=int(advice_statuses.get("failed", 0)),
@@ -1061,6 +1133,9 @@ def replay_video_through_live_pipeline(
         advice_withheld=int(advice_statuses.get("withheld", 0)),
         advice_statuses=dict(sorted(advice_statuses.items())),
         artifact_paths=runtime_artifacts,
+        status=scan_status,
+        status_reason=scan_reason,
+        untrusted_pass_count=untrusted_pass_count,
     )
 
 

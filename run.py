@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+from multiprocessing import freeze_support
 from pathlib import Path
 import sys
+
+
+# PyInstaller replaces this function in frozen builds.  It must run before
+# startup diagnostics, Qt, or any worker-capable application module is loaded,
+# otherwise a spawned Windows worker can recursively launch the full GUI.
+freeze_support()
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -84,6 +91,22 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         metavar="ZIP",
         help="导出脱敏支持包；默认不包含截图，需显式 --include-support-images。",
+    )
+    parser.add_argument(
+        "--export-session-diagnostic",
+        type=Path,
+        metavar="SESSION",
+        help="导出一个已封存对局；默认不含媒体，--include-session-media 显式包含。",
+    )
+    parser.add_argument(
+        "--session-diagnostic-output-root",
+        type=Path,
+        help="为对局诊断显式指定可写根目录。",
+    )
+    parser.add_argument(
+        "--include-session-media",
+        action="store_true",
+        help="明确同意在对局完整诊断中包含录像和事故截图。",
     )
     parser.add_argument(
         "--support-run-dir",
@@ -172,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             args.restore_portable_migration is not None,
             args._doctor_import_probe is not None,
             args.export_support is not None,
+            args.export_session_diagnostic is not None,
             args.repro_support is not None,
             args._repro_probe is not None,
             args.compare_repro is not None,
@@ -186,6 +210,11 @@ def main(argv: list[str] | None = None) -> int:
         args.doctor or args._doctor_import_probe is not None
     ):
         parser.error("--doctor-output 只能与 --doctor 一起使用")
+    if (
+        args.session_diagnostic_output_root is not None
+        or args.include_session_media
+    ) and args.export_session_diagnostic is None:
+        parser.error("对局诊断选项只能与 --export-session-diagnostic 一起使用")
     if args.benchmark_output is not None and not args.fabledan_fixed_benchmark:
         parser.error("--benchmark-output 只能与 --fabledan-fixed-benchmark 一起使用")
     if (
@@ -214,6 +243,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report.get("status") == "PASS" else 2
+    if args.export_session_diagnostic is not None:
+        from daguandan_bridge.automatic_log_delivery import (
+            export_automatic_session_log,
+        )
+
+        result = export_automatic_session_log(
+            args.export_session_diagnostic,
+            include_media=args.include_session_media,
+            documents_root=args.session_diagnostic_output_root,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
     if args.annotate_repro_truth is not None:
         if args.truth_output is None:
             parser.error("--annotate-repro-truth 必须同时指定 --truth-output")

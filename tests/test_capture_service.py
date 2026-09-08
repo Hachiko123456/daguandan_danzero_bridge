@@ -234,8 +234,46 @@ def test_live_source_reports_geometry_change_as_interruption(tmp_path, monkeypat
     )
 
     source = service.open_live_source("test_game")
-    with pytest.raises(LiveCaptureInterrupted, match="geometry"):
+    with pytest.raises(LiveCaptureInterrupted, match="geometry") as captured:
         source.capture()
+    assert captured.value.details["old_rect"] == [10, 20, 1280, 720]
+    assert captured.value.details["new_rect"] == [10, 20, 1200, 700]
+    assert captured.value.details["change_types"] == ["resize"]
+    source.close()
+
+
+def test_live_source_reports_dpi_change_even_when_rect_is_unchanged(
+    tmp_path,
+    monkeypatch,
+):
+    service = CaptureService(tmp_path / "profiles")
+    create_profile(
+        service.profiles_root,
+        ProfileConfig("test_game", "Test", ("Test",)),
+    )
+    target = TargetWindow(hwnd=123, title="Test Window")
+    dpi_values = iter((96, 144))
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_target_window",
+        lambda _keywords: target,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.get_client_rect_on_screen",
+        lambda _target: ClientRect(10, 20, 1280, 720),
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.get_window_dpi",
+        lambda _target: next(dpi_values),
+    )
+
+    source = service.open_live_source("test_game")
+    with pytest.raises(LiveCaptureInterrupted) as captured:
+        source.capture()
+
+    assert captured.value.code == "GEOMETRY-CHANGED"
+    assert captured.value.details["change_types"] == ["dpi"]
+    assert captured.value.details["old_dpi"] == 96
+    assert captured.value.details["new_dpi"] == 144
     source.close()
 
 

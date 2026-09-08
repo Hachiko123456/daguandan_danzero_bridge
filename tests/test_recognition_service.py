@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import json
 import shutil
 
 import cv2
@@ -15,7 +16,9 @@ from daguandan_bridge.live.card_uncertainty import normalized_suit_options
 from daguandan_bridge.live.consensus import BurstConsensus, ConsensusContext
 from daguandan_bridge.live.suit_correction import SuitCorrectionTracker
 from daguandan_bridge.models import Box
+from daguandan_bridge.opening_gate import evaluate_opening_gate
 from daguandan_bridge.recognition_service import (
+    FastSignalResult,
     OpeningSignal,
     RecognizedEvent,
     ScreenshotRecognitionService,
@@ -27,10 +30,102 @@ from daguandan_bridge.template_service import TemplateService
 PROFILE_ROOT = PROFILES_ROOT / "tencent_daguandan"
 
 
+class _ReadOnlyTemplates(TemplateService):
+    def list_templates(self):
+        return tuple(json.loads(self.templates_path.read_text(encoding="utf-8"))["templates"])
+
+
 def _paste_template(canvas: np.ndarray, relative_file: str, x: int, y: int) -> None:
     template = read_image_unicode(PROFILE_ROOT / relative_file)
     height, width = template.shape[:2]
     canvas[y : y + height, x : x + width] = template
+
+
+def _paste_first_marker(canvas: np.ndarray, seat: str) -> None:
+    regions = {r.name: r for r in AnnotationService(PROFILES_ROOT).list_regions()}
+    box = AnnotationService._box_for_image(regions[f"first_play_{seat}"], canvas)
+    _paste_template(canvas, "templates/status/first_play.png", box.x + 24, box.y + 24)
+
+
+@pytest.mark.parametrize("seat", ["left", "opposite", "right", "self"])
+@pytest.mark.parametrize("edge", ["inside", "left", "right", "top", "bottom"])
+@pytest.mark.parametrize("render_scale", [1.0, 1.25, 1.5])
+def test_all_first_marker_rois_cover_edges_after_standardization(seat, edge, render_scale):
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    regions = {r.name: r for r in AnnotationService(PROFILES_ROOT).list_regions()}
+    box = AnnotationService._box_for_image(regions[f"first_play_{seat}"], image)
+    marker = read_image_unicode(PROFILE_ROOT / "templates/status/first_play.png")
+    height, width = marker.shape[:2]
+    x, y = box.x + 24, box.y + 24
+    if edge == "left": x = box.x - 8
+    if edge == "right": x = box.x + box.w - width + 8
+    if edge == "top": y = box.y - 8
+    if edge == "bottom": y = box.y + box.h - height + 8
+    x, y = max(0, min(1280 - width, x)), max(0, min(720 - height, y))
+    image[y:y + height, x:x + width] = marker
+    if render_scale != 1.0:
+        rendered = cv2.resize(image, (round(1280 * render_scale), round(720 * render_scale)))
+        image = cv2.resize(rendered, (1280, 720))
+    service = ScreenshotRecognitionService(AnnotationService(PROFILES_ROOT), _ReadOnlyTemplates(PROFILES_ROOT))
+    assert service.recognize_lead_player(image) == seat
+
+
+def test_equal_first_markers_in_two_seats_fail_closed():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_first_marker(image, "left")
+    _paste_first_marker(image, "right")
+    service = ScreenshotRecognitionService(AnnotationService(PROFILES_ROOT), _ReadOnlyTemplates(PROFILES_ROOT))
+    assert service.recognize_lead_player(image) is None
+
+
+def test_old_self_marker_location_is_not_in_the_corrected_user_region():
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/status/first_play.png", 580, 240)
+    service = ScreenshotRecognitionService(AnnotationService(PROFILES_ROOT), _ReadOnlyTemplates(PROFILES_ROOT))
+    assert service.recognize_lead_player(image) is None
+
+
+def test_real_remote_left_opening_with_user_corrected_regions():
+    image_path = Path("C:/Users/yhx/Documents/掼蛋助手日志/2026-09-04/manual_20260904_234625/OPEN-1256916375-26465c0a/frames/standardized_000286.png")
+    if not image_path.is_file():
+        pytest.skip("optional private remote-game evidence is not installed")
+    service = ScreenshotRecognitionService(AnnotationService(PROFILES_ROOT), _ReadOnlyTemplates(PROFILES_ROOT))
+    image = read_image_unicode(image_path)
+    recognized = service.recognize(image, allow_unknown_suit=True)
+    assert recognized.lead_player == "left"
+    assert recognized.current_player == "self"
+    assert len(recognized.my_hand) == 27
+    evaluation = evaluate_opening_gate(recognized, anchor_score=service.recognize_table_anchor(image))
+    assert evaluation.ready
+    assert evaluation.seed.opening_action.cards == ("2C",)
+
+
+@pytest.mark.parametrize(("buttons", "anchor", "expected"), [
+    (("change_table", "continue_game"), .95, "settlement"),
+    (("continue_game",), .20, "settlement"),
+    (("continue_game",), .95, "unknown"),
+    ((), .95, "table"),
+    ((), .20, "unknown"),
+])
+def test_page_probe_requires_reliable_terminal_and_page_evidence(monkeypatch, buttons, anchor, expected):
+    from daguandan_bridge.domain.recognition import RecognitionAnnotation
+    service = ScreenshotRecognitionService(AnnotationService(PROFILES_ROOT), _ReadOnlyTemplates(PROFILES_ROOT))
+    annotations = tuple(RecognitionAnnotation(b, (300, 560, 60, 40), .95, "button") for b in buttons)
+    monkeypatch.setattr(service, "_recognize_buttons_in_regions", lambda *a: (buttons, .95, "template", annotations))
+    monkeypatch.setattr(service, "recognize_table_anchor", lambda image: anchor)
+    signal = service.recognize_listening_page(np.zeros((720, 1280, 3), dtype=np.uint8))
+    assert signal.stage == expected
+    assert signal.allows_media == (expected == "table")
+
+
+def test_real_remote_settlement_is_not_a_recordable_table():
+    image_path = Path("C:/Users/yhx/Documents/掼蛋助手日志/2026-09-04/manual_20260904_234625/OPEN-1257465484-84882e44/frames/standardized_002249.png")
+    if not image_path.is_file():
+        pytest.skip("optional private remote-game evidence is not installed")
+    service = ScreenshotRecognitionService(AnnotationService(PROFILES_ROOT), _ReadOnlyTemplates(PROFILES_ROOT))
+    signal = service.recognize_listening_page(read_image_unicode(image_path))
+    assert signal.stage == "settlement"
+    assert not signal.allows_media
 
 
 def _required_screenshot(session: str, filename: str) -> Path:
@@ -48,7 +143,7 @@ def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
     _paste_template(image, "templates/rank/3_hand.png", 110, 510)
     _paste_template(image, "templates/suit/heart_hand.png", 113, 550)
     _paste_template(image, "templates/timer/active.png", 450, 220)
-    _paste_template(image, "templates/status/first_play.png", 580, 240)
+    _paste_first_marker(image, "self")
 
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
@@ -325,9 +420,9 @@ def test_first_play_marker_requires_at_least_080_confidence(monkeypatch):
     from daguandan_bridge import recognition_service as rs_module
 
     def fake_match(search, _template, _method):
-        # ``first_play_right`` is 163 x 156 in the Tencent profile.  Make
-        # only that ROI look like the known pre-doubling false positive.
-        score = 0.79 if search.shape[:2] == (156, 163) else 0.0
+        # Every seat-local padded search sees a sub-threshold false match.
+        # Do not couple this threshold test to a user's editable ROI size.
+        score = 0.79
         return np.full((1, 1), score, dtype=np.float32)
 
     monkeypatch.setattr(rs_module.cv2, "matchTemplate", fake_match)
@@ -355,7 +450,7 @@ def test_template_recognizer_leaves_unknown_fields_unresolved():
 def test_opening_signal_collects_marker_timer_and_super_double_without_committing_lead():
     """Opening recognition exposes raw evidence; the state machine owns the decision."""
     image = np.full((720, 1280, 3), 255, dtype=np.uint8)
-    _paste_template(image, "templates/status/first_play.png", 580, 240)
+    _paste_first_marker(image, "self")
     _paste_template(image, "templates/timer/active.png", 450, 220)
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
@@ -407,6 +502,105 @@ def test_fast_signals_recognize_change_table_as_an_end_control():
     signals = service.recognize_fast_signals(image, "self")
 
     assert signals.game_end_control == "change_table"
+
+
+def test_fast_signals_report_cannot_beat_details_without_full_recognition(monkeypatch):
+    image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    _paste_template(image, "templates/button/cannot_beat.png", 600, 240)
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    def fail_full_recognition(*_args, **_kwargs):
+        pytest.fail("recognize_fast_signals must not call full recognize()")
+
+    monkeypatch.setattr(service, "recognize", fail_full_recognition)
+    original_button_scan = service._recognize_buttons_in_regions
+    button_scan_count = 0
+
+    def counted_button_scan(*args, **kwargs):
+        nonlocal button_scan_count
+        button_scan_count += 1
+        return original_button_scan(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_recognize_buttons_in_regions", counted_button_scan)
+
+    signal = service.recognize_fast_signals(image, "self")
+
+    assert button_scan_count == 1
+    assert signal.cannot_beat_visible is True
+    assert signal.cannot_beat_confidence >= 0.72
+    assert signal.cannot_beat_box is not None
+    assert signal.self_action_buttons_visible is True
+
+
+def test_fast_signal_cannot_beat_fields_are_backward_compatible_defaults():
+    signal = FastSignalResult(
+        expected_player="self",
+        active_player=None,
+        pass_visible=False,
+        self_action_buttons_visible=False,
+        effect_visible=False,
+    )
+
+    assert signal.cannot_beat_visible is False
+    assert signal.cannot_beat_confidence == 0.0
+    assert signal.cannot_beat_box is None
+
+
+@pytest.mark.parametrize("expected_player", ("right", "opposite", "left"))
+@pytest.mark.parametrize(
+    "button",
+    ("play_cards", "hint", "pass", "cannot_beat"),
+)
+def test_fast_signals_report_local_action_controls_independent_of_expected_player(
+    monkeypatch,
+    expected_player,
+    button,
+):
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    monkeypatch.setattr(
+        service,
+        "_recognize_buttons_in_regions",
+        lambda *_args, **_kwargs: ((button,), 0.99, "test", ()),
+    )
+
+    signals = service.recognize_fast_signals(
+        np.zeros((720, 1280, 3), dtype=np.uint8),
+        expected_player,
+    )
+
+    assert signals.self_action_buttons_visible is True
+
+
+@pytest.mark.parametrize(
+    "button",
+    ("continue_game", "change_table", "chat", "rules", "super_double"),
+)
+def test_fast_signals_do_not_treat_non_action_controls_as_local_turn(
+    monkeypatch,
+    button,
+):
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    monkeypatch.setattr(
+        service,
+        "_recognize_buttons_in_regions",
+        lambda *_args, **_kwargs: ((button,), 0.99, "test", ()),
+    )
+
+    signals = service.recognize_fast_signals(
+        np.zeros((720, 1280, 3), dtype=np.uint8),
+        "right",
+    )
+
+    assert signals.self_action_buttons_visible is False
 
 
 @pytest.mark.parametrize(

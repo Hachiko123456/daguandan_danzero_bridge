@@ -77,6 +77,61 @@ def test_timeline_markdown_is_llm_readable(tmp_path):
     assert "证据=OBS-0183, frame:344" in text
 
 
+def test_event_keeps_canonical_fsync_but_defers_derived_markdown(tmp_path, monkeypatch):
+    from daguandan_bridge.live import session_store as module
+    store = _started_store(tmp_path)
+    synced = []
+    original = module.os.fsync
+    monkeypatch.setattr(module.os, "fsync", lambda fd: (synced.append(fd), original(fd))[1])
+    store.append_event(_event("game-a"))
+    assert len(synced) == 1
+    assert len(read_json_lines(store.timeline_path)) == 1
+    assert "右家出牌" not in store._timeline_markdown_path.read_text("utf-8")
+    assert "右家出牌" in store.timeline_markdown_path.read_text("utf-8")
+
+
+def test_derived_write_and_cleanup_failures_do_not_abort_seal(tmp_path, monkeypatch):
+    from pathlib import Path
+    store = _started_store(tmp_path)
+    store.append_event(_event("game-a"))
+    replace, unlink = Path.replace, Path.unlink
+    def denied_replace(path, target):
+        if ".timeline.md." in path.name:
+            raise PermissionError("derived view locked")
+        return replace(path, target)
+    def denied_unlink(path, *args, **kwargs):
+        if ".timeline.md." in path.name:
+            raise PermissionError("derived temp locked")
+        return unlink(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "replace", denied_replace)
+    monkeypatch.setattr(Path, "unlink", denied_unlink)
+    store.seal(frame_count=0, dropped_frames=0)
+    manifest = json.loads(store.manifest_path.read_text("utf-8"))
+    assert manifest["status"] == "sealed"
+    counters = manifest["pipeline_timing"]["counters"]
+    assert counters["markdown_write_failed"] == 1
+    assert counters["markdown_cleanup_failed"] == 1
+    assert len(read_json_lines(store.timeline_path)) == 1
+
+
+def test_pipeline_summary_is_bounded_exported_and_throttled(tmp_path, monkeypatch):
+    store = _started_store(tmp_path)
+    store.pipeline_timing.increment("analysis_without_result", 7)
+    store.pipeline_timing.observe("analysis", 17)
+    writes = []
+    original = store._update_manifest
+    monkeypatch.setattr(store, "_update_manifest", lambda changes: (writes.append(changes), original(changes))[1])
+    store.flush_pipeline_timing()
+    assert not writes
+    store.flush_pipeline_timing(force=True)
+    store.flush_pipeline_timing()
+    assert len(writes) == 1
+    store.seal(frame_count=0, dropped_frames=0)
+    manifest = json.loads(store.manifest_path.read_text("utf-8"))
+    assert manifest["pipeline_timing"]["counters"]["analysis_without_result"] == 7
+    assert manifest["pipeline_timing"]["clock"] == "processing_monotonic_ns"
+
+
 def test_advice_log_keeps_full_engine_input(tmp_path):
     store = _started_store(tmp_path)
     engine_input = {"request_id": "ADV-4", "legal_actions": [["PASS"]]}

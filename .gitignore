@@ -52,6 +52,19 @@ data/profiles/*/models/benchmarks/
 *.part
 *.bak
 
+# Local replay, packaging, and media outputs
+.pytest_tmp_*/
+tmp/
+temp/
+*.zip
+*.7z
+*.rar
+*.exe
+*.avi
+*.mp4
+*.mkv
+*.dmp
+
 # Local diagnostic run artifacts
 /$runRoot/
 /Q
