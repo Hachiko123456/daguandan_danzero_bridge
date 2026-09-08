@@ -62,6 +62,20 @@ from .types import (
     StateVersion,
     VersionIdentity,
 )
+from .opening_core import HandLevelEvidence, LeadEvidence, OpeningPhase, OpeningResult, OpeningState
+from .simple_advice_gate import AdviceGateDecision, AdviceGateResult, SimpleAdviceGate
+from .single_turn_observer import ObservationDisposition, ObservationResult, SeatDisplay, SingleTurnObserver
+from .turn_core import (
+    ActionRepairEvent,
+    CommittedAction,
+    HistoryIntegrity,
+    PendingAction,
+    RuleAdvance,
+    SimpleSeatRules,
+    TurnCursor,
+    TurnPhase,
+    TurnState,
+)
 
 __all__ = [
     "ActionCandidate",
@@ -127,4 +141,25 @@ __all__ = [
     "InputRejectionReason",
     "LiveEngine",
     "ResolutionResult",
+    "AdviceGateDecision",
+    "AdviceGateResult",
+    "SimpleAdviceGate",
+    "ActionRepairEvent",
+    "CommittedAction",
+    "HistoryIntegrity",
+    "PendingAction",
+    "RuleAdvance",
+    "SimpleSeatRules",
+    "TurnCursor",
+    "TurnPhase",
+    "TurnState",
+    "HandLevelEvidence",
+    "LeadEvidence",
+    "OpeningPhase",
+    "OpeningResult",
+    "OpeningState",
+    "ObservationDisposition",
+    "ObservationResult",
+    "SeatDisplay",
+    "SingleTurnObserver",
 ]

@@ -14,6 +14,7 @@ from ..live_v2.action_semantics import ActionSemantics
 from ..live_v2.candidates import ActionCandidate, CandidateReason, EvidenceOrigin
 from ..live_v2.engine import EngineInput, EngineResult, LiveEngine
 from ..live_v2.identity import Seat, VersionIdentity
+from .live_v2_candidate_gate import gate_visual_candidates
 from .live_v2_advice_protocol import AdviceRuntimeResult
 from .live_v2_advice_pump import (
     AdviceRuntimeLike, LiveV2AdvicePump, result_matches_opportunity,
@@ -79,6 +80,7 @@ class LiveV2SessionRuntime(
         self._generation = self._sequence = self._frame_sequence = self._last_ms = 0
         self._hint = LocalRuleHintTracker()
         self._status_before_pause: LiveStatus | None = None
+        self._opening_required = False
 
     @property
     def snapshot(self) -> LiveSnapshot:
@@ -106,7 +108,8 @@ class LiveV2SessionRuntime(
                 capture_generation=0, evidence_id="initial-state",
             )
             self._initialized = True
-            self.status = "waiting_lead" if lead_player is None else "running"
+            self._opening_required = lead_player is None
+            self.status = "waiting_lead" if self._opening_required else "running"
             self.store.update_runtime_identity(self._identity())
             self._journal.lifecycle("session_started", lead_player=lead_player)
             return self._plain_update()
@@ -165,12 +168,26 @@ class LiveV2SessionRuntime(
                 self._safe_fault("vision_runtime", fault, monotonic_ms=identity.captured_ms)
             observations = tuple(item for result in results for item in result.observations)
             candidates = tuple(item for result in results for item in result.candidates)
-            opening = self._commit_visual_opening(candidates)
-            if opening is not None:
-                return opening
-            self._pending.update((item.candidate_id, item) for item in candidates)
+            gated = gate_visual_candidates(snapshot, candidates)
+            if self._opening_required and not snapshot.play_history:
+                # Opening is a hard barrier.  A seed lead or several static
+                # seat reads must never reach the normal engine/advice path.
+                opening = (
+                    self._commit_visual_opening(gated.selected)
+                    if len(gated.selected) == 1 and snapshot.lead_seat is None
+                    else None
+                )
+                if opening is not None:
+                    self._opening_required = not bool(opening.snapshot.play_history)
+                    return opening
+                return self._plain_update(
+                    fast=results[-1].fast_signals if results else None,
+                    block_reason="opening_waiting_for_unique_visual_action",
+                )
+            selected = gated.selected
+            self._pending.update((item.candidate_id, item) for item in selected)
             return self._process(
-                EngineInput(observations=observations, candidates=candidates,
+                EngineInput(observations=observations, candidates=selected,
                             captured_watermark_ms=identity.captured_ms),
                 fast=results[-1].fast_signals if results else None,
             )
@@ -304,6 +321,8 @@ class LiveV2SessionRuntime(
 
     def _rule_failure(self, operation: str, exc: Exception) -> LiveUpdate:
         self.status = "review_required"
+        if operation == "opening_action" and not self._trusted_snapshot().play_history:
+            self._opening_required = True
         self._safe_fault("rule_session", str(exc), operation=operation)
         return self._plain_update(block_reason=f"rule_{operation}_failed")
 

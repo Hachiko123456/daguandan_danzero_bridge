@@ -129,6 +129,7 @@ class LiveV2FramePipeline:
             frame=frame,
             metrics=metrics,
             self_opportunity=self_opportunity,
+            expected_seat=(expected if self.config.strict_current_seat_only else None),
         )
         batch = self.dispatcher.drain(
             version=version,

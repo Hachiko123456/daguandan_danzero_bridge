@@ -79,6 +79,7 @@ class FramePipelineConfig:
     evidence_max_age_ms: int = 3_000
     evidence_max_count: int = 512
     evidence_max_bytes: int = 2 * 1024 * 1024
+    strict_current_seat_only: bool = False
 
     def __post_init__(self) -> None:
         if min(
@@ -92,6 +93,8 @@ class FramePipelineConfig:
             self.evidence_max_bytes,
         ) <= 0:
             raise ValueError("frame pipeline limits must be positive")
+        if not isinstance(self.strict_current_seat_only, bool):
+            raise TypeError("strict_current_seat_only must be bool")
 
 
 @dataclass(frozen=True, slots=True)

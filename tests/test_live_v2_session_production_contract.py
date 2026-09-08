@@ -284,7 +284,7 @@ def test_missing_trace_fields_use_safe_monotonic_defaults(rigs) -> None:
     assert identity.source_id == "live-v2-capture"
 
 
-def test_confirm_candidate_preserves_candidate_semantics_with_one_manual_audit(rigs) -> None:
+def test_conflicting_current_seat_candidates_are_not_retained_for_manual_guessing(rigs) -> None:
     rig = _rig(rigs); rig.bind()
     vision = rig.visions[-1]
     vision.queue(
@@ -295,17 +295,9 @@ def test_confirm_candidate_preserves_candidate_semantics_with_one_manual_audit(r
     review = rig.live.analyze_frame(object(), monotonic_ms=100)
     assert review.snapshot.revision == 1
     confirmed = rig.live.confirm_candidate("chosen")
-    event = confirmed.event
-    play = confirmed.snapshot.play_history[-1]
-    assert play.cards == ("3?",)
-    assert play.suit_options == (("3?", "3S", "3D"),)
-    assert play.action_metadata["action_epoch"] == 47
-    assert play.action_metadata["evidence_ids"] == ["visual-a", "visual-b"]
-    assert event.source == "manual_candidate_confirmation"
-    assert len(event.evidence_refs) == 1
-    assert event.evidence_refs == ("manual:confirm:chosen",)
-    assert len(rig.store.batches) == 2
-    assert rig.store.batches[-1] == (event,)
+    assert confirmed.block_reason == "unknown_candidate"
+    assert not confirmed.snapshot.play_history
+    assert len(rig.store.batches) == 1
 
 
 def test_opening_action_uses_one_audit_evidence_and_the_unified_commit(rigs) -> None:
@@ -406,13 +398,14 @@ def test_persistence_failure_is_visible_and_never_advances_history(rigs) -> None
     assert failed.status == "review_required" and failed.block_reason
 
 
-def test_blocking_and_expired_gap_keep_consuming_vision_until_recovery(rigs) -> None:
+def test_foreign_candidate_is_ignored_without_entering_gap_recovery(rigs) -> None:
     rig = _rig(rigs); rig.bind(); vision = rig.visions[-1]
     vision.queue(_play("out-of-order", "opposite", (), kind="pass"))
     blocked = rig.live.analyze_frame(object(), monotonic_ms=100)
-    assert blocked.status == "review_required" and vision.calls == 1
+    assert blocked.status == "running" and vision.calls == 1
+    assert not blocked.block_reason
     expired = rig.live.analyze_frame(object(), monotonic_ms=8_200)
-    assert expired.block_reason == "recovery_budget_exceeded" and vision.calls == 2
+    assert not expired.block_reason and vision.calls == 2
     vision.queue(_play("recovery", "right", ("3D",)))
     recovered = rig.live.analyze_frame(object(), monotonic_ms=8_300)
     assert vision.calls == 3

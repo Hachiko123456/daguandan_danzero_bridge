@@ -93,6 +93,10 @@ def test_dependency_table_is_explicit_and_acyclic_for_runtime_core() -> None:
         "scheduling_records": frozenset({"types"}),
         "seat_tracker": frozenset({"types"}),
         "vision_adapter": frozenset({"types"}),
+        "turn_core": frozenset({"candidates", "identity"}),
+        "opening_core": frozenset({"identity", "turn_core"}),
+        "single_turn_observer": frozenset({"candidates", "identity", "turn_core"}),
+        "simple_advice_gate": frozenset({"turn_core"}),
         "architecture": frozenset(),
         "__init__": frozenset(
             {
@@ -105,7 +109,11 @@ def test_dependency_table_is_explicit_and_acyclic_for_runtime_core() -> None:
                 "opportunity",
                 "protocols",
                 "reconciliation",
+                "opening_core",
+                "simple_advice_gate",
+                "single_turn_observer",
                 "types",
+                "turn_core",
             }
         ),
     }
@@ -215,6 +223,7 @@ def test_readability_target_is_advisory_and_hard_limit_is_relaxed() -> None:
     assert CONTRACT_MODULE_LINES == MAX_MODULE_LINES
     assert MODULE_LINE_LIMITS["candidates"] == MAX_MODULE_LINES
     assert MODULE_LINE_LIMITS["results"] == MAX_MODULE_LINES
+    assert MODULE_LINE_LIMITS["turn_core"] == 650
 
 
 def test_package_checker_does_not_silently_ignore_a_new_module(tmp_path: Path) -> None:

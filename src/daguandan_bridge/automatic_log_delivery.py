@@ -11,10 +11,12 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from pathlib import PurePosixPath
 from uuid import uuid4
 
 from .storage import atomic_write_json
 from .support_bundle import sanitize_support_text
+from .diagnostic_test_evidence import build_test_evidence
 
 
 AUTO_LOG_SCHEMA = "guandan.auto-log-delivery/1"
@@ -112,6 +114,34 @@ class AutomaticLogDeliveryService:
             include_media=include_media,
             used_fallback=used_fallback,
         )
+        try:
+            test_evidence = build_test_evidence(session)
+        except Exception as exc:
+            # Auxiliary test evidence must never prevent delivery of the
+            # canonical diagnostic files.  Keep only a type-level error so
+            # paths or user data do not leak into the fallback summary.
+            test_evidence = None
+            summary["test_evidence"] = {
+                "schema": "guandan.test-evidence/1",
+                "source": "program-generated",
+                "truth_status": "unverified",
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "files": [],
+                "record_counts": {},
+                "truncated": False,
+            }
+        else:
+            _publish_test_evidence(output, test_evidence.files)
+            summary["test_evidence"] = {
+                "schema": "guandan.test-evidence/1",
+                "source": "program-generated",
+                "truth_status": "unverified",
+                "status": "ready",
+                "files": sorted(test_evidence.files),
+                "record_counts": dict(test_evidence.record_counts),
+                "truncated": test_evidence.truncated,
+            }
         machine_path = output / "summary.json"
         atomic_write_json(machine_path, summary)
         text_path = output / "摘要.txt"
@@ -126,6 +156,7 @@ class AutomaticLogDeliveryService:
             session,
             zip_path,
             include_media=include_media,
+            extra_files={} if test_evidence is None else test_evidence.files,
         )
         summary["diagnostic_zip_path"] = str(zip_path)
         summary["diagnostic_zip_sha256"] = zip_sha256
@@ -356,6 +387,35 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _publish_test_evidence(output: Path, files: dict[str, bytes] | object) -> None:
+    """Materialize the bounded virtual evidence beside the user summary."""
+    mapping = files if isinstance(files, dict) else {}
+    for archive_name, content in mapping.items():
+        relative = PurePosixPath(str(archive_name))
+        if (
+            relative.is_absolute()
+            or relative.parts[:1] != ("test_evidence",)
+            or ".." in relative.parts
+        ):
+            raise ValueError("unsafe generated test evidence path")
+        target = output.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(target, bytes(content))
+
+
 def _zip_sources(session: Path, *, include_media: bool) -> tuple[Path, ...]:
     session = Path(session).resolve(strict=True)
     _assert_safe_session_tree(session)
@@ -536,11 +596,25 @@ def _write_zip_atomic(
     destination: Path,
     *,
     include_media: bool,
+    extra_files: dict[str, bytes] | None = None,
 ) -> tuple[Path, str, int]:
     temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
     try:
         sources = _zip_sources(session, include_media=include_media)
         payloads = tuple(_archive_payload(session, source) for source in sources)
+        for path in (extra_files or {}):
+            relative = PurePosixPath(str(path))
+            if (
+                relative.is_absolute()
+                or relative.parts[:1] != ("test_evidence",)
+                or ".." in relative.parts
+            ):
+                raise ValueError("unsafe generated test evidence archive path")
+        generated = tuple(
+            _ArchivePayload(path, "generated-test-evidence", content=content)
+            for path, content in sorted((extra_files or {}).items())
+        )
+        payloads += generated
         manifest_files = []
         for payload in payloads:
             size = (

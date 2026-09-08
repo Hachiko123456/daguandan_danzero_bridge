@@ -64,6 +64,10 @@ MODULE_DEPENDENCY_ALLOWLIST: dict[str, frozenset[str]] = {
     "scheduling_records": frozenset({"types"}),
     "seat_tracker": frozenset({"types"}),
     "vision_adapter": frozenset({"types"}),
+    "turn_core": frozenset({"candidates", "identity"}),
+    "opening_core": frozenset({"identity", "turn_core"}),
+    "single_turn_observer": frozenset({"candidates", "identity", "turn_core"}),
+    "simple_advice_gate": frozenset({"turn_core"}),
     "architecture": frozenset(),
     "__init__": frozenset(
         {
@@ -76,7 +80,11 @@ MODULE_DEPENDENCY_ALLOWLIST: dict[str, frozenset[str]] = {
             "opportunity",
             "protocols",
             "reconciliation",
+            "opening_core",
+            "simple_advice_gate",
+            "single_turn_observer",
             "types",
+            "turn_core",
         }
     ),
 }
@@ -110,6 +118,10 @@ STDLIB_IMPORT_ALLOWLIST: dict[str, frozenset[str]] = {
     "scheduling_records": frozenset({"__future__", "dataclasses", "typing"}),
     "seat_tracker": frozenset({"__future__", "dataclasses"}),
     "vision_adapter": frozenset({"__future__", "collections"}),
+    "turn_core": frozenset({"__future__", "dataclasses", "enum", "typing"}),
+    "opening_core": frozenset({"__future__", "dataclasses", "enum", "typing"}),
+    "single_turn_observer": frozenset({"__future__", "dataclasses", "enum"}),
+    "simple_advice_gate": frozenset({"__future__", "dataclasses", "enum"}),
     "architecture": frozenset({"__future__", "ast", "dataclasses", "pathlib"}),
     "__init__": frozenset(),
 }
@@ -156,6 +168,9 @@ MODULE_LINE_LIMITS: dict[str, int] = {
     "events": CONTRACT_MODULE_LINES,
     "types": CONTRACT_MODULE_LINES,
     "protocols": CONTRACT_MODULE_LINES,
+    # Cohesive pure state-transition core; review rather than mechanically
+    # split when it exceeds the general limit by a small margin.
+    "turn_core": 650,
 }
 
 

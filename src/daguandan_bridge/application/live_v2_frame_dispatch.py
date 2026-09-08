@@ -122,8 +122,11 @@ class FrameReadDispatcher:
         frame: FrameIdentity,
         metrics: tuple[SeatSurfaceMetrics, ...],
         self_opportunity: bool,
+        expected_seat: Seat | None = None,
     ) -> None:
         for item in metrics:
+            if expected_seat is not None and item.seat is not expected_seat:
+                continue
             tracker = self.trackers[item.seat].snapshot()
             should_read = bool(
                 item.content_changed

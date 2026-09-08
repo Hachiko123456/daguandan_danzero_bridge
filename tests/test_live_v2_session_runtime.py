@@ -299,16 +299,16 @@ def test_analyze_frame_passes_last_formal_action_boundary_to_vision() -> None:
     assert visions[0].formal_action_boundaries[-1] == boundary
 
 
-def test_expired_gap_does_not_stop_future_observation_and_recovery() -> None:
+def test_foreign_candidate_does_not_open_recovery_or_stop_future_observation() -> None:
     live, _first, _store, _recorder, clock, visions, _advisers = runtime()
     vision = visions[0]
     vision.queue(Seat.OPPOSITE, ActionKind.PASS)
     clock.value = 200
     blocked = live.analyze_frame(object(), monotonic_ms=200)
-    assert blocked.block_reason
+    assert not blocked.block_reason
     vision.empty(); clock.value = 8_300
     expired = live.analyze_frame(object(), monotonic_ms=8_300)
-    assert expired.block_reason == "recovery_budget_exceeded"
+    assert not expired.block_reason
     calls_before = vision.calls
     vision.queue(Seat.RIGHT, ActionKind.PLAY, ("3D",))
     clock.value = 8_400

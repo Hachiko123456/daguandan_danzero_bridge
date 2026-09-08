@@ -320,8 +320,8 @@ def test_staged_opening_publishes_actual_progress_and_starts_once_with_action(tm
         task = _WaitingAnalysisTask(SimpleNamespace(captured_monotonic_ms=100 + index * 500), 0)
         controller._consume_waiting_recognition(result, task)
     assert len(started) == 1
-    assert started[0]["opening_action"].cards == ("2C",)
-    assert started[0]["opening_action"].actor == "left"
+    assert started[0]["lead_player"] is None
+    assert started[0]["opening_action"] is None
     assert statuses[0]["phase"] == "confirming_hand"
     assert statuses[-1]["phase"] == "ready"
     assert all("重新连接" not in status["message"] for status in statuses)

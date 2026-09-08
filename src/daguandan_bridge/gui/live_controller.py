@@ -826,7 +826,11 @@ class LiveAssistantController(QObject):
         elif self._opening_tracker.completed:
             seed = self._opening_tracker.candidate
         else:
-            seed = self._legacy_detected_seed(result)
+            # A hand/level read without a completed opening action is not
+            # enough to start normal turn listening.  The live-v2 runtime must
+            # confirm the lead's first play itself; otherwise static hand
+            # cards can enter the normal action pipeline as pre-opening plays.
+            return
         if seed is None:
             return
         self._pending_auto_session = seed
@@ -860,9 +864,12 @@ class LiveAssistantController(QObject):
         if not self.start_session(
             round_level=pending.round_level,
             hand=pending.hand,
-            lead_player=pending.lead_player,
+            # Automatic sessions always re-confirm lead + opening play in the
+            # live-v2 opening barrier.  The waiting tracker seed is only a
+            # trigger, never authoritative action history.
+            lead_player=None,
             recognition_strategy=self._recognition_strategy,
-            opening_action=pending.opening_action,
+            opening_action=None,
         ):
             self._table_anchor_observed = False
             self._start_waiting_workers()

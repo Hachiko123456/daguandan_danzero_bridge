@@ -8,6 +8,7 @@ from ..advisor_strategy import normalize_advisor_strategy
 from ..application.live_v2_advice_protocol import AdviceWorkerConfig
 from ..application.live_v2_session_runtime import LiveV2SessionRuntime
 from ..application.live_v2_vision_protocol import VisionWorkerConfig
+from ..application.live_v2_frame_types import FramePipelineConfig
 from ..application.ports import RecognitionPort, RecordingPort, SessionPersistencePort
 from ..domain.live_runtime import LiveUpdate
 from .live_v2_advice_service_factory import create_live_v2_advice_runtime
@@ -33,6 +34,7 @@ def build_production_live_v2_runtime(
     vision_config = VisionWorkerConfig(
         profile_root=str(profiles_root),
         profile_name=profile_name,
+        pipeline=FramePipelineConfig(strict_current_seat_only=True),
     )
     backend = normalize_advisor_strategy(advisor_backend)
     advice_config = AdviceWorkerConfig(
