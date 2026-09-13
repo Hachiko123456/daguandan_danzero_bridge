@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from threading import RLock
 from time import monotonic_ns
 from typing import Any, Callable
@@ -11,9 +11,9 @@ from ..domain.live import LiveSnapshot
 from ..domain.live_runtime import LiveAdvice, LiveStatus, LiveUpdate
 from ..live.local_rule_hint import LocalRuleHintTracker
 from ..live_v2.action_semantics import ActionSemantics
-from ..live_v2.candidates import ActionCandidate, CandidateReason, EvidenceOrigin
+from ..live_v2.candidates import ActionCandidate, ActionKind, CandidateReason, EvidenceOrigin
 from ..live_v2.engine import EngineInput, EngineResult, LiveEngine
-from ..live_v2.identity import Seat, VersionIdentity
+from ..live_v2.identity import FrameIdentity, Seat, VersionIdentity
 from .live_v2_candidate_gate import gate_visual_candidates
 from .live_v2_advice_protocol import AdviceRuntimeResult
 from .live_v2_advice_pump import (
@@ -24,8 +24,9 @@ from .live_v2_runtime_journal import LiveV2LifecycleMixin, LiveV2RuntimeJournal
 from .live_v2_session_runtime_commands import LiveV2RuleCommandsMixin
 from .live_v2_session_runtime_controls import LiveV2ControlMixin
 from .live_v2_runtime_updates import (
-    VisionRuntimeLike, consume_vision, live_update, project_engine_result,
-    runtime_result_to_advice, trusted_candidate, trusted_to_live_snapshot,
+    VisionRuntimeLike, consume_vision, correction_event, live_update,
+    project_engine_result, runtime_result_to_advice, trusted_candidate,
+    trusted_to_live_snapshot,
 )
 from .ports import RecognitionPort, RecordingPort, SessionPersistencePort
 
@@ -39,6 +40,73 @@ class _Clock:
 
     def processing_ms(self) -> int:
         return max(self._floor, int(self._provider()))
+
+
+@dataclass
+class _VisualCorrection:
+    action_id: str
+    seat: Seat
+    cards: tuple[str, ...]
+    suit_options: tuple[tuple[str, ...], ...]
+    last_signature: tuple[object, ...] | None
+    rejected_signature: tuple[object, ...] | None
+    streak: int
+    last_frame: FrameIdentity | None
+    expires_ms: int
+
+
+def _normalized_options(
+    cards: tuple[str, ...],
+    options: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], ...]:
+    if len(cards) != len(options):
+        return tuple((card,) for card in cards)
+    return tuple(
+        tuple(sorted(dict.fromkeys(str(value) for value in choices if str(value))))
+        or (card,)
+        for card, choices in zip(cards, options, strict=True)
+    )
+
+
+def _same_cards(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return sorted(str(card) for card in left) == sorted(str(card) for card in right)
+
+
+def _repair_signature(
+    cards: tuple[str, ...],
+    options: tuple[tuple[str, ...], ...],
+) -> tuple[object, ...]:
+    normalized = _normalized_options(cards, options)
+    return tuple(
+        sorted(
+            (card, choices)
+            for card, choices in zip(cards, normalized, strict=True)
+        )
+    )
+
+
+def _resolve_visual_correction(
+    target_cards: tuple[str, ...], target_options: tuple[tuple[str, ...], ...],
+    observed_cards: tuple[str, ...], observed_options: tuple[tuple[str, ...], ...],
+) -> tuple[str, ...] | None:
+    """Return a complete later reread whenever it changes the formal action.
+
+    Visual repair is intentionally action-wide rather than suit-only.  A later
+    stable reread may correct ranks, suits and card count together; legality and
+    all downstream state are validated atomically by ``RuleSession.correct_latest``.
+    Unknown cards are not accepted as a repair target because they do not improve
+    the canonical physical action.
+    """
+
+    target = tuple(str(card) for card in target_cards)
+    observed = tuple(str(card) for card in observed_cards)
+    if not target or not observed or any(card.endswith("?") for card in observed):
+        return None
+    if _repair_signature(target, target_options) == _repair_signature(
+        observed, observed_options
+    ):
+        return None
+    return observed
 
 
 class LiveV2SessionRuntime(
@@ -55,6 +123,7 @@ class LiveV2SessionRuntime(
         processing_clock_ms: Callable[[], int] | None = None,
         roi_version: str = "live-v2", source_id: str = "live-v2-capture",
         local_hint_window_ms: int = 200,
+        synchronous_vision: bool = False,
     ) -> None:
         if not isinstance(rule_session, RuleSession):
             raise TypeError("rule_session must implement RuleSession")
@@ -68,6 +137,7 @@ class LiveV2SessionRuntime(
         self._clock = _Clock(processing_clock_ms or (lambda: monotonic_ns() // 1_000_000))
         self._roi_version, self._source_id = roi_version, source_id
         self._local_hint_window_ms = local_hint_window_ms
+        self._synchronous_vision = bool(synchronous_vision)
         self._journal = LiveV2RuntimeJournal(store)
         self._lock = RLock()
         self._engine: LiveEngine | None = None
@@ -81,6 +151,8 @@ class LiveV2SessionRuntime(
         self._hint = LocalRuleHintTracker()
         self._status_before_pause: LiveStatus | None = None
         self._opening_required = False
+        self._visual_corrections: dict[str, _VisualCorrection] = {}
+        self._suppressed_correction_surfaces: dict[Seat, tuple[str, ...]] = {}
 
     @property
     def snapshot(self) -> LiveSnapshot:
@@ -132,6 +204,8 @@ class LiveV2SessionRuntime(
             self._generation = generation
             self._frame_sequence = 0
             self._hint.reset()
+            self._visual_corrections.clear()
+            self._suppressed_correction_surfaces.clear()
             self._install_workers(binding)
             self.store.update_runtime_identity(self._identity())
             self._journal.lifecycle("capture_generation_bound", generation=generation)
@@ -154,6 +228,7 @@ class LiveV2SessionRuntime(
                 return self._plain_update(block_reason="stale_capture_identity")
             snapshot = self._engine.state.snapshot
             expected = snapshot.current_seat
+            self._expire_visual_corrections(identity.captured_ms, expected)
             formal_action_boundary = (
                 snapshot.play_history[-1].last_frame
                 if snapshot.play_history else None
@@ -163,11 +238,28 @@ class LiveV2SessionRuntime(
                 wild_rank=snapshot.wild_rank,
                 expected_seat=expected, processing_ms=self._clock.processing_ms(),
                 formal_action_boundary=formal_action_boundary,
+                repair_seats=tuple(
+                    dict.fromkeys(
+                        item.seat
+                        for item in reversed(tuple(self._visual_corrections.values()))
+                    )
+                ),
+                synchronous=self._synchronous_vision,
             )
             for fault in faults:
                 self._safe_fault("vision_runtime", fault, monotonic_ms=identity.captured_ms)
             observations = tuple(item for result in results for item in result.observations)
             candidates = tuple(item for result in results for item in result.candidates)
+            repaired = self._try_visual_corrections(
+                observations,
+                expected_seat=expected,
+                fast=(results[-1].fast_signals if results else None),
+            )
+            if repaired is not None:
+                return repaired
+            candidates = self._filter_suppressed_correction_surfaces(
+                candidates, observations
+            )
             gated = gate_visual_candidates(snapshot, candidates)
             if self._opening_required and not snapshot.play_history:
                 # Opening is a hard barrier.  A seed lead or several static
@@ -185,12 +277,199 @@ class LiveV2SessionRuntime(
                     block_reason="opening_waiting_for_unique_visual_action",
                 )
             selected = gated.selected
+            if selected:
+                # A new formal action for the same seat closes any older repair
+                # window that never produced a valid correction.  It must not
+                # block the new turn or fabricate a second action.
+                selected_seats = {item.seat for item in selected}
+                for action_id, pending in tuple(self._visual_corrections.items()):
+                    if pending.seat in selected_seats:
+                        self._visual_corrections.pop(action_id, None)
             self._pending.update((item.candidate_id, item) for item in selected)
             return self._process(
                 EngineInput(observations=observations, candidates=selected,
                             captured_watermark_ms=identity.captured_ms),
                 fast=results[-1].fast_signals if results else None,
             )
+
+    def _register_visual_correction(self, action: Any) -> None:
+        if (
+            getattr(action, "kind", None) is not ActionKind.PLAY
+            or getattr(action, "evidence_origin", None) is not EvidenceOrigin.VISUAL
+        ):
+            return
+        action_id = str(action.action_id)
+        # At most one repair window per seat is useful.  A newer formal play
+        # supersedes an older surface that was never repaired.
+        for existing_id, pending in tuple(self._visual_corrections.items()):
+            if pending.seat is action.seat:
+                self._visual_corrections.pop(existing_id, None)
+        self._visual_corrections[action_id] = _VisualCorrection(
+            action_id=action_id,
+            seat=action.seat,
+            cards=tuple(action.cards),
+            suit_options=tuple(tuple(item) for item in action.suit_options),
+            last_signature=None,
+            rejected_signature=None,
+            streak=0,
+            last_frame=None,
+            expires_ms=int(action.captured_ms) + 8_000,
+        )
+
+    def _expire_visual_corrections(
+        self, captured_ms: int, expected_seat: Seat | None
+    ) -> None:
+        for action_id, pending in tuple(self._visual_corrections.items()):
+            if captured_ms > pending.expires_ms or pending.seat is expected_seat:
+                self._visual_corrections.pop(action_id, None)
+
+    def _try_visual_corrections(
+        self, observations: tuple[Any, ...], *,
+        expected_seat: Seat | None, fast: Any = None
+    ):
+        if not self._visual_corrections:
+            return None
+        # Prefer the latest formal action while retaining older seats until
+        # their displayed surface is explicitly cleared or replaced.
+        for pending in reversed(tuple(self._visual_corrections.values())):
+            if pending.seat is expected_seat:
+                continue
+            for observation in observations:
+                if observation.seat is not pending.seat:
+                    continue
+                kind = str(getattr(observation.kind, "value", observation.kind))
+                if kind in {"empty", "pass"}:
+                    self._visual_corrections.pop(pending.action_id, None)
+                    break
+                if kind != "play":
+                    continue
+                observed_cards = tuple(str(card) for card in observation.cards)
+                observed_options = tuple(
+                    tuple(str(value) for value in choices)
+                    for choices in observation.suit_options
+                )
+                corrected = _resolve_visual_correction(
+                    pending.cards,
+                    pending.suit_options,
+                    observed_cards,
+                    observed_options,
+                )
+                if corrected is None:
+                    pending.last_signature = None
+                    pending.streak = 0
+                    pending.last_frame = observation.frame
+                    continue
+                signature = _repair_signature(corrected, observed_options)
+                if signature == pending.rejected_signature:
+                    continue
+                if (
+                    pending.last_signature == signature
+                    and pending.last_frame is not None
+                    and observation.frame.frame_sequence
+                    > pending.last_frame.frame_sequence
+                ):
+                    pending.streak += 1
+                else:
+                    pending.streak = 1
+                pending.last_signature = signature
+                pending.last_frame = observation.frame
+                # All action-wide changes use the same two-frame rule.  The
+                # rule backend then validates the corrected action plus every
+                # downstream event before the replacement is adopted.
+                if pending.streak >= 2:
+                    repaired = self._commit_visual_correction(
+                        pending, corrected, observation, fast=fast
+                    )
+                    if repaired is not None:
+                        return repaired
+        return None
+
+    def _filter_suppressed_correction_surfaces(
+        self, candidates: tuple[ActionCandidate, ...],
+        observations: tuple[Any, ...],
+    ) -> tuple[ActionCandidate, ...]:
+        for seat, cards in tuple(self._suppressed_correction_surfaces.items()):
+            for observation in observations:
+                if observation.seat is not seat:
+                    continue
+                kind = str(getattr(observation.kind, "value", observation.kind))
+                if kind == "empty":
+                    self._suppressed_correction_surfaces.pop(seat, None)
+                    break
+                if kind == "play" and _same_cards(cards, tuple(observation.cards)):
+                    break
+                if kind == "play":
+                    self._suppressed_correction_surfaces.pop(seat, None)
+                    break
+        return tuple(
+            item for item in candidates
+            if not (
+                item.seat in self._suppressed_correction_surfaces
+                and _same_cards(
+                    self._suppressed_correction_surfaces[item.seat],
+                    tuple(item.cards),
+                )
+            )
+        )
+
+    def _commit_visual_correction(
+        self, pending: "_VisualCorrection", corrected: tuple[str, ...],
+        observation: Any, *, fast: Any = None,
+    ):
+        from ..live_v2.corrections import CorrectionCommand, CorrectionReason
+        evidence_id = (
+            f"visual-correction:{pending.action_id}:"
+            f"{observation.frame.frame_sequence}"
+        )
+        try:
+            correction = self.rule_session.correct_latest(CorrectionCommand(
+                correction_id=f"correction:{pending.action_id}:{observation.frame.frame_sequence}",
+                expected_version=self.rule_session.version,
+                target_action_id=pending.action_id,
+                kind=ActionKind.PLAY,
+                cards=corrected,
+                suit_options=tuple((card,) for card in corrected),
+                reason=CorrectionReason.VISUAL_REREAD,
+                evidence_id=evidence_id,
+                evidence_origin=EvidenceOrigin.VISUAL,
+                confidence=float(observation.confidence),
+                corrected_ms=int(observation.frame.captured_ms),
+            ))
+        except Exception as exc:
+            pending.rejected_signature = pending.last_signature
+            pending.streak = 0
+            self._safe_fault(
+                "visual_correction", str(exc),
+                target_action_id=pending.action_id,
+            )
+            # A rejected reread is only non-authoritative visual evidence.
+            # Keep listening for a different stable reread instead of blocking
+            # the whole session.
+            return None
+        self._visual_corrections.pop(pending.action_id, None)
+        self._suppressed_correction_surfaces[pending.seat] = tuple(corrected)
+        detached = self._detach_workers()
+        self._close_detached(detached)
+        with self._lock:
+            binding = self.rule_session.bind_generation(self._generation)
+            self._install_workers(binding)
+            update = self._process(
+                EngineInput(captured_watermark_ms=self._last_ms), fast=fast
+            )
+            event = correction_event(
+                correction, snapshot=self._trusted_snapshot()
+            )
+            target = next(
+                item
+                for item in self.rule_session.confirmed_actions
+                if item.action_id == pending.action_id
+            )
+            target_event = self.rule_session.events_for_actions((target,))[0]
+            event = replace(
+                event,
+                payload={**event.payload, "target_event_id": target_event.event_id},
+            )
+            return replace(update, event=event, events=(event,))
 
     def commit_trusted_action(
         self, *, actor: str, cards: tuple[str, ...] = (), is_pass: bool,
@@ -265,6 +544,8 @@ class LiveV2SessionRuntime(
             status=self.status, latest_advice=self.latest_advice,
             sequence=self._sequence, fast_signals=fast,
         )
+        for action in confirmed:
+            self._register_visual_correction(action)
         return projected
 
     def _commit_trusted(

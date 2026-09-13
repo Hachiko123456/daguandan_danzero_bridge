@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..advisor_strategy import EVALUATION_STRATEGY_OPTIONS
+from ..config import PROFILES_ROOT
 from ..application.model_evaluation import (
     EvaluationInputValidation,
     EvaluationProgress,
@@ -131,16 +132,23 @@ class ModelEvaluationPanel(QWidget):
         *,
         service: ModelEvaluationService | None = None,
         repair_service: TimelineTruthMigrationService | None = None,
+        profiles_root: Path | str | None = None,
+        profile_name: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("modelEvaluationPanel")
         self.setMaximumWidth(720)
         self.session = Path(session).resolve()
-        profile_root = self.session.parents[1]
+        selected_profiles_root = (
+            Path(profiles_root).expanduser().resolve()
+            if profiles_root is not None
+            else PROFILES_ROOT
+        )
+        selected_profile_name = str(profile_name or "tencent_daguandan")
         self.service = service or ModelEvaluationService(
-            profiles_root=profile_root.parent,
-            profile_name=profile_root.name,
+            profiles_root=selected_profiles_root,
+            profile_name=selected_profile_name,
         )
         self.repair_service = repair_service or TimelineTruthMigrationService()
         self._token = 0

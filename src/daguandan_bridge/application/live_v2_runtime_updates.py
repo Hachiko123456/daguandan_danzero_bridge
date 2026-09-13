@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -249,23 +248,48 @@ def consume_vision(
     vision: VisionRuntimeLike, image: Any, *, frame: FrameIdentity,
     version: VersionIdentity, wild_rank: str, expected_seat: Seat | None,
     processing_ms: int, formal_action_boundary: FrameIdentity | None,
+    repair_seats: tuple[Seat, ...] = (),
+    synchronous: bool = False,
 ) -> tuple[tuple[FramePipelineResult, ...], tuple[str, ...]]:
+    if synchronous:
+        process_sync = getattr(vision, "process_frame_sync", None)
+        if not callable(process_sync):
+            raise TypeError("synchronous vision runtime must provide process_frame_sync")
+        kwargs: dict[str, object] = {
+            "image": image, "frame": frame, "version": version,
+            "wild_rank": wild_rank, "expected_seat": expected_seat,
+            "request_sequence": frame.frame_sequence,
+            "formal_action_boundary": formal_action_boundary,
+        }
+        if repair_seats:
+            kwargs["repair_seats"] = repair_seats
+        return (process_sync(**kwargs),), ()
+
     process = getattr(vision, "process_frame", None)
     if callable(process):
-        return (process(
-            image, frame=frame, version=version, wild_rank=wild_rank,
-            expected_seat=expected_seat, now_ms=processing_ms,
-            formal_action_boundary=formal_action_boundary,
-        ),), ()
+        kwargs = {
+            "image": image, "frame": frame, "version": version,
+            "wild_rank": wild_rank, "expected_seat": expected_seat,
+            "now_ms": processing_ms,
+            "formal_action_boundary": formal_action_boundary,
+        }
+        if repair_seats:
+            kwargs["repair_seats"] = repair_seats
+        return (process(**kwargs),), ()
+
     submit = getattr(vision, "submit", None)
     if not callable(submit):
         raise TypeError("vision runtime must provide process_frame or submit")
-    values = list(submit(
-        image, frame=frame, version=version, expected_seat=expected_seat,
-        visual_self_opportunity=expected_seat is Seat.SELF,
-        wild_rank=wild_rank, request_sequence=frame.frame_sequence,
-        formal_action_boundary=formal_action_boundary,
-    ))
+    submit_kwargs: dict[str, object] = {
+        "image": image, "frame": frame, "version": version,
+        "expected_seat": expected_seat,
+        "visual_self_opportunity": expected_seat is Seat.SELF,
+        "wild_rank": wild_rank, "request_sequence": frame.frame_sequence,
+        "formal_action_boundary": formal_action_boundary,
+    }
+    if repair_seats:
+        submit_kwargs["repair_seats"] = repair_seats
+    values = list(submit(**submit_kwargs))
     drain = getattr(vision, "drain_results", None)
     if callable(drain):
         values.extend(drain())

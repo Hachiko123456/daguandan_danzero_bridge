@@ -1,12 +1,8 @@
 """Latest-only supervisor for the long-lived live-v2 vision process."""
-
 from __future__ import annotations
-
 from threading import RLock
 import time
-
 import numpy as np
-
 from ..live_v2.identity import FrameIdentity, Seat, VersionIdentity
 from .live_v2_vision_protocol import (
     VisionRequestIdentity,
@@ -23,11 +19,11 @@ from .live_v2_worker_protocol import (
     WorkerResult,
     WorkerResultStatus,
 )
+from .live_v2_vision_sync import VisionSyncMixin
 
 
-class LiveV2VisionRuntime:
+class LiveV2VisionRuntime(VisionSyncMixin):
     """Own one worker, one latest frame slot and strict result version gates."""
-
     def __init__(
         self,
         config: VisionWorkerConfig,
@@ -47,19 +43,15 @@ class LiveV2VisionRuntime:
         self._active_stream = (session_id, capture_generation)
         self._retired_streams: set[tuple[str, int]] = set()
         self._closed = False
-
     @property
     def state(self) -> object:
         return self._host.state
-
     @property
     def worker_pid(self) -> int | None:
         return self._host.worker_pid
-
     @property
     def worker_generation(self) -> int:
         return self._host.worker_generation
-
     def start(self, *, timeout: float = 10.0) -> None:
         try:
             self._host.start(timeout=timeout)
@@ -72,7 +64,6 @@ class LiveV2VisionRuntime:
                 raise RuntimeError(
                     f"vision worker failed two bounded starts: {first}; {second}"
                 ) from second
-
     def submit(
         self,
         image: np.ndarray,
@@ -84,6 +75,7 @@ class LiveV2VisionRuntime:
         wild_rank: str,
         request_sequence: int,
         formal_action_boundary: FrameIdentity | None = None,
+        repair_seats: tuple[Seat | str, ...] = (),
         timeout_ms: int = 2_000,
     ) -> tuple[VisionRuntimeResult, ...]:
         identity = VisionRequestIdentity(frame, version, request_sequence)
@@ -126,6 +118,7 @@ class LiveV2VisionRuntime:
                     wild_rank,
                     owned,
                     formal_action_boundary,
+                    tuple(dict.fromkeys(Seat(item) for item in repair_seats)),
                 ),
                 delivery=DeliveryMode.LATEST_ONLY,
                 timeout_ms=timeout_ms,
@@ -150,7 +143,6 @@ class LiveV2VisionRuntime:
                     str(exc),
                 )
             return tuple(self._convert(item, remove=True) for item in self._host.drain_results())
-
     def restart(self, *, version: VersionIdentity, timeout: float = 10.0) -> int:
         """Explicitly replace the worker; its process-local pipeline cache dies."""
 

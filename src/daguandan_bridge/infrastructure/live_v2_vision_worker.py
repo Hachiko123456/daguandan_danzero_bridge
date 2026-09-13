@@ -76,6 +76,7 @@ def run_live_v2_vision_worker(request: WorkerRequest) -> VisionWorkerSuccess:
             else payload.expected_seat
         ),
         formal_action_boundary=payload.formal_action_boundary,
+        repair_seats=payload.repair_seats,
     )
     return VisionWorkerSuccess(
         identity=identity,

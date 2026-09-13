@@ -11,8 +11,13 @@ import pytest
 
 import daguandan_bridge.application.session_replay_audit as audit_module
 
+from daguandan_bridge.application.live_v2_recorded_replay import _opening_recognition_fields
+
 from daguandan_bridge.application.session_replay_audit import (
     SessionReplayAuditService,
+    _listener_completion,
+    _row_quality_failures,
+    _visual_advice_summary,
     compare_truth_visual_fields,
     resolve_truth_audit_reference,
     summarize_visual_events,
@@ -28,6 +33,174 @@ from daguandan_bridge.live.truth_log import (
     TruthTurn,
     save_truth_log,
 )
+
+
+def _replay_result(tmp_path: Path, *, status_reason: str, current_player=None, actions=1):
+    output = tmp_path / "visual.jsonl"
+    output.write_text(
+        json.dumps({"current_player": current_player}) + "\n",
+        encoding="utf-8",
+    )
+    return VisualPipelineReplayResult(
+        output_path=output,
+        comparison_path=tmp_path / "comparison.json",
+        frame_count=1,
+        warnings=(),
+        comparison=ReplayComparison((), (), (), (), ()),
+        status="complete",
+        status_reason=status_reason,
+        runtime_identity={
+            "runtime": "live_v2",
+            "listener_terminal": current_player is None,
+            "current_player": current_player,
+        },
+    ), {"actions": {"count": actions}}
+
+
+def test_listener_completion_does_not_equate_sealed_or_empty_listener(tmp_path: Path):
+    result, visual = _replay_result(
+        tmp_path, status_reason="runtime_sealed_terminal", actions=0
+    )
+
+    status, reason = _listener_completion(result, visual, True)
+
+    assert status == "incomplete"
+    assert reason == "no_listener_actions"
+
+
+def test_listener_completion_requires_terminal_reason_and_no_current_player(tmp_path: Path):
+    result, visual = _replay_result(
+        tmp_path, status_reason="listener_not_terminal", current_player="left"
+    )
+
+    status, reason = _listener_completion(result, visual, True)
+
+    assert status == "incomplete"
+    assert reason == "current_player=left"
+
+    result, visual = _replay_result(tmp_path, status_reason="runtime_sealed_terminal")
+    status, reason = _listener_completion(result, visual, True)
+    assert status == "incomplete"
+    assert reason == "non_terminal_status_reason=runtime_sealed_terminal"
+
+
+def test_listener_completion_prefers_runtime_identity_current_player(tmp_path: Path):
+    result, visual = _replay_result(tmp_path, status_reason="listener_terminal", current_player="left")
+    result = VisualPipelineReplayResult(
+        output_path=result.output_path,
+        comparison_path=result.comparison_path,
+        frame_count=result.frame_count,
+        warnings=result.warnings,
+        comparison=result.comparison,
+        status="complete",
+        status_reason="listener_terminal",
+        runtime_identity={
+            "runtime": "live_v2",
+            "listener_status": "complete",
+            "listener_terminal": True,
+            "current_player": None,
+        },
+    )
+
+    status, reason = _listener_completion(result, visual, True)
+
+    assert status == "complete"
+    assert reason == "listener_terminal"
+
+
+def test_listener_completion_honors_live_v2_identity_listener_status(tmp_path: Path):
+    result, visual = _replay_result(tmp_path, status_reason="listener_terminal")
+    result = VisualPipelineReplayResult(
+        output_path=result.output_path,
+        comparison_path=result.comparison_path,
+        frame_count=result.frame_count,
+        warnings=result.warnings,
+        comparison=result.comparison,
+        status=result.status,
+        status_reason=result.status_reason,
+        runtime_identity={
+            "runtime": "live_v2",
+            "listener_status": "incomplete",
+            "listener_terminal": True,
+            "current_player": None,
+        },
+    )
+
+    status, reason = _listener_completion(result, visual, True)
+
+    assert status == "incomplete"
+    assert reason == "runtime_listener_status=incomplete"
+
+
+def _visual_result(tmp_path: Path, **kwargs) -> VisualPipelineReplayResult:
+    output = tmp_path / "visual.jsonl"
+    output.write_text("{}\n", encoding="utf-8")
+    values = {
+        "advice_requested": 0,
+        "advice_ready": 0,
+        "advice_failed": 0,
+        "advice_stale": 0,
+        "advice_timeouts": 0,
+        "advice_withheld": 0,
+        "advice_statuses": {},
+        "completed": True,
+        "status": "complete",
+        "runtime_identity": {"runtime": "live_v2", "listener_status": "complete"},
+    }
+    values.update(kwargs)
+    return VisualPipelineReplayResult(
+        output_path=output,
+        comparison_path=tmp_path / "comparison.json",
+        frame_count=1,
+        warnings=(),
+        comparison=ReplayComparison((), (), (), (), ()),
+        **values,
+    )
+
+
+def test_visual_advice_summary_does_not_call_empty_completed_run_passed(tmp_path: Path):
+    result = _visual_result(tmp_path)
+
+    summary = _visual_advice_summary(result, _AuditAdvisor(), listener_status="complete")
+
+    assert summary["status"] == "not_exercised"
+    assert summary["status"] != "passed"
+
+
+def test_visual_advice_summary_reports_listener_gap_separately(tmp_path: Path):
+    result = _visual_result(tmp_path, advice_withheld=1)
+
+    summary = _visual_advice_summary(result, _AuditAdvisor(), listener_status="incomplete")
+
+    assert summary["status"] == "withheld_due_listener_gap"
+
+
+def test_visual_advice_summary_reports_passed_when_all_requests_succeed(tmp_path: Path):
+    result = _visual_result(tmp_path, advice_requested=2, advice_ready=2)
+
+    summary = _visual_advice_summary(result, _AuditAdvisor(), listener_status="complete")
+
+    assert summary["status"] == "passed"
+
+
+def test_visual_advice_summary_reports_failed_when_a_request_fails(tmp_path: Path):
+    result = _visual_result(tmp_path, advice_requested=2, advice_ready=1, advice_failed=1)
+
+    summary = _visual_advice_summary(result, _AuditAdvisor(), listener_status="complete")
+
+    assert summary["status"] == "failed"
+
+
+def test_opening_read_fields_preserve_recognized_level_and_full_hand():
+    level, hand = _opening_recognition_fields(
+        type("Recognized", (), {
+            "round_level": "7",
+            "my_hand": ("2S", "2H", "AS"),
+        })()
+    )
+
+    assert level == "7"
+    assert hand == ["2S", "2H", "AS"]
 
 
 def test_truth_reference_prefers_canonical_then_requested_staged_draft(tmp_path: Path):
@@ -148,7 +321,128 @@ def test_field_metrics_compare_ordered_actor_pass_and_card_multisets():
     assert metrics["actions"]["order"]["duplicate_actual_turn_ids"] == [1]
 
 
-def test_all_session_audit_writes_only_under_explicit_output(tmp_path: Path):
+def test_inventory_truth_metadata_is_presence_only_and_does_not_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    session = tmp_path / "profile" / "sessions" / "game"
+    session.mkdir(parents=True)
+    (session / "manifest.json").write_text('{"session_id":"game"}', encoding="utf-8")
+    truth = session / "truth_log.json"
+    truth.write_text('{"secret":"must-not-be-read"}', encoding="utf-8")
+
+    def fail_resolve(*_args, **_kwargs):
+        raise AssertionError("TruthLog reference must be resolved after visual replay")
+
+    monkeypatch.setattr(audit_module, "resolve_truth_audit_reference", fail_resolve)
+    item = audit_module._Session(session, session.parent, "store", "game")
+    inventory = audit_module._inventory((item,), (session.parent,), None)
+    files = inventory["sessions"][0]["files"]
+
+    assert inventory["sessions"][0]["truth_kind"] == "canonical"
+    assert files["truth"]["exists"] is True
+    assert files["truth"]["path"] == str(truth)
+    assert set(files["truth"]) == {"path", "exists", "size", "mtime_ns"}
+    assert "sha256" not in files["canonical_truth"]
+
+    snapshot = audit_module._source_snapshot((session.parent,))
+    truth_snapshot = next(
+        row for row in snapshot.values() if row["relative_path"] == "game/truth_log.json"
+    )
+    assert "sha256" not in truth_snapshot
+
+
+def test_visual_advice_summary_marks_stale_results_without_marking_failure(tmp_path: Path):
+    result = _visual_result(
+        tmp_path,
+        advice_requested=26,
+        advice_ready=21,
+        advice_stale=5,
+    )
+
+    summary = _visual_advice_summary(result, _AuditAdvisor(), listener_status="complete")
+
+    assert summary["status"] == "completed_with_stale"
+    assert summary["advice"]["stale"] == 5
+
+
+def _strict_fabledan_quality_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "execution_status": "completed",
+        "frame_replay_status": "complete",
+        "listener_status": "complete",
+        "opening_status": "recognized",
+        "truth_quality": "passed",
+        "visual_quality": "passed",
+        "comparison_status": "passed",
+        "fabledan_quality": "advisory",
+        "fabledan": {
+            "truth_driven": {
+                "available": True,
+                "completed": True,
+                "status": "passed",
+                "advice": {
+                    "requested": 78,
+                    "ready": 78,
+                    "failed": 0,
+                    "timeout": 0,
+                },
+            },
+            "visual_driven": {
+                "available": True,
+                "completed": True,
+                "status": "completed_with_stale",
+                "advice": {
+                    "requested": 26,
+                    "ready": 21,
+                    "failed": 0,
+                    "stale": 5,
+                    "timeout": 0,
+                },
+            },
+        },
+    }
+    row.update(overrides)
+    return row
+
+
+def test_row_quality_failures_allows_advisory_for_completed_truth_and_stale_visual():
+    row = _strict_fabledan_quality_row()
+
+    assert _row_quality_failures(row) == []
+    assert row["fabledan"]["visual_driven"]["advice"]["stale"] == 5
+
+
+@pytest.mark.parametrize(
+    "change, expected_reason",
+    [
+        (lambda row: row.update(fabledan_quality="failed"), "fabledan_quality='failed'"),
+        (
+            lambda row: row["fabledan"]["truth_driven"].update(status="incomplete", completed=False),
+            "fabledan_truth_channel_incomplete",
+        ),
+        (
+            lambda row: row["fabledan"]["truth_driven"]["advice"].update(failed=1),
+            "fabledan_truth_failed=1",
+        ),
+        (
+            lambda row: row["fabledan"]["visual_driven"]["advice"].update(timeout=1),
+            "fabledan_visual_timeout=1",
+        ),
+    ],
+)
+def test_row_quality_failures_blocks_failed_or_incomplete_fabledan(
+    change, expected_reason: str
+):
+    row = _strict_fabledan_quality_row()
+    change(row)
+
+    failures = _row_quality_failures(row)
+
+    assert expected_reason in failures
+
+def test_all_session_audit_writes_only_under_explicit_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     profiles = tmp_path / "profiles"
     session = profiles / "profile" / "sessions" / "game-one"
     session.mkdir(parents=True)
@@ -182,8 +476,34 @@ def test_all_session_audit_writes_only_under_explicit_output(tmp_path: Path):
     truth_path = session / "truth_log.json"
     save_truth_log(truth_path, TruthLog("game-one", TruthInitialState("2", "self", ("2S",)), ()))
     source_truth = truth_path.read_bytes()
+    visual_started = False
+    real_path_open = Path.open
+    real_sha_file = audit_module._sha_file
+    real_load_truth = audit_module._load_truth
 
-    def visual(_session, _recognition, *, output_root, **_kwargs):
+    def guarded_path_open(path, *args, **kwargs):
+        if path.name == "truth_log.json" and not visual_started:
+            raise AssertionError("TruthLog must not be opened before visual replay")
+        return real_path_open(path, *args, **kwargs)
+
+    def guarded_sha_file(path):
+        if Path(path).name == "truth_log.json" and not visual_started:
+            raise AssertionError("TruthLog hash must not be computed before visual replay")
+        return real_sha_file(path)
+
+    def guarded_load_truth(session_path, reference):
+        if not visual_started:
+            raise AssertionError("TruthLog must not be loaded before visual replay")
+        return real_load_truth(session_path, reference)
+
+    monkeypatch.setattr(Path, "open", guarded_path_open)
+    monkeypatch.setattr(audit_module, "_sha_file", guarded_sha_file)
+    monkeypatch.setattr(audit_module, "_load_truth", guarded_load_truth)
+
+    def visual(_session, _recognition, *, output_root, **kwargs):
+        nonlocal visual_started
+        visual_started = True
+        assert "truth_log" not in kwargs
         output = Path(output_root) / "visual.jsonl"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
@@ -690,3 +1010,19 @@ def _make_audit_session(root: Path, session_id: str, *, frame_count: int) -> Pat
         writer.write(np.full((32, 64, 3), index * 20, np.uint8))
     writer.release()
     return session
+
+
+def test_is_strict_row_accepts_verified_truth_kind():
+    from daguandan_bridge.application.session_replay_audit import _is_strict_row
+
+    for kind in ("canonical", "verified"):
+        for qualification in ("verified_label", "verified", "trusted_for_run"):
+            assert _is_strict_row({
+                "truth_log": {"kind": kind},
+                "truth_qualification": qualification,
+            }) is True
+
+    assert _is_strict_row({
+        "truth_log": {"kind": "verified"},
+        "truth_qualification": "reference_only",
+    }) is False

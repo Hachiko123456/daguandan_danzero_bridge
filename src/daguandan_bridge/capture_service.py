@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from .config import PROFILES_ROOT
+from .domain.frame import FrameEnvelope
 from .profiles import ProfileConfig, ProfilePaths, get_profile_paths, load_profile_config
 from .window_capture import (
     CapturedStandardizedFrame,
@@ -35,6 +36,25 @@ class FrameSnapshot:
     @property
     def image(self) -> Any:
         return self.frame.image
+
+    def to_envelope(
+        self,
+        *,
+        capture_seq: int | None = None,
+        capture_generation: int = 0,
+        frame_index: int | None = None,
+    ) -> FrameEnvelope:
+        return FrameEnvelope(
+            image=self.image,
+            captured_monotonic_ms=int(self.captured_monotonic_ms),
+            wall_time=self.captured_at.isoformat(),
+            frame_index=frame_index,
+            capture_seq=capture_seq,
+            capture_generation=int(capture_generation),
+            evidence_frame_id=self.evidence_frame_id,
+            roi_version="live-v2",
+            source_id="screen-capture",
+        )
 
 
 @dataclass(frozen=True)

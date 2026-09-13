@@ -98,3 +98,54 @@ def test_two_trick_replay_preserves_current_lead_for_fabledan(tmp_path) -> None:
     projected = advice.engine_input["project_snapshot"]
     assert projected["lead_player"] == "opposite"
     assert projected["current_player"] == "self"
+
+
+def test_direct_snapshot_projection_preserves_unknown_physical_options():
+    before = StateVersion("unknown-advice-session", 0, 0)
+    specs = (
+        (Seat.RIGHT, ActionKind.PLAY, ("3?",), (("3?", "3S", "3C"),)),
+        (Seat.OPPOSITE, ActionKind.PASS, (), ()),
+        (Seat.LEFT, ActionKind.PASS, (), ()),
+    )
+    actions = []
+    for index, (seat, kind, cards, options) in enumerate(specs, start=1):
+        after = StateVersion(
+            before.session_id, before.state_revision + 1, before.turn_index + 1
+        )
+        frame = FrameIdentity(
+            before.session_id, 1, index, 100 + index, "roi"
+        )
+        actions.append(GameAction(
+            f"unknown-{index}", before, after, seat, kind, cards, options,
+            index, (f"unknown-evidence-{index}",), frame, frame, 0.9,
+            frame.captured_ms,
+        ))
+        before = after
+    snapshot = TrustedGameSnapshot(
+        version=VersionIdentity.from_state(
+            before, capture_generation=1, update_sequence=3
+        ),
+        round_level="6",
+        wild_rank="6",
+        trick_index=1,
+        current_seat=Seat.SELF,
+        lead_seat=Seat.RIGHT,
+        my_hand=HAND,
+        play_history=tuple(actions),
+        current_trick=tuple(actions),
+        remaining=tuple(
+            SeatCardCount(seat, 26 if seat is Seat.RIGHT else 27)
+            for seat in Seat
+        ),
+        finished=(),
+        trusted=True,
+        terminal=False,
+        captured_ms=110,
+    )
+
+    state = replay_trusted_snapshot(snapshot)
+
+    assert state.play_history[0].cards == ("3?",)
+    assert state.play_history[0].suit_options == (("3?", "3S", "3C"),)
+    assert state.trick_plays == state.play_history
+    assert state.current_player == "self"

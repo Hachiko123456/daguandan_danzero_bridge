@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import gzip
 import threading
 import time
 import zipfile
 from bisect import bisect_right
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QImage, QPalette, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -47,6 +49,9 @@ from qfluentwidgets import (
 
 from ..annotation_service import AnnotationService
 from ..application.replay_turn_draft import ReplayTurnDraftAssembler
+from ..application.truth_log_from_scan import build_truth_log_from_scan
+from ..application.session_workbench import inspect_session
+from ..application.unverified_batch_scan import UnverifiedBatchScanService
 from ..advisor_strategy import (
     ADVISOR_OPTIONS,
     build_advisor,
@@ -55,6 +60,8 @@ from ..advisor_strategy import (
     save_profile_advisor_strategy,
 )
 from ..config import PROFILES_ROOT
+from ..danzero.state import RANKS
+from ..domain.truth import LabelProvenance, TruthEvidence
 from ..image_io import save_image_unicode
 from ..live.models import LiveEvent
 from ..live.reducer import LiveReducer
@@ -77,9 +84,16 @@ from ..live.truth_log import (
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
 from .single_image_danzero_page import SingleImageDanzeroPage
-from .truth_log_editor import TruthLogEditor
+from .truth_log_editor import CardPickerDialog, TruthLogEditor
 from .video_playback import ReplayDecodeThread, SessionPlaybackToolbar
 from .workers import OneShotThread
+
+
+def _truth_status_icon(color: str) -> QIcon:
+    """Small stable status swatch for the QFluent session selector."""
+    pixmap = QPixmap(12, 12)
+    pixmap.fill(QColor(color))
+    return QIcon(pixmap)
 
 
 class FrameInspectDialog(QDialog):
@@ -94,15 +108,17 @@ class FrameInspectDialog(QDialog):
         *,
         session: Path | None = None,
         frame_number: int | None = None,
+        profiles_root: Path | None = None,
+        profile_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("单图标注")
         self.resize(980, 900)
         self._frame = frame
         self._recognition_service = recognition
-        if session is not None:
-            self._profiles_root = Path(session).parents[2]
-            self._profile_name = Path(session).parents[1].name
+        if profiles_root is not None and profile_name:
+            self._profiles_root = Path(profiles_root).expanduser().resolve()
+            self._profile_name = str(profile_name)
         else:
             self._profiles_root = PROFILES_ROOT
             self._profile_name = "tencent_daguandan"
@@ -161,7 +177,8 @@ class FrameInspectDialog(QDialog):
         try:
             if self._session is not None:
                 target_dir = (
-                    self._session.parent.parent
+                    self._profiles_root
+                    / self._profile_name
                     / "screenshots"
                     / self._session.name
                 )
@@ -249,11 +266,19 @@ class VisualRecognitionReplayThread(QThread):
         parent=None,
         *,
         position_provider: Callable[[], int | None] | None = None,
+        profiles_root: Path | None = None,
+        profile_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = session
         self.truth_log = truth_log
         self._position_provider = position_provider
+        self.profiles_root = (
+            Path(profiles_root).expanduser().resolve()
+            if profiles_root is not None
+            else None
+        )
+        self.profile_name = str(profile_name) if profile_name else None
         self._stop_requested = threading.Event()
         self._last_progress_percent: int | None = None
 
@@ -291,8 +316,8 @@ class VisualRecognitionReplayThread(QThread):
 
     def run(self) -> None:
         try:
-            profile_root = self.session.parents[2]
-            profile_name = self.session.parents[1].name
+            profile_root = self.profiles_root or PROFILES_ROOT
+            profile_name = self.profile_name or "tencent_daguandan"
             recognition = ScreenshotRecognitionService(
                 AnnotationService(profile_root, profile_name),
                 TemplateService(profile_root, profile_name),
@@ -317,6 +342,241 @@ class VisualRecognitionReplayThread(QThread):
             self.failed.emit(str(exc))
 
 
+class PureVideoScanThread(QThread):
+    """Run an AVI-first scan without supplying historical session logs.
+
+    ``VisualRecognitionReplayThread`` stays available for a legacy TruthLog
+    comparison. This worker is the observation-generation path: it receives
+    only the immutable video, an optional frame index, and an explicit
+    recognition service.
+    """
+
+    completed = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+    action_result = Signal(object)
+    frame_progress = Signal(int, int, int)
+
+    def __init__(
+        self,
+        *,
+        video_path: Path,
+        frame_index_path: Path | None,
+        output_root: Path,
+        recognition: ScreenshotRecognitionService,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.video_path = Path(video_path)
+        self.frame_index_path = (
+            Path(frame_index_path) if frame_index_path is not None else None
+        )
+        self.output_root = Path(output_root)
+        self.recognition = recognition
+        self._stop_requested = threading.Event()
+        self._last_progress_percent: int | None = None
+
+    def stop(self) -> None:
+        self._stop_requested.set()
+
+    def _emit_frame_progress(
+        self,
+        processed: int,
+        total: int,
+        frame_index: int,
+    ) -> None:
+        safe_total = max(1, int(total))
+        percent = min(100, max(0, int(processed)) * 100 // safe_total)
+        if (
+            processed not in {0, total}
+            and percent == self._last_progress_percent
+        ):
+            return
+        self._last_progress_percent = percent
+        self.frame_progress.emit(int(processed), safe_total, int(frame_index))
+
+    def run(self) -> None:
+        try:
+            # Lazy import keeps rolling upgrades from breaking page import.
+            # The service itself must not consume TruthLog or timeline input.
+            from ..application.video_scan import (
+                VideoActionScanner,
+                VideoScanRequest,
+            )
+
+            request = VideoScanRequest(
+                video_path=self.video_path,
+                frame_index_path=self.frame_index_path,
+                output_directory=self.output_root,
+            )
+            service = VideoActionScanner(self.recognition)
+            result = service.scan(
+                request,
+                stop_requested=self._stop_requested.is_set,
+                on_progress=self._emit_frame_progress,
+                on_action=lambda row: self.action_result.emit(row),
+            )
+            if self._stop_requested.is_set():
+                self.cancelled.emit()
+            else:
+                self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class UnverifiedBatchScanThread(QThread):
+    """Run the session-level unverified scan without blocking the replay UI."""
+
+    progress = Signal(str, int, int, int, int, int)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        service: UnverifiedBatchScanService,
+        descriptors: tuple[object, ...],
+        profile_root: Path,
+        output_root: Path,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.service = service
+        self.descriptors = tuple(descriptors)
+        self.profile_root = Path(profile_root)
+        self.output_root = Path(output_root)
+        self._stop_requested = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_requested.set()
+
+    def _relay_progress(self, *args: object) -> None:
+        """Relay a batch progress sample, tolerating the legacy 5-field form.
+
+        The service reports ``(session_id, done, total, frame, completed,
+        overall_percent)``; older callers (and test doubles) only supply the
+        first five, so the aggregate figure is derived when it is missing.
+        """
+        fields = list(args) + [0] * 6
+        session_id, done, total, frame, completed = fields[:5]
+        percent = int(args[5]) if len(args) > 5 else (100 if completed else 0)
+        self.progress.emit(session_id, done, total, frame, completed, percent)
+
+    def run(self) -> None:
+        try:
+            result = self.service.scan(
+                self.descriptors,
+                profile_root=self.profile_root,
+                output_root=self.output_root,
+                stop_requested=self._stop_requested.is_set,
+                on_progress=self._relay_progress,
+            )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            self.completed.emit(result)
+
+
+class ScanInitialStateDialog(QDialog):
+    """Confirm only the initial facts needed before an AVI scan becomes a draft."""
+
+    _SEAT_LABELS = {
+        "self": "自己",
+        "right": "右家",
+        "opposite": "对家",
+        "left": "左家",
+    }
+
+    def __init__(self, candidates: dict[str, object], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("校对扫描初始状态")
+        self.setMinimumWidth(520)
+        hand_candidate = candidates.get("my_hand", ())
+        self._hand = (
+            tuple(str(card) for card in hand_candidate)
+            if isinstance(hand_candidate, (list, tuple))
+            else ()
+        )
+        layout = QVBoxLayout(self)
+        hint = BodyLabel(
+            "以下仅显示 AVI 逐帧扫描候选，不读取 timeline 或已有 TruthLog。"
+            "请确认首出、级牌和手牌后，再进入动作校对。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        grid = QGridLayout()
+        grid.addWidget(QLabel("首出玩家"), 0, 0)
+        self.lead_combo = ComboBox()
+        self.lead_combo.addItem("请选择", userData="")
+        for seat, label in self._SEAT_LABELS.items():
+            self.lead_combo.addItem(label, userData=seat)
+        lead = str(candidates.get("lead_player") or "")
+        lead_index = self.lead_combo.findData(lead)
+        if lead_index >= 0:
+            self.lead_combo.setCurrentIndex(lead_index)
+        grid.addWidget(self.lead_combo, 0, 1)
+        grid.addWidget(QLabel("级牌"), 1, 0)
+        self.level_combo = ComboBox()
+        self.level_combo.addItem("请选择", userData="")
+        for rank in RANKS:
+            self.level_combo.addItem(rank, userData=rank)
+        level = str(candidates.get("round_level") or "")
+        level_index = self.level_combo.findData(level)
+        if level_index >= 0:
+            self.level_combo.setCurrentIndex(level_index)
+        grid.addWidget(self.level_combo, 1, 1)
+        grid.addWidget(QLabel("我方手牌"), 2, 0)
+        self.hand_label = BodyLabel()
+        self.hand_label.setWordWrap(True)
+        grid.addWidget(self.hand_label, 2, 1)
+        self.hand_button = PushButton("编辑手牌")
+        grid.addWidget(self.hand_button, 2, 2)
+        layout.addLayout(grid)
+        self.error_label = BodyLabel("")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.cancel_button = PushButton("取消")
+        self.confirm_button = PrimaryPushButton("生成校对草稿")
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.confirm_button)
+        layout.addLayout(buttons)
+        self.hand_button.clicked.connect(self._edit_hand)
+        self.cancel_button.clicked.connect(self.reject)
+        self.confirm_button.clicked.connect(self._confirm)
+        self._render_hand()
+
+    def _render_hand(self) -> None:
+        self.hand_label.setText(
+            "、".join(self._hand) if self._hand else "未识别，请手动补充"
+        )
+
+    def _edit_hand(self) -> None:
+        picker = CardPickerDialog(self._hand, self)
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            self._hand = picker.cards()
+            self._render_hand()
+
+    def _confirm(self) -> None:
+        if self.lead_combo.currentData() not in self._SEAT_LABELS:
+            self.error_label.setText("请确认首出玩家")
+            return
+        if self.level_combo.currentData() not in RANKS:
+            self.error_label.setText("请确认级牌")
+            return
+        if not self._hand:
+            self.error_label.setText("请补充我方初始手牌")
+            return
+        self.accept()
+
+    def initial_state(self) -> dict[str, object]:
+        return {
+            "lead_player": str(self.lead_combo.currentData() or ""),
+            "round_level": str(self.level_combo.currentData() or ""),
+            "my_hand": list(self._hand),
+        }
+
+
 class TrustedAdviceReplayThread(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -329,11 +589,19 @@ class TrustedAdviceReplayThread(QThread):
         parent=None,
         *,
         advisor_strategy: str = "danzero",
+        profiles_root: Path | None = None,
+        profile_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = Path(session)
         self.truth_log = truth_log
         self.advisor_strategy = normalize_advisor_strategy(advisor_strategy)
+        self.profiles_root = (
+            Path(profiles_root).expanduser().resolve()
+            if profiles_root is not None
+            else None
+        )
+        self.profile_name = str(profile_name) if profile_name else None
         self._stop_requested = threading.Event()
 
     def stop(self) -> None:
@@ -341,8 +609,8 @@ class TrustedAdviceReplayThread(QThread):
 
     def run(self) -> None:
         try:
-            profiles_root = self.session.parents[2]
-            profile_name = self.session.parents[1].name
+            profiles_root = self.profiles_root or PROFILES_ROOT
+            profile_name = self.profile_name or "tencent_daguandan"
             result = replay_truth_through_live_advisor(
                 self.session,
                 build_advisor(
@@ -360,14 +628,27 @@ class TrustedAdviceReplayThread(QThread):
 
 
 class ReplayPage(QWidget):
-    def __init__(self, sessions_root: Path | None = None, parent=None) -> None:
+    def __init__(
+        self,
+        sessions_root: Path | None = None,
+        parent=None,
+        *,
+        profiles_root: Path | None = None,
+        profile_name: str | None = None,
+        unverified_batch_service: UnverifiedBatchScanService | None = None,
+        batch_output_root: Path | str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.sessions_root = Path(
             sessions_root
             or (PROFILES_ROOT / "tencent_daguandan" / "sessions")
         )
-        self.profiles_root = self.sessions_root.parent.parent
-        self.profile_name = self.sessions_root.parent.name
+        self.profiles_root = (
+            Path(profiles_root).expanduser().resolve()
+            if profiles_root is not None
+            else PROFILES_ROOT
+        )
+        self.profile_name = str(profile_name or "tencent_daguandan")
         self.advisor_strategy = load_profile_advisor_strategy(
             self.profiles_root,
             self.profile_name,
@@ -375,7 +656,22 @@ class ReplayPage(QWidget):
         self.current_session: Path | None = None
         self._decode_thread: ReplayDecodeThread | None = None
         self._visual_thread: VisualRecognitionReplayThread | None = None
+        self._pure_scan_thread: PureVideoScanThread | None = None
         self._trusted_thread: TrustedAdviceReplayThread | None = None
+        self._unverified_batch_thread: UnverifiedBatchScanThread | None = None
+        self._unverified_batch_service = unverified_batch_service or UnverifiedBatchScanService()
+        self._batch_descriptors: tuple[object, ...] = ()
+        self._batch_selected_count = 0
+        # The batch scanner writes external artifacts by design.  Keep the
+        # latest run root so the editor can load its unverified action draft
+        # without publishing it into the session source directory.
+        self._last_unverified_batch_output: Path | None = None
+        self._batch_scan_draft_source: Path | None = None
+        self.batch_output_root = (
+            Path(batch_output_root).expanduser().resolve()
+            if batch_output_root is not None
+            else Path.cwd() / "reports" / "session-corpus-validation" / "unverified-scans"
+        )
         self._seek_frame: int | None = None
         self.truth_log: TruthLog | None = None
         self._truth_scan_base: TruthLog | None = None
@@ -392,6 +688,10 @@ class ReplayPage(QWidget):
         self._truth_scan_progress_processed = 0
         self._truth_scan_progress_total = 0
         self._truth_scan_progress_frame_index = 0
+        self._pure_scan_actions: list[dict[str, object]] = []
+        self._pure_scan_result: object | None = None
+        self._pure_scan_review_items: tuple[dict[str, object], ...] = ()
+        self._proposed_scan_log: TruthLog | None = None
         self._truth_editor: TruthLogEditor | None = None
         self._content_vertical: bool | None = None
         self._current_record: FrameIndexRecord | None = None
@@ -405,6 +705,40 @@ class ReplayPage(QWidget):
         qconfig.themeChanged.connect(self._apply_theme)
         self._apply_theme()
         self.refresh_sessions()
+
+    def configure_context(
+        self,
+        sessions_root: Path | str,
+        *,
+        profiles_root: Path | str,
+        profile_name: str,
+        session: Path | str | None = None,
+    ) -> None:
+        """Switch to an explicitly selected session/profile context.
+
+        This is the workbench hand-off point.  It intentionally accepts the
+        profile independently from the session location and never derives
+        either value from ``session.parents``.
+        """
+
+        self._stop_decode()
+        if self._visual_thread is not None and self._visual_thread.isRunning():
+            self._visual_thread.stop()
+        if self._pure_scan_thread is not None and self._pure_scan_thread.isRunning():
+            self._pure_scan_thread.stop()
+        if self._unverified_batch_thread is not None and self._unverified_batch_thread.isRunning():
+            self._unverified_batch_thread.stop()
+        self.sessions_root = Path(sessions_root).expanduser().resolve()
+        self.profiles_root = Path(profiles_root).expanduser().resolve()
+        self.profile_name = str(profile_name).strip()
+        self._recognition_service = None
+        self.advisor_strategy = load_profile_advisor_strategy(
+            self.profiles_root,
+            self.profile_name,
+        )
+        self.refresh_sessions()
+        if session is not None:
+            self.select_session(Path(session))
 
     def _apply_theme(self, *_args) -> None:
         dark = bool(isDarkTheme())
@@ -551,7 +885,7 @@ class ReplayPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 28)
         root.setSpacing(14)
-        root.addWidget(TitleLabel("对局回放与复测"))
+        root.addWidget(TitleLabel("对局回放"))
 
         selector = CardWidget()
         self.selector_card = selector
@@ -672,11 +1006,37 @@ class ReplayPage(QWidget):
         self.truth_export_button = PushButton("导出日志")
         self.truth_replay_button = PrimaryPushButton("复测")
         self.truth_edit_button = PushButton("编辑日志")
+        self.scan_initial_state_button = PushButton("校对初始状态")
+        self.scan_initial_state_button.setToolTip(
+            "只使用本次 AVI 扫描候选补齐首家、级牌和手牌，再进入 TruthLog 动作校对"
+        )
+        self.scan_initial_state_button.setEnabled(False)
+        batch_scan_row = QHBoxLayout()
+        self.scan_unverified_button = PrimaryPushButton("扫描未验证对局")
+        self.scan_unverified_button.setToolTip(
+            "一次扫描所有尚未验证且包含录像的对局；已验证对局会自动跳过"
+        )
+        self.cancel_unverified_button = PushButton("取消批量扫描")
+        self.cancel_unverified_button.setEnabled(False)
+        batch_scan_row.addWidget(self.scan_unverified_button)
+        batch_scan_row.addWidget(self.cancel_unverified_button)
+        batch_scan_row.addStretch(1)
+        diag_layout.addLayout(batch_scan_row)
+        self.batch_progress_label = BodyLabel("批量扫描：未开始")
+        self.batch_progress_label.setWordWrap(True)
+        diag_layout.addWidget(self.batch_progress_label)
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setObjectName("unverifiedBatchProgress")
+        self.batch_progress.setRange(0, 100)
+        self.batch_progress.setValue(0)
+        self.batch_progress.setVisible(False)
+        diag_layout.addWidget(self.batch_progress)
         self.diagnostics = TextEdit()
         self.diagnostics.setObjectName("replayDiagnostics")
         self.diagnostics.setReadOnly(True)
         self.diagnostics.setPlaceholderText("复测结果会显示在这里。")
         diag_layout.addWidget(self.visual_replay_button)
+        diag_layout.addWidget(self.scan_initial_state_button)
         diag_layout.addWidget(self.truth_edit_button)
         diag_layout.addWidget(self.truth_replay_button)
         self.truth_status = BodyLabel("出牌日志：未维护")
@@ -769,6 +1129,11 @@ class ReplayPage(QWidget):
         )
         self.state_replay_button.clicked.connect(self.replay_state)
         self.visual_replay_button.clicked.connect(self.analyze_video_to_truth_log)
+        self.scan_unverified_button.clicked.connect(self._scan_unverified_sessions)
+        self.cancel_unverified_button.clicked.connect(self._cancel_unverified_sessions)
+        self.scan_initial_state_button.clicked.connect(
+            self._open_pure_scan_initial_state_review
+        )
         self.truth_edit_button.clicked.connect(self.edit_truth_log)
         self.truth_replay_button.clicked.connect(self.replay_truth)
         self.back_to_diagnostics_button.clicked.connect(self._back_to_diagnostics)
@@ -798,10 +1163,12 @@ class ReplayPage(QWidget):
         self.content_layout.setStretch(0, 1 if vertical else 3)
         self.content_layout.setStretch(1, 1 if vertical else 2)
 
-    def refresh_sessions(self) -> None:
+    def refresh_sessions(self, *, preserve_current: bool = False) -> None:
         selected = self.current_session
+        self._batch_descriptors = ()
         self.session_combo.blockSignals(True)
         self.session_combo.clear()
+        descriptors: list[object] = []
         if self.sessions_root.is_dir():
             sessions = sorted(
                 (
@@ -825,23 +1192,195 @@ class ReplayPage(QWidget):
                         label = f"监听录像 · {path.name}"
                 except (OSError, json.JSONDecodeError):
                     pass
-                self.session_combo.addItem(label, userData=str(path))
+                descriptor = inspect_session(path)
+                descriptors.append(descriptor)
+                truth_prefix = {
+                    "verified": "✓ 已验证",
+                    "draft": "△ 草稿",
+                    "missing": "○ 未维护",
+                    "invalid": "! 不可读",
+                }.get(descriptor.truth_status, "○ 未维护")
+                label = f"{truth_prefix} · {label}"
+                color = {
+                    "verified": "#198754",
+                    "draft": "#b7791f",
+                    "missing": "#6c757d",
+                    "invalid": "#c53030",
+                }.get(descriptor.truth_status, "#6c757d")
+                self.session_combo.addItem(
+                    label,
+                    icon=_truth_status_icon(color),
+                    userData=str(path),
+                )
         self.session_combo.blockSignals(False)
+        self._batch_descriptors = tuple(descriptors)
+        self._update_unverified_batch_controls()
         if selected is not None and selected.is_dir():
-            self.select_session(selected)
+            if preserve_current:
+                index = self.session_combo.findData(str(selected))
+                if index >= 0:
+                    self.session_combo.blockSignals(True)
+                    self.session_combo.setCurrentIndex(index)
+                    self.session_combo.blockSignals(False)
+            else:
+                self.select_session(selected)
         elif self.session_combo.count():
             self._session_selected(0)
+
+    def _update_unverified_batch_controls(self) -> None:
+        thread = self._unverified_batch_thread
+        running = thread is not None and thread.isRunning()
+        pending = sum(
+            1
+            for item in self._batch_descriptors
+            if getattr(item, "truth_status", "") in {"draft", "missing", "invalid"}
+            and bool(getattr(item, "has_video", False))
+        )
+        self._batch_selected_count = pending
+        self.scan_unverified_button.setEnabled(not running and pending > 0)
+        self.cancel_unverified_button.setEnabled(running)
+
+    @Slot()
+    def _scan_unverified_sessions(self) -> None:
+        thread = self._unverified_batch_thread
+        if thread is not None and thread.isRunning():
+            return
+        pending = tuple(
+            item
+            for item in self._batch_descriptors
+            if getattr(item, "truth_status", "") in {"draft", "missing", "invalid"}
+            and bool(getattr(item, "has_video", False))
+        )
+        if not pending:
+            self.batch_progress.setValue(100)
+            self.batch_progress.setVisible(True)
+            self.batch_progress_label.setText("批量扫描：没有未验证且包含录像的对局")
+            self._update_unverified_batch_controls()
+            return
+        thread = UnverifiedBatchScanThread(
+            self._unverified_batch_service,
+            pending,
+            self.profiles_root / self.profile_name,
+            self.batch_output_root,
+            self,
+        )
+        thread.progress.connect(self._unverified_batch_progress)
+        thread.completed.connect(self._unverified_batch_completed)
+        thread.failed.connect(self._unverified_batch_failed)
+        thread.finished.connect(lambda: self._unverified_batch_finished(thread))
+        self._unverified_batch_thread = thread
+        self._batch_selected_count = len(pending)
+        self.scan_unverified_button.setEnabled(False)
+        self.cancel_unverified_button.setEnabled(True)
+        self.batch_progress.setRange(0, 100)
+        self.batch_progress.setValue(0)
+        self.batch_progress.setVisible(True)
+        self.batch_progress_label.setText(
+            f"批量扫描：0%（0/{len(pending)} 局完成）｜并发上限 "
+            f"{self._unverified_batch_service.recommended_workers()}"
+        )
+        thread.start()
+
+    @Slot()
+    def _cancel_unverified_sessions(self) -> None:
+        thread = self._unverified_batch_thread
+        if thread is not None and thread.isRunning():
+            thread.stop()
+            self.cancel_unverified_button.setEnabled(False)
+            self.batch_progress_label.setText(
+                "批量扫描：正在请求取消；当前对局会在安全帧边界停止"
+            )
+
+    @Slot(str, int, int, int, int, int)
+    def _unverified_batch_progress(
+        self,
+        session_id: str,
+        done: int,
+        total: int,
+        frame: int,
+        completed: int,
+        overall_percent: int,
+    ) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._unverified_batch_thread:
+            return
+        count = max(1, self._batch_selected_count)
+        percent = max(0, min(100, int(overall_percent)))
+        # The bar tracks the WHOLE batch and never moves backwards, even though
+        # two workers report their own frames independently.  Per-session frame
+        # detail stays in the caption so it cannot make the bar jump.
+        self.batch_progress.setValue(max(self.batch_progress.value(), percent))
+        detail = f"当前 {session_id} 第 {done}/{total} 帧" if total else "正在准备"
+        self.batch_progress_label.setText(
+            f"批量扫描：{percent}%（{completed}/{count} 局完成）｜{detail}"
+        )
+
+    @Slot(object)
+    def _unverified_batch_completed(self, result: object) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._unverified_batch_thread:
+            return
+        selected = int(getattr(result, "selected_count", 0))
+        completed = int(getattr(result, "completed_count", 0))
+        failed = int(getattr(result, "failed_count", 0))
+        cancelled = bool(getattr(result, "cancelled", False))
+        summary = getattr(result, "summary_path", None)
+        output_directory = getattr(result, "output_directory", None)
+        if output_directory:
+            self._last_unverified_batch_output = Path(str(output_directory)).expanduser().resolve()
+        self.batch_progress.setValue(100 if not cancelled else self.batch_progress.value())
+        state = "已取消" if cancelled else "完成"
+        self.batch_progress_label.setText(
+            f"批量扫描：{state}；{completed}/{selected} 局成功，{failed} 局失败；"
+            f"汇总：{summary}"
+        )
+        self.diagnostics.setPlainText(
+            f"未验证对局批量扫描{state}。结果写入："
+            f"{getattr(result, 'output_directory', self.batch_output_root)}"
+        )
+        self.refresh_sessions(preserve_current=True)
+        if self.current_session is not None and self._load_latest_unverified_batch_draft():
+            video = self.current_session / "video" / "game.avi"
+            index_path = self.current_session / "video" / "frame_index.jsonl"
+            self._set_session_actions(
+                True,
+                playable=video.is_file() and index_path.is_file(),
+                scannable=video.is_file(),
+            )
+
+    @Slot(str)
+    def _unverified_batch_failed(self, message: str) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._unverified_batch_thread:
+            return
+        self.batch_progress_label.setText(f"批量扫描失败：{message}")
+        InfoBar.error("批量扫描失败", message, parent=self)
+
+    def _unverified_batch_finished(self, thread: UnverifiedBatchScanThread) -> None:
+        if thread is not self._unverified_batch_thread:
+            return
+        self._unverified_batch_thread = None
+        self._update_unverified_batch_controls()
 
     def select_session(self, session: Path) -> None:
         session = Path(session).resolve()
         if self._visual_thread is not None and self._visual_thread.isRunning():
             self._visual_thread.stop()
+        if self._pure_scan_thread is not None and self._pure_scan_thread.isRunning():
+            self._pure_scan_thread.stop()
         self._truth_scan_base = None
         self._truth_scan_log = None
         self._truth_draft_assembler = None
         self._truth_scan_next_source_turn_id = 1
         self._truth_scan_failure = None
         self._truth_scan_session = None
+        self._pure_scan_actions = []
+        self._pure_scan_result = None
+        self._pure_scan_review_items = ()
+        self._proposed_scan_log = None
+        self._batch_scan_draft_source = None
+        if hasattr(self, "scan_initial_state_button"):
+            self.scan_initial_state_button.setEnabled(False)
         if hasattr(self, "truth_scan_status"):
             self.truth_scan_status.setText("扫描：未开始")
         self._reset_truth_scan_progress()
@@ -874,7 +1413,10 @@ class ReplayPage(QWidget):
             return
         video = session / "video" / "game.avi"
         index_path = session / "video" / "frame_index.jsonl"
+        # AVI is the source of a pure scan. A capture frame index is useful for
+        # playback metadata but cannot decide whether scan can start.
         playable = video.is_file() and index_path.is_file()
+        scannable = video.is_file()
         frame_count = max(0, int(manifest.get("frame_count", 0) or 0))
         if frame_count <= 0:
             frame_count = len(self._index_records())
@@ -884,7 +1426,8 @@ class ReplayPage(QWidget):
             f"录像帧 {manifest.get('frame_count', 0)}　|　丢帧 {manifest.get('dropped_frames', 0)}"
         )
         self._load_truth_log_for_session(manifest)
-        self._set_session_actions(True, playable=playable)
+        self._load_latest_unverified_batch_draft()
+        self._set_session_actions(True, playable=playable, scannable=scannable)
 
     def _session_selected(self, _index: int) -> None:
         value = self.session_combo.currentData()
@@ -914,13 +1457,18 @@ class ReplayPage(QWidget):
         except Exception as exc:
             self._show_error(str(exc))
 
-    def _set_session_actions(self, enabled: bool, *, playable: bool = False) -> None:
-        for widget in (
-            self.visual_replay_button,
-            self.truth_edit_button,
-            self.truth_replay_button,
-        ):
-            widget.setEnabled(enabled and playable)
+    def _set_session_actions(
+        self,
+        enabled: bool,
+        *,
+        playable: bool = False,
+        scannable: bool = False,
+    ) -> None:
+        # Pure AVI scan is independent from the optional playback index and
+        # every historical TruthLog/timeline artifact.
+        self.visual_replay_button.setEnabled(enabled and scannable)
+        self.truth_edit_button.setEnabled(enabled and (playable or scannable))
+        self.truth_replay_button.setEnabled(enabled and playable)
         trusted_mode = self.replay_mode_combo.currentData() == "trusted_advisor"
         self.truth_replay_button.setEnabled(
             enabled
@@ -1056,6 +1604,8 @@ class ReplayPage(QWidget):
             self,
             session=self.current_session,
             frame_number=record.frame_index if record is not None else None,
+            profiles_root=self.profiles_root,
+            profile_name=self.profile_name,
         )
         dialog.exec()
         dialog.shutdown()
@@ -1197,6 +1747,123 @@ class ReplayPage(QWidget):
             self.truth_log = None
             self.truth_status.setText(f"标准日志不可用：{exc}")
 
+    def _latest_unverified_batch_session_dir(self, session_id: str) -> Path | None:
+        """Find the newest completed external batch artifact for one session."""
+
+        roots: list[Path] = []
+        if self._last_unverified_batch_output is not None:
+            roots.append(self._last_unverified_batch_output)
+        roots.append(self.batch_output_root)
+        # Batch rescans and saveable repair batches are kept separate from the
+        # original unverified-scan directory.  They are still external drafts,
+        # so the selector should discover them without publishing them.
+        batch_parent = self.batch_output_root.parent
+        roots.extend(
+            batch_parent / name
+            for name in ("unverified-rescans", "unverified-saveable")
+        )
+        candidates: list[tuple[float, Path]] = []
+        seen: set[Path] = set()
+        for root in roots:
+            root = Path(root).expanduser().resolve()
+            if not root.is_dir():
+                continue
+            batch_dirs = [root] if (root / session_id).is_dir() else [
+                item for item in root.iterdir() if item.is_dir()
+            ]
+            for batch_dir in batch_dirs:
+                session_dir = batch_dir / session_id
+                action_path = session_dir / "action_trace.jsonl"
+                if not session_dir.is_dir() or not action_path.is_file():
+                    continue
+                session_dir = session_dir.resolve()
+                if session_dir in seen:
+                    continue
+                seen.add(session_dir)
+                summary_path = batch_dir / "summary.json"
+                stamp = max(
+                    action_path.stat().st_mtime,
+                    summary_path.stat().st_mtime if summary_path.is_file() else 0.0,
+                )
+                candidates.append((stamp, session_dir))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    def _load_latest_unverified_batch_draft(self) -> bool:
+        """Attach an external batch action trace to the editor as an unverified draft.
+
+        Batch scanning intentionally does not publish ``truth_log.json``.  The
+        editor still needs to show the generated actions, so use the session's
+        initial-state baseline (including the timeline fallback) and convert
+        only the external canonical action trace in memory.  A source TruthLog
+        newer than the scan is respected so a later user save is not silently
+        replaced by an older batch result.
+        """
+
+        if self.current_session is None or self.truth_log is None:
+            return False
+        session_dir = self._latest_unverified_batch_session_dir(
+            self.current_session.name
+        )
+        if session_dir is None:
+            return False
+        summary_path = session_dir.parent / "summary.json"
+        scan_summary_path = session_dir / "scan_summary.json"
+        scan_stamp = max(
+            (summary_path.stat().st_mtime if summary_path.is_file() else 0.0),
+            (scan_summary_path.stat().st_mtime if scan_summary_path.is_file() else 0.0),
+            (session_dir / "action_trace.jsonl").stat().st_mtime,
+        )
+        source_truth = self.current_session / "truth_log.json"
+        if source_truth.is_file() and source_truth.stat().st_mtime >= scan_stamp:
+            return False
+
+        draft_path = session_dir / "truth_log.draft.json"
+        try:
+            if draft_path.is_file():
+                draft = load_truth_log(
+                    draft_path,
+                    session_id=self.current_session.name,
+                )
+                review_count = None
+            else:
+                actions = [
+                    json.loads(line)
+                    for line in (session_dir / "action_trace.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                ]
+                assembled = build_truth_log_from_scan(self.truth_log, actions)
+                draft = assembled.truth_log
+                self._pure_scan_review_items = tuple(assembled.review_items)
+                review_count = len(assembled.review_items)
+        except Exception as exc:
+            self.truth_scan_status.setText(f"批量扫描草稿不可用：{exc}")
+            return False
+
+        self._batch_scan_draft_source = session_dir
+        self._proposed_scan_log = draft
+        self._truth_scan_log = draft
+        self.truth_log = draft
+        self._truth_scan_status = "needs_review"
+        self._truth_scan_status_reason = "批量扫描动作已生成，等待人工校验"
+        self.truth_status.setText(
+            f"出牌日志：批量扫描草稿 {len(draft.turns)} 条（未校验）"
+        )
+        self.truth_scan_status.setText(
+            "批量扫描已生成动作；当前仅载入编辑器，未写入正式 truth_log.json，"
+            "请人工校验后保存"
+        )
+        details = [
+            f"批量扫描动作已载入：{session_dir / 'action_trace.jsonl'}",
+            f"动作数：{len(draft.turns)}",
+            "状态：未校验（不会自动标记为 verified）",
+        ]
+        if review_count is not None:
+            details.append(f"待复核项：{review_count}")
+        self.diagnostics.setPlainText("\n".join(details))
+        return True
+
     def _truth_log_from_session(self, manifest: dict[str, object]) -> TruthLog | None:
         if self.current_session is None:
             return None
@@ -1255,6 +1922,12 @@ class ReplayPage(QWidget):
     def edit_truth_log(self) -> None:
         if self.current_session is None:
             return
+        if self._pure_scan_result is not None and self._proposed_scan_log is None:
+            self._open_pure_scan_initial_state_review()
+            return
+        if self._proposed_scan_log is not None:
+            self._show_truth_log_editor(self._proposed_scan_log)
+            return
         if self.truth_log is None:
             _frame_index, image = self._current_frame_bgr_and_index()
             if image is None:
@@ -1286,6 +1959,9 @@ class ReplayPage(QWidget):
             log,
             frame_provider=self._current_frame_bgr_and_index,
             frame_scan_provider=self._frames_after_current,
+            recognition_service=self._recognition(),
+            profiles_root=self.profiles_root,
+            profile_name=self.profile_name,
         )
         editor.log_saved.connect(self._on_truth_log_saved)
         self._truth_editor = editor
@@ -1298,7 +1974,10 @@ class ReplayPage(QWidget):
 
     def _on_truth_log_saved(self, log: object) -> None:
         self.truth_log = log
-        self.truth_status.setText(f"出牌日志：已维护 {len(self.truth_log.turns)} 条")
+        status = "已发布可信" if self.truth_log.label_status == "verified" else "已保存草稿"
+        self.truth_status.setText(
+            f"出牌日志：{status} {len(self.truth_log.turns)} 条"
+        )
         self.truth_replay_button.setEnabled(bool(self.truth_log.turns))
 
     @staticmethod
@@ -1339,8 +2018,8 @@ class ReplayPage(QWidget):
         if self._recognition_service is None:
             if self.current_session is None:
                 raise RuntimeError("尚未选择对局")
-            profile_root = self.current_session.parents[2]
-            profile_name = self.current_session.parents[1].name
+            profile_root = self.profiles_root
+            profile_name = self.profile_name
             self._recognition_service = ScreenshotRecognitionService(
                 AnnotationService(profile_root, profile_name),
                 TemplateService(profile_root, profile_name),
@@ -1433,6 +2112,8 @@ class ReplayPage(QWidget):
                 if self._current_record is not None
                 else 0
             ),
+            profiles_root=self.profiles_root,
+            profile_name=self.profile_name,
         )
         thread.completed.connect(self._visual_completed)
         thread.failed.connect(self._show_error)
@@ -1458,6 +2139,8 @@ class ReplayPage(QWidget):
             truth_log,
             self,
             advisor_strategy=self.advisor_strategy,
+            profiles_root=self.profiles_root,
+            profile_name=self.profile_name,
         )
         thread.completed.connect(self._trusted_completed)
         thread.failed.connect(self._show_error)
@@ -1620,39 +2303,431 @@ class ReplayPage(QWidget):
             self._visual_thread is not None and self._visual_thread.isRunning()
         ):
             return
-        try:
-            baseline = self._truth_log_for_video_scan()
-            self._begin_truth_scan(baseline)
-        except Exception as exc:
-            message = str(exc)
+        if self._pure_scan_thread is not None and self._pure_scan_thread.isRunning():
+            return
+        video_path = self.current_session / "video" / "game.avi"
+        if not video_path.is_file():
+            message = "当前对局没有可读取的 AVI 录像"
             self.truth_scan_status.setText(f"扫描失败：{message}")
             self._show_error(message)
             return
-        thread = VisualRecognitionReplayThread(
-            self.current_session,
-            baseline,
+        frame_index_path = self.current_session / "video" / "frame_index.jsonl"
+        if not frame_index_path.is_file():
+            frame_index_path = None
+        try:
+            recognition = self._recognition()
+        except Exception as exc:
+            message = f"识别 profile 不可用：{exc}"
+            self.truth_scan_status.setText(f"扫描失败：{message}")
+            self._show_error(message)
+            return
+        output_root = self._pure_scan_output_root()
+        self._pure_scan_actions = []
+        self._pure_scan_result = None
+        self._proposed_scan_log = None
+        self._truth_scan_status = "running"
+        self._truth_scan_status_reason = ""
+        self._truth_scan_failure = None
+        self._truth_scan_session = self.current_session
+        self._start_truth_scan_progress()
+        thread = PureVideoScanThread(
+            video_path=video_path,
+            frame_index_path=frame_index_path,
+            output_root=output_root,
+            recognition=recognition,
             parent=self,
         )
-        thread.completed.connect(self._truth_scan_completed)
-        thread.failed.connect(self._truth_scan_failed)
-        thread.cancelled.connect(self._truth_scan_cancelled)
-        thread.turn_result.connect(self._collect_truth_scan_turn)
-        thread.frame_progress.connect(self._truth_scan_progress_changed)
-        thread.finished.connect(self._on_visual_thread_finished)
-        thread.replay_mode = "pipeline"
-        thread.use_saved_baseline = True
-        thread.recognition_strategy = str(self.recognition_strategy_combo.currentData())
-        self._visual_thread = thread
+        thread.completed.connect(self._pure_scan_completed)
+        thread.failed.connect(self._pure_scan_failed)
+        thread.cancelled.connect(self._pure_scan_cancelled)
+        thread.action_result.connect(self._collect_pure_scan_action)
+        thread.frame_progress.connect(self._pure_scan_progress_changed)
+        thread.finished.connect(self._on_pure_scan_thread_finished)
+        self._pure_scan_thread = thread
         self.visual_replay_button.setEnabled(False)
         self.truth_edit_button.setEnabled(False)
         self.truth_replay_button.setEnabled(False)
-        self.truth_scan_status.setText("扫描中：正在逐帧识别出牌，编辑与保存暂不可用")
+        self.truth_scan_status.setText(
+            "扫描中：纯 AVI 逐帧分析；不读取 timeline、TruthLog 或旧识别日志"
+        )
         self.diagnostics.setPlainText(
-            "正在逐帧识别出牌；使用与实时助手相同的状态机和识别策略。\n"
-            "识别结果仅保留在内存；完成后可编辑并点击『保存日志』写入 truth_log.json。"
+            "正在逐帧分析 AVI；分析结果会写入外部派生目录，完成后载入候选动作供人工校对。\n"
+            f"输出目录：{output_root}"
         )
         thread.start()
 
+    def _pure_scan_output_root(self) -> Path:
+        """Return an external run directory; never write scan output to a session."""
+
+        if self.current_session is None:
+            raise RuntimeError("尚未选择对局")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return (
+            Path.cwd()
+            / "reports"
+            / "video-scans"
+            / f"{self.current_session.name}_{stamp}"
+        )
+
+    @staticmethod
+    def _scan_result_value(result: object, name: str, default: object = None) -> object:
+        if isinstance(result, dict):
+            return result.get(name, default)
+        return getattr(result, name, default)
+
+    def _pure_scan_progress_changed(
+        self,
+        processed: int,
+        total: int,
+        frame_index: int,
+    ) -> None:
+        if self._truth_scan_session != self.current_session:
+            return
+        safe_total = max(1, int(total))
+        safe_processed = min(safe_total, max(0, int(processed)))
+        self._truth_scan_progress_processed = safe_processed
+        self._truth_scan_progress_total = safe_total
+        self._truth_scan_progress_frame_index = int(frame_index)
+        self.truth_scan_progress.setRange(0, safe_total)
+        self.truth_scan_progress.setValue(safe_processed)
+        self.truth_scan_progress.setVisible(True)
+        percent = (safe_processed * 100 + safe_total // 2) // safe_total
+        self.truth_scan_status.setText(
+            f"扫描中：{safe_processed}/{safe_total} 帧（{percent}%）"
+        )
+
+    def _collect_pure_scan_action(self, data: object) -> None:
+        if self._truth_scan_session != self.current_session:
+            return
+        if isinstance(data, dict):
+            self._pure_scan_actions.append(dict(data))
+
+    def _pure_scan_failed(self, message: str) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._pure_scan_thread:
+            return
+        if self._truth_scan_session != self.current_session:
+            return
+        self._truth_scan_failure = str(message)
+        self._truth_scan_status = "failed"
+        self.truth_scan_status.setText(f"扫描失败：{message}")
+        self._reset_truth_scan_progress()
+        self.truth_status.setText("出牌日志：扫描未完成，未自动保存")
+        InfoBar.error(title="扫描失败", content=str(message), parent=self)
+        self.diagnostics.insertPlainText(f"\n[纯 AVI 扫描失败] {message}\n")
+
+    def _pure_scan_cancelled(self) -> None:
+        if self._truth_scan_session != self.current_session:
+            return
+        self._truth_scan_status = "cancelled"
+        self.truth_scan_status.setText("扫描已取消；已保留外部已生成的分析证据")
+        self._reset_truth_scan_progress()
+
+    def _pure_scan_completed(self, result: object) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._pure_scan_thread:
+            return
+        if self._truth_scan_session != self.current_session:
+            return
+        self._pure_scan_result = result
+        status = str(self._scan_result_value(result, "status", "complete") or "complete")
+        reason = str(self._scan_result_value(result, "status_reason", "") or "")
+        self._truth_scan_status = status
+        self._truth_scan_status_reason = reason
+        self._truth_scan_progress_processed = self._truth_scan_progress_total
+        if self._truth_scan_progress_total > 0:
+            self.truth_scan_progress.setValue(self._truth_scan_progress_total)
+            self.truth_scan_progress.setEnabled(False)
+            self.truth_scan_progress.setVisible(True)
+        try:
+            proposed = self._truth_log_from_pure_scan_result(result)
+        except Exception as exc:
+            proposed = None
+            reason = reason or f"无法从扫描结果生成校对草稿：{exc}"
+            status = "needs_review"
+        if proposed is None:
+            self.scan_initial_state_button.setEnabled(True)
+        self._proposed_scan_log = proposed
+        if proposed is not None:
+            self.scan_initial_state_button.setEnabled(False)
+            self._truth_scan_log = proposed
+            self.truth_status.setText(
+                f"出牌日志：扫描草稿 {len(proposed.turns)} 条（未保存）"
+            )
+            if self._truth_editor is None:
+                self._show_truth_log_editor(proposed)
+            if self._truth_editor is not None:
+                self._truth_editor.setEnabled(True)
+        scan_dir = self._scan_result_value(
+            result,
+            "output_directory",
+            self._scan_result_value(result, "scan_directory", ""),
+        )
+        frames = self._scan_result_value(
+            result,
+            "decoded_frames",
+            self._scan_result_value(result, "frames_processed", "?"),
+        )
+        errors = self._scan_result_value(
+            result,
+            "failed_frames",
+            self._scan_result_value(result, "decode_errors", ()),
+        )
+        needs_review = self._scan_result_value(result, "needs_review", ())
+        review_count = self._scan_result_value(
+            result,
+            "needs_review_count",
+            len(needs_review) if isinstance(needs_review, (list, tuple)) else "?",
+        )
+        initial_complete = bool(
+            proposed is not None
+            and proposed.initial_state.round_level in RANKS
+            and proposed.initial_state.lead_player
+            in {"self", "right", "opposite", "left"}
+            and proposed.initial_state.my_hand
+        )
+        if not initial_complete and status == "complete":
+            status = "needs_review"
+        self._truth_scan_status = status
+        detail = reason or (
+            "请人工校对首家、级牌、手牌和动作"
+            if status != "complete"
+            else ""
+        )
+        self.truth_scan_status.setText(
+            f"扫描完成：{status}；处理帧数 {frames}；需要复核 {review_count}；"
+            "扫描日志已生成"
+        )
+        self.diagnostics.setPlainText(
+            "纯 AVI 逐帧扫描完成（未读取旧日志）\n"
+            f"状态：{status}\n"
+            f"处理帧数：{frames}\n"
+            f"解码错误：{len(errors) if isinstance(errors, (list, tuple)) else errors}\n"
+            f"候选动作：{len(self._pure_scan_actions)}\n"
+            f"输出目录：{scan_dir}\n"
+            + (f"待复核：{detail}\n" if detail else "")
+        )
+        if status == "complete":
+            InfoBar.success(
+                title="扫描完成",
+                content="已生成外部逐帧分析日志，请在下方校对后保存 TruthLog",
+                parent=self,
+            )
+        else:
+            InfoBar.warning(
+                title="扫描完成，需人工复核",
+                content=detail or "分析结果不完整，但原始扫描证据已保留",
+                parent=self,
+            )
+
+    def _open_pure_scan_initial_state_review(self) -> None:
+        """Let the user complete missing opening facts from the scan package."""
+
+        if self._pure_scan_result is None:
+            return
+        candidates = self._pure_scan_initial_candidates(self._pure_scan_result)
+        dialog = ScanInitialStateDialog(candidates, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        proposed = self._truth_log_from_pure_scan_result(
+            self._pure_scan_result,
+            initial_override=dialog.initial_state(),
+        )
+        if proposed is None:
+            self._show_error("初始状态仍不完整，未生成草稿")
+            return
+        self._proposed_scan_log = proposed
+        self._truth_scan_log = proposed
+        self.truth_status.setText(
+            f"出牌日志：扫描草稿 {len(proposed.turns)} 条（未保存）"
+        )
+        self.scan_initial_state_button.setEnabled(False)
+        self._show_truth_log_editor(proposed)
+        if self._truth_editor is not None:
+            self._truth_editor.setEnabled(True)
+
+    def _truth_log_from_pure_scan_result(
+        self,
+        result: object,
+        *,
+        initial_override: dict[str, object] | None = None,
+    ) -> TruthLog | None:
+        """Build a draft only when video evidence contains all initial facts.
+
+        A missing lead, level or hand is not filled with an arbitrary value.
+        In that case callers retain the scan package for manual review instead
+        of presenting a misleading, saveable TruthLog.
+        """
+
+        if self.current_session is None:
+            raise RuntimeError("尚未选择对局")
+        initial = initial_override or self._scan_result_value(result, "initial_state", {})
+        if not isinstance(initial, dict):
+            initial = {}
+        opening_path = self._scan_result_value(result, "opening_path", None)
+        if opening_path and initial_override is None:
+            path = Path(str(opening_path))
+            if path.is_file():
+                try:
+                    opening = json.loads(path.read_text("utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    opening = {}
+                if isinstance(opening, dict):
+                    initial = {
+                        **initial,
+                        "lead_player": opening.get("lead_player")
+                        or initial.get("lead_player"),
+                    }
+        # Opening cards and level are frame evidence, not a session baseline.
+        # Pick the richest opening observation so a missing first-frame read
+        # does not prevent the editor from loading a useful draft.
+        observations_path = self._scan_result_value(result, "observations_path", None)
+        if observations_path and initial_override is None:
+            path = Path(str(observations_path))
+            if path.is_file():
+                best_opening: dict[str, object] = {}
+                try:
+                    with gzip.open(path, "rt", encoding="utf-8") as stream:
+                        for line in stream:
+                            try:
+                                raw = json.loads(line)
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                continue
+                            candidate = raw.get("opening") if isinstance(raw, dict) else None
+                            if not isinstance(candidate, dict):
+                                continue
+                            hand = candidate.get("my_hand")
+                            score = (
+                                (2 if candidate.get("round_level") else 0)
+                                + (len(hand) if isinstance(hand, (list, tuple)) else 0)
+                            )
+                            old_hand = best_opening.get("my_hand")
+                            old_score = (
+                                (2 if best_opening.get("round_level") else 0)
+                                + (len(old_hand) if isinstance(old_hand, (list, tuple)) else 0)
+                            )
+                            if score > old_score:
+                                best_opening = candidate
+                except (OSError, EOFError, gzip.BadGzipFile):
+                    best_opening = {}
+                if best_opening:
+                    initial = {
+                        **initial,
+                        "round_level": initial.get("round_level")
+                        or best_opening.get("round_level"),
+                        "my_hand": initial.get("my_hand")
+                        or best_opening.get("my_hand"),
+                        "lead_player": initial.get("lead_player")
+                        or best_opening.get("lead_player_signal"),
+                    }
+        round_level = str(
+            initial.get("round_level") or initial.get("wild_rank") or ""
+        )
+        lead = str(initial.get("lead_player") or "")
+        hand_raw = initial.get("my_hand", ())
+        hand = tuple(str(card) for card in hand_raw) if isinstance(hand_raw, (list, tuple)) else ()
+        if (
+            round_level not in RANKS
+            or lead not in {"self", "right", "opposite", "left"}
+            or not hand
+        ):
+            return None
+        action_rows: object = self._scan_result_value(result, "action_trace", ())
+        action_path = self._scan_result_value(result, "action_trace_path", None)
+        if action_path:
+            path = Path(str(action_path))
+            if path.is_file():
+                action_rows = read_json_lines(path)
+        if not isinstance(action_rows, (list, tuple)):
+            action_rows = ()
+        session_id = self.current_session.name
+        manifest_path = self.current_session / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                session_id = str(
+                    json.loads(manifest_path.read_text("utf-8")).get("session_id")
+                    or session_id
+                )
+            except Exception:
+                pass
+
+        # Keep one conversion boundary for the single-session UI and the
+        # batch/session-corpus paths.  The baseline contributes only session
+        # metadata and the manually/visually confirmed initial state; the
+        # canonical action trace remains the sole source of turn data.
+        baseline = TruthLog(
+            source_session_id=session_id,
+            initial_state=TruthInitialState(round_level, lead, hand),
+            turns=(),
+            source_video="video/game.avi",
+            frame_index_path=(
+                "video/frame_index.jsonl"
+                if (self.current_session / "video" / "frame_index.jsonl").is_file()
+                else ""
+            ),
+        )
+        generated = build_truth_log_from_scan(baseline, action_rows)
+        self._pure_scan_review_items = generated.review_items
+        return generated.truth_log
+
+    def _pure_scan_initial_candidates(self, result: object) -> dict[str, object]:
+        """Read candidate initial facts from scan artifacts for manual review."""
+
+        candidates: dict[str, object] = {}
+        opening_path = self._scan_result_value(result, "opening_path", None)
+        if opening_path:
+            path = Path(str(opening_path))
+            if path.is_file():
+                try:
+                    value = json.loads(path.read_text("utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    value = {}
+                if isinstance(value, dict):
+                    candidates.update(
+                        {
+                            "lead_player": value.get("lead_player"),
+                            "candidates": value.get("candidates", ()),
+                        }
+                    )
+        observations_path = self._scan_result_value(result, "observations_path", None)
+        if observations_path:
+            path = Path(str(observations_path))
+            if path.is_file():
+                best: dict[str, object] = {}
+                try:
+                    with gzip.open(path, "rt", encoding="utf-8") as stream:
+                        for line in stream:
+                            try:
+                                raw = json.loads(line)
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                continue
+                            opening = raw.get("opening") if isinstance(raw, dict) else None
+                            if not isinstance(opening, dict):
+                                continue
+                            hand = opening.get("my_hand")
+                            score = (
+                                (2 if opening.get("round_level") else 0)
+                                + (len(hand) if isinstance(hand, (list, tuple)) else 0)
+                            )
+                            old_hand = best.get("my_hand")
+                            old_score = (
+                                (2 if best.get("round_level") else 0)
+                                + (len(old_hand) if isinstance(old_hand, (list, tuple)) else 0)
+                            )
+                            if score > old_score:
+                                best = opening
+                except (OSError, EOFError, gzip.BadGzipFile):
+                    best = {}
+                if best:
+                    candidates.update(
+                        {
+                            "round_level": best.get("round_level"),
+                            "my_hand": best.get("my_hand", ()),
+                            "lead_player": candidates.get("lead_player")
+                            or best.get("lead_player_signal"),
+                        }
+                    )
+        return candidates
     def replay_visual(self) -> None:
         """Compatibility entry point for the former standalone visual scan."""
         self.analyze_video_to_truth_log()
@@ -1969,11 +3044,11 @@ class ReplayPage(QWidget):
         )
         if result_status == "complete":
             self.truth_scan_status.setText(
-                "扫描完成：动作链已闭合，可编辑并点击『保存日志』写入 truth_log.json"
+                "扫描完成：动作链已闭合，可编辑并点击『保存 TruthLog』写入 truth_log.json"
             )
             InfoBar.success(
                 title="扫描完成",
-                content="动作链已闭合，可编辑并点击『保存日志』写入 truth_log.json",
+                content="动作链已闭合，可编辑并点击『保存 TruthLog』写入 truth_log.json",
                 parent=self,
             )
         else:
@@ -2083,6 +3158,29 @@ class ReplayPage(QWidget):
             and bool(self.truth_log.turns)
         )
 
+    @Slot()
+    def _on_pure_scan_thread_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, PureVideoScanThread):
+            self._pure_scan_finished(thread)
+
+    def _pure_scan_finished(self, thread: PureVideoScanThread) -> None:
+        if thread is not self._pure_scan_thread:
+            return
+        self._pure_scan_thread = None
+        self._set_session_actions(
+            self.current_session is not None,
+            playable=(
+                self.current_session is not None
+                and (self.current_session / "video" / "game.avi").is_file()
+                and (self.current_session / "video" / "frame_index.jsonl").is_file()
+            ),
+            scannable=(
+                self.current_session is not None
+                and (self.current_session / "video" / "game.avi").is_file()
+            ),
+        )
+
     def _trusted_finished(self, thread: TrustedAdviceReplayThread) -> None:
         if thread is not self._trusted_thread:
             return
@@ -2093,6 +3191,10 @@ class ReplayPage(QWidget):
                 self.current_session is not None
                 and (self.current_session / "video" / "game.avi").is_file()
                 and (self.current_session / "video" / "frame_index.jsonl").is_file()
+            ),
+            scannable=(
+                self.current_session is not None
+                and (self.current_session / "video" / "game.avi").is_file()
             ),
         )
 
@@ -2133,6 +3235,12 @@ class ReplayPage(QWidget):
         if self._visual_thread is not None and self._visual_thread.isRunning():
             self._visual_thread.stop()
             self._visual_thread.wait(30_000)
+        if self._pure_scan_thread is not None and self._pure_scan_thread.isRunning():
+            self._pure_scan_thread.stop()
+            self._pure_scan_thread.wait(30_000)
+        if self._unverified_batch_thread is not None and self._unverified_batch_thread.isRunning():
+            self._unverified_batch_thread.stop()
+            self._unverified_batch_thread.wait(30_000)
         if self._trusted_thread is not None and self._trusted_thread.isRunning():
             self._trusted_thread.stop()
             self._trusted_thread.wait(30_000)

@@ -38,6 +38,9 @@ class LiveV2RuleCommandsMixin:
         update = self._process(EngineInput(
             captured_watermark_ms=candidate.last_captured_ms
         ))
+        register = getattr(self, "_register_visual_correction", None)
+        if callable(register):
+            register(committed.action)
         return replace(
             update, event=committed.events[-1], events=committed.events
         )

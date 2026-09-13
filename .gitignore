@@ -33,6 +33,7 @@ release/
 /artifacts/
 *.egg-info/
 .worktrees/
+.workbuddy/
 .superpowers/
 
 # Project runtime output. Keep profile templates/configuration/model assets tracked.
@@ -86,3 +87,10 @@ Desktop.ini
 .codex/
 .agents/
 AGENTS.md
+
+.cache/
+*.pid
+*.prof
+*.trace
+*.sqlite
+*.sqlite3

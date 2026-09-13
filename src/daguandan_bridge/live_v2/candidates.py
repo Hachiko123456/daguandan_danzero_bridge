@@ -33,6 +33,7 @@ class CandidateReason(str, Enum):
     LOCAL_ACTION_CONFIRMED = "local_action_confirmed"
     OPENING_ACTION_CONFIRMED = "opening_action_confirmed"
     RECONCILIATION_EVIDENCE = "reconciliation_evidence"
+    VISUAL_CORRECTION = "visual_correction"
 
 
 class EvidenceOrigin(str, Enum):
@@ -122,6 +123,13 @@ class ActionCandidate:
                 raise ValueError("candidate evidence frame_sequence must strictly increase")
             if self.last_frame.captured_ms <= self.first_frame.captured_ms:
                 raise ValueError("candidate evidence captured_ms must strictly increase")
+        elif self.reason is CandidateReason.VISUAL_CORRECTION:
+            if self.evidence_origin is not EvidenceOrigin.VISUAL:
+                raise ValueError("visual correction requires VISUAL evidence origin")
+            if len(self.evidence_ids) < 1:
+                raise ValueError("visual correction requires evidence")
+            if self.audit_evidence_ids:
+                raise ValueError("visual correction cannot claim audit evidence")
         else:
             allowed_origins = (
                 {EvidenceOrigin.MANUAL, EvidenceOrigin.TRUSTED}
@@ -264,6 +272,13 @@ class ConfirmedAction:
                 raise ValueError("confirmed pass cannot contain cards or suit_options")
             if self.semantics is not None:
                 raise ValueError("confirmed pass cannot contain action semantics")
+
+    @property
+    def partial_suits(self) -> bool:
+        """Whether any confirmed physical card still has multiple suit options."""
+        return self.kind is ActionKind.PLAY and any(
+            len(options) != 1 for options in self.suit_options
+        )
 
     @property
     def candidate_ids(self) -> tuple[str, ...]:

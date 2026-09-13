@@ -20,13 +20,13 @@ import cv2
 
 from ..advisor_strategy import build_advisor
 from ..annotation_service import AnnotationService
+from ..application.live_v2_recorded_replay import replay_video_through_production_live_v2
 from ..live.replay import (
     ReplayComparison,
     TrustedAdviceReplayResult,
     VideoReplaySource,
     VisualPipelineReplayResult,
     replay_truth_through_live_advisor,
-    replay_video_through_live_pipeline,
 )
 from ..live.session_store import read_json_lines
 from ..live.truth_log import TruthLog, load_truth_log
@@ -38,6 +38,7 @@ _ACTION_TYPES = frozenset({"player_played", "player_passed", "manual_confirmed_e
 _GAP_TYPES = frozenset({"terminal_history_gap", "history_gap_detected"})
 _FRAME_WARNINGS = frozenset({"missing_video_frames", "extra_video_frames"})
 _SEATS = ("self", "right", "opposite", "left")
+ProgressCallback = Callable[[str, str, int, int, str], None]
 
 
 @dataclass(frozen=True)
@@ -149,15 +150,27 @@ class SessionReplayAuditService:
         *,
         recognition_factory: Callable[[Path], ScreenshotRecognitionService] | None = None,
         opening_probe: Callable[[Path, ScreenshotRecognitionService, dict[str, object]], dict[str, object]] | None = None,
-        visual_replay: Callable[..., VisualPipelineReplayResult] = replay_video_through_live_pipeline,
+        visual_replay: Callable[..., VisualPipelineReplayResult] | None = None,
         advisor_factory: Callable[[Path, str], Any] | None = None,
         advisor_replay: Callable[..., TrustedAdviceReplayResult] = replay_truth_through_live_advisor,
+        profile_root: Path | str | None = None,
+        trusted_session_ids: Iterable[str] = (),
     ) -> None:
-        self._recognition_factory = recognition_factory or _recognition_for_session
-        self._opening_probe = opening_probe or _opening_agreement
-        self._visual_replay = visual_replay
+        self._profile_root = Path(profile_root).resolve() if profile_root is not None else None
+        self._recognition_factory = recognition_factory or (
+            _recognition_for_profile(self._profile_root)
+            if self._profile_root is not None
+            else _recognition_for_session
+        )
+        # ``opening_probe`` is retained only for legacy/unit-test injection.
+        # The production audit deliberately has no pre-replay TruthLog probe.
+        self._opening_probe = opening_probe
+        self._visual_replay = visual_replay or replay_video_through_production_live_v2
         self._advisor_factory = advisor_factory or _fabledan_for_profile
         self._advisor_replay = advisor_replay
+        self._trusted_session_ids = frozenset(
+            str(item).strip() for item in trusted_session_ids if str(item).strip()
+        )
 
     def audit(
         self,
@@ -167,33 +180,42 @@ class SessionReplayAuditService:
         scan_run_id: str | Iterable[str] | None = None,
         run_id: str | None = None,
         command: Iterable[str] | None = None,
+        session_paths: Iterable[Path | str] | None = None,
+        on_progress: ProgressCallback | None = None,
     ) -> SessionReplayAuditRun:
         roots = _normalize_roots(session_roots)
+        explicit_sessions = _normalize_explicit_sessions(session_paths)
+        source_roots = _unique_paths((*roots, *(item.source for item in explicit_sessions)))
         output_root = Path(output).resolve()
-        _reject_internal_output(output_root, roots)
+        _reject_internal_output(output_root, source_roots)
         run_dir = output_root / _safe_name(run_id or _new_run_id())
-        _reject_internal_output(run_dir, roots)
+        _reject_internal_output(run_dir, source_roots)
         run_dir.mkdir(parents=True, exist_ok=False)
 
-        sessions = _discover(roots)
-        before = _source_snapshot(roots)
+        sessions = _discover(roots, explicit_sessions=explicit_sessions)
+        before = _source_snapshot(source_roots)
         before_path = run_dir / "source_snapshot_before.json"
         atomic_write_json(before_path, before)
-        inventory = _inventory(sessions, roots, scan_run_id)
+        inventory = _inventory(sessions, source_roots, scan_run_id, profile_root=self._profile_root)
         inventory_path = run_dir / "inventory.json"
         atomic_write_json(inventory_path, inventory)
         rows: list[dict[str, object]] = []
-        for session in sessions:
+        for index, session in enumerate(sessions, start=1):
             session_dir = run_dir / "sessions" / session.store_id / _safe_name(session.session_id)
+            if on_progress is not None:
+                on_progress("session_start", session.session_id, index - 1, len(sessions), "准备会话")
             rows.append(
                 self._audit_session(
                     session,
                     session_dir,
                     scan_run_id,
                     _inventory_row(inventory, session),
+                    on_progress=on_progress,
                 )
             )
-        after = _source_snapshot(roots)
+            if on_progress is not None:
+                on_progress("session_done", session.session_id, index, len(sessions), "会话完成")
+        after = _source_snapshot(source_roots)
         after_path = run_dir / "source_snapshot_after.json"
         atomic_write_json(after_path, after)
         summary = _make_summary(
@@ -228,13 +250,26 @@ class SessionReplayAuditService:
         output: Path,
         scan_run_id: str | Iterable[str] | None,
         inventory: dict[str, object],
+        *,
+        on_progress: ProgressCallback | None = None,
     ) -> dict[str, object]:
+        """Run the visual audit first; load TruthLog only as post-run evidence.
+
+        The default visual path intentionally starts with no TruthLog object and
+        no saved level/hand/lead.  A custom ``opening_probe`` is supported for
+        old unit tests only and is never selected by the production CLI.
+        """
         output.mkdir(parents=True, exist_ok=True)
-        reference = resolve_truth_audit_reference(item.source, scan_run_id=scan_run_id)
+        reference: TruthAuditReference | None = None
         initial_frame_inventory = inventory.get("frame_index", {})
         initial_frame_inventory = (
             initial_frame_inventory if isinstance(initial_frame_inventory, dict) else {}
         )
+
+        def report(phase: str, processed: int = 0, total: int = 0, detail: str = "") -> None:
+            if on_progress is not None:
+                on_progress(phase, item.session_id, int(processed), int(total), detail)
+
         row: dict[str, object] = {
             "source": str(item.source),
             "sessions_root": str(item.root),
@@ -247,29 +282,73 @@ class SessionReplayAuditService:
             "fabledan_quality": "not_evaluated",
             "frames_processed": 0,
             "indexed_frames": int(initial_frame_inventory.get("row_count", 0) or 0),
-            "truth_log": {"kind": reference.kind if reference else "none", "path": str(reference.path) if reference else None},
+            "truth_log": {
+                "kind": str(inventory.get("truth_kind", "none")),
+                "path": inventory.get("truth_path"),
+                "loaded_before_visual_replay": False,
+            },
             "inventory": inventory,
             "evidence_paths": {"session_audit": str(output)},
         }
+        truth: TruthLog | None = None
+        opening: dict[str, object] = {}
         try:
-            truth = _load_truth(item.source, reference)
-            row["truth_log"] = _truth_metadata(reference, truth)
-            expected_initial = _expected_initial(item.source, truth)
             recognition = self._recognition_factory(item.source)
-            opening = self._opening_probe(item.source, recognition, expected_initial)
+            legacy_probe = self._opening_probe
+            if legacy_probe is not None:
+                # Compatibility path for injected test doubles.  The default
+                # CLI never enters this branch.
+                # Legacy injected probes may inspect the recorded timeline,
+                # but they must not receive TruthLog data before visual replay.
+                expected_initial = _stored_initial(item.source)
+                report("opening", 0, 0, "检查级牌、手牌和首出（兼容测试注入）")
+                opening = legacy_probe(item.source, recognition, expected_initial)
+            else:
+                report("opening", 0, 0, "生产开局链路：页面/牌桌/级牌/手牌/首出")
+
             visual_advisor = self._advisor(item.source)
+            report("visual", 0, int(initial_frame_inventory.get("row_count", 0) or 0), "开始 LiveV2 视觉监听回放")
+            visual_kwargs: dict[str, object] = {}
+            if on_progress is not None:
+                visual_kwargs["on_progress"] = (
+                    lambda processed, total, frame: report(
+                        "visual", processed, total, f"帧 {frame}"
+                    )
+                )
+            if legacy_probe is None and self._visual_replay is replay_video_through_production_live_v2:
+                visual_kwargs["profile_root"] = self._profile_root or item.source.parent.parent
+                visual_kwargs["advisor"] = visual_advisor
+            else:
+                # Existing injected doubles use the historical signature, but
+                # the visual replay must never receive TruthLog as an input.
+                # TruthLog is resolved and loaded only after this call returns.
+                visual_kwargs["use_live_pipeline"] = True
+                visual_kwargs["recognition_strategy"] = "two_valid_streak"
+                visual_kwargs["advisor"] = visual_advisor
             result = self._visual_replay(
                 item.source,
                 recognition,
-                truth_log=reference.path if reference else None,
-                use_live_pipeline=True,
-                recognition_strategy="two_valid_streak",
                 output_root=output / "visual_driven",
-                advisor=visual_advisor,
+                **visual_kwargs,
             )
+
+            # Resolve, load and hash TruthLog only after visual replay has
+            # completed, solely for comparison and isolated advice.
+            reference = resolve_truth_audit_reference(item.source, scan_run_id=scan_run_id)
+            truth = _load_truth(item.source, reference)
+            row["truth_log"]["loaded_before_visual_replay"] = False  # type: ignore[index]
+            if legacy_probe is None:
+                opening = dict(getattr(result, "opening", {}) or {})
+
+            if truth is not None:
+                row["truth_log"] = _truth_metadata(
+                    reference,
+                    truth,
+                    trusted=item.session_id in self._trusted_session_ids,
+                )
+                row["truth_log"]["loaded_before_visual_replay"] = False  # type: ignore[index]
             events = _read_replay_events(result.output_path)
             visual = summarize_visual_events(events)
-            recorded = summarize_visual_events(read_json_lines(item.source / "timeline.jsonl"))
             frame_inventory = inventory.get("frame_index", {})
             frame_inventory = frame_inventory if isinstance(frame_inventory, dict) else {}
             indexed = int(frame_inventory.get("row_count", 0))
@@ -279,6 +358,9 @@ class SessionReplayAuditService:
                 and bool(frame_inventory.get("continuous"))
                 and not frame_inventory.get("parse_error")
                 and not any(w.reason in _FRAME_WARNINGS for w in result.warnings)
+            )
+            listener_status, listener_status_reason = _listener_completion(
+                result, visual, complete, legacy_compat=legacy_probe is not None
             )
             metrics = _field_metrics(truth, opening, visual) if truth else _na_metrics()
             divergence = _first_divergence(truth, opening, visual)
@@ -294,26 +376,69 @@ class SessionReplayAuditService:
                 if divergence
                 else None
             )
-            visual_fabledan = _visual_advice_summary(result, visual_advisor)
-            truth_fabledan = self._truth_advice(item.source, output, reference)
+            visual_fabledan = _visual_advice_summary(
+                result, visual_advisor, listener_status=listener_status
+            )
+            report("fabledan_truth", 0, len(truth.turns) if truth is not None else 0, "完整 TruthLog 驱动 FableDan")
+            truth_fabledan = self._truth_advice(
+                item.source,
+                output,
+                reference,
+                on_progress=(
+                    lambda processed, total, detail: report(
+                        "fabledan_truth", processed, total, detail
+                    )
+                )
+                if on_progress is not None
+                else None,
+            )
             truth_tool_complete = (
                 not truth_fabledan.get("available")
                 or bool(truth_fabledan.get("completed"))
             )
-            execution_complete = complete and truth_tool_complete
-            strict = _strict_quality(metrics) if reference and reference.kind == "canonical" else "diagnostic"
+            execution_complete = listener_status == "complete" and truth_tool_complete
+            strict = (
+                _strict_quality(metrics)
+                if reference
+                and reference.kind == "canonical"
+                and truth is not None
+                and (
+                    truth.label_status == "verified"
+                    or item.session_id in self._trusted_session_ids
+                )
+                else "diagnostic"
+            )
             row.update(
                 {
                     "status": "completed" if execution_complete else "error",
                     "execution_status": "completed" if execution_complete else "incomplete",
+                    "frame_replay_status": "complete" if complete else "incomplete",
+                    "opening_status": str(opening.get("status", "recognized" if opening else "not_observable")),
+                    "listener_status": listener_status,
+                    "listener_status_reason": listener_status_reason,
+                    "comparison_status": strict,
                     "truth_quality": strict,
-                    "visual_quality": _visual_quality(metrics, complete),
-                    "fabledan_quality": _advice_quality(truth_fabledan, visual_fabledan),
+                    "truth_qualification": (
+                        "trusted_for_run"
+                        if item.session_id in self._trusted_session_ids
+                        else "verified_label"
+                        if truth is not None and truth.label_status == "verified"
+                        else "reference_only"
+                    ),
                     "frames_processed": result.frame_count,
                     "indexed_frames": indexed,
-                    "initial_visual_agreement": opening,
-                    "visual": visual,
-                    "recorded_timeline_diagnostics": recorded,
+                    "processed_turns": result.processed_turn_count,
+                    "visual_quality": _visual_quality(
+                        metrics, listener_status == "complete"
+                    ),
+                    "fabledan_quality": _advice_quality(
+                        truth_fabledan, visual_fabledan
+                    ),
+                    "lineage": {
+                        "runtime": "live_v2" if not legacy_probe else "legacy_injected_test_double",
+                        "legacy_orchestrator_used": bool(legacy_probe is not None),
+                        "truth_log_used_as_visual_input": False if legacy_probe is None else True,
+                    },
                     "field_metrics": metrics,
                     "warnings": [{"reason": w.reason, "details": w.details} for w in result.warnings],
                     "timeline_comparison": _comparison_summary(result.comparison),
@@ -329,8 +454,8 @@ class SessionReplayAuditService:
             )
             if not execution_complete:
                 row["error"] = (
-                    f"frame replay incomplete: processed={result.frame_count}, indexed={indexed}"
-                    if not complete
+                    f"frame/listener replay incomplete: processed={result.frame_count}, indexed={indexed}, status={result.status}"
+                    if listener_status != "complete"
                     else str(truth_fabledan.get("error", "truth-driven advisor replay incomplete"))
                 )
         except Exception as exc:
@@ -339,43 +464,83 @@ class SessionReplayAuditService:
         return row
 
     def _advisor(self, session: Path) -> Any:
-        advisor = self._advisor_factory(session.parent.parent.parent, session.parent.parent.name)
+        profile = self._profile_root or session.parent.parent
+        advisor = self._advisor_factory(profile.parent, profile.name)
         if hasattr(advisor, "write_decision_log"):
             advisor.write_decision_log = False
         return advisor
 
     def _truth_advice(
-        self, session: Path, output: Path, reference: TruthAuditReference | None
+        self,
+        session: Path,
+        output: Path,
+        reference: TruthAuditReference | None,
+        *,
+        on_progress: Callable[[int, int, str], None] | None = None,
     ) -> dict[str, object]:
         if reference is None:
             return {"available": False, "quality": "not_available", "reason": "no explicitly selected truth log"}
         try:
             advisor = self._advisor(session)
+            load_truth_log(reference.path, session_id=_session_id(session))
+            advice_kwargs: dict[str, object] = {}
+            if on_progress is not None:
+                advice_kwargs["on_progress"] = (
+                    lambda processed, total, turn_id: on_progress(
+                        processed,
+                        total,
+                        f"TruthLog 回合 {turn_id}/{total}",
+                    )
+                )
             result = self._advisor_replay(
                 session,
                 advisor,
                 truth_log=reference.path,
                 output_root=output / "truth_driven",
+                **advice_kwargs,
             )
+            if on_progress is not None:
+                on_progress(
+                    int(result.processed_turn_count),
+                    int(result.turn_count),
+                    f"推荐处理 {result.processed_turn_count}/{result.turn_count}",
+                )
             summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
             statuses = summary.get("advice_statuses", {})
+            advice = {
+                "requested": int(result.advice_requested),
+                "ready": int(result.advice_ready),
+                "failed": int(result.advice_failed),
+                "stale": int(result.advice_stale),
+                "timeout": int(result.advice_timeouts),
+                "timeouts": int(result.advice_timeouts),
+                "withheld": int(statuses.get("withheld", 0)),
+                "statuses": statuses,
+            }
+            if advice["failed"] or advice["timeout"]:
+                status = "failed"
+                status_reason = "advice_failure_or_timeout"
+            elif not bool(result.completed):
+                status = "incomplete"
+                status_reason = "truth_replay_incomplete"
+            else:
+                # A completed trusted replay with no failed/timeout requests
+                # is a valid TruthLog-driven FableDan result. Stale counts,
+                # if any, remain visible in ``advice`` and do not turn a
+                # completed trusted channel into a false failure.
+                status = "passed"
+                status_reason = "truth_replay_completed"
             return {
                 "available": True,
+                "status": status,
+                "status_reason": status_reason,
+                "quality": status,
                 "truth_log_kind": reference.kind,
                 "run_directory": str(result.run_directory),
-                "completed": result.completed,
+                "completed": bool(result.completed),
                 "turn_count": result.turn_count,
                 "processed_turn_count": result.processed_turn_count,
-                "advice": {
-                    "requested": result.advice_requested,
-                    "ready": result.advice_ready,
-                    "failed": result.advice_failed,
-                    "stale": result.advice_stale,
-                    "timeout": result.advice_timeouts,
-                    "timeouts": result.advice_timeouts,
-                    "withheld": int(statuses.get("withheld", 0)),
-                    "statuses": statuses,
-                },
+                "advice": advice,
                 "advisor": _advisor_info(advisor),
                 "artifacts": _artifact_map(result.run_directory),
             }
@@ -498,10 +663,23 @@ def _effective_actions(rows: tuple[dict[str, object], ...]) -> list[dict[str, ob
     return actions
 
 
-def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str, object]) -> dict[str, object]:
+def _opening_evidence(opening: dict[str, object]) -> dict[str, object]:
+    confirmed = opening.get("confirmed")
+    if isinstance(confirmed, dict):
+        return confirmed
     reads = opening.get("reads", ())
-    actual_open = reads[0] if isinstance(reads, list) and reads else {}
-    actual_open = actual_open if isinstance(actual_open, dict) else {}
+    if isinstance(reads, list):
+        for row in reversed(reads):
+            if isinstance(row, dict) and row.get("candidate_ready"):
+                return row
+        for row in reversed(reads):
+            if isinstance(row, dict) and row.get("round_level") and row.get("hand"):
+                return row
+    return {}
+
+
+def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str, object]) -> dict[str, object]:
+    actual_open = _opening_evidence(opening)
     expected_hand = Counter(truth.initial_state.my_hand)
     actual_hand = Counter(str(card) for card in actual_open.get("hand", ()) or ())
     hand_matches = sum((expected_hand & actual_hand).values())
@@ -537,6 +715,13 @@ def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str
     actual_lead = confirmations[0].get("lead_player") if confirmations else None
     finish_expected = list(truth.outcome.finish_order)
     finish_actual = [row.get("actor") for row in visual.get("rankings", ())]
+    ranking_comparable = bool(truth.outcome.complete)
+    ranking_status = (
+        "strict" if ranking_comparable and finish_expected
+        else "diagnostic_only_outcome_incomplete" if finish_expected
+        else "not_available"
+    )
+    ranking_expected_for_metrics = finish_expected if ranking_comparable else []
     return {
         "strict": True,
         "level": _metric(1, int(actual_open.get("round_level") == truth.initial_state.round_level), truth.initial_state.round_level, actual_open.get("round_level")),
@@ -554,7 +739,15 @@ def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str
             "mismatches": changed, "missing_rows": expected[compared:], "added_rows": actual[compared:],
         },
         "wind_catch_chain": {"denominator": 0, "correct": 0, "errors": 0, "accuracy": None, "status": "diagnostic_only_truth_schema_has_no_wind_chain", "actual": visual.get("wind_catch_chain", ())},
-        "ranking": {**_metric(len(finish_expected), sum(a == b for a, b in zip(finish_expected, finish_actual))), "expected": finish_expected, "actual": finish_actual, "status": "strict" if finish_expected else "not_available"},
+        "ranking": {
+            **_metric(
+                len(ranking_expected_for_metrics),
+                sum(a == b for a, b in zip(ranking_expected_for_metrics, finish_actual)),
+            ),
+            "expected": finish_expected,
+            "actual": finish_actual,
+            "status": ranking_status,
+        },
     }
 
 
@@ -565,9 +758,7 @@ def _na_metrics() -> dict[str, object]:
 def _first_divergence(truth: TruthLog | None, opening: dict[str, object], visual: dict[str, object]) -> dict[str, object] | None:
     if truth is None:
         return None
-    reads = opening.get("reads", ())
-    actual_open = reads[0] if isinstance(reads, list) and reads else {}
-    actual_open = actual_open if isinstance(actual_open, dict) else {}
+    actual_open = _opening_evidence(opening)
     expected_open = {"round_level": truth.initial_state.round_level, "hand": sorted(truth.initial_state.my_hand), "lead_player": truth.initial_state.lead_player}
     if expected_open["round_level"] != actual_open.get("round_level") or Counter(expected_open["hand"]) != Counter(actual_open.get("hand", ())):
         return {"kind": "initial_state", "field": "round_level_or_hand", "frame_index": _int_or_none(actual_open.get("frame_index")) or 0, "monotonic_ms": _int_or_none(actual_open.get("monotonic_ms")), "expected": expected_open, "actual": actual_open}
@@ -587,7 +778,7 @@ def _first_divergence(truth: TruthLog | None, opening: dict[str, object], visual
     expected_ranking = list(truth.outcome.finish_order)
     actual_ranking_rows = list(visual.get("rankings", ()))
     actual_ranking = [row.get("actor") for row in actual_ranking_rows]
-    if expected_ranking and expected_ranking != actual_ranking:
+    if truth.outcome.complete and expected_ranking and expected_ranking != actual_ranking:
         first_rank = actual_ranking_rows[0] if actual_ranking_rows else {}
         fallback_frame = truth.turns[-1].frame_index if truth.turns else 0
         return {
@@ -924,12 +1115,84 @@ def _save_frame_rois(video: Path, index: int, output: Path, actor: str) -> dict[
     return saved
 
 
-def _visual_advice_summary(result: VisualPipelineReplayResult, advisor: Any) -> dict[str, object]:
+def _visual_advice_summary(
+    result: VisualPipelineReplayResult,
+    advisor: Any,
+    *,
+    listener_status: str | None = None,
+) -> dict[str, object]:
+    """Summarize visual advice without treating an empty run as success.
+
+    Replay completion means the input frames were consumed; it does not prove
+    that the listener reached an advice opportunity.  The status below keeps
+    "not exercised", "withheld because the listener is incomplete", and a real
+    successful advice run distinct.
+    """
+
+    requested = int(result.advice_requested or 0)
+    ready = int(result.advice_ready or 0)
+    failed = int(result.advice_failed or 0)
+    stale = int(result.advice_stale or 0)
+    timeouts = int(result.advice_timeouts or 0)
+    withheld = int(result.advice_withheld or 0)
+    identity = getattr(result, "runtime_identity", {}) or {}
+    identity = identity if isinstance(identity, dict) else {}
+    effective_listener_status = listener_status or identity.get("listener_status")
+    result_status = str(getattr(result, "status", "") or "")
+    listener_gap = (
+        effective_listener_status in {
+            "incomplete", "blocked", "review_required", "error", "not_started"
+        }
+        or result_status in {"incomplete", "blocked", "review_required", "error"}
+        or withheld > 0
+    )
+
+    if failed > 0 or timeouts > 0:
+        status = "failed"
+        status_reason = "advice_failure_or_timeout"
+    elif listener_gap:
+        status = "withheld_due_listener_gap"
+        status_reason = (
+            "advice_withheld"
+            if withheld > 0
+            else f"listener_status={effective_listener_status or result_status or 'unknown'}"
+        )
+    elif requested == 0:
+        status = "not_exercised"
+        status_reason = "no_advice_requests"
+    elif bool(getattr(result, "completed", False)) and ready == requested and stale == 0:
+        status = "passed"
+        status_reason = "advice_requests_completed"
+    elif bool(getattr(result, "completed", False)) and ready + stale >= requested:
+        # ``stale`` means the production advice result was superseded before
+        # consumption. It is an explicit visual-channel advisory, not a
+        # FableDan failure and must never be hidden or relabeled as passed.
+        status = "completed_with_stale"
+        status_reason = "advice_requests_completed_with_stale"
+    else:
+        status = "incomplete"
+        status_reason = "visual_replay_not_completed_or_advice_incomplete"
+
     return {
-        "available": True, "completed": result.completed, "processed_turn_count": result.processed_turn_count,
+        "available": True,
+        "status": status,
+        "status_reason": status_reason,
+        "completed": bool(result.completed),
+        "listener_status": effective_listener_status,
+        "processed_turn_count": result.processed_turn_count,
         "run_directory": str(result.run_directory) if result.run_directory else None,
-        "advice": {"requested": result.advice_requested, "ready": result.advice_ready, "failed": result.advice_failed, "stale": result.advice_stale, "timeout": result.advice_timeouts, "timeouts": result.advice_timeouts, "withheld": result.advice_withheld, "statuses": dict(result.advice_statuses)},
-        "advisor": _advisor_info(advisor), "artifacts": {name: str(path) for name, path in result.artifact_paths.items()},
+        "advice": {
+            "requested": requested,
+            "ready": ready,
+            "failed": failed,
+            "stale": stale,
+            "timeout": timeouts,
+            "timeouts": timeouts,
+            "withheld": withheld,
+            "statuses": dict(result.advice_statuses),
+        },
+        "advisor": _advisor_info(advisor),
+        "artifacts": {name: str(path) for name, path in result.artifact_paths.items()},
     }
 
 
@@ -964,9 +1227,15 @@ def _reject_internal_output(output: Path, roots: tuple[Path, ...]) -> None:
         raise ValueError("audit output must be outside every sessions root")
 
 
-def _discover(roots: tuple[Path, ...]) -> tuple[_Session, ...]:
+def _discover(
+    roots: tuple[Path, ...],
+    *,
+    explicit_sessions: tuple[_Session, ...] = (),
+) -> tuple[_Session, ...]:
     result: list[_Session] = []
     used: set[str] = set()
+    result.extend(explicit_sessions)
+    used.update(item.store_id for item in explicit_sessions)
     for index, root in enumerate(roots, start=1):
         label = root.parent.name if root.name.lower() == "sessions" else root.name
         store_id = f"{_safe_name(label or f'store_{index}')}_{hashlib.sha256(str(root).casefold().encode()).hexdigest()[:8]}"
@@ -981,25 +1250,79 @@ def _discover(roots: tuple[Path, ...]) -> tuple[_Session, ...]:
     return tuple(result)
 
 
-def _inventory(sessions: tuple[_Session, ...], roots: tuple[Path, ...], scan_run_id: str | Iterable[str] | None) -> dict[str, object]:
+def _normalize_explicit_sessions(values: Iterable[Path | str] | None) -> tuple[_Session, ...]:
+    if values is None:
+        return ()
+    result: list[_Session] = []
+    used: set[tuple[Path, str]] = set()
+    for value in values:
+        source = Path(value).resolve()
+        if not source.is_dir() or not (source / "manifest.json").is_file():
+            raise ValueError(f"explicit session must contain manifest.json: {source}")
+        root = source.parent
+        store_id = f"{_safe_name(root.name or 'session')}_{hashlib.sha256(str(root).casefold().encode()).hexdigest()[:8]}"
+        key = (source, store_id)
+        if key not in used:
+            result.append(_Session(source, root, store_id, _session_id(source)))
+            used.add(key)
+    return tuple(result)
+
+
+def _unique_paths(values: Iterable[Path]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    for value in values:
+        path = Path(value).resolve()
+        if path not in result:
+            result.append(path)
+    return tuple(result)
+
+
+def _inventory(
+    sessions: tuple[_Session, ...],
+    roots: tuple[Path, ...],
+    scan_run_id: str | Iterable[str] | None,
+    *,
+    profile_root: Path | None = None,
+) -> dict[str, object]:
     rows: list[dict[str, object]] = []
     profile_cache: dict[Path, dict[str, object]] = {}
+    scan_ids = _scan_run_ids(scan_run_id)
     for item in sessions:
-        reference = resolve_truth_audit_reference(item.source, scan_run_id=scan_run_id)
+        # Presence-only metadata is intentional. Do not call
+        # resolve_truth_audit_reference() here: reference selection, parsing and
+        # hashing belong to the post-visual comparison phase.
+        canonical_truth = item.source / "truth_log.json"
+        staged_truth = [
+            item.source / "derived" / "truth_scan_drafts" / run_id / "truth_log.json"
+            for run_id in scan_ids
+        ]
+        selected_truth = canonical_truth if canonical_truth.is_file() else next(
+            (path for path in staged_truth if path.is_file()), None
+        )
+        truth_kind = (
+            "canonical" if canonical_truth.is_file()
+            else "staged" if selected_truth is not None
+            else "none"
+        )
         frame_path = item.source / "video" / "frame_index.jsonl"
         frame_rows, frame_error = _read_lines_safe(frame_path)
         indices = [_int_or_none(row.get("frame_index")) for row in frame_rows]
         values = [value for value in indices if value is not None]
-        profile = item.source.parent.parent
+        profile = profile_root or item.source.parent.parent
         profile_data = profile_cache.setdefault(profile, _profile_inventory(profile))
         rows.append(
             {
                 "source": str(item.source), "sessions_root": str(item.root), "store_id": item.store_id, "session_id": item.session_id,
-                "truth_kind": reference.kind if reference else "none",
+                "truth_kind": truth_kind,
+                "truth_path": str(selected_truth) if selected_truth is not None else None,
                 "files": {
                     "manifest": _file_info(item.source / "manifest.json"), "video": _file_info(item.source / "video" / "game.avi"),
-                    "frame_index": _file_info(frame_path), "truth": _file_info(reference.path if reference else None),
-                    "canonical_truth": _file_info(item.source / "truth_log.json"), "recognition_trace": _file_info(item.source / "recognition_trace.jsonl"), "timeline": _file_info(item.source / "timeline.jsonl"),
+                    "frame_index": _file_info(frame_path),
+                    # TruthLog is presence metadata only during inventory;
+                    # its bytes/hash are post-visual evidence.
+                    "truth": _presence_file_info(selected_truth),
+                    "canonical_truth": _presence_file_info(canonical_truth),
+                    "recognition_trace": _file_info(item.source / "recognition_trace.jsonl"), "timeline": _file_info(item.source / "timeline.jsonl"),
                 },
                 "frame_index": {"row_count": len(frame_rows), "continuous": bool(values) and all(b == a + 1 for a, b in zip(values, values[1:])), "first": values[0] if values else None, "last": values[-1] if values else None, "duplicates": sorted(v for v, count in Counter(values).items() if count > 1), "parse_error": frame_error},
                 "profile_artifacts": profile_data,
@@ -1030,7 +1353,7 @@ def _source_snapshot(roots: tuple[Path, ...]) -> dict[str, dict[str, object]]:
             stat = path.stat()
             key = f"{root}::{path.relative_to(root).as_posix()}"
             data: dict[str, object] = {"relative_path": path.relative_to(root).as_posix(), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-            if path.name in {"manifest.json", "timeline.jsonl", "truth_log.json", "recognition_trace.jsonl", "game.avi", "frame_index.jsonl"}:
+            if path.name in {"manifest.json", "timeline.jsonl", "recognition_trace.jsonl", "game.avi", "frame_index.jsonl"}:
                 data["sha256"] = _sha_file(path)
             result[key] = data
     return result
@@ -1052,6 +1375,7 @@ def _aggregate_advice(rows: Iterable[dict[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for channel in ("truth_driven", "visual_driven"):
         totals = Counter()
+        status_counts = Counter()
         available = completed = 0
         for row in rows:
             fabledan = row.get("fabledan", {})
@@ -1060,16 +1384,24 @@ def _aggregate_advice(rows: Iterable[dict[str, object]]) -> dict[str, object]:
                 continue
             available += 1
             completed += bool(data.get("completed"))
+            status = data.get("status")
+            if status:
+                status_counts[str(status)] += 1
             advice = data.get("advice", {})
             if isinstance(advice, dict):
                 for name in ("requested", "ready", "failed", "stale", "timeout", "withheld"):
                     totals[name] += int(advice.get(name, 0) or 0)
-        result[channel] = {"available_sessions": available, "completed_sessions": completed, **dict(totals)}
+        result[channel] = {
+            "available_sessions": available,
+            "completed_sessions": completed,
+            "status_counts": dict(sorted(status_counts.items())),
+            **dict(totals),
+        }
     return result
 
 
 def _write_sessions_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
-    fields = ("store_id", "session_id", "source", "truth_kind", "execution_status", "truth_quality", "visual_quality", "fabledan_quality", "frames_processed", "indexed_frames", "visual_requested", "visual_ready", "truth_requested", "truth_ready")
+    fields = ("store_id", "session_id", "source", "truth_kind", "execution_status", "truth_quality", "visual_quality", "fabledan_quality", "visual_advice_status", "frames_processed", "indexed_frames", "visual_requested", "visual_ready", "truth_requested", "truth_ready")
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -1079,7 +1411,7 @@ def _write_sessions_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
             truth = fabledan.get("truth_driven", {}) if isinstance(fabledan, dict) else {}
             va = visual.get("advice", {}) if isinstance(visual, dict) else {}
             ta = truth.get("advice", {}) if isinstance(truth, dict) else {}
-            writer.writerow({"store_id": row.get("store_id"), "session_id": row.get("session_id"), "source": row.get("source"), "truth_kind": row.get("truth_log", {}).get("kind"), "execution_status": row.get("execution_status"), "truth_quality": row.get("truth_quality"), "visual_quality": row.get("visual_quality"), "fabledan_quality": row.get("fabledan_quality"), "frames_processed": row.get("frames_processed", 0), "indexed_frames": row.get("indexed_frames", 0), "visual_requested": va.get("requested", 0), "visual_ready": va.get("ready", 0), "truth_requested": ta.get("requested", 0), "truth_ready": ta.get("ready", 0)})
+            writer.writerow({"store_id": row.get("store_id"), "session_id": row.get("session_id"), "source": row.get("source"), "truth_kind": row.get("truth_log", {}).get("kind"), "execution_status": row.get("execution_status"), "truth_quality": row.get("truth_quality"), "visual_quality": row.get("visual_quality"), "fabledan_quality": row.get("fabledan_quality"), "visual_advice_status": visual.get("status"), "frames_processed": row.get("frames_processed", 0), "indexed_frames": row.get("indexed_frames", 0), "visual_requested": va.get("requested", 0), "visual_ready": va.get("ready", 0), "truth_requested": ta.get("requested", 0), "truth_ready": ta.get("ready", 0)})
 
 
 def _write_failures_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
@@ -1106,8 +1438,23 @@ def _write_markdown(path: Path, summary: dict[str, object]) -> None:
     for channel, data in summary.get("fabledan", {}).items():
         lines.append(f"- {channel}：{json.dumps(data, ensure_ascii=False)}")
     lines.extend(["", "## 会话", ""])
+    lines.extend([
+        "## 主链运行时",
+        "",
+        "主视觉验收链：LiveV2SessionRuntime -> LiveV2 Vision Runtime -> "
+        "LiveEngine -> ProductionRuleSession -> LiveV2 Advice/FableDan。",
+        "旧 LiveOrchestrator 仅属于兼容/单元测试路径，不是主链。",
+        "",
+        "## 会话",
+        "",
+    ])
     for row in summary.get("sessions", ()):
-        lines.append(f"- `{row.get('store_id')}/{row.get('session_id')}`：执行={row.get('execution_status')}，视觉={row.get('visual_quality')}，FableDan={row.get('fabledan_quality')}")
+        lines.append(
+            f"- `{row.get('store_id')}/{row.get('session_id')}`："
+            f"执行={row.get('execution_status')}，监听={row.get('listener_status')} "
+            f"({row.get('listener_status_reason')})，视觉={row.get('visual_quality')}，"
+            f"FableDan={row.get('fabledan_quality')}"
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1123,13 +1470,73 @@ def _verify(run_dir: Path, summary: dict[str, object], before: dict[str, dict[st
         "source_unchanged": before == after,
         "required_artifacts_exist": all((run_dir / name).is_file() for name in ("all_session_audit.json", "inventory.json", "sessions.csv", "failures.csv", "summary.md", "source_snapshot_before.json", "source_snapshot_after.json")),
         "per_session_summaries_exist": all((run_dir / "sessions" / str(row.get("store_id")) / _safe_name(str(row.get("session_id"))) / "summary.json").is_file() for row in rows),
+        "per_session_quality": all(
+            not _is_strict_row(row) or not _row_quality_failures(row)
+            for row in rows if isinstance(row, dict)
+        ),
     }
     return {"schema": "guandan.session-replay-verification/1", "created_at": datetime.now().astimezone().isoformat(), "passed": all(checks.values()), "checks": checks, "counts": {"json_sessions": count, "csv_sessions": csv_count, "frames_processed": summary.get("frames_processed", 0), "indexed_frames": summary.get("indexed_frames", 0), "tool_errors": summary.get("errors", 0), "source_changes": len(_source_changes(before, after))}}
 
 
+def _is_strict_row(row: dict[str, object]) -> bool:
+    truth = row.get("truth_log")
+    return (
+        isinstance(truth, dict)
+        and truth.get("kind") in {"canonical", "verified"}
+        and row.get("truth_qualification") in {
+            "verified_label", "verified", "trusted_for_run"
+        }
+    )
+
+
+def _row_quality_failures(row: dict[str, object]) -> list[str]:
+    """Return strict verification failures for one canonical verified row.
+
+    ``fabledan_quality`` is an aggregate, not a replacement for the two
+    channel reports.  ``advisory`` is therefore valid when the trusted
+    TruthLog channel completed successfully and the visual channel only has
+    stale responses.  The nested channel checks remain authoritative for
+    incomplete TruthLog advice and real failed/timeout requests.
+    """
+
+    failures: list[str] = []
+    expected = {
+        "execution_status": "completed",
+        "frame_replay_status": "complete",
+        "listener_status": "complete",
+        "opening_status": "recognized",
+        "truth_quality": "passed",
+        "visual_quality": "passed",
+        "comparison_status": "passed",
+    }
+    for key, value in expected.items():
+        if row.get(key) != value:
+            failures.append(f"{key}={row.get(key)!r}")
+
+    # A stale visual response is an advisory finding and remains visible in
+    # fabledan.visual_driven.advice.stale.  Only an explicit overall failure
+    # (or an unknown/missing aggregate) fails here; trusted-channel and
+    # request-level failures are handled by the nested checks below.
+    overall_quality = str(row.get("fabledan_quality", "") or "")
+    if overall_quality not in {"passed", "advisory"}:
+        failures.append(f"fabledan_quality={overall_quality!r}")
+
+    failures.extend(_fabledan_blocking_reasons(row, strict=True))
+    return failures
+
 def _recognition_for_session(session: Path) -> ScreenshotRecognitionService:
     profile = session.parent.parent
     return ScreenshotRecognitionService(AnnotationService(profile.parent, profile.name), TemplateService(profile.parent, profile.name))
+
+
+def _recognition_for_profile(profile_root: Path | None) -> Callable[[Path], ScreenshotRecognitionService]:
+    if profile_root is None:
+        return _recognition_for_session
+    profile = Path(profile_root).resolve()
+    return lambda _session: ScreenshotRecognitionService(
+        AnnotationService(profile.parent, profile.name),
+        TemplateService(profile.parent, profile.name),
+    )
 
 
 def _fabledan_for_profile(profiles_root: Path, profile_name: str) -> Any:
@@ -1140,11 +1547,28 @@ def _load_truth(session: Path, reference: TruthAuditReference | None) -> TruthLo
     return load_truth_log(reference.path, session_id=_session_id(session)) if reference else None
 
 
-def _truth_metadata(reference: TruthAuditReference | None, truth: TruthLog | None) -> dict[str, object]:
+def _truth_metadata(
+    reference: TruthAuditReference | None,
+    truth: TruthLog | None,
+    *,
+    trusted: bool = False,
+) -> dict[str, object]:
     if not reference or not truth:
         return {"kind": "none", "path": None, "sha256": None, "schema": None, "provenance": None}
     raw = json.loads(reference.path.read_text(encoding="utf-8"))
-    return {"kind": reference.kind, "path": str(reference.path), "sha256": _sha_file(reference.path), "schema": raw.get("schema", raw.get("schema_version")), "provenance": truth.provenance.to_dict(), "label_status": truth.label_status}
+    return {
+        # ``kind`` describes where the reference came from.  Do not replace
+        # canonical with ``verified`` here: the CLI uses the separate
+        # ``truth_qualification`` field to decide whether it is strict.
+        "kind": reference.kind,
+        "reference_kind": reference.kind,
+        "trusted_session": trusted,
+        "path": str(reference.path),
+        "sha256": _sha_file(reference.path),
+        "schema": raw.get("schema", raw.get("schema_version")),
+        "provenance": truth.provenance.to_dict(),
+        "label_status": truth.label_status,
+    }
 
 
 def _session_id(session: Path) -> str:
@@ -1155,11 +1579,27 @@ def _session_id(session: Path) -> str:
     return str(raw.get("session_id", session.name))
 
 
-def _file_info(path: Path | None) -> dict[str, object]:
+def _presence_file_info(path: Path | None) -> dict[str, object]:
+    """Return TruthLog presence metadata without touching file contents."""
+
+    return _file_info(path, include_hash=False)
+
+
+def _file_info(path: Path | None, *, include_hash: bool = True) -> dict[str, object]:
     if path is None or not path.is_file():
-        return {"path": str(path) if path else None, "exists": False, "size": None, "sha256": None}
-    stat = path.stat()
-    return {"path": str(path), "exists": True, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": _sha_file(path)}
+        result: dict[str, object] = {
+            "path": str(path) if path else None, "exists": False,
+            "size": None, "mtime_ns": None,
+        }
+    else:
+        stat = path.stat()
+        result = {
+            "path": str(path), "exists": True, "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    if include_hash:
+        result["sha256"] = _sha_file(path) if path is not None and path.is_file() else None
+    return result
 
 
 def _tree_hash(paths: Iterable[Path], base: Path) -> str | None:
@@ -1234,6 +1674,97 @@ def _strict_quality(metrics: dict[str, object]) -> str:
     return "passed" if passed else "failed"
 
 
+_TERMINAL_LISTENER_REASONS = frozenset({
+    "listener_terminal",
+    "terminal_reached",
+    "game_finished",
+})
+
+
+def _last_replay_frame(path: Path) -> dict[str, object]:
+    """Return the last replay row with nested runtime identity flattened.
+
+    LiveV2 writes the authoritative terminal/current-player fields under the
+    replay summary's ``runtime`` object.  Older artifacts may have written
+    those fields at the top level, so normalize both shapes for diagnostics.
+    """
+
+    last: dict[str, object] = {}
+    try:
+        for row in read_json_lines(path):
+            if isinstance(row, dict):
+                last = row
+    except Exception:
+        return {}
+    runtime = last.get("runtime")
+    if isinstance(runtime, dict):
+        normalized = dict(last)
+        for key in (
+            "runtime", "current_player", "listener_terminal",
+            "listener_status", "listener_status_reason", "status_reason",
+        ):
+            if key in runtime and key not in normalized:
+                normalized[key] = runtime[key]
+        return normalized
+    return last
+
+
+def _listener_completion(
+    result: VisualPipelineReplayResult,
+    visual: dict[str, object],
+    frame_complete: bool,
+    *,
+    legacy_compat: bool = False,
+) -> tuple[str, str]:
+    """Decide completion from production listener evidence, not sealing."""
+
+    if legacy_compat:
+        if frame_complete and str(getattr(result, "status", "")) == "complete":
+            return "complete", "legacy_result_complete"
+        return "incomplete", "legacy_result_incomplete"
+    if not frame_complete:
+        return "incomplete", "frame_replay_incomplete"
+
+    result_status = str(getattr(result, "status", "") or "")
+    if result_status != "complete":
+        return "incomplete", f"result_status={result_status or 'missing'}"
+
+    identity = getattr(result, "runtime_identity", {}) or {}
+    if not isinstance(identity, dict):
+        return "incomplete", "runtime_identity_invalid"
+    if identity.get("runtime") != "live_v2":
+        return "incomplete", "runtime_identity_not_live_v2"
+    identity_listener_status = identity.get("listener_status")
+    if identity_listener_status not in (None, "", "complete"):
+        return "incomplete", f"runtime_listener_status={identity_listener_status}"
+
+    actions = visual.get("actions", {})
+    action_count = int(actions.get("count", 0) or 0) if isinstance(actions, dict) else 0
+    if action_count <= 0:
+        return "incomplete", "no_listener_actions"
+
+    if "current_player" in identity:
+        current_player = identity.get("current_player")
+    else:
+        # Backward-compatible fallback for old replay artifacts only; the
+        # runtime identity always wins when it provides the field.
+        current_player = _last_replay_frame(result.output_path).get("current_player")
+    if current_player not in (None, ""):
+        return "incomplete", f"current_player={current_player}"
+
+    reason = str(
+        getattr(result, "status_reason", "")
+        or identity.get("listener_status_reason", "")
+        or identity.get("status_reason", "")
+        or ""
+    )
+    if reason not in _TERMINAL_LISTENER_REASONS:
+        return "incomplete", f"non_terminal_status_reason={reason or 'missing'}"
+    if identity.get("listener_terminal") is not True:
+        return "incomplete", "runtime_reports_non_terminal_or_missing"
+    return "complete", reason
+
+
 def _visual_quality(metrics: dict[str, object], complete: bool) -> str:
     if not complete:
         return "incomplete"
@@ -1241,12 +1772,110 @@ def _visual_quality(metrics: dict[str, object], complete: bool) -> str:
 
 
 def _advice_quality(truth: dict[str, object], visual: dict[str, object]) -> str:
-    channels = [visual, truth] if truth.get("available") else [visual]
-    for channel in channels:
-        advice = channel.get("advice", {})
-        if not channel.get("completed") or int(advice.get("failed", 0) or 0) or int(advice.get("timeout", 0) or 0):
+    """Return overall advice quality without hiding visual-channel status."""
+
+    visual_status = str(visual.get("status", "") or "")
+    if visual_status == "failed":
+        return "failed"
+
+    truth_available = bool(truth.get("available"))
+    if truth_available:
+        truth_status = str(truth.get("status", "") or "")
+        if truth_status == "failed" or not bool(truth.get("completed")):
             return "failed"
-    return "passed"
+        advice = truth.get("advice", {})
+        advice = advice if isinstance(advice, dict) else {}
+        if int(advice.get("failed", 0) or 0) or int(advice.get("timeout", advice.get("timeouts", 0)) or 0):
+            return "failed"
+        # TruthLog-driven advice is the authoritative overall channel.  A
+        # completed visual run with stale responses remains an advisory issue,
+        # not an overall failure; an unexercised/withheld visual path remains
+        # visible through its nested status and is not called a visual pass.
+        if visual_status in {"", "passed", "completed_with_stale"}:
+            return "passed"
+        return "advisory"
+
+    if visual_status == "passed":
+        return "passed"
+    if visual_status in {"completed_with_stale", "withheld_due_listener_gap", "not_exercised"}:
+        return "advisory"
+    return "not_available"
+
+
+def _fabledan_blocking_reasons(
+    row: dict[str, object], *, strict: bool
+) -> list[str]:
+    """Return only FableDan conditions that are allowed to block a run.
+
+    Visual stale/withheld/incomplete states are intentionally advisory. The
+    blocking rules are limited to actual failed/timeout requests and an
+    incomplete trusted TruthLog channel, as required by the regression
+    contract.
+    """
+
+    fabledan = row.get("fabledan")
+    channels = fabledan if isinstance(fabledan, dict) else {}
+    reasons: list[str] = []
+    truth = channels.get("truth_driven")
+    visual = channels.get("visual_driven")
+
+    if strict:
+        if isinstance(truth, dict):
+            if not truth.get("available"):
+                reasons.append("fabledan_truth_channel_not_available")
+            else:
+                truth_status = str(truth.get("status", "") or "")
+                if truth_status in {"failed", "incomplete", "timeout"} or not bool(
+                    truth.get("completed")
+                ):
+                    reasons.append("fabledan_truth_channel_incomplete")
+        elif channels:
+            # A structured FableDan report is present but has no trusted
+            # channel, so a strict session cannot claim trusted completion.
+            reasons.append("fabledan_truth_channel_not_available")
+        else:
+            # Compatibility for older summaries that contain only the overall
+            # quality. ``advisory`` is a valid outcome: it means the trusted
+            # channel passed while the visual channel has explainable stale
+            # results. It must not be treated as a verification failure.
+            overall = str(row.get("fabledan_quality", "") or "")
+            if overall not in {"passed", "advisory"}:
+                reasons.append("fabledan_truth_channel_not_available")
+
+    for name, channel in (("truth", truth), ("visual", visual)):
+        if not isinstance(channel, dict) or not channel.get("available"):
+            continue
+        status = str(channel.get("status", "") or "")
+        if status in {"failed", "timeout"}:
+            reasons.append(f"fabledan_{name}_{status}")
+        if name == "truth" and (
+            status == "incomplete" or not bool(channel.get("completed"))
+        ):
+            reasons.append("fabledan_truth_channel_incomplete")
+        advice = channel.get("advice", {})
+        advice = advice if isinstance(advice, dict) else {}
+        failed = int(advice.get("failed", 0) or 0)
+        timeouts = int(advice.get("timeout", advice.get("timeouts", 0)) or 0)
+        if failed:
+            reasons.append(f"fabledan_{name}_failed={failed}")
+        if timeouts:
+            reasons.append(f"fabledan_{name}_timeout={timeouts}")
+
+    # Explicit overall failures remain blocking even when a producer omitted
+    # one of the nested channel details. Advisory is intentionally excluded.
+    overall = str(row.get("fabledan_quality", "") or "")
+    if overall in {"failed", "timeout"}:
+        reasons.append(f"fabledan_quality={overall}")
+    elif strict and overall in {"not_evaluated", "incomplete"} and not channels:
+        reasons.append(f"fabledan_quality={overall}")
+    return reasons
+
+
+def _advice_has_failures(advice: dict[str, object]) -> bool:
+    return bool(
+        int(advice.get("failed", 0) or 0)
+        or int(advice.get("timeout", advice.get("timeouts", 0)) or 0)
+    )
 
 
 def _duplicates(rows: Iterable[dict[str, object]]) -> list[int]:

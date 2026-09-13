@@ -22,6 +22,9 @@ class ListeningPageSignal:
     stage: str
     anchor_score: float
     buttons: tuple[str, ...] = ()
+    table_anchor_1_score: float | None = None
+    table_anchor_2_score: float | None = None
+    game_logo_anchor_score: float | None = None
 
     @property
     def allows_media(self) -> bool:

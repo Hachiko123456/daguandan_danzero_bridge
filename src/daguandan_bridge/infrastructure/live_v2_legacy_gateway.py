@@ -238,7 +238,7 @@ def stage_reducer(
     )
 
 
-def stage_latest_correction(
+def stage_action_correction(
     *,
     reducer: LiveReducer,
     target_action: ConfirmedAction,
@@ -280,7 +280,11 @@ def stage_latest_correction(
         last_frame=frame,
         processing_ms=command.corrected_ms,
         confidence=command.confidence,
-        reason=CandidateReason.LOCAL_ACTION_CONFIRMED,
+        reason=(
+            CandidateReason.VISUAL_CORRECTION
+            if command.evidence_origin is EvidenceOrigin.VISUAL
+            else CandidateReason.LOCAL_ACTION_CONFIRMED
+        ),
         evidence_origin=command.evidence_origin,
         requested_semantics=command.requested_semantics,
     )
@@ -294,7 +298,11 @@ def stage_latest_correction(
         raise ValueError("corrected action is not legal in the target state")
     corrected_semantics = validation.actions[0].semantics
 
-    current_play = reducer.snapshot().play_history[-1]
+    play_history = reducer.snapshot().play_history
+    target_turn_index = int(target_action.version_before.turn_index)
+    if target_turn_index < 0 or target_turn_index >= len(play_history):
+        raise ValueError("correction target is outside reducer play history")
+    current_play = play_history[target_turn_index]
     previous_kind = ActionKind.PASS if current_play.is_pass else ActionKind.PLAY
     previous_options = _public_suit_options(
         tuple(current_play.cards),
@@ -355,6 +363,10 @@ def stage_latest_correction(
     return StagedCorrectionResult(staged, correction, enriched)
 
 
+# Compatibility name retained for existing callers; the implementation now
+# accepts any still-uncorrected action in the committed history.
+stage_latest_correction = stage_action_correction
+
 def _public_suit_options(
     cards: tuple[str, ...],
     legacy_options: tuple[tuple[str, ...], ...],
@@ -366,7 +378,10 @@ def _public_suit_options(
             option if len(option) > 1 else f"{card[:-1]}{option}"
             for option in supplied
         )
-        result.append(choices or ((card,) if card[-1:] in "SHCD" else ()))
+        # The public correction contract requires the displayed card token
+        # itself to remain among its physical options, including ``5?``.
+        values = tuple(dict.fromkeys((card, *choices)))
+        result.append(values or ((card,) if card[-1:] in "SHCD" else ()))
     return tuple(result)
 
 

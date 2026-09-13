@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .placement_projection import project_recorded_placements
-from ..live.truth_log import TruthInitialState, TruthLog, TruthTurn
+from ..live.reducer import LiveReducer
+from ..live.truth_log import (
+    TruthInitialState,
+    TruthLog,
+    TruthTurn,
+    validate_truth_log_card_inventory,
+)
 from ..live.turns import (
     TURN_ORDER,
     next_active_seat,
@@ -32,7 +38,8 @@ def next_actor_after_prefix(
     if lead not in TURN_ORDER:
         raise ValueError("首出玩家无效")
     hand = tuple(getattr(initial_state, "my_hand", ()))
-    remaining = {seat: 27 for seat in TURN_ORDER}
+    size_map = dict(getattr(initial_state, "seat_hand_sizes", ()) or ())
+    remaining = {seat: int(size_map.get(seat, 27)) for seat in TURN_ORDER}
     remaining["self"] = len(hand)
     finished: set[str] = set()
     trick_leader: str | None = None
@@ -89,6 +96,33 @@ def validate_turn_actor_chain(log: TruthLog) -> None:
     """Raise when a truth-log action sequence does not follow turn ownership."""
 
     next_actor_after_prefix(log.initial_state, log.turns)
+
+
+def validate_truth_log_with_live_reducer(log: TruthLog) -> None:
+    """Replay every TruthLog event through the production LiveReducer.
+
+    Actor-chain validation catches turn ownership errors, while the reducer also
+    validates the complete initial state, card quantities, pass-cycle semantics,
+    and the same event contract used by the live main flow.  This is deliberately
+    a separate gate so callers can retain the existing draft-only escape hatch.
+    """
+
+    if not isinstance(log, TruthLog):
+        raise TypeError("log must be a TruthLog")
+    validate_truth_log_card_inventory(log)
+    reducer = LiveReducer(log.source_session_id)
+    for event in log.to_events(session_id=log.source_session_id):
+        try:
+            reducer.apply(event)
+        except Exception as exc:
+            location = (
+                "初始状态"
+                if int(event.turn_id or 0) == 0
+                else f"第 {int(event.turn_id)} 条动作"
+            )
+            raise ValueError(
+                f"LiveReducer 全量回放失败（{location}）：{exc}"
+            ) from exc
 
 
 @dataclass(frozen=True)

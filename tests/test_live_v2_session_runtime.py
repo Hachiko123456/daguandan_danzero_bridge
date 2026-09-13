@@ -9,7 +9,7 @@ from daguandan_bridge.application.live_v2_advice_protocol import (
     AdviceRequestIdentity, AdviceRuntimeResult, AdviceRuntimeStatus,
 )
 from daguandan_bridge.application.live_v2_frame_types import FramePipelineResult
-from daguandan_bridge.application.live_v2_session_runtime import LiveV2SessionRuntime
+from daguandan_bridge.application.live_v2_session_runtime import LiveV2SessionRuntime, _resolve_visual_correction
 from daguandan_bridge.application.live_v2_vision_protocol import (
     VisionRequestIdentity, VisionRuntimeResult, VisionRuntimeStatus,
 )
@@ -22,6 +22,7 @@ from daguandan_bridge.live_v2.candidates import (
     ActionCandidate, ActionKind, CandidateReason,
 )
 from daguandan_bridge.live_v2.identity import FrameIdentity, Seat
+from daguandan_bridge.live_v2.observations import ObservationKind, ObservationReason, SeatObservation
 
 
 HAND = tuple(
@@ -261,6 +262,164 @@ def runtime(*, lead="right", recorder=None, store=None,
         value.bind_capture_generation(1)
     _LIVE_RUNTIMES.append(value)
     return value, update, store, recorder, clock, visions, advisers
+
+
+
+class VisualCorrectionVision:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def process_frame(
+        self, image, *, frame, version, wild_rank, expected_seat=None,
+        now_ms=None, formal_action_boundary=None, repair_seats=(),
+    ):
+        del image, wild_rank, formal_action_boundary, repair_seats
+        self.calls += 1
+        fast = _fast(expected_seat.value if expected_seat else "right")
+        if self.calls == 1:
+            first = FrameIdentity(
+                frame.session_id, frame.capture_generation, 1,
+                max(0, frame.captured_ms - 1), frame.roi_version, frame.source_id,
+            )
+            last = FrameIdentity(
+                frame.session_id, frame.capture_generation, 2,
+                frame.captured_ms, frame.roi_version, frame.source_id,
+            )
+            candidate = ActionCandidate(
+                "uncertain-5", version, Seat.RIGHT, ActionKind.PLAY,
+                ("5?",), (("5?", "5S", "5C"),), ("u1", "u2"),
+                0, first, last, int(now_ms), 0.9, CandidateReason.STABLE_PLAY,
+            )
+            return FramePipelineResult(frame, fast, (), (), (candidate,), (), (), 0)
+        observation = SeatObservation(
+            "reread-5S", frame, Seat.RIGHT, ObservationKind.PLAY, ("5S",),
+            0.95, ObservationReason.CARDS_RECOGNIZED, int(now_ms), (("5S",),),
+        )
+        return FramePipelineResult(frame, fast, (), (observation,), (), (), (), 0)
+
+
+def test_visual_uncertain_action_is_repaired_without_creating_second_turn():
+    store = MemoryStore(); recorder = MemoryRecorder(); store.start({"schema": "test.live-v2/1"})
+    clock = ManualClock(); vision = VisualCorrectionVision()
+    advisers = []
+
+    def advice_factory(_version):
+        value = FakeAdviceRuntime(); advisers.append(value); return value
+
+    live = LiveV2SessionRuntime(
+        rule_session=ProductionRuleSession(store), store=store, recorder=recorder,
+        recognition_service=FakeRecognition(), vision_factory=lambda _version: vision,
+        advice_runtime_factory=advice_factory, processing_clock_ms=clock,
+    )
+    _LIVE_RUNTIMES.append(live)
+    live.start(
+        round_level="2", hand=HAND, lead_player="right", monotonic_ms=0,
+        wall_time="2026-09-13T00:00:00+08:00",
+    )
+    live.bind_capture_generation(1)
+    clock.value = 100
+    first = live.analyze_frame(object(), monotonic_ms=100)
+    assert first.event and first.event.event_type == "player_played"
+    assert live.snapshot.play_history[-1].cards == ("5?",)
+
+    clock.value = 200
+    confirming = live.analyze_frame(object(), monotonic_ms=200)
+    assert confirming.event is None
+
+    clock.value = 300
+    repaired = live.analyze_frame(object(), monotonic_ms=300)
+
+    assert repaired.event and repaired.event.event_type == "event_correction"
+    assert repaired.event.payload["target_action_id"] == live.rule_session.confirmed_actions[0].action_id
+    assert live.snapshot.play_history[-1].cards == ("5S",)
+    assert len(live.snapshot.play_history) == 1
+    assert live.snapshot.current_player == "opposite"
+
+class VisualCountCorrectionVision:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def process_frame(
+        self, image, *, frame, version, wild_rank, expected_seat=None,
+        now_ms=None, formal_action_boundary=None, repair_seats=(),
+    ):
+        del image, wild_rank, formal_action_boundary, repair_seats
+        self.calls += 1
+        fast = _fast(expected_seat.value if expected_seat else "right")
+        if self.calls == 1:
+            first = FrameIdentity(
+                frame.session_id, frame.capture_generation, 1,
+                max(0, frame.captured_ms - 1), frame.roi_version, frame.source_id,
+            )
+            last = FrameIdentity(
+                frame.session_id, frame.capture_generation, 2,
+                frame.captured_ms, frame.roi_version, frame.source_id,
+            )
+            candidate = ActionCandidate(
+                "partial-four-aces", version, Seat.RIGHT, ActionKind.PLAY,
+                ("AH", "A?"), (("AH",), ("A?", "AH", "AD")),
+                ("a1", "a2"), 0, first, last, int(now_ms), 0.7,
+                CandidateReason.STABLE_PLAY,
+            )
+            return FramePipelineResult(
+                frame, fast, (), (), (candidate,), (), (), 0
+            )
+        observation = SeatObservation(
+            f"reread-four-aces-{self.calls}", frame, Seat.RIGHT,
+            ObservationKind.PLAY, ("AH", "AH", "AD", "AC"), 0.95,
+            ObservationReason.CARDS_RECOGNIZED, int(now_ms),
+            (("AH",), ("AH",), ("AD",), ("AC",)),
+        )
+        return FramePipelineResult(
+            frame, fast, (), (observation,), (), (), (), 0
+        )
+
+
+def test_visual_reread_can_repair_rank_suit_and_card_count_in_place():
+    store = MemoryStore(); recorder = MemoryRecorder()
+    store.start({"schema": "test.live-v2/1"})
+    clock = ManualClock(); vision = VisualCountCorrectionVision()
+
+    live = LiveV2SessionRuntime(
+        rule_session=ProductionRuleSession(store), store=store, recorder=recorder,
+        recognition_service=FakeRecognition(), vision_factory=lambda _version: vision,
+        advice_runtime_factory=lambda _version: FakeAdviceRuntime(),
+        processing_clock_ms=clock,
+    )
+    _LIVE_RUNTIMES.append(live)
+    live.start(
+        round_level="2", hand=HAND, lead_player="right", monotonic_ms=0,
+        wall_time="2026-09-13T00:00:00+08:00",
+    )
+    live.bind_capture_generation(1)
+    clock.value = 100
+    first = live.analyze_frame(object(), monotonic_ms=100)
+    assert first.event and first.event.event_type == "player_played"
+    assert live.snapshot.play_history[-1].cards == ("A?", "AH")
+
+    clock.value = 200
+    assert live.analyze_frame(object(), monotonic_ms=200).event is None
+    clock.value = 300
+    repaired = live.analyze_frame(object(), monotonic_ms=300)
+
+    assert repaired.event and repaired.event.event_type == "event_correction"
+    assert repaired.event.payload["correction_reason"] == "visual_reread"
+    assert tuple(repaired.event.payload["cards"]) == ("AC", "AD", "AH", "AH")
+    assert live.snapshot.play_history[-1].cards == ("AC", "AD", "AH", "AH")
+    assert len(live.snapshot.play_history) == 1
+    assert live.snapshot.current_player == "opposite"
 
 
 def test_complete_multi_seat_chain_reaches_self_and_publishes_advice_once() -> None:
@@ -766,3 +925,34 @@ def test_action_metadata_is_audit_only_and_does_not_override_rules() -> None:
     assert result.snapshot.play_history[-1].cards == ("3D",)
     assert any(item.get("kind") == "trusted_action_metadata"
                for item in store.observations)
+
+
+def test_visual_correction_matches_same_rank_and_narrows_unknown_suit():
+    corrected = _resolve_visual_correction(
+        ("5?", "3S"),
+        (("5S", "5C"), ("3S",)),
+        ("5S", "3S"),
+        (("5S",), ("3S",)),
+    )
+
+    assert corrected == ("5S", "3S")
+
+
+def test_visual_correction_accepts_rank_and_card_count_changes():
+    target = (("5?", "5S", "5C"),)
+    assert _resolve_visual_correction(
+        ("5?",), target, ("6S",), (("6S",),)
+    ) == ("6S",)
+    assert _resolve_visual_correction(
+        ("AH", "A?"),
+        (("AH",), ("A?", "AH", "AD")),
+        ("AH", "AH", "AD", "AC"),
+        (("AH",), ("AH",), ("AD",), ("AC",)),
+    ) == ("AH", "AH", "AD", "AC")
+
+
+def test_visual_correction_rejects_another_incomplete_reread():
+    target = (("5?", "5S", "5C"),)
+    assert _resolve_visual_correction(
+        ("5?",), target, ("5?",), (("5?", "5S", "5C"),)
+    ) is None

@@ -181,24 +181,42 @@ class ScreenshotRecognitionService:
         }
 
     def recognize_table_anchor(self, image: np.ndarray | Path) -> float:
-        """Return the best ``table_anchor_1`` score on the current table page.
+        """Return the legacy single score for the table-page anchor probe.
 
-        Anchor samples live in the template manifest rather than in the
-        annotation-region document, so they must not be routed through the
-        ordinary region recognizer.  This is intentionally a narrow direct
-        match: the controller uses one score at or above 0.85 to begin
-        recording, while all game-state fields retain their own stability
-        requirements.
+        The public compatibility method now returns the strongest score from
+        the three fixed table-page anchors.  Callers that need the individual
+        evidence values should use :meth:`recognize_page_anchor_scores`.
         """
 
+        return max(self.recognize_page_anchor_scores(image).values(), default=0.0)
+
+    def recognize_page_anchor_scores(
+        self, image: np.ndarray | Path
+    ) -> dict[str, float]:
+        """Return the three independent fixed-ROI page anchor scores."""
+
         source_image = self._source_image(image)
+        scores = {
+            "table_anchor_1_score": self._recognize_anchor_label(
+                source_image, "table_anchor_1"
+            ),
+            "table_anchor_2_score": self._recognize_anchor_label(
+                source_image, "table_anchor_2"
+            ),
+            "game_logo_anchor_score": self._recognize_anchor_label(
+                source_image, "game_logo_anchor"
+            ),
+        }
+        self._diagnostic_local.last_page_anchor_scores = dict(scores)
+        return scores
+
+    def _recognize_anchor_label(
+        self, source_image: np.ndarray, label: str
+    ) -> float:
         image_height, image_width = source_image.shape[:2]
         best_score = 0.0
         for raw, template in self._templates():
-            if (
-                raw.get("kind") != "anchor"
-                or raw.get("label") != "table_anchor_1"
-            ):
+            if raw.get("kind") != "anchor" or raw.get("label") != label:
                 continue
             try:
                 ratio_box = tuple(float(value) for value in raw["ratio_box"])
@@ -213,8 +231,12 @@ class ScreenshotRecognitionService:
                 max(1, round(ratio_w * image_width)),
                 max(1, round(ratio_h * image_height)),
             )
-            padding_x = max(1, round(box.w * self._TABLE_ANCHOR_SEARCH_PADDING_RATIO))
-            padding_y = max(1, round(box.h * self._TABLE_ANCHOR_SEARCH_PADDING_RATIO))
+            padding_x = max(
+                1, round(box.w * self._TABLE_ANCHOR_SEARCH_PADDING_RATIO)
+            )
+            padding_y = max(
+                1, round(box.h * self._TABLE_ANCHOR_SEARCH_PADDING_RATIO)
+            )
             left = max(0, box.x - padding_x)
             top = max(0, box.y - padding_y)
             right = min(image_width, box.x + box.w + padding_x)
@@ -225,9 +247,7 @@ class ScreenshotRecognitionService:
             template_height, template_width = template.shape[:2]
             if template_height != box.h or template_width != box.w:
                 template = cv2.resize(
-                    template,
-                    (box.w, box.h),
-                    interpolation=cv2.INTER_AREA,
+                    template, (box.w, box.h), interpolation=cv2.INTER_AREA
                 )
                 template_height, template_width = template.shape[:2]
             if (
@@ -235,19 +255,19 @@ class ScreenshotRecognitionService:
                 or template_width > search.shape[1]
             ):
                 continue
-            if search.ndim == 3:
-                search_gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
-            else:
-                search_gray = search
-            if template.ndim == 3:
-                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-            else:
-                template_gray = template
+            search_gray = (
+                cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+                if search.ndim == 3
+                else search
+            )
+            template_gray = (
+                cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                if template.ndim == 3
+                else template
+            )
             _min_score, max_score, _min_location, _max_location = cv2.minMaxLoc(
                 cv2.matchTemplate(
-                    search_gray,
-                    template_gray,
-                    cv2.TM_CCOEFF_NORMED,
+                    search_gray, template_gray, cv2.TM_CCOEFF_NORMED
                 )
             )
             best_score = max(best_score, float(max_score))
@@ -665,16 +685,38 @@ class ScreenshotRecognitionService:
         reliable = tuple(
             item.label for item in annotations if item.confidence >= 0.80
         )
+        # Keep the legacy method as the compatibility seam: older test doubles
+        # and external recognizers may override it.  The bundled implementation
+        # leaves the three component scores in thread-local state.
+        self._diagnostic_local.last_page_anchor_scores = None
         anchor = self.recognize_table_anchor(source_image)
+        anchor_scores = getattr(
+            self._diagnostic_local, "last_page_anchor_scores", None
+        )
+        if not isinstance(anchor_scores, dict):
+            anchor_scores = {
+                "table_anchor_1_score": float(anchor),
+                "table_anchor_2_score": 0.0,
+                "game_logo_anchor_score": 0.0,
+            }
         terminal = set(reliable) & {"change_table", "continue_game"}
         actions = set(reliable) & {"play_cards", "pass", "cannot_beat", "double", "super_double"}
-        if terminal and not actions and (len(terminal) == 2 or anchor < self._TABLE_ANCHOR_THRESHOLD):
+        if terminal and not actions and (
+            len(terminal) == 2 or anchor < self._TABLE_ANCHOR_THRESHOLD
+        ):
             stage = "settlement"
         elif anchor >= self._TABLE_ANCHOR_THRESHOLD and not terminal:
             stage = "table"
         else:
             stage = "unknown"
-        return ListeningPageSignal(stage, anchor, tuple(buttons))
+        return ListeningPageSignal(
+            stage,
+            anchor,
+            tuple(buttons),
+            table_anchor_1_score=anchor_scores["table_anchor_1_score"],
+            table_anchor_2_score=anchor_scores["table_anchor_2_score"],
+            game_logo_anchor_score=anchor_scores["game_logo_anchor_score"],
+        )
 
     def recognize_opening_signal(self, image: np.ndarray | Path) -> OpeningSignal:
         """Collect the opening-only signals without deciding who leads.

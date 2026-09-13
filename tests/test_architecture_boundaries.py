@@ -10,7 +10,14 @@ SOURCE = Path(__file__).parents[1] / "src" / "daguandan_bridge"
 # UI/infrastructure adapters together but do not contain reusable application
 # use cases.  Keep the list explicit so a new boundary exception cannot appear
 # unnoticed.
+#
+# ``live_v2_recorded_replay.py`` is intentionally an exception even though it
+# lives under ``application``: it is the recorded-replay entry point that must
+# construct the same production LiveV2 runtime used by the live controller.
+# Its infrastructure imports are therefore explicit and reviewable here,
+# rather than hidden behind a dynamic import or a broad boundary exemption.
 APPLICATION_COMPOSITION_ROOTS = {
+    "live_v2_recorded_replay.py",
     "session_replay_audit.py",
     "shadow_live_replay.py",
     "simulated_game_window.py",
@@ -48,6 +55,13 @@ def test_application_composition_root_exceptions_are_exact_and_present():
     }
 
 
+def test_recorded_replay_exception_documents_production_composition_boundary():
+    """Recorded replay is exempt because it deliberately wires production adapters."""
+    imports = _imports(SOURCE / "application" / "live_v2_recorded_replay.py")
+    assert "..infrastructure.live_session" in imports
+    assert "..infrastructure.live_v2_composition" in imports
+
+
 def test_orchestrator_depends_on_ports_not_live_concrete_adapters():
     source = (SOURCE / "live" / "orchestrator.py").read_text(encoding="utf-8")
     for concrete in (
@@ -70,3 +84,7 @@ def test_live_controller_and_window_do_not_construct_live_adapters():
         assert concrete not in controller
         assert concrete not in window
     assert "session_factory.start_session" in controller
+
+def test_video_scan_application_use_case_does_not_import_media_runtime_packages():
+    imports = _imports(SOURCE / "application" / "video_scan.py")
+    assert not any(name.startswith(("cv2", "numpy")) for name in imports), imports

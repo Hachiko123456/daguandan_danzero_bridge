@@ -16,10 +16,6 @@ from daguandan_bridge.gui.truth_log_editor import (
     TruthLogEditor,
     _sort_hand_cards,
 )
-from daguandan_bridge.application.fabledan_training_data import (
-    FableDanTrainingExportResult,
-    FableDanTrainingReviewResult,
-)
 from daguandan_bridge.live.truth_log import TruthInitialState, TruthLog, TruthTurn
 from daguandan_bridge.recognition_service import (
     PlayRegionResult,
@@ -57,38 +53,6 @@ def _fake_result(**overrides) -> RecognitionResult:
     )
     fields.update(overrides)
     return RecognitionResult(**fields)
-
-
-class _FakeFableDanTrainingData:
-    def __init__(self, session):
-        self.session = session
-        self.inspected = False
-
-    def inspect_session(self, session):
-        assert session == self.session
-        self.inspected = True
-        return FableDanTrainingReviewResult(
-            session=session,
-            review_path=session / "fabledan_training_review.json",
-            status="draft",
-            message="可在核对回放后确认并导出训练样本。",
-            candidate_count=2,
-            eligible_count=1,
-            skipped=(),
-            payload={},
-        )
-
-    def confirm_and_export(self, session):
-        assert self.inspected and session == self.session
-        return FableDanTrainingExportResult(
-            session=session,
-            review_path=session / "fabledan_training_review.json",
-            samples_path=session / "derived" / "fabledan_training_samples.jsonl",
-            manifest_path=session / "derived" / "fabledan_training_manifest.json",
-            sample_count=1,
-            skipped=(),
-            payload={},
-        )
 
 
 class _FakeRecognition:
@@ -129,6 +93,8 @@ def test_editor_keeps_log_columns_compact_and_reorders_rows(tmp_path):
     assert [editor.table.horizontalHeaderItem(index).text() for index in range(4)] == [
         "序号", "玩家", "牌面", "牌墩"
     ]
+    assert not hasattr(editor, "evaluation_panel")
+    assert not hasattr(editor, "fabledan_training_card")
     editor.add_row()
     editor.add_row()
     editor.table.selectRow(0)
@@ -136,21 +102,6 @@ def test_editor_keeps_log_columns_compact_and_reorders_rows(tmp_path):
 
     assert editor.table.rowCount() == 1
     assert editor.table.item(0, 0).text() == "1"
-
-
-def test_editor_requires_explicit_review_before_exporting_fabledan_samples(tmp_path):
-    _app()
-    service = _FakeFableDanTrainingData(tmp_path)
-    editor = TruthLogEditor(tmp_path, _log(), training_data_service=service)
-
-    assert not editor.confirm_fabledan_training_button.isEnabled()
-    editor.inspect_fabledan_training_button.click()
-
-    assert editor.confirm_fabledan_training_button.isEnabled()
-    assert "候选决策 2 条" in editor.fabledan_training_status.text()
-    editor.confirm_fabledan_training_button.click()
-    assert not editor.confirm_fabledan_training_button.isEnabled()
-    assert "已确认并导出 1 条" in editor.fabledan_training_status.text()
 
 
 def test_editor_exposes_turn_metadata(tmp_path):
@@ -166,12 +117,10 @@ def test_editor_exposes_turn_metadata(tmp_path):
     editor = TruthLogEditor(tmp_path, log)
 
     assert [
-        editor.table.horizontalHeaderItem(index).text() for index in range(5)
-    ] == ["序号", "玩家", "牌面", "牌墩", "模型推荐"]
+        editor.table.horizontalHeaderItem(index).text() for index in range(4)
+    ] == ["序号", "玩家", "牌面", "牌墩"]
     assert editor.table.item(1, 3).text() == "1"
     assert editor.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == 26
-    assert editor.table.cellWidget(0, 4) is None
-    assert editor.table.cellWidget(1, 4) is None
 
 
 def test_editor_shows_recorded_finish_rank_on_last_play(tmp_path):
@@ -217,7 +166,7 @@ def test_append_confirmed_turn_stays_unsaved_without_status_column(tmp_path):
     )
 
     assert row == 0
-    assert editor.table.columnCount() == 5
+    assert editor.table.columnCount() == 4
     assert not (tmp_path / "truth_log.json").exists()
 
 
@@ -1133,7 +1082,7 @@ def test_unknown_suit_card_round_trips(tmp_path):
             _fake_result(), region_result=region_result
         ),
     )
-    assert editor.save_button.text() == "保存日志"
+    assert editor.save_button.text() == "保存 TruthLog"
     assert editor.add_button.text() == "新增"
     assert editor.insert_button.text() == "插入"
     assert editor.remove_button.text() == "删除"
@@ -1383,3 +1332,115 @@ def test_editor_shows_resume_banner_and_can_clear(tmp_path):
     fresh = TruthLogEditor(tmp_path, _log())
     assert fresh.resume_banner is None
     assert fresh.clear_button is None
+
+
+def test_verified_save_requires_live_reducer_full_replay(tmp_path, monkeypatch):
+    _app()
+    import daguandan_bridge.gui.truth_log_editor as editor_module
+    from PySide6.QtWidgets import QMessageBox
+
+    editor = TruthLogEditor(tmp_path, _log())
+    # Actor ownership is valid, but the production reducer rejects a leading
+    # pass because there is no current trick to pass.
+    editor._append_row(TruthTurn(1, "self", True, ()))
+    monkeypatch.setattr(
+        editor_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Cancel,
+    )
+
+    editor._save_truth_log()
+
+    assert not (tmp_path / "truth_log.json").exists()
+    assert "LiveReducer 全量回放失败" in editor.save_status.text()
+
+
+def test_verified_save_publishes_only_after_live_reducer_replay_passes(tmp_path):
+    _app()
+    from daguandan_bridge.live.truth_log import load_truth_log
+
+    editor = TruthLogEditor(tmp_path, _log())
+    editor._save_truth_log()
+
+    saved = load_truth_log(tmp_path / "truth_log.json", session_id="game")
+    assert saved.label_status == "verified"
+
+
+def test_single_save_button_forces_audited_draft_only_after_explicit_confirmation(tmp_path, monkeypatch):
+    _app()
+    import daguandan_bridge.gui.truth_log_editor as editor_module
+    from PySide6.QtWidgets import QMessageBox
+    from daguandan_bridge.live.truth_log import load_truth_log
+
+    editor = TruthLogEditor(tmp_path, _log())
+    editor._append_row(TruthTurn(1, "self", False, ("2S",)))
+    # The second actor should be right.  Keep the human-selected left action
+    # intact to prove that forced draft save never rewrites it to pass strict
+    # actor-chain validation.
+    editor._append_row(TruthTurn(2, "left", True, ()))
+    monkeypatch.setattr(
+        editor_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    editor._save_truth_log()
+
+    assert editor.save_button.text() == "保存 TruthLog"
+    assert editor.publish_button is editor.save_button
+    saved = load_truth_log(tmp_path / "truth_log.json", session_id="game")
+    assert saved.label_status == "draft"
+    assert [turn.actor for turn in saved.turns] == ["self", "left"]
+    audits = list((tmp_path / "truth_revisions").glob("*.validation.json"))
+    assert len(audits) == 1
+    audit = json.loads(audits[0].read_text(encoding="utf-8"))
+    assert audit["forced"] is True
+    assert "应为 right，实际为 left" in audit["validation_error"]
+    assert "已强制保存草稿" in editor.save_status.text()
+
+
+def test_single_save_button_cancels_invalid_chain_without_writing(tmp_path, monkeypatch):
+    _app()
+    import daguandan_bridge.gui.truth_log_editor as editor_module
+    from PySide6.QtWidgets import QMessageBox
+
+    editor = TruthLogEditor(tmp_path, _log())
+    editor._append_row(TruthTurn(1, "left", True, ()))
+    monkeypatch.setattr(
+        editor_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Cancel,
+    )
+
+    editor._save_truth_log()
+
+    assert not (tmp_path / "truth_log.json").exists()
+    assert "未保存" in editor.save_status.text()
+
+
+
+def test_save_button_hard_blocks_impossible_double_deck_inventory(tmp_path, monkeypatch):
+    _app()
+    import daguandan_bridge.gui.truth_log_editor as editor_module
+
+    editor = TruthLogEditor(tmp_path, _log())
+    editor._append_row(TruthTurn(1, "self", False, ("2S",)))
+    # The initial self hand already contains one 3D.  These two opponent plays
+    # would require a physically impossible third 3D in a double deck.
+    editor._append_row(TruthTurn(2, "right", False, ("3D",)))
+    editor._append_row(TruthTurn(3, "opposite", False, ("3D",)))
+
+    def forced_draft_must_not_be_offered(*_args, **_kwargs):
+        raise AssertionError("card inventory errors must not offer forced draft save")
+
+    monkeypatch.setattr(
+        editor_module.QMessageBox,
+        "question",
+        forced_draft_must_not_be_offered,
+    )
+
+    editor._save_truth_log()
+
+    assert not (tmp_path / "truth_log.json").exists()
+    assert "TruthLog 牌库数量校验未通过" in editor.save_status.text()
+    assert "方块3（3D）共 3 张" in editor.save_status.text()

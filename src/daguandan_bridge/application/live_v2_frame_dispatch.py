@@ -123,9 +123,12 @@ class FrameReadDispatcher:
         metrics: tuple[SeatSurfaceMetrics, ...],
         self_opportunity: bool,
         expected_seat: Seat | None = None,
+        repair_seats: tuple[Seat, ...] = (),
     ) -> None:
         for item in metrics:
-            if expected_seat is not None and item.seat is not expected_seat:
+            if expected_seat is not None and (
+                item.seat is not expected_seat and item.seat not in repair_seats
+            ):
                 continue
             tracker = self.trackers[item.seat].snapshot()
             should_read = bool(
@@ -137,6 +140,7 @@ class FrameReadDispatcher:
                 or self._is_starved(item.seat, frame.captured_ms)
                 or (item.seat is Seat.SELF and self_opportunity)
                 or (tracker.emitted_signature is not None and item.stable_empty)
+                or item.seat in repair_seats
             )
             if should_read:
                 self.scheduler.submit_raw(
@@ -158,15 +162,24 @@ class FrameReadDispatcher:
         formal_action_boundary: FrameIdentity | None,
         processing_base: int,
         started_clock: int,
+        repair_seats: tuple[Seat, ...] = (),
     ) -> DispatchBatch:
         observations: list[SeatObservation] = []
         candidates: list[ActionCandidate] = []
         diagnostics: list[str] = []
-        for _ in range(self.config.max_deep_reads_per_frame):
+        for read_index in range(self.config.max_deep_reads_per_frame):
+            repair_preferred = (
+                repair_seats[0]
+                if repair_seats and read_index == 0
+                else expected_seat
+            )
             item = self.scheduler.pop_next(
                 now_ms=self.processing_ms(processing_base, started_clock),
-                expected_seat=expected_seat,
-                self_opportunity=self_opportunity,
+                expected_seat=repair_preferred,
+                self_opportunity=(
+                    self_opportunity
+                    and repair_preferred is expected_seat
+                ),
             )
             if item is None:
                 break
@@ -209,6 +222,10 @@ class FrameReadDispatcher:
                 size_bytes=_observation_size(observation),
                 now_ms=processed_ms,
             )
+            # A repair read belongs to an already committed action. It must be
+            # retained as evidence but must not create a new tracker candidate.
+            if item.seat in repair_seats and item.seat is not expected_seat:
+                continue
             candidate = self.trackers[item.seat].ingest(observation, version=version)
             if candidate is None:
                 continue

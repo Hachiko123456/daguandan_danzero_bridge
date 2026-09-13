@@ -60,6 +60,7 @@ class LiveReducer:
         self._remaining_cards: dict[Seat, int] = {
             seat: 27 for seat in TURN_ORDER
         }
+        self._seat_hand_sizes: dict[Seat, int] = dict(self._remaining_cards)
         self._finished_seats: set[Seat] = set()
         self._trick_id = 0
         self._turn_id = 0
@@ -290,9 +291,15 @@ class LiveReducer:
         source: str = "manual_correction",
     ) -> LiveEvent:
         actions = [event for event in self._events if event.event_type in _ACTION_EVENT_TYPES]
-        if not actions or actions[-1].event_id != target_event_id:
-            raise GameStateError("第一版只能纠正最近一次正式动作")
-        target = actions[-1]
+        target = next((event for event in actions if event.event_id == target_event_id), None)
+        if target is None:
+            raise GameStateError("待纠正的正式动作不存在")
+        if any(
+            event.event_type == "event_correction"
+            and str(event.payload.get("target_event_id", "")) == target_event_id
+            for event in self._events
+        ):
+            raise GameStateError("该动作已经被纠正")
         normalized = () if is_pass else self._normalize_cards(cards)
         event = self._new_event(
             "event_correction",
@@ -483,6 +490,17 @@ class LiveReducer:
         lead = event.payload.get("lead_player")
         if lead is not None and lead not in TURN_ORDER:
             raise GameStateError("开局首出座位无效")
+        raw_sizes = event.payload.get("seat_hand_sizes", {})
+        sizes = {seat: 27 for seat in TURN_ORDER}
+        if isinstance(raw_sizes, dict):
+            for seat in TURN_ORDER:
+                value = raw_sizes.get(seat, 27)
+                if not isinstance(value, int) or not 0 <= value <= 54:
+                    raise GameStateError("座位起手牌数无效")
+                sizes[seat] = value
+        sizes["self"] = len(hand)
+        self._seat_hand_sizes = sizes
+        self._remaining_cards = dict(sizes)
         self._round_level = round_level
         self._wild_rank = wild_rank
         self._my_hand = hand

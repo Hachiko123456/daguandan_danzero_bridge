@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -24,38 +25,42 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import CardWidget, CaptionLabel, PrimaryPushButton, PushButton
+from qfluentwidgets import PrimaryPushButton, PushButton
 
 from ..annotation_service import AnnotationService
-from ..application.fabledan_training_data import FableDanTrainingDataService
-from ..application.model_evaluation import EvaluationRunResult, ModelEvaluationService
 from ..application.replay_turn_draft import (
     next_actor_after_prefix,
+    validate_truth_log_with_live_reducer,
     validate_turn_actor_chain,
 )
 from ..application.placement_projection import (
     PlacementProjection,
     format_placement_summary,
     project_recorded_placements,
+    project_truth_log_placements,
+    derive_finish_order,
 )
-from ..application.timeline_truth_migration import TimelineTruthMigrationService
+from ..application.truth_revision_store import TruthRevisionStore
+from ..config import PROFILES_ROOT
+from ..storage import atomic_write_json
 from ..danzero.state import RANKS, SEATS, SUITS
 from ..live.truth_log import (
     TruthInitialState,
     TruthLog,
     TruthTurn,
+    TruthLogCardInventoryError,
     card_code_to_text,
     load_truth_log,
     save_truth_log,
+    validate_truth_log_card_inventory,
 )
-from ..domain.truth import LabelProvenance, TruthEvidence
+from ..domain.truth import LabelProvenance, TruthEvidence, TruthOutcome
 from ..live.turns import TURN_ORDER
 from ..live.session_store import read_json_lines
 from ..live.suit_correction import SuitCorrectionTracker
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
 from .single_image_danzero_page import CardBadge
-from .model_evaluation_page import ModelEvaluationPanel
 
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _RANK_LABELS = {rank: rank for rank in RANKS}
@@ -180,6 +185,7 @@ class ScrollSafeComboBox(QComboBox):
 
 class TruthLogEditor(QWidget):
     log_saved = Signal(object)
+    log_published = Signal(object)
     draft_changed = Signal()
 
     def __init__(
@@ -193,9 +199,8 @@ class TruthLogEditor(QWidget):
         frame_scan_provider: Callable[[int], Iterable[tuple[int, np.ndarray]]]
         | None = None,
         recognition_service: ScreenshotRecognitionService | None = None,
-        evaluation_service: ModelEvaluationService | None = None,
-        repair_service: TimelineTruthMigrationService | None = None,
-        training_data_service: FableDanTrainingDataService | None = None,
+        profiles_root: Path | None = None,
+        profile_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = Path(session)
@@ -203,8 +208,13 @@ class TruthLogEditor(QWidget):
         self._frame_provider = frame_provider
         self._frame_scan_provider = frame_scan_provider
         self._recognition_service = recognition_service
-        self._training_data_service = training_data_service or FableDanTrainingDataService()
-        self._training_review_result = None
+        self._profiles_root = (
+            Path(profiles_root).expanduser().resolve()
+            if profiles_root is not None
+            else PROFILES_ROOT
+        )
+        self._profile_name = str(profile_name or "tencent_daguandan")
+        self._revision_store = TruthRevisionStore(self.session)
         self._last_recognized_frame: int | None = None
         self._placements = self._load_placements(truth_log)
         self._placement_badges_by_turn = self._placement_badges(self._placements)
@@ -281,9 +291,9 @@ class TruthLogEditor(QWidget):
         self._render_hand_badges()
         self.edit_hand_button.clicked.connect(self._edit_hand)
         self.recognize_hand_button.clicked.connect(self._recognize_hand)
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
-            ("序号", "玩家", "牌面", "牌墩", "模型推荐")
+            ("序号", "玩家", "牌面", "牌墩")
         )
         header = self.table.horizontalHeader()
         for column in (0, 1, 3):
@@ -291,7 +301,7 @@ class TruthLogEditor(QWidget):
                 column,
                 QHeaderView.ResizeMode.ResizeToContents,
             )
-        for column in (2, 4):
+        for column in (2,):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
@@ -313,66 +323,34 @@ class TruthLogEditor(QWidget):
         self.recognition_hint.setWordWrap(True)
         layout.addWidget(self.recognition_hint)
         buttons = QHBoxLayout()
-        self.save_button = QPushButton("保存日志")
+        # One primary save flow: strict validation publishes a verified log;
+        # a validation failure offers an explicit draft-only escape hatch in
+        # the same dialog, so the main window never grows a second save button.
+        self.save_button = PrimaryPushButton("保存 TruthLog")
+        self.save_button.setToolTip(
+            "默认严格校验并保存为可信 TruthLog；校验失败时可选择强制保存草稿"
+        )
         buttons.addWidget(self.save_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+        # Compatibility alias for integrations that used to inspect the old
+        # publish button. It is intentionally not a second visible control.
+        self.publish_button = self.save_button
         self.end_status = QLabel("对局状态：进行中")
         self.end_status.setWordWrap(True)
         layout.addWidget(self.end_status)
-        self.save_status = QLabel("未保存（点击保存日志后写入 truth_log.json）")
+        self.save_status = QLabel(
+            "未保存（默认严格校验后保存为可信 TruthLog；校验失败时可强制保存草稿）"
+        )
         self.save_status.setWordWrap(True)
         layout.addWidget(self.save_status)
-        self.fabledan_training_card = CardWidget(self)
-        training_layout = QVBoxLayout(self.fabledan_training_card)
-        training_layout.setContentsMargins(12, 10, 12, 10)
-        training_layout.addWidget(CaptionLabel("FableDan 真实对局训练数据"))
-        self.fabledan_training_status = QLabel(
-            "先核对回放，再检查训练资格。导出只生成离线样本，不会训练或替换当前模型。"
-        )
-        self.fabledan_training_status.setWordWrap(True)
-        training_layout.addWidget(self.fabledan_training_status)
-        training_buttons = QHBoxLayout()
-        self.inspect_fabledan_training_button = PushButton("检查训练资格")
-        self.confirm_fabledan_training_button = PrimaryPushButton(
-            "确认并导出 FableDan 样本"
-        )
-        self.confirm_fabledan_training_button.setEnabled(False)
-        training_buttons.addWidget(self.inspect_fabledan_training_button)
-        training_buttons.addWidget(self.confirm_fabledan_training_button)
-        training_buttons.addStretch(1)
-        training_layout.addLayout(training_buttons)
-        layout.addWidget(self.fabledan_training_card)
         self.add_button.clicked.connect(self.add_row)
         self.insert_button.clicked.connect(self.insert_row)
         self.remove_button.clicked.connect(self.remove_row)
         self.recognize_frame_button.clicked.connect(self._recognize_frame)
-        self.save_button.clicked.connect(self._save)
-        self.inspect_fabledan_training_button.clicked.connect(
-            self._inspect_fabledan_training
-        )
-        self.confirm_fabledan_training_button.clicked.connect(
-            self._confirm_fabledan_training
-        )
+        self.save_button.clicked.connect(self._save_truth_log)
         self.table.cellChanged.connect(self._cell_changed)
         self._render()
-        self.evaluation_panel = ModelEvaluationPanel(
-            self.session,
-            service=evaluation_service,
-            repair_service=repair_service,
-            parent=self,
-        )
-        self.evaluation_panel.result_ready.connect(self._show_evaluation_result)
-        self.evaluation_panel.result_invalidated.connect(self._clear_recommendations)
-        self.evaluation_panel.truth_repaired.connect(self._reload_repaired_truth)
-        layout.addWidget(
-            self.evaluation_panel,
-            0,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-        )
-        layout.setStretchFactor(self.table, 1)
-        if not self._matches_saved_truth():
-            self.evaluation_panel.invalidate_input()
         self.lead_combo.currentIndexChanged.connect(self._draft_mutated)
         self.round_level_combo.currentIndexChanged.connect(
             self._round_level_changed
@@ -456,6 +434,11 @@ class TruthLogEditor(QWidget):
         self._resize_table()
 
     def _matches_saved_truth(self) -> bool:
+        # Do not even inspect a legacy TruthLog while loading a pure AVI scan
+        # draft. The draft must remain independent until the user explicitly
+        # chooses to save or publish it.
+        if self.truth_log.provenance.source == "video_scan":
+            return False
         try:
             saved = load_truth_log(
                 self.session / "truth_log.json",
@@ -468,6 +451,14 @@ class TruthLogEditor(QWidget):
     def _load_placements(self, truth_log: TruthLog) -> tuple[PlacementProjection, ...]:
         """Read one rank-ordered, evidence-safe projection from the timeline."""
 
+        # Card-count placements are self-contained TruthLog evidence and work
+        # for pure AVI scans too. Timeline badges are an optional secondary
+        # source only when the card ledger cannot establish an order.
+        derived = project_truth_log_placements(truth_log)
+        if derived:
+            return derived
+        if truth_log.provenance.source == "video_scan":
+            return ()
         timeline_path = self.session / "timeline.jsonl"
         if not timeline_path.is_file():
             return ()
@@ -646,7 +637,6 @@ class TruthLogEditor(QWidget):
         self.table.setItem(row, 3, trick)
         if status:
             player.setToolTip(status)
-        self.table.removeCellWidget(row, 4)
 
     def _replace_row(
         self,
@@ -776,7 +766,6 @@ class TruthLogEditor(QWidget):
             player.setProperty("sequenceConflict", False)
             player.setToolTip("已人工确认玩家")
             self.save_status.setText("玩家顺序冲突已人工确认；出牌日志仍未保存")
-        self._clear_recommendations()
         self._draft_mutated()
 
     def _row_for_widget(self, widget: QWidget) -> int:
@@ -816,11 +805,15 @@ class TruthLogEditor(QWidget):
         )
         return bool(original.is_pass) if isinstance(original, TruthTurn) else False
 
-    def _build_log(self) -> TruthLog:
+    def _build_log(self, *, validate_actor_chain: bool = True) -> TruthLog:
         turns: list[TruthTurn] = []
         for row in range(self.table.rowCount()):
             player = self.table.cellWidget(row, 1)
-            if player is not None and bool(player.property("sequenceConflict")):
+            if (
+                validate_actor_chain
+                and player is not None
+                and bool(player.property("sequenceConflict"))
+            ):
                 raise ValueError(
                     f"第 {row + 1} 条动作的前后玩家候选冲突，"
                     "请人工确认玩家后再保存"
@@ -872,28 +865,48 @@ class TruthLogEditor(QWidget):
         hand = _sort_hand_cards(self._hand, round_level)
         if not hand:
             raise ValueError("我方手牌不能为空")
+        finish_order = derive_finish_order(
+            turns,
+            initial_hand_size=len(hand),
+        )
+        outcome = TruthOutcome(
+            complete=False,
+            finish_order=finish_order,
+            team_result="unknown",
+            reward=None,
+            reward_scheme="",
+        ) if finish_order else self.truth_log.outcome
+        seat_hand_sizes = dict(self.truth_log.initial_state.seat_hand_sizes)
+        if seat_hand_sizes:
+            seat_hand_sizes["self"] = len(hand)
         log = TruthLog(
             source_session_id=self.truth_log.source_session_id,
-            initial_state=TruthInitialState(str(round_level), lead, hand),
+            initial_state=TruthInitialState(
+                str(round_level),
+                lead,
+                hand,
+                tuple(sorted(seat_hand_sizes.items())),
+            ),
             turns=tuple(turns),
             source_video=self.truth_log.source_video,
             frame_index_path=self.truth_log.frame_index_path,
             label_status=self.truth_log.label_status,
             provenance=self.truth_log.provenance,
-            outcome=self.truth_log.outcome,
+            outcome=outcome,
         )
         # ``trick_id`` is display/provenance data in the editor.  Saving must
         # instead re-derive the complete action chain so a stale id cannot
         # conceal a direct seat jump (for example left -> right, skipping
         # self).  The validator also skips players whose recorded cards are
         # exhausted, matching the reducer's live turn ownership.
-        validate_turn_actor_chain(log)
+        if validate_actor_chain:
+            validate_turn_actor_chain(log)
         return log
 
     def _recognition(self) -> ScreenshotRecognitionService:
         if self._recognition_service is None:
-            profile_root = self.session.parents[2]
-            profile_name = self.session.parents[1].name
+            profile_root = self._profiles_root
+            profile_name = self._profile_name
             self._recognition_service = ScreenshotRecognitionService(
                 AnnotationService(profile_root, profile_name),
                 TemplateService(profile_root, profile_name),
@@ -915,7 +928,8 @@ class TruthLogEditor(QWidget):
     def _finished_players(self, played: dict[str, int]) -> set[str]:
         out: set[str] = set()
         for player in TURN_ORDER:
-            start = len(self._hand) if player == "self" else _STARTING_CARDS
+            size_map = dict(self.truth_log.initial_state.seat_hand_sizes)
+            start = len(self._hand) if player == "self" else int(size_map.get(player, _STARTING_CARDS))
             if played.get(player, 0) >= start:
                 out.add(player)
         return out
@@ -940,10 +954,14 @@ class TruthLogEditor(QWidget):
         return actor if actor in TURN_ORDER else None
 
     def _current_initial_state(self) -> TruthInitialState:
+        sizes = dict(self.truth_log.initial_state.seat_hand_sizes)
+        if sizes:
+            sizes["self"] = len(self._hand)
         return TruthInitialState(
             str(self.round_level_combo.currentData()),
             str(self.lead_combo.currentData()),
             tuple(self._hand),
+            tuple(sorted(sizes.items())),
         )
 
     def _prefix_turns(self, stop_row: int) -> tuple[TruthTurn, ...]:
@@ -1433,133 +1451,116 @@ class TruthLogEditor(QWidget):
                 f"识别当前画面：已追加 1 条出牌记录（{source_note}）"
             )
 
-    def _save(self) -> None:
+    def _save_truth_log(self) -> None:
+        """Strictly save a verified log, or explicitly retain an invalid draft.
+
+        The default remains intentionally strict.  A user may choose draft-only
+        persistence only after seeing the validation error; this never changes
+        an action to make the sequence appear valid.
+        """
         try:
-            log = self._build_log()
-            save_truth_log(self.session / "truth_log.json", log)
-            self.truth_log = log
-            self.save_status.setText(f"已保存 {len(log.turns)} 条，可继续编辑")
-            self.log_saved.emit(log)
-            self.evaluation_panel.saved_input_updated()
+            # Build without the actor-chain gate first so a simultaneous turn
+            # error cannot route an impossible card inventory into forced-draft
+            # saving before the hard physical check has run.
+            log = self._build_log(validate_actor_chain=False)
+            # Physical double-deck inventory is a hard save invariant.  Unlike
+            # an actor-chain draft error, it must not be bypassed by the
+            # "强制保存草稿" escape hatch.
+            validate_truth_log_card_inventory(log)
+            validate_turn_actor_chain(log)
+            validate_truth_log_with_live_reducer(log)
+        except TruthLogCardInventoryError as exc:
+            self.save_status.setText(f"保存失败：{exc}")
+            QLabel(str(exc), self).show()
+            return
+        except ValueError as exc:
+            self._offer_forced_draft_save(str(exc))
+            return
+        except Exception as exc:
+            self.save_status.setText(f"保存失败：{exc}")
+            QLabel(str(exc), self).show()
+            return
+        try:
+            revision = self._revision_store.publish(
+                log,
+                author="truth_log_editor",
+            )
+            published = replace(log, label_status="verified")
+            self.truth_log = published
+            self.save_status.setText(
+                f"已校验并保存可信 TruthLog：{revision.revision_id}（{len(published.turns)} 条）"
+            )
+            self.log_saved.emit(published)
+            self.log_published.emit(published)
         except Exception as exc:
             self.save_status.setText(f"保存失败：{exc}")
             QLabel(str(exc), self).show()
 
-    def _inspect_fabledan_training(self) -> None:
-        """Refresh the sealed-session eligibility; this never changes weights."""
+    # Compatibility entrypoint retained for old callers/tests; it follows the
+    # single-button save flow and does not create a separate draft button.
+    def _save(self) -> None:
+        self._save_truth_log()
 
-        try:
-            result = self._training_data_service.inspect_session(self.session)
-        except Exception as exc:
-            self._training_review_result = None
-            self.confirm_fabledan_training_button.setEnabled(False)
-            self.fabledan_training_status.setText(f"训练数据检查失败：{exc}")
-            return
-        self._training_review_result = result
-        self.confirm_fabledan_training_button.setEnabled(result.can_confirm)
-        if result.status == "not_applicable":
-            text = result.message
-        elif result.status == "verified":
-            text = (
-                f"训练数据：已人工确认；可导出样本 {result.eligible_count} 条。"
-                "当前模型未被修改。"
-            )
-        else:
-            text = (
-                f"训练数据：候选决策 {result.candidate_count} 条，"
-                f"可导出 {result.eligible_count} 条。{result.message}"
-            )
-            if result.skipped:
-                text += f" 已排除 {len(result.skipped)} 条不完整或无法唯一映射的记录。"
-        self.fabledan_training_status.setText(text)
+    def _publish(self) -> None:
+        self._save_truth_log()
 
-    def _confirm_fabledan_training(self) -> None:
-        try:
-            result = self._training_data_service.confirm_and_export(self.session)
-        except Exception as exc:
-            self.confirm_fabledan_training_button.setEnabled(False)
-            self.fabledan_training_status.setText(f"训练样本未导出：{exc}")
-            return
-        self.confirm_fabledan_training_button.setEnabled(False)
-        self.fabledan_training_status.setText(
-            f"训练数据：已确认并导出 {result.sample_count} 条 FableDan 离线样本。"
-            "模型权重保持不变。"
+    def _offer_forced_draft_save(self, validation_error: str) -> None:
+        choice = QMessageBox.question(
+            self,
+            "TruthLog 严格校验未通过",
+            "严格校验未通过，当前内容尚不能发布为可信 TruthLog。\n\n"
+            f"{validation_error}\n\n"
+            "校验包含玩家顺序和 LiveReducer 全量回放。\n"
+            "是否强制保存为草稿？草稿会保留全部人工编辑和校验错误，"
+            "但不会被标记为可信，也不能用于正式训练或发布。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
+        if choice != QMessageBox.StandardButton.Yes:
+            self.save_status.setText(f"未保存：{validation_error}")
+            return
+        try:
+            log = self._build_log(validate_actor_chain=False)
+            validation_kind = (
+                "live_reducer_replay_failed"
+                if "LiveReducer 全量回放失败" in validation_error
+                else "actor_chain_validation_failed"
+            )
+            revision = self._revision_store.save_draft(
+                log,
+                author="truth_log_editor:forced_draft",
+                changed_fields=(
+                    "forced_draft",
+                    validation_kind,
+                    f"validation_error:{validation_error}",
+                ),
+            )
+            audit_path = self.session / "truth_revisions" / f"{revision.revision_id}.validation.json"
+            atomic_write_json(
+                audit_path,
+                {
+                    "schema": "guandan.truth-draft-validation/1",
+                    "revision_id": revision.revision_id,
+                    "label_status": "draft",
+                    "forced": True,
+                    "validation_error": validation_error,
+                },
+            )
+            saved = replace(log, label_status="draft")
+            self.truth_log = saved
+            self.save_status.setText(
+                f"已强制保存草稿 {revision.revision_id}（{len(saved.turns)} 条）；"
+                "动作链仍待修复，未发布为可信 TruthLog"
+            )
+            self.log_saved.emit(saved)
+        except Exception as exc:
+            self.save_status.setText(f"强制保存草稿失败：{exc}")
+            QLabel(str(exc), self).show()
 
     def _draft_mutated(self, *_args) -> None:
         self._clear_placement_badges()
-        panel = getattr(self, "evaluation_panel", None)
-        if panel is not None:
-            panel.invalidate_input()
         self.draft_changed.emit()
 
-    def _clear_recommendations(self, *, resize: bool = True) -> None:
-        for row in range(self.table.rowCount()):
-            self.table.removeCellWidget(row, 4)
-        if resize:
-            self._resize_table()
-
-    @staticmethod
-    def _recommendation_widget(value: object, *, error: str = "") -> QWidget:
-        if error:
-            return TruthLogEditor._card_strip_widget((), empty_label=error)
-        if not isinstance(value, dict):
-            return TruthLogEditor._card_strip_widget((), empty_label="—")
-        is_pass = bool(value.get("is_pass", False))
-        cards = tuple(str(card) for card in value.get("cards", ()))
-        return TruthLogEditor._card_strip_widget(cards, is_pass=is_pass)
-
-    def _show_evaluation_result(self, result: EvaluationRunResult) -> None:
-        self._clear_recommendations(resize=False)
-        for decision in result.decisions:
-            turn_id = decision.get("turn_id")
-            if not isinstance(turn_id, int):
-                continue
-            row = turn_id - 1
-            if not 0 <= row < self.table.rowCount():
-                continue
-            player = self.table.cellWidget(row, 1)
-            if player is None or player.currentData() != "self":
-                continue
-            predicted = decision.get("predicted_action")
-            error = ""
-            if decision.get("status") != "evaluated":
-                code = str(decision.get("error_code") or "UNKNOWN")
-                message = str(decision.get("error_message") or "没有记录具体错误原因")
-                error = f"错误：{message}（错误代码：{code}）"
-            self.table.setCellWidget(
-                row,
-                4,
-                self._recommendation_widget(predicted, error=error),
-            )
-        # Recommendations are added after the original pass-only rows were
-        # rendered.  Recompute once so model card badges can never be clipped.
-        self._resize_table()
-
-    def _reload_repaired_truth(self, _result: object) -> None:
-        try:
-            repaired = load_truth_log(
-                self.session / "truth_log.json",
-                session_id=self.session.name,
-            )
-        except Exception as exc:
-            self.save_status.setText(f"修复后重新载入失败：{exc}")
-            return
-        self.truth_log = repaired
-        self._placements = self._load_placements(repaired)
-        self._placement_badges_by_turn = self._placement_badges(self._placements)
-        self._refresh_placement_summary()
-        self.lead_combo.setCurrentIndex(
-            max(0, self.lead_combo.findData(repaired.initial_state.lead_player))
-        )
-        self.round_level_combo.setCurrentIndex(
-            max(0, self.round_level_combo.findData(repaired.initial_state.round_level))
-        )
-        self._hand = tuple(repaired.initial_state.my_hand)
-        self._render_hand_badges()
-        self._render()
-        self.evaluation_panel.saved_input_updated()
-        self.save_status.setText("旧日志已安全修复并重新载入；原文件已备份")
-
     def shutdown(self) -> None:
-        self.evaluation_panel.shutdown()
+        """Compatibility hook; the editor no longer owns evaluation workers."""
+        return

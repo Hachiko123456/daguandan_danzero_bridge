@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from daguandan_bridge.application.placement_projection import (
+    derive_finish_order,
+    project_truth_log_placements,
     format_placement_summary,
     project_recorded_placements,
 )
@@ -76,3 +78,29 @@ def test_exact_action_reference_and_legacy_immediate_boundary_can_show_row_badge
     placements = project_recorded_placements(events, turns)
 
     assert placements[0].anchor_turn_id == 1
+
+
+def test_card_count_finish_order_infers_last_place_after_three_zero_crossings():
+    from daguandan_bridge.live.truth_log import TruthInitialState, TruthLog, TruthTurn
+
+    hand = tuple(f"{rank}{suit}" for rank in ("2", "3", "4", "5", "6", "7") for suit in "SHCD") + ("8S", "8H", "8C")
+    log = TruthLog(
+        "game",
+        TruthInitialState("6", "opposite", hand),
+        (
+            TruthTurn(1, "opposite", False, ("3S",) * 27),
+            TruthTurn(2, "right", False, ("4S",) * 27),
+            TruthTurn(3, "left", False, ("5S",) * 27),
+        ),
+    )
+
+    assert derive_finish_order(log.turns, initial_hand_size=len(hand)) == (
+        "opposite", "right", "left", "self"
+    )
+    placements = project_truth_log_placements(log)
+    assert [(item.placement, item.actor, item.anchor_turn_id) for item in placements] == [
+        ("head", "opposite", 1),
+        ("second", "right", 2),
+        ("third", "left", 3),
+        ("last", "self", None),
+    ]

@@ -79,6 +79,7 @@ class VisionWorkerPayload:
     wild_rank: str
     image: np.ndarray
     formal_action_boundary: FrameIdentity | None = None
+    repair_seats: tuple[Seat, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, VisionWorkerConfig):
@@ -87,6 +88,12 @@ class VisionWorkerPayload:
             raise TypeError("identity must be VisionRequestIdentity")
         if self.expected_seat is not None and not isinstance(self.expected_seat, Seat):
             raise TypeError("expected_seat must be Seat or None")
+        if not isinstance(self.repair_seats, tuple) or any(
+            not isinstance(item, Seat) for item in self.repair_seats
+        ):
+            raise TypeError("repair_seats must be a tuple of Seat")
+        if len(set(self.repair_seats)) != len(self.repair_seats):
+            raise ValueError("repair_seats must be unique")
         if not isinstance(self.visual_self_opportunity, bool):
             raise TypeError("visual_self_opportunity must be bool")
         if not isinstance(self.wild_rank, str) or not self.wild_rank.strip():

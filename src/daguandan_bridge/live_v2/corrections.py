@@ -26,6 +26,7 @@ class CorrectionReason(str, Enum):
     MANUAL_REVIEW = "manual_review"
     TRUSTED_REPLAY = "trusted_replay"
     ADJACENT_ACTION_REVIEW = "adjacent_action_review"
+    VISUAL_REREAD = "visual_reread"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +52,10 @@ class CorrectionCommand:
         require_enum(self.reason, CorrectionReason, "reason")
         require_text(self.evidence_id, "evidence_id")
         require_enum(self.evidence_origin, EvidenceOrigin, "evidence_origin")
-        if self.evidence_origin not in {EvidenceOrigin.MANUAL, EvidenceOrigin.TRUSTED}:
-            raise ValueError("correction evidence must be MANUAL or TRUSTED")
+        if self.evidence_origin not in {
+            EvidenceOrigin.MANUAL, EvidenceOrigin.TRUSTED, EvidenceOrigin.VISUAL
+        }:
+            raise ValueError("correction evidence must be MANUAL, TRUSTED, or VISUAL")
         require_probability(self.confidence, "confidence")
         require_non_negative_int(self.corrected_ms, "corrected_ms")
         if self.requested_semantics is not None and not isinstance(
@@ -94,8 +97,10 @@ class ConfirmedCorrection:
         require_enum(self.reason, CorrectionReason, "reason")
         require_text(self.evidence_id, "evidence_id")
         require_enum(self.evidence_origin, EvidenceOrigin, "evidence_origin")
-        if self.evidence_origin not in {EvidenceOrigin.MANUAL, EvidenceOrigin.TRUSTED}:
-            raise ValueError("correction evidence must be MANUAL or TRUSTED")
+        if self.evidence_origin not in {
+            EvidenceOrigin.MANUAL, EvidenceOrigin.TRUSTED, EvidenceOrigin.VISUAL
+        }:
+            raise ValueError("correction evidence must be MANUAL, TRUSTED, or VISUAL")
         require_probability(self.confidence, "confidence")
         require_non_negative_int(self.corrected_ms, "corrected_ms")
         for name, semantics in (

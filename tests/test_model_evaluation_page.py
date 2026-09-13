@@ -3,16 +3,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from threading import Event
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.application.model_evaluation import (
-    EvaluationRunResult,
     ModelEvaluationService,
 )
 from daguandan_bridge.application.timeline_truth_migration import (
@@ -20,7 +17,6 @@ from daguandan_bridge.application.timeline_truth_migration import (
 )
 from daguandan_bridge.domain.advice import AdviceResult
 from daguandan_bridge.gui.model_evaluation_page import ModelEvaluationPanel
-from daguandan_bridge.gui.truth_log_editor import TruthLogEditor
 from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.truth_log import (
     TruthInitialState,
@@ -59,18 +55,6 @@ class _Advisor:
             request_id=request_id,
             engine_input={"backend": "numpy"},
         )
-
-
-class _SlowAdvisor(_Advisor):
-    def __init__(self) -> None:
-        super().__init__()
-        self.started = Event()
-        self.release = Event()
-
-    def recommend(self, state, *, request_id="", trace=None):
-        self.started.set()
-        self.release.wait(2.0)
-        return super().recommend(state, request_id=request_id, trace=trace)
 
 
 def _app():
@@ -154,122 +138,6 @@ def test_fixed_session_panel_initializes_model_only_after_explicit_start(tmp_pat
     assert str(panel._result.report_directory / "decisions.jsonl") in details
     panel.shutdown()
     panel.close()
-
-
-def test_editor_shows_recommendations_only_on_self_rows_and_invalidates_on_edit(
-    tmp_path,
-):
-    app = _app()
-    session, truth = _session(tmp_path)
-    editor = TruthLogEditor(
-        session,
-        truth,
-        evaluation_service=ModelEvaluationService(
-            advisor_factory=lambda _strategy: _Advisor()
-        ),
-    )
-
-    panel_item = editor.layout().itemAt(
-        editor.layout().indexOf(editor.evaluation_panel)
-    )
-    alignment = panel_item.alignment()
-    assert alignment & Qt.AlignmentFlag.AlignLeft
-    assert alignment & Qt.AlignmentFlag.AlignTop
-
-    editor.evaluation_panel.start_button.click()
-    _wait(app, lambda: editor.evaluation_panel._result is not None)
-
-    recommendation = editor.table.cellWidget(0, 4)
-    assert recommendation is not None
-    assert recommendation.layout().itemAt(0).widget().card_code == "2S"
-    assert editor.table.cellWidget(1, 4) is None
-    editor.table.cellWidget(0, 1).setCurrentIndex(
-        editor.table.cellWidget(0, 1).findData("right")
-    )
-    assert editor.table.cellWidget(0, 4) is None
-    assert "失效" in editor.evaluation_panel.metrics_label.text()
-    assert not editor.evaluation_panel.start_button.isEnabled()
-    assert "保存" in editor.evaluation_panel.eligibility_label.text()
-    editor.shutdown()
-    editor.close()
-
-
-def test_pass_row_expands_for_card_recommendation_without_clipping(tmp_path):
-    app = _app()
-    session, _truth = _session(tmp_path)
-    truth = TruthLog(
-        "game",
-        TruthInitialState("8", "right", HAND),
-        (
-            TruthTurn(1, "right", False, ("3S",), trick_id=1),
-            TruthTurn(2, "self", True, (), trick_id=1),
-        ),
-    )
-    editor = TruthLogEditor(session, truth)
-    editor.show()
-    app.processEvents()
-
-    editor._show_evaluation_result(
-        EvaluationRunResult(
-            "test-run",
-            "completed",
-            session,
-            {},
-            (
-                {
-                    "turn_id": 2,
-                    "status": "evaluated",
-                    "predicted_action": {
-                        "is_pass": False,
-                        "cards": ["7S", "7H"],
-                    },
-                },
-            ),
-        )
-    )
-    app.processEvents()
-
-    actual = editor.table.cellWidget(1, 2)
-    recommendation = editor.table.cellWidget(1, 4)
-    assert actual is not None
-    assert recommendation is not None
-    pass_badge = actual.layout().itemAt(0).widget()
-    recommendation_badge = recommendation.layout().itemAt(0).widget()
-    assert pass_badge.objectName() == "passBadge"
-    assert pass_badge.minimumHeight() == 72
-    assert recommendation_badge.minimumHeight() == 72
-    assert editor.table.rowHeight(1) >= 72
-    editor.shutdown()
-    editor.close()
-
-
-def test_editor_mutation_during_worker_keeps_frozen_run_but_rejects_stale_ui(
-    tmp_path,
-):
-    app = _app()
-    session, truth = _session(tmp_path)
-    advisor = _SlowAdvisor()
-    editor = TruthLogEditor(
-        session,
-        truth,
-        evaluation_service=ModelEvaluationService(
-            advisor_factory=lambda _strategy: advisor
-        ),
-    )
-
-    editor.evaluation_panel.start_button.click()
-    _wait(app, advisor.started.is_set)
-    editor.table.cellWidget(0, 1).setCurrentIndex(
-        editor.table.cellWidget(0, 1).findData("right")
-    )
-    advisor.release.set()
-    _wait(app, lambda: editor.evaluation_panel._result is not None)
-
-    assert editor.evaluation_panel._result.summary["input_sha256"] is not None
-    assert editor.table.cellWidget(0, 4) is None
-    assert "不一致" in editor.evaluation_panel.status_label.text()
-    editor.shutdown()
-    editor.close()
 
 
 def test_panel_exposes_explicit_guarded_existing_log_repair(tmp_path):

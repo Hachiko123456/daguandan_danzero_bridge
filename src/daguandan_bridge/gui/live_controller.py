@@ -32,6 +32,7 @@ from ..capture_service import FrameSnapshot
 from ..dependencies import preload_live_worker_dependencies
 from ..danzero.state import GuanDanState, RANKS
 from ..domain.live_runtime import AdviceRequestKey, LiveAdvice, LiveUpdate
+from ..live.frame_pipeline import analyze_frame_envelope
 from ..live.latest_worker import LatestOnlyWorker
 from ..live.pipeline_timing import PipelineTiming
 from ..opening_evidence import (
@@ -1629,18 +1630,20 @@ class LiveAssistantController(QObject):
         started_ns = monotonic_ns()
         timing.increment("analysis_started")
         try:
-            update = token.orchestrator.analyze_frame(
-                task.snapshot.image,
-                monotonic_ms=task.captured_ms,
+            envelope = task.snapshot.to_envelope(
+                capture_seq=task.capture_seq,
+                capture_generation=token.generation,
+            )
+            update = analyze_frame_envelope(
+                token.orchestrator,
+                envelope,
                 trace_context={
                     "worker_token": {
                         "session_id": token.session_id,
                         "nonce": token.nonce,
                         "generation": token.generation,
                     },
-                    "capture_seq": task.capture_seq,
                     "captured_ms": task.captured_ms,
-                    "capture_generation": token.generation,
                 },
             )
         except Exception:

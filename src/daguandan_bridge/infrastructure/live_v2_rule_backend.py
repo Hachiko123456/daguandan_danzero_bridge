@@ -26,7 +26,7 @@ from .live_v2_legacy_gateway import (
     is_legacy_reducer,
     legacy_events,
     legacy_identity,
-    stage_latest_correction,
+    stage_action_correction,
     stage_reducer,
 )
 from .live_v2_legacy_projection import (
@@ -202,14 +202,18 @@ class LegacyReducerTransactionBackend:
             actions = self._ledger.actions
             if command.expected_version != current:
                 return CommitReason.VERSION_CONFLICT, None, current
-            if not actions or actions[-1].action_id != command.target_action_id:
+            target_action = next(
+                (item for item in actions if item.action_id == command.target_action_id),
+                None,
+            )
+            if target_action is None:
                 return CommitReason.TRANSACTION_REJECTED, None, current
             baseline = _baseline(self._reducer)
             try:
-                staged = stage_latest_correction(
+                staged = stage_action_correction(
                     reducer=self._reducer,
-                    target_action=actions[-1],
-                    target_event=self.events_for_actions((actions[-1],))[0],
+                    target_action=target_action,
+                    target_event=self.events_for_actions((target_action,))[0],
                     command=command,
                 )
                 resulting = current.with_state(

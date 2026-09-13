@@ -1137,10 +1137,26 @@ class LiveOrchestrator:
                 and self._ownership_allows_sample()
                 and self._sample_due(monotonic_ms)
             )
+            # 左家打出 5 张及以上时，牌尾会伸进我方按钮区（不出/提示/出牌），
+            # 按钮可见期间的左家牌面读数花色不可信，甚至会产生幻影多牌。
+            # 遮挡帧一律不进入共识采样与上一手复核：等按钮消失（自己行动后）
+            # 再由换手/恢复/复核路径干净重读，宁可延迟也不可提交错误牌面。
+            if collect_expected_sample and expected == "left" and fast.self_action_buttons_visible:
+                collect_expected_sample = False
+            previous_action_occluded = bool(
+                previous_action_target is not None
+                and previous_action_target.target.actor == "left"
+                and fast.self_action_buttons_visible
+            )
+            legacy_suit_occluded = bool(
+                legacy_suit_target is not None
+                and getattr(legacy_suit_target, "actor", None) == "left"
+                and fast.self_action_buttons_visible
+            )
             if (
                 not collect_expected_sample
-                and previous_action_target is None
-                and legacy_suit_target is None
+                and (previous_action_target is None or previous_action_occluded)
+                and (legacy_suit_target is None or legacy_suit_occluded)
             ):
                 return self._update(fast_signals=fast)
 
@@ -1153,12 +1169,12 @@ class LiveOrchestrator:
             frame,
             target=previous_action_target,
             wild_rank=wild_rank,
-        ) if previous_action_target is not None else None
+        ) if previous_action_target is not None and not previous_action_occluded else None
         legacy_suit_result = self._probe_suit_correction(
             frame,
             target=legacy_suit_target,
             wild_rank=wild_rank,
-        ) if legacy_suit_target is not None else None
+        ) if legacy_suit_target is not None and not legacy_suit_occluded else None
         result = (
             self._recognize_play_region(
                 frame,
@@ -1174,10 +1190,14 @@ class LiveOrchestrator:
                 return self._update()
             if self._zone is None or self._zone.expected_player != expected:
                 return self._update()
-            previous_action_event = self._apply_previous_action_correction(
-                previous_action_target,
-                previous_action_result,
-                monotonic_ms=monotonic_ms,
+            previous_action_event = (
+                None
+                if previous_action_occluded
+                else self._apply_previous_action_correction(
+                    previous_action_target,
+                    previous_action_result,
+                    monotonic_ms=monotonic_ms,
+                )
             )
             if previous_action_event is not None:
                 return self._update(
@@ -2010,6 +2030,9 @@ class LiveOrchestrator:
                 preview.apply(event)
             for player in path:
                 if preview.snapshot().current_player != player:
+                    break
+                # 我方按钮可见时左家牌面被遮挡，遮挡读数不得进入动作链。
+                if player == "left" and fast.self_action_buttons_visible:
                     break
                 observation = self._recognize_play_region(
                     frame, player, wild_rank=snapshot.wild_rank, allow_pass=False,
@@ -3730,6 +3753,15 @@ class LiveOrchestrator:
             if candidate is None:
                 window.turn_recovery_cycle_missing_player = player
                 return None
+            # 左家牌面在我方按钮可见期间被遮挡：此时恢复的左家出牌候选不可信，
+            # 视为本轮恢复未命中，等按钮消失后的干净帧再恢复。
+            if (
+                player == "left"
+                and not candidate.is_pass
+                and fast.self_action_buttons_visible
+            ):
+                window.turn_recovery_cycle_missing_player = player
+                return None
             if not candidate.is_pass:
                 # Every non-PASS, not just the first, needs its own bound
                 # unconsumed pixel baseline. Two complete distinct captures
@@ -4944,6 +4976,11 @@ class LiveOrchestrator:
                 allow_pass=False,
             )
         except (cv2.error, OSError, RuntimeError, ValueError):
+            return None
+        # 我方按钮可见时左家牌面被遮挡：不得用遮挡读数确认接风方出牌。
+        if receiver == "left" and fast.self_action_buttons_visible:
+            window.wind_catch_receiver_play = None
+            window.wind_catch_receiver_play_streak = 0
             return None
         if (
             observation.player != receiver

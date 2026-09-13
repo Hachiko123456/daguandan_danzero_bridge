@@ -161,18 +161,39 @@ def test_template_recognizer_reads_level_hand_timer_and_lead(tmp_path):
     assert any(annotation.label == "2S" for annotation in result.annotations)
 
 
-def test_table_anchor_uses_one_frame_at_the_configured_085_threshold():
+@pytest.mark.parametrize(
+    ("template", "x", "y", "score_field"),
+    (
+        ("templates/anchor/table_anchor_1.png", 1150, 2, "table_anchor_1_score"),
+        ("templates/anchor/table_anchor_2.png", 16, 5, "table_anchor_2_score"),
+        ("templates/anchor/game_logo_anchor.png", 204, 6, "game_logo_anchor_score"),
+    ),
+)
+def test_any_table_page_anchor_uses_the_configured_085_threshold(
+    template, x, y, score_field
+):
     service = ScreenshotRecognitionService(
         AnnotationService(PROFILES_ROOT),
         TemplateService(PROFILES_ROOT),
     )
     image = np.zeros((720, 1280, 3), dtype=np.uint8)
-    _paste_template(image, "templates/anchor/table_anchor_1.png", 1150, 2)
+    _paste_template(image, template, x, y)
 
+    scores = service.recognize_page_anchor_scores(image)
+    assert scores[score_field] >= 0.85
     assert service.recognize_table_anchor(image) >= 0.85
-    assert service.recognize_table_anchor(
-        np.zeros((720, 1280, 3), dtype=np.uint8)
-    ) < 0.85
+    assert service.recognize_listening_page(image).stage == "table"
+
+
+def test_blank_frame_does_not_match_any_table_page_anchor():
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    blank = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    assert service.recognize_table_anchor(blank) < 0.85
+    assert service.recognize_listening_page(blank).stage == "unknown"
 
 
 def test_initial_hand_keeps_a_rank_when_its_suit_is_occluded():

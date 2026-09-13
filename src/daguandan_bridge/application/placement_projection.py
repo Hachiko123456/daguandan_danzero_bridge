@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from ..live.truth_log import TruthTurn
+from ..live.truth_log import TruthLog, TruthTurn
 
 
 PLACEMENT_ORDER = ("head", "second", "third", "last")
@@ -16,6 +16,65 @@ PLACEMENT_LABELS = {
     "last": "末游",
 }
 _ACTION_TYPES = frozenset({"player_played", "player_passed", "manual_confirmed_event"})
+
+
+def derive_finish_order(
+    turns: Iterable[TruthTurn],
+    *,
+    initial_hand_size: int,
+    standard_hand_size: int = 27,
+) -> tuple[str, ...]:
+    """Derive all four placements from first-three zero-card crossings.
+
+    The fourth place is deterministic once three players have exhausted their
+    hands; it does not require the last player's cards to reach zero.
+    """
+    if initial_hand_size <= 0 or standard_hand_size <= 0:
+        return ()
+    remaining = {seat: standard_hand_size for seat in ("self", "right", "opposite", "left")}
+    remaining["self"] = initial_hand_size
+    finish: list[str] = []
+    for turn in turns:
+        if turn.is_pass or turn.actor not in remaining:
+            continue
+        remaining[turn.actor] -= len(turn.cards)
+        if remaining[turn.actor] < 0:
+            return ()
+        if remaining[turn.actor] == 0 and turn.actor not in finish:
+            finish.append(turn.actor)
+            if len(finish) == 3:
+                finish.extend(seat for seat in remaining if seat not in finish)
+                break
+    return tuple(finish)
+
+
+def project_truth_log_placements(truth_log: TruthLog) -> tuple[PlacementProjection, ...]:
+    """Project placement badges directly from a TruthLog's card counts."""
+    order = tuple(str(seat) for seat in truth_log.outcome.finish_order)
+    if len(order) < 4:
+        order = derive_finish_order(
+            truth_log.turns,
+            initial_hand_size=len(truth_log.initial_state.my_hand),
+        )
+    result = []
+    for index, actor in enumerate(order[:4]):
+        placement = PLACEMENT_ORDER[index]
+        anchor = None
+        remaining = 27 if actor != "self" else len(truth_log.initial_state.my_hand)
+        last_play = None
+        for turn in truth_log.turns:
+            if turn.actor == actor and not turn.is_pass:
+                last_play = turn.index
+                remaining -= len(turn.cards)
+                if remaining == 0:
+                    anchor = turn.index
+                    break
+        # A direct row anchor is safe only for a player whose hand actually
+        # reached zero. The inferred fourth place remains summary-only.
+        if anchor is None and index < 3:
+            anchor = last_play
+        result.append(PlacementProjection(placement, actor, anchor, "card_count"))
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -84,7 +143,7 @@ def format_placement_summary(
 
     items = tuple(projections)
     if not items:
-        return "出完顺序：暂无录像名次记录"
+        return "出完顺序：未知（未识别到可信录像名次证据）"
     return "出完顺序：" + "  →  ".join(
         f"{index} {seat_labels.get(item.actor, item.actor)}·{item.label}"
         for index, item in enumerate(items, start=1)

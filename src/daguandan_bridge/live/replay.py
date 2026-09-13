@@ -16,8 +16,10 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from ..domain.frame import FrameEnvelope
 from ..storage import append_json_line, atomic_write_json
 from ..danzero.state import GuanDanState
+from .frame_pipeline import analyze_frame_envelope
 from .models import LiveEvent, LiveSnapshot
 from .orchestrator import LiveOrchestrator
 from .recorder import SessionRecorder
@@ -103,6 +105,8 @@ class VisualPipelineReplayResult:
     status: str = "complete"
     status_reason: str = ""
     untrusted_pass_count: int = 0
+    opening: dict[str, object] = field(default_factory=dict)
+    runtime_identity: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -155,6 +159,7 @@ def replay_truth_through_live_advisor(
     output_root: Path | None = None,
     stop_requested: Callable[[], bool] | None = None,
     on_advice: Callable[[dict[str, object]], None] | None = None,
+    on_progress: Callable[[int, int, int], None] | None = None,
     advice_timeout_sec: float = 60.0,
 ) -> TrustedAdviceReplayResult:
     """Drive the production live state/advisor path from trusted actions.
@@ -294,6 +299,8 @@ def replay_truth_through_live_advisor(
             )
             started = True
             consume_advice(update, store)
+            if on_progress is not None:
+                on_progress(0, len(truth_log.turns), 0)
             for turn in truth_log.turns:
                 if stop_requested is not None and stop_requested():
                     break
@@ -307,6 +314,8 @@ def replay_truth_through_live_advisor(
                 )
                 processed_turn_count += 1
                 consume_advice(update, store)
+                if on_progress is not None:
+                    on_progress(processed_turn_count, len(truth_log.turns), turn.index)
         finally:
             if started:
                 orchestrator.finish()
@@ -678,6 +687,31 @@ class VideoReplaySource:
             self._warnings = tuple(warnings)
 
 
+    def envelopes(
+        self,
+        *,
+        start_frame: int | None = None,
+        capture_generation: int = 0,
+    ) -> Iterator[FrameEnvelope]:
+        """Yield recorded frames in the same canonical form as live capture."""
+
+        for capture_seq, (record, frame) in enumerate(
+            self.frames(start_frame=start_frame),
+            start=1,
+        ):
+            yield FrameEnvelope(
+                image=frame,
+                captured_monotonic_ms=record.monotonic_ms,
+                wall_time=record.wall_time,
+                frame_index=record.frame_index,
+                capture_seq=capture_seq,
+                capture_generation=capture_generation,
+                evidence_frame_id=f"replay-{record.frame_index}",
+                roi_version="live-v2",
+                source_id=f"avi:{self.video_path.stem}",
+            )
+
+
 def _stable_visual_initial_state(
     recognition_service: Any,
     frames: tuple[np.ndarray, ...],
@@ -820,14 +854,13 @@ def replay_video_through_live_pipeline(
 
     video_source = VideoReplaySource(video_path, frame_index_path)
     indexed_frame_count = video_source.indexed_frame_count
-    frames = iter(video_source.frames())
-    first = next(frames, None)
-    if first is None:
+    frames = iter(video_source.envelopes())
+    first_frame = next(frames, None)
+    if first_frame is None:
         raise ValueError("录像没有可回放帧")
-    first_record, first_frame = first
     if on_progress is not None:
-        on_progress(0, indexed_frame_count, first_record.frame_index)
-    prefetched_frames = [(first_record, first_frame)]
+        on_progress(0, indexed_frame_count, int(first_frame.frame_index or 0))
+    prefetched_frames = [first_frame]
     initial_state_warnings: list[ReplayWarning] = []
     if use_live_pipeline:
         second = next(frames, None)
@@ -835,7 +868,7 @@ def replay_video_through_live_pipeline(
             prefetched_frames.append(second)
         visual_initial = _stable_visual_initial_state(
             recognition_service,
-            tuple(frame for _record, frame in prefetched_frames),
+            tuple(item.image for item in prefetched_frames),
         )
         if visual_initial is not None:
             visual_level, visual_hand = visual_initial
@@ -853,7 +886,7 @@ def replay_video_through_live_pipeline(
             hand = visual_hand
     actual_events: tuple[LiveEvent, ...] = ()
     frame_count = 0
-    last_record = first_record
+    last_record = first_frame
     runtime_directory: Path | None = None
     advice_timeout_count = 0
     waited_advice_requests: set[str] = set()
@@ -867,7 +900,7 @@ def replay_video_through_live_pipeline(
         root = Path(temp)
         store = LiveSessionStore(root, "replay", session_id="visual-replay")
         store.start({"source_session": str(session), "mode": "visual_pipeline"})
-        height, width = first_frame.shape[:2]
+        height, width = first_frame.image.shape[:2]
         recorder = SessionRecorder(store.directory, size=(width, height), fps=10)
         runner = LiveOrchestrator(
             reducer=LiveReducer("visual-replay"),
@@ -890,24 +923,23 @@ def replay_video_through_live_pipeline(
                 None if use_live_pipeline else lead_player
             ),
             # 必须与录像时间线对齐，保证区域生命周期从首帧开始计时。
-            monotonic_ms=int(first_record.monotonic_ms),
-            wall_time=first_record.wall_time,
+            monotonic_ms=int(first_frame.captured_monotonic_ms),
+            wall_time=first_frame.wall_time,
             historical_scan=use_saved_baseline,
         )
         try:
-            for record, frame in chain(prefetched_frames, frames):
+            for envelope in chain(prefetched_frames, frames):
                 if stop_requested is not None and stop_requested():
                     break
-                if wait_for_position is not None and not wait_for_position(
-                    record.frame_index
-                ):
+                frame_index = int(envelope.frame_index or 0)
+                if wait_for_position is not None and not wait_for_position(frame_index):
                     break
-                update = runner.analyze_frame(
-                    frame,
-                    monotonic_ms=record.monotonic_ms,
+                update = analyze_frame_envelope(
+                    runner,
+                    envelope,
                     trace_context={
-                        "source_wall_time": record.wall_time,
                         "historical_scan": use_saved_baseline,
+                        "replay_mode": "sequential_every_frame",
                     },
                 )
                 raw_advice = getattr(update, "advice", None)
@@ -944,8 +976,8 @@ def replay_video_through_live_pipeline(
                     append_json_line(
                         output,
                         {
-                        "frame_index": record.frame_index,
-                        "monotonic_ms": record.monotonic_ms,
+                        "frame_index": frame_index,
+                        "monotonic_ms": envelope.captured_monotonic_ms,
                         "status": update.status,
                         "current_player": update.snapshot.current_player,
                         "state_revision": update.snapshot.revision,
@@ -956,13 +988,13 @@ def replay_video_through_live_pipeline(
                         ),
                         },
                     )
-                last_record = record
+                last_record = envelope
                 frame_count += 1
                 if on_progress is not None:
                     on_progress(
                         frame_count,
                         indexed_frame_count,
-                        record.frame_index,
+                        frame_index,
                     )
                 if on_turn is not None:
                     turn_id_by_event_id: dict[str, int] = {
@@ -974,7 +1006,7 @@ def replay_video_through_live_pipeline(
                         if event.event_type in _ACTION_TYPES:
                             turn_data = _event_to_turn_data(
                                 event,
-                                record.frame_index,
+                                frame_index,
                                 truth_log,
                             )
                             if turn_data["pass_audit"] == "inferred":
@@ -1010,7 +1042,7 @@ def replay_video_through_live_pipeline(
                                 ),
                                 "trick_id": event.trick_id,
                                 "confidence": round(float(event.confidence), 4),
-                                "frame_index": record.frame_index,
+                                "frame_index": frame_index,
                             }
                         )
         finally:
@@ -1030,8 +1062,8 @@ def replay_video_through_live_pipeline(
                 append_json_line(
                     output,
                     {
-                        "frame_index": last_record.frame_index,
-                        "monotonic_ms": last_record.monotonic_ms,
+                        "frame_index": int(last_record.frame_index or 0),
+                        "monotonic_ms": last_record.captured_monotonic_ms,
                         "status": runner.status,
                         "current_player": snapshot.current_player,
                         "state_revision": snapshot.revision,

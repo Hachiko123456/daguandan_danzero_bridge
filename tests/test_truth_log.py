@@ -10,12 +10,14 @@ from daguandan_bridge.domain.truth import LabelProvenance, TruthEvidence
 from daguandan_bridge.live.truth_log import (
     TruthInitialState,
     TruthLog,
+    TruthLogCardInventoryError,
     TruthTurn,
     card_code_to_text,
     card_text_to_code,
     load_truth_log,
     save_truth_log,
     truth_log_from_dict,
+    validate_truth_log_card_inventory,
 )
 
 HAND = tuple(
@@ -210,3 +212,78 @@ def test_truth_v4_round_trips_explicit_wildcard_semantics_into_live_events():
     assert loaded.turns[0].move_semantics == semantics
     assert event.payload["physical_cards"] == list(turn.cards)
     assert event.payload["move_semantics"] == semantics
+
+
+
+def test_card_inventory_rejects_third_exact_card_across_hand_and_opponents():
+    log = TruthLog(
+        "inventory-exact",
+        TruthInitialState("2", "right", HAND),
+        (
+            TruthTurn(1, "right", False, ("3D",)),
+            TruthTurn(2, "opposite", False, ("3D",)),
+        ),
+    )
+
+    with pytest.raises(TruthLogCardInventoryError) as captured:
+        validate_truth_log_card_inventory(log)
+
+    message = str(captured.value)
+    assert "方块3（3D）共 3 张" in message
+    assert "双副牌最多 2 张" in message
+    assert "第 1、2 条动作" in message
+
+
+def test_card_inventory_checks_rank_and_suit_double_deck_limits():
+    rank_overflow = TruthLog(
+        "inventory-rank",
+        TruthInitialState(
+            "2",
+            "right",
+            ("3S", "3S", "3H", "3H", "3C", "3C", "3D", "3D"),
+        ),
+        (TruthTurn(1, "right", False, ("3?",)),),
+    )
+    with pytest.raises(TruthLogCardInventoryError, match="点数 3 共 9 张"):
+        validate_truth_log_card_inventory(rank_overflow)
+
+    full_spade_suit = tuple(
+        card for rank in ("2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A")
+        for card in (f"{rank}S", f"{rank}S")
+    )
+    suit_overflow = TruthLog(
+        "inventory-suit",
+        TruthInitialState("2", "right", full_spade_suit),
+        (TruthTurn(1, "right", False, ("AS",)),),
+    )
+    with pytest.raises(TruthLogCardInventoryError, match="花色 黑桃 共 27 张"):
+        validate_truth_log_card_inventory(suit_overflow)
+
+
+def test_card_inventory_rejects_self_card_not_present_in_initial_hand():
+    log = TruthLog(
+        "inventory-self",
+        TruthInitialState("2", "self", HAND),
+        (TruthTurn(1, "self", False, ("AS",)),),
+    )
+
+    with pytest.raises(TruthLogCardInventoryError, match="自己累计打出点数 A 1 张"):
+        validate_truth_log_card_inventory(log)
+
+
+def test_save_truth_log_never_persists_impossible_verified_inventory(tmp_path):
+    path = tmp_path / "truth_log.json"
+    log = TruthLog(
+        "inventory-save",
+        TruthInitialState("2", "right", HAND),
+        (
+            TruthTurn(1, "right", False, ("3D",)),
+            TruthTurn(2, "opposite", False, ("3D",)),
+        ),
+        label_status="verified",
+    )
+
+    with pytest.raises(TruthLogCardInventoryError):
+        save_truth_log(path, log)
+
+    assert not path.exists()

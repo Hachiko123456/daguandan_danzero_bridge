@@ -7,7 +7,7 @@ from daguandan_bridge.application.live_v2_frame_types import FramePipelineResult
 from daguandan_bridge.application.live_v2_runtime_updates import consume_vision
 from daguandan_bridge.application.live_v2_vision_protocol import (
     VisionRequestIdentity, VisionRuntimeResult, VisionRuntimeStatus,
-    VisionWorkerConfig, VisionWorkerSuccess,
+    VisionWorkerConfig, VisionWorkerPayload, VisionWorkerSuccess,
 )
 from daguandan_bridge.application.live_v2_vision_runtime import LiveV2VisionRuntime
 from daguandan_bridge.application.live_v2_worker_protocol import (
@@ -87,6 +87,38 @@ def test_success_from_old_formal_state_in_same_stream_remains_a_frame(latest) ->
     assert result.status is VisionRuntimeStatus.FRAME
     assert result.identity.version == VersionIdentity("session-a", 1, 1, 1, 0)
     assert result.pipeline_result.frame == frame(1, 1)
+
+
+def test_process_frame_sync_waits_for_exact_frame_identity():
+    host = Host()
+    runtime = LiveV2VisionRuntime(
+        VisionWorkerConfig("profiles"), host=host,
+        session_id="session-a", capture_generation=1,
+    )
+    # Leave an older result in the host queue. The synchronous API must not
+    # return it merely because it is a valid FRAME result.
+    submit(runtime, VersionIdentity("session-a", 1, 1, 1, 0), 1)
+    host.results.append(success(host.requests[0]))
+    requested_version = VersionIdentity("session-a", 1, 1, 2, 0)
+    requested_frame = frame(2, 1)
+    host.results.append(
+        success(WorkerRequest(
+            session_id="session-a", capture_generation=1, request_sequence=2,
+            state_revision=1, submitted_processing_ms=0,
+            payload=VisionWorkerPayload(
+                VisionWorkerConfig("profiles"),
+                VisionRequestIdentity(requested_frame, requested_version, 2),
+                Seat.RIGHT, False, "10", np.zeros((4, 8, 3), dtype=np.uint8),
+            ),
+        ))
+    )
+    result = runtime.process_frame_sync(
+        np.zeros((4, 8, 3), dtype=np.uint8), frame=requested_frame,
+        version=requested_version, expected_seat=Seat.RIGHT,
+        wild_rank="10", request_sequence=2,
+    )
+    assert result.frame == requested_frame
+    assert result.frame.frame_sequence == 2
 
 
 def test_success_from_old_capture_generation_is_rejected() -> None:

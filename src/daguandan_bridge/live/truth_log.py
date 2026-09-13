@@ -25,6 +25,12 @@ _SCHEMA_VERSIONS = {"guandan.truth/3": 3, _SCHEMA: _SCHEMA_VERSION}
 _SEAT_LABELS = {"self": "自己", "right": "右家", "opposite": "对家", "left": "左家"}
 _SUIT_LABELS = {"S": "黑桃", "H": "红桃", "C": "梅花", "D": "方块"}
 _LABEL_TO_SUIT = {value: key for key, value in _SUIT_LABELS.items()}
+
+
+class TruthLogCardInventoryError(ValueError):
+    """Raised when a TruthLog cannot fit in one physical double deck."""
+
+
 def card_code_to_text(card: str) -> str:
     if card == "small_joker":
         return "小王"
@@ -76,6 +82,9 @@ class TruthInitialState:
     round_level: str
     lead_player: Seat
     my_hand: tuple[str, ...]
+    # Other seats may start with 25–29 cards because of tribute.  Empty keeps
+    # the legacy 27-card default; populated values make strict replay honest.
+    seat_hand_sizes: tuple[tuple[str, int], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -83,6 +92,11 @@ class TruthInitialState:
             "wild_rank": self.round_level,
             "lead_player": self.lead_player,
             "my_hand": list(self.my_hand),
+            **(
+                {"seat_hand_sizes": {seat: int(size) for seat, size in self.seat_hand_sizes}}
+                if self.seat_hand_sizes
+                else {}
+            ),
         }
 
 
@@ -244,6 +258,11 @@ class TruthLog:
                     "wild_rank": self.initial_state.round_level,
                     "hand": list(self.initial_state.my_hand),
                     "lead_player": self.initial_state.lead_player,
+                    **(
+                        {"seat_hand_sizes": {seat: int(size) for seat, size in self.initial_state.seat_hand_sizes}}
+                        if self.initial_state.seat_hand_sizes
+                        else {}
+                    ),
                 },
                 confidence=1.0,
                 source="truth_log",
@@ -280,6 +299,203 @@ class TruthLog:
                 )
             )
         return tuple(events)
+
+
+def _physical_rank(card: str) -> str:
+    if card in {"small_joker", "big_joker"}:
+        return card
+    return card[:-1]
+
+
+def _physical_suit(card: str) -> str | None:
+    return card[-1] if card[-1:] in SUITS else None
+
+
+def _is_exact_physical_card(card: str) -> bool:
+    return card in {"small_joker", "big_joker"} or card[-1:] in SUITS
+
+
+def _turn_references(
+    turns: Iterable[TruthTurn],
+    *,
+    card: str | None = None,
+    rank: str | None = None,
+    suit: str | None = None,
+) -> str:
+    indices: list[int] = []
+    for turn in turns:
+        if turn.is_pass:
+            continue
+        matched = any(
+            (card is not None and value == card)
+            or (rank is not None and _physical_rank(value) == rank)
+            or (suit is not None and _physical_suit(value) == suit)
+            for value in turn.cards
+        )
+        if matched:
+            indices.append(int(turn.index))
+    if not indices:
+        return ""
+    rendered = "、".join(str(value) for value in indices[:12])
+    if len(indices) > 12:
+        rendered += f" 等 {len(indices)} 条"
+    return f"；涉及第 {rendered} 条动作"
+
+
+def _rank_label(rank: str) -> str:
+    if rank == "small_joker":
+        return "小王"
+    if rank == "big_joker":
+        return "大王"
+    return rank
+
+
+def validate_truth_log_card_inventory(log: TruthLog) -> None:
+    """Reject a TruthLog that cannot fit in a physical double deck.
+
+    ``my_hand`` is the complete initial hand, so self plays are validated as a
+    subset of that hand instead of being counted a second time.  The global
+    physical ledger is therefore ``my_hand + all opponents' played cards``.
+    This catches impossible third copies even before the last copy is played by
+    self, while avoiding false positives from counting self's cards twice.
+
+    Double-deck limits are checked at all useful levels:
+
+    * one exact rank+suit card (and each Joker): at most 2 copies;
+    * one ordinary rank across four suits: at most 8 copies;
+    * one suit across thirteen ranks: at most 26 copies.
+
+    Unknown-suit cards still consume their rank allowance but do not consume an
+    arbitrary exact-card or suit slot until their suit is confirmed.
+    """
+
+    if not isinstance(log, TruthLog):
+        raise TypeError("log must be a TruthLog")
+
+    hand = tuple(card_text_to_code(str(card)) for card in log.initial_state.my_hand)
+    self_turns = tuple(
+        turn for turn in log.turns if not turn.is_pass and turn.actor == "self"
+    )
+    opponent_turns = tuple(
+        turn for turn in log.turns if not turn.is_pass and turn.actor != "self"
+    )
+    self_cards = tuple(
+        card_text_to_code(str(card)) for turn in self_turns for card in turn.cards
+    )
+    opponent_cards = tuple(
+        card_text_to_code(str(card))
+        for turn in opponent_turns
+        for card in turn.cards
+    )
+
+    hand_exact = Counter(card for card in hand if _is_exact_physical_card(card))
+    self_exact = Counter(
+        card for card in self_cards if _is_exact_physical_card(card)
+    )
+    opponent_exact = Counter(
+        card for card in opponent_cards if _is_exact_physical_card(card)
+    )
+    observed_exact = hand_exact + opponent_exact
+
+    hand_ranks = Counter(_physical_rank(card) for card in hand)
+    self_ranks = Counter(_physical_rank(card) for card in self_cards)
+    opponent_ranks = Counter(_physical_rank(card) for card in opponent_cards)
+    observed_ranks = hand_ranks + opponent_ranks
+
+    hand_suits = Counter(
+        suit for card in hand if (suit := _physical_suit(card)) is not None
+    )
+    opponent_suits = Counter(
+        suit
+        for card in opponent_cards
+        if (suit := _physical_suit(card)) is not None
+    )
+    observed_suits = hand_suits + opponent_suits
+    hand_unknown_ranks = Counter(
+        _physical_rank(card) for card in hand if card.endswith("?")
+    )
+
+    violations: list[str] = []
+
+    for card, count in sorted(observed_exact.items()):
+        if count <= 2:
+            continue
+        references = _turn_references(opponent_turns, card=card)
+        violations.append(
+            f"牌面 {card_code_to_text(card)}（{card}）共 {count} 张："
+            f"我方初始手牌 {hand_exact[card]} 张，其他玩家历史出牌 "
+            f"{opponent_exact[card]} 张；双副牌最多 2 张{references}"
+        )
+
+    ordered_ranks = (*RANKS, "small_joker", "big_joker")
+    for rank in ordered_ranks:
+        count = observed_ranks[rank]
+        limit = 2 if rank in {"small_joker", "big_joker"} else 8
+        if count <= limit:
+            continue
+        references = _turn_references(opponent_turns, rank=rank)
+        violations.append(
+            f"点数 {_rank_label(rank)} 共 {count} 张：我方初始手牌 "
+            f"{hand_ranks[rank]} 张，其他玩家历史出牌 {opponent_ranks[rank]} 张；"
+            f"双副牌最多 {limit} 张{references}"
+        )
+
+    for suit in SUITS:
+        count = observed_suits[suit]
+        if count <= 26:
+            continue
+        references = _turn_references(opponent_turns, suit=suit)
+        violations.append(
+            f"花色 {_SUIT_LABELS[suit]} 共 {count} 张：我方初始手牌 "
+            f"{hand_suits[suit]} 张，其他玩家历史出牌 {opponent_suits[suit]} 张；"
+            f"双副牌最多 26 张{references}"
+        )
+
+    for rank in ordered_ranks:
+        if self_ranks[rank] <= hand_ranks[rank]:
+            continue
+        references = _turn_references(self_turns, rank=rank)
+        violations.append(
+            f"自己累计打出点数 {_rank_label(rank)} {self_ranks[rank]} 张，"
+            f"但初始手牌只有 {hand_ranks[rank]} 张{references}"
+        )
+
+    for rank in RANKS:
+        deficits = {
+            card: max(0, self_exact[card] - hand_exact[card])
+            for card in (f"{rank}{suit}" for suit in SUITS)
+        }
+        required_unknowns = sum(deficits.values())
+        if required_unknowns <= hand_unknown_ranks[rank]:
+            continue
+        detail = "、".join(
+            f"{card_code_to_text(card)}缺 {count} 张"
+            for card, count in deficits.items()
+            if count
+        )
+        references = _turn_references(self_turns, rank=rank)
+        violations.append(
+            f"自己打出的点数 {rank} 与初始手牌花色不一致：{detail}；"
+            f"初始手牌只有 {hand_unknown_ranks[rank]} 张未知花色可用于匹配"
+            f"{references}"
+        )
+
+    for joker in ("small_joker", "big_joker"):
+        if self_exact[joker] <= hand_exact[joker]:
+            continue
+        references = _turn_references(self_turns, card=joker)
+        violations.append(
+            f"自己累计打出{card_code_to_text(joker)} {self_exact[joker]} 张，"
+            f"但初始手牌只有 {hand_exact[joker]} 张{references}"
+        )
+
+    if violations:
+        visible = violations[:10]
+        if len(violations) > len(visible):
+            visible.append(f"另有 {len(violations) - len(visible)} 项牌库数量冲突")
+        raise TruthLogCardInventoryError(
+            "TruthLog 牌库数量校验未通过：\n- " + "\n- ".join(visible)
+        )
 
 
 def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
@@ -352,6 +568,18 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
                 move_semantics=item.get("move_semantics"),  # type: ignore[arg-type]
             )
         )
+    raw_sizes = initial.get("seat_hand_sizes", {})
+    seat_hand_sizes: tuple[tuple[str, int], ...] = ()
+    if isinstance(raw_sizes, dict):
+        parsed_sizes = []
+        for seat, value in raw_sizes.items():
+            if str(seat) not in SEATS:
+                raise ValueError("标准日志中的座位起手牌数无效")
+            size = int(value)
+            if not 0 <= size <= 54:
+                raise ValueError("标准日志中的座位起手牌数超出范围")
+            parsed_sizes.append((str(seat), size))
+        seat_hand_sizes = tuple(sorted(parsed_sizes))
     source = raw.get("source_video") or {}
     if not isinstance(source, dict):
         raise ValueError("标准日志录像路径无效")
@@ -361,6 +589,7 @@ def truth_log_from_dict(raw: dict[str, Any]) -> TruthLog:
             round_level=str(initial.get("round_level", initial.get("wild_rank", ""))),
             lead_player=lead,  # type: ignore[arg-type]
             my_hand=hand,
+            seat_hand_sizes=seat_hand_sizes,
         ),
         turns=tuple(turns),
         source_video=str(source.get("path", "video/game.avi")),
@@ -390,7 +619,12 @@ def load_truth_log(path: Path, *, session_id: str | None = None) -> TruthLog:
 
 
 def save_truth_log(path: Path, log: TruthLog) -> None:
-    atomic_write_json(path, truth_log_from_dict(log.to_dict()).to_dict())
+    normalized = truth_log_from_dict(log.to_dict())
+    # Diagnostic scan drafts may intentionally preserve impossible visual
+    # observations for later human repair.  Canonical verified writes may not.
+    if normalized.label_status == "verified":
+        validate_truth_log_card_inventory(normalized)
+    atomic_write_json(path, normalized.to_dict())
 
 
 def _with_inferred_trick_ids(
