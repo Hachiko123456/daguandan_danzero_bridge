@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import csv
+import gc
 import hashlib
 import json
 import platform
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Iterable, Literal
 from uuid import uuid4
 
@@ -182,8 +185,15 @@ class SessionReplayAuditService:
         command: Iterable[str] | None = None,
         session_paths: Iterable[Path | str] | None = None,
         on_progress: ProgressCallback | None = None,
+        max_workers: int = 1,
     ) -> SessionReplayAuditRun:
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int):
+            raise TypeError("max_workers must be an integer")
+        if not 1 <= max_workers <= 3:
+            raise ValueError("max_workers must be between 1 and 3")
         roots = _normalize_roots(session_roots)
+        scan_run_ids = tuple(_scan_run_ids(scan_run_id))
+        command_values = tuple(command) if command is not None else None
         explicit_sessions = _normalize_explicit_sessions(session_paths)
         source_roots = _unique_paths((*roots, *(item.source for item in explicit_sessions)))
         output_root = Path(output).resolve()
@@ -196,25 +206,97 @@ class SessionReplayAuditService:
         before = _source_snapshot(source_roots)
         before_path = run_dir / "source_snapshot_before.json"
         atomic_write_json(before_path, before)
-        inventory = _inventory(sessions, source_roots, scan_run_id, profile_root=self._profile_root)
+        inventory = _inventory(
+            sessions, source_roots, scan_run_ids, profile_root=self._profile_root
+        )
         inventory_path = run_dir / "inventory.json"
         atomic_write_json(inventory_path, inventory)
-        rows: list[dict[str, object]] = []
-        for index, session in enumerate(sessions, start=1):
-            session_dir = run_dir / "sessions" / session.store_id / _safe_name(session.session_id)
-            if on_progress is not None:
-                on_progress("session_start", session.session_id, index - 1, len(sessions), "准备会话")
-            rows.append(
-                self._audit_session(
-                    session,
-                    session_dir,
-                    scan_run_id,
-                    _inventory_row(inventory, session),
-                    on_progress=on_progress,
-                )
+        # Each session owns its VideoCapture, recognizer, runtime workers and
+        # temporary output.  Bound the executor so only a small number of
+        # frame streams and model workers exist at once; never preload all AVI
+        # frames or keep completed session objects in memory.
+        rows_by_index: list[dict[str, object] | None] = [None] * len(sessions)
+        progress_lock = Lock()
+
+        def emit(phase: str, session_id: str, processed: int, total: int, detail: str) -> None:
+            if on_progress is None:
+                return
+            # Progress callbacks are application-owned and are often not
+            # thread-safe (the CLI writes one terminal line).  Serialize them
+            # without serializing the actual session work.
+            with progress_lock:
+                on_progress(phase, session_id, processed, total, detail)
+
+        worker_count = min(max_workers, max(1, len(sessions)))
+        previous_cv_threads: int | None = None
+        if worker_count > 1:
+            # One OpenCV thread per session worker avoids nested native thread
+            # pools multiplying CPU and memory usage.
+            previous_cv_threads = int(cv2.getNumThreads())
+            cv2.setNumThreads(1)
+        def audit_one(
+            session: _Session,
+            session_dir: Path,
+            inventory_row: dict[str, object],
+        ) -> dict[str, object]:
+            emit("session_start", session.session_id, 0, len(sessions), "准备会话")
+            return self._audit_session(
+                session,
+                session_dir,
+                scan_run_ids,
+                inventory_row,
+                on_progress=emit,
             )
-            if on_progress is not None:
-                on_progress("session_done", session.session_id, index, len(sessions), "会话完成")
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="listener-regression",
+            ) as executor:
+                futures = {}
+                for index, session in enumerate(sessions):
+                    session_dir = (
+                        run_dir
+                        / "sessions"
+                        / session.store_id
+                        / _safe_name(session.session_id)
+                    )
+                    future = executor.submit(
+                        audit_one,
+                        session,
+                        session_dir,
+                        _inventory_row(inventory, session),
+                    )
+                    futures[future] = (index, session, session_dir)
+
+                completed_count = 0
+                for future in as_completed(futures):
+                    index, session, session_dir = futures.pop(future)
+                    try:
+                        row = future.result()
+                    except Exception as exc:
+                        # One unexpected session error must not discard results
+                        # from other workers or prevent the run from producing a
+                        # machine-readable failure report.
+                        row = _unexpected_session_row(
+                            session, session_dir, exc, _inventory_row(inventory, session)
+                        )
+                    rows_by_index[index] = row
+                    completed_count += 1
+                    emit(
+                        "session_done", session.session_id, completed_count,
+                        len(sessions), "会话完成"
+                    )
+                    # Release cyclic references and large temporary arrays as
+                    # soon as a worker result is collected.  The executor still
+                    # bounds concurrent memory even if the Python allocator
+                    # retains arenas.
+                    gc.collect()
+        finally:
+            if previous_cv_threads is not None:
+                cv2.setNumThreads(previous_cv_threads)
+
+        rows = [row for row in rows_by_index if row is not None]
         after = _source_snapshot(source_roots)
         after_path = run_dir / "source_snapshot_after.json"
         atomic_write_json(after_path, after)
@@ -222,10 +304,11 @@ class SessionReplayAuditService:
             run_id=run_dir.name,
             rows=rows,
             inventory=inventory,
-            scan_run_id=scan_run_id,
-            command=command,
+            scan_run_id=scan_run_ids,
+            command=command_values,
             source_changes=_source_changes(before, after),
             source_snapshot_paths=(before_path, after_path),
+            max_workers=worker_count,
         )
         summary_path = run_dir / "all_session_audit.json"
         atomic_write_json(summary_path, summary)
@@ -1359,11 +1442,20 @@ def _source_snapshot(roots: tuple[Path, ...]) -> dict[str, dict[str, object]]:
     return result
 
 
-def _make_summary(*, run_id: str, rows: list[dict[str, object]], inventory: dict[str, object], scan_run_id: str | Iterable[str] | None, command: Iterable[str] | None, source_changes: list[dict[str, object]], source_snapshot_paths: tuple[Path, Path]) -> dict[str, object]:
+def _make_summary(*, run_id: str, rows: list[dict[str, object]], inventory: dict[str, object], scan_run_id: str | Iterable[str] | None, command: Iterable[str] | None, source_changes: list[dict[str, object]], source_snapshot_paths: tuple[Path, Path], max_workers: int = 1) -> dict[str, object]:
     completed = sum(row.get("execution_status") == "completed" for row in rows)
     return {
         "schema": "guandan.session-replay-audit/2", "run_id": run_id, "created_at": datetime.now().astimezone().isoformat(),
-        "parameters": {"sessions_roots": inventory.get("roots", ()), "scan_run_ids": list(_scan_run_ids(scan_run_id)), "command": list(command) if command else None},
+        "parameters": {
+            "sessions_roots": inventory.get("roots", ()),
+            "scan_run_ids": list(_scan_run_ids(scan_run_id)),
+            "command": list(command) if command else None,
+            "max_workers": int(max_workers),
+            "execution_mode": "bounded_thread_pool",
+            "memory_policy": "at most three sequential frame streams; one OpenCV native thread per worker; runtime workers cleaned per session",
+            "report_order": "original session selection order",
+            "report_merge": "top-level files are generated once after every worker finishes",
+        },
         "environment": inventory.get("environment", {}), "session_count": len(rows), "completed": completed, "errors": len(rows) - completed,
         "frames_processed": sum(int(row.get("frames_processed", 0) or 0) for row in rows), "indexed_frames": sum(int(row.get("indexed_frames", 0) or 0) for row in rows),
         "source_integrity": {"unchanged": not source_changes, "changes": source_changes, "before_snapshot": str(source_snapshot_paths[0]), "after_snapshot": str(source_snapshot_paths[1])},
@@ -1523,6 +1615,61 @@ def _row_quality_failures(row: dict[str, object]) -> list[str]:
 
     failures.extend(_fabledan_blocking_reasons(row, strict=True))
     return failures
+
+def _unexpected_session_row(
+    item: _Session,
+    output: Path,
+    exc: Exception,
+    inventory: dict[str, object],
+) -> dict[str, object]:
+    """Return a failure row if a worker escapes the normal audit guard."""
+
+    frame_inventory = inventory.get("frame_index", {})
+    indexed = (
+        int(frame_inventory.get("row_count", 0) or 0)
+        if isinstance(frame_inventory, dict)
+        else 0
+    )
+    row = {
+        "source": str(item.source),
+        "sessions_root": str(item.root),
+        "store_id": item.store_id,
+        "session_id": item.session_id,
+        "status": "error",
+        "execution_status": "error",
+        "frame_replay_status": "incomplete",
+        "opening_status": "not_observable",
+        "listener_status": "incomplete",
+        "listener_status_reason": "worker_exception",
+        "comparison_status": "failed",
+        "truth_quality": "not_available",
+        "visual_quality": "incomplete",
+        "fabledan_quality": "not_evaluated",
+        "frames_processed": 0,
+        "indexed_frames": indexed,
+        "processed_turns": 0,
+        "truth_log": {
+            "kind": str(inventory.get("truth_kind", "none")),
+            "path": inventory.get("truth_path"),
+            "loaded_before_visual_replay": False,
+        },
+        "inventory": inventory,
+        "lineage": {
+            "runtime": "live_v2",
+            "legacy_orchestrator_used": False,
+            "truth_log_used_as_visual_input": False,
+        },
+        "warnings": [],
+        "first_divergence": None,
+        "timeline_comparison": {},
+        "fabledan": {},
+        "evidence_paths": {},
+        "error": f"{type(exc).__name__}: {exc}",
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output / "summary.json", row)
+    return row
+
 
 def _recognition_for_session(session: Path) -> ScreenshotRecognitionService:
     profile = session.parent.parent

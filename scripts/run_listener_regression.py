@@ -24,6 +24,7 @@ import random
 import secrets
 import sys
 import time
+from threading import Lock
 from pathlib import Path
 from typing import Iterable
 
@@ -68,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  4. 视觉驱动 FableDan 与 TruthLog 隔离驱动 FableDan 分开统计。\n"
             "     旧 LiveOrchestrator 仅保留兼容/单元测试路径，不是主验收链。\n\n"
             "选择优先级：--session 先过滤；--random-count 再从过滤后的集合随机抽取。\n"
+            "--session 可以一次指定多个 ID，也可以重复写多个 --session。\n"
+            "默认同时处理 3 局；--workers 可在 1～3 之间调整。\n"
             "随机测试建议配合 --seed 使用，以便之后复现同一批 session。\n\n"
             "退出码：0=严格回归通过；1=发现质量失败；2=参数、路径或执行错误。\n\n"
             "示例：\n"
@@ -96,11 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--session",
-        action="append",
+        action="extend",
+        nargs="+",
         default=[],
+        metavar="SESSION",
         help=(
-            "先按 session ID、目录名或绝对路径过滤；可重复。"
-            "不指定时使用 sessions-root 下的全部候选。"
+            "按 session ID、目录名或绝对路径过滤；一次可指定多个，"
+            "也可重复 --session。不指定时使用 sessions-root 下的全部候选。"
         ),
     )
     parser.add_argument(
@@ -137,10 +142,47 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--workers",
+        "--max-workers",
+        dest="workers",
+        type=int,
+        default=3,
+        help=(
+            "同时处理的 session 数量，默认 3；范围 1～3。"
+            "线程只按 session 并发，不会把一局的帧全部加载到内存。"
+        ),
+    )
+    parser.add_argument(
         "--run-id",
         help="报告目录名；不指定时自动生成。重复名称会报错，避免覆盖旧报告。",
     )
     return parser
+
+
+def _normalize_session_filters(values: Iterable[object]) -> tuple[str, ...]:
+    if isinstance(values, (str, Path)):
+        values = (values,)
+    result: list[str] = []
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            result.extend(_normalize_session_filters(value))
+        else:
+            normalized = str(value).strip()
+            if normalized:
+                result.append(normalized)
+    return tuple(dict.fromkeys(result))
+
+
+def _validate_worker_count(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("--workers 必须是 1～3 之间的整数")
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--workers 必须是 1～3 之间的整数") from exc
+    if not 1 <= workers <= 3:
+        raise ValueError("--workers 必须是 1～3 之间的整数")
+    return workers
 
 
 def select_descriptors(
@@ -152,16 +194,26 @@ def select_descriptors(
     random_count: int | None = None,
     seed: int | None = None,
 ) -> tuple[SessionDescriptor, ...]:
-    filters = {str(value).strip() for value in session_filters if str(value).strip()}
+    filters = _normalize_session_filters(session_filters)
     available = tuple(descriptors)
     if filters:
-        available = tuple(
-            item
-            for item in available
-            if item.session_id in filters
-            or item.root.name in filters
-            or str(item.root) in filters
-        )
+        ordered: list[SessionDescriptor] = []
+        used: set[Path] = set()
+        for value in filters:
+            match = next(
+                (
+                    item
+                    for item in available
+                    if item.session_id == value
+                    or item.root.name == value
+                    or str(item.root) == value
+                ),
+                None,
+            )
+            if match is not None and match.root not in used:
+                ordered.append(match)
+                used.add(match.root)
+        available = tuple(ordered)
     statuses = {"verified"}
     if include_draft:
         statuses.add("draft")
@@ -300,7 +352,7 @@ def _write_markdown_report(
 
 
 class _ConsoleProgress:
-    """Render one quiet, live-updating progress bar for the audit run."""
+    """Render one aggregate progress bar for concurrent session workers."""
 
     _PHASE_LABELS = {
         "prepare": "准备",
@@ -316,7 +368,9 @@ class _ConsoleProgress:
         self.completed = 0
         self.session_id = ""
         self.phase = "准备"
-        self.fraction = 0.0
+        self.detail = ""
+        self._states: dict[str, dict[str, object]] = {}
+        self._lock = Lock()
         self._last_length = 0
         self._last_draw_at = 0.0
         self._last_percent = -1.0
@@ -330,48 +384,61 @@ class _ConsoleProgress:
         total: int,
         detail: str,
     ) -> None:
-        self.session_id = str(session_id or self.session_id)
-        self.phase = self._PHASE_LABELS.get(phase, phase)
-        if phase == "session_start":
-            self.completed = max(0, min(self.total_sessions, int(processed)))
-            self.fraction = 0.0
-        elif phase == "session_done":
-            self.completed = max(0, min(self.total_sessions, int(processed)))
-            self.fraction = 0.0
-        elif phase == "visual":
-            self.fraction = 0.5 * self._ratio(processed, total)
-        elif phase == "fabledan_truth":
-            self.fraction = 0.5 + 0.5 * self._ratio(processed, total)
-        else:
-            self.fraction = max(0.0, min(0.5, self.fraction))
-        overall = min(1.0, (self.completed + self.fraction) / self.total_sessions)
-        percent = overall * 100.0
-        now = time.monotonic()
-        phase_changed = self.phase != self._last_phase
-        is_terminal = phase in {"session_done"}
-        if (
-            not phase_changed
-            and not is_terminal
-            and percent < self._last_percent + 0.5
-            and now - self._last_draw_at < 0.5
-        ):
-            return
-        self._last_phase = self.phase
-        self._last_percent = percent
-        self._last_draw_at = now
-        width = 28
-        filled = min(width, max(0, int(percent / 100.0 * width)))
-        bar = "#" * filled + "-" * (width - filled)
-        session = self.session_id or "-"
-        suffix = f" | {detail}" if detail else ""
-        text = (
-            f"\r[{bar}] {percent:6.2f}% | 局 "
-            f"{self.completed}/{self.total_sessions} | {self.phase} | {session}{suffix}"
-        )
-        padding = max(0, self._last_length - len(text))
-        sys.stdout.write(text + (" " * padding))
-        sys.stdout.flush()
-        self._last_length = len(text)
+        with self._lock:
+            sid = str(session_id or "unknown")
+            state = self._states.setdefault(sid, {"fraction": 0.0, "phase": "准备"})
+            phase_label = self._PHASE_LABELS.get(phase, phase)
+            current_fraction = float(state.get("fraction", 0.0) or 0.0)
+            next_fraction = current_fraction
+            if phase == "session_start":
+                next_fraction = current_fraction
+            elif phase == "session_done":
+                next_fraction = 1.0
+            elif phase == "visual":
+                next_fraction = 0.5 * self._ratio(processed, total)
+            elif phase == "fabledan_truth":
+                next_fraction = 0.5 + 0.5 * self._ratio(processed, total)
+            state["fraction"] = max(current_fraction, next_fraction)
+            state["phase"] = phase_label
+            state["detail"] = detail
+            self.session_id = sid
+            self.phase = phase_label
+            self.detail = detail
+            self.completed = sum(
+                float(item.get("fraction", 0.0) or 0.0) >= 1.0
+                for item in self._states.values()
+            )
+            overall = min(
+                1.0,
+                sum(float(item.get("fraction", 0.0) or 0.0) for item in self._states.values())
+                / self.total_sessions,
+            )
+            percent = overall * 100.0
+            now = time.monotonic()
+            phase_changed = self.phase != self._last_phase
+            is_terminal = phase == "session_done"
+            if (
+                not phase_changed
+                and not is_terminal
+                and percent < self._last_percent + 0.5
+                and now - self._last_draw_at < 0.5
+            ):
+                return
+            self._last_phase = self.phase
+            self._last_percent = percent
+            self._last_draw_at = now
+            width = 28
+            filled = min(width, max(0, int(percent / 100.0 * width)))
+            bar = "#" * filled + "-" * (width - filled)
+            suffix = f" | {detail}" if detail else ""
+            text = (
+                f"\r[{bar}] {percent:6.2f}% | 局 "
+                f"{self.completed}/{self.total_sessions} | {self.phase} | {sid}{suffix}"
+            )
+            padding = max(0, self._last_length - len(text))
+            sys.stdout.write(text + (" " * padding))
+            sys.stdout.flush()
+            self._last_length = len(text)
 
     @staticmethod
     def _ratio(processed: int, total: int) -> float:
@@ -380,8 +447,9 @@ class _ConsoleProgress:
         return max(0.0, min(1.0, int(processed) / int(total)))
 
     def finish(self) -> None:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        with self._lock:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 def _print_console_report(report: dict[str, object], *, summary_path: Path) -> None:
@@ -633,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"profile-root 不存在：{profile_root}", file=sys.stderr)
         return 2
     try:
+        workers = _validate_worker_count(args.workers)
         descriptors = inspect_sessions(sessions_root)
         effective_seed = (
             secrets.randbits(64)
@@ -653,7 +722,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"准备开始核心监听回归：已选择 {len(selected)} 局；"
             f"随机种子={effective_seed if args.random_count is not None else '不适用'}；"
-            "视觉监听和 FableDan 会依次执行。",
+            f"并发线程={min(workers, len(selected))}；"
+            "视觉监听和 FableDan 会按 session 并发执行。",
             flush=True,
         )
         output_root.mkdir(parents=True, exist_ok=True)
@@ -669,6 +739,7 @@ def main(argv: list[str] | None = None) -> int:
             session_paths=[item.root for item in selected],
             command=[str(Path(__file__).resolve()), *(argv or sys.argv[1:])],
             on_progress=progress,
+            max_workers=workers,
         )
         progress.finish()
         raw_summary = json.loads(run.summary_path.read_text(encoding="utf-8"))
@@ -687,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
                 "random_count": args.random_count,
                 "random_seed": effective_seed,
                 "session_ids": [item.session_id for item in selected],
+                "workers": min(workers, len(selected)),
             },
             "quality": quality,
             "fabledan": raw_summary.get("fabledan", {}),

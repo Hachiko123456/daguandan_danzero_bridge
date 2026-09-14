@@ -41,6 +41,58 @@ def test_console_progress_renders_phase_and_frame_counts(capsys):
     assert "frame 50" in output
 
 
+def test_parser_accepts_multiple_session_ids_in_one_option():
+    args = command.build_parser().parse_args(
+        ["--session", "game-a", "game-b", "--session", "game-c"]
+    )
+
+    assert args.session == ["game-a", "game-b", "game-c"]
+
+
+def test_select_descriptors_accepts_multiple_session_filters(tmp_path: Path):
+    descriptors = tuple(
+        _descriptor(tmp_path, f"game-{index}", "verified")
+        for index in range(3)
+    )
+
+    selected = command.select_descriptors(
+        descriptors, session_filters=("game-2", "game-0", "game-2")
+    )
+
+    assert [item.session_id for item in selected] == ["game-2", "game-0"]
+
+
+def test_worker_count_is_bounded_and_defaults_to_three():
+    args = command.build_parser().parse_args([])
+    assert args.workers == 3
+    assert command._validate_worker_count(1) == 1
+    assert command._validate_worker_count(3) == 3
+    with pytest.raises(ValueError):
+        command._validate_worker_count(4)
+
+
+def test_concurrent_progress_is_aggregate_and_never_moves_backwards(capsys):
+    progress = command._ConsoleProgress(2)
+    progress("session_start", "game-a", 0, 2, "准备")
+    progress("session_start", "game-b", 0, 2, "准备")
+    progress("visual", "game-a", 80, 100, "帧 80")
+    progress("visual", "game-b", 20, 100, "帧 20")
+    progress("fabledan_truth", "game-a", 5, 10, "推荐 5/10")
+    progress("visual", "game-b", 10, 100, "迟到的旧进度")
+    progress("session_done", "game-a", 1, 2, "完成")
+    progress("session_done", "game-b", 2, 2, "完成")
+    progress.finish()
+
+    import re
+
+    percentages = [
+        float(value)
+        for value in re.findall(r"([0-9]+(?:\.[0-9]+)?)%", capsys.readouterr().out)
+    ]
+    assert percentages == sorted(percentages)
+    assert percentages[-1] == 100.0
+
+
 def test_default_selection_uses_only_verified_video_sessions(tmp_path: Path):
     selected = command.select_descriptors(
         (
@@ -78,6 +130,8 @@ def test_help_explains_random_selection_and_seed():
 
     assert "--random-count" in help_text
     assert "--seed" in help_text
+    assert "--workers" in help_text
+    assert "一次指定多个" in help_text
     assert "TruthLog" in help_text
     assert "LiveV2SessionRuntime" in help_text
     assert "LiveOrchestrator" in help_text

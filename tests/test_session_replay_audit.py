@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -55,6 +56,86 @@ def _replay_result(tmp_path: Path, *, status_reason: str, current_player=None, a
             "current_player": current_player,
         },
     ), {"actions": {"count": actions}}
+
+
+def test_audit_rejects_more_than_three_workers(tmp_path: Path):
+    with pytest.raises(ValueError, match="between 1 and 3"):
+        SessionReplayAuditService().audit([], output=tmp_path / "reports", max_workers=4)
+
+
+def test_parallel_audit_keeps_report_order_and_serializes_progress(
+    tmp_path: Path, monkeypatch
+):
+    sessions = []
+    for name in ("game-a", "game-b", "game-c"):
+        session = tmp_path / "sessions" / name
+        session.mkdir(parents=True)
+        (session / "manifest.json").write_text(
+            json.dumps({"session_id": name}), encoding="utf-8"
+        )
+        sessions.append(session)
+
+    service = SessionReplayAuditService()
+    progress = []
+
+    def fake_audit(item, output, scan_run_id, inventory, *, on_progress=None):
+        del scan_run_id, inventory
+        if on_progress is not None:
+            on_progress("visual", item.session_id, 1, 2, "帧 1")
+        # Finish in reverse order to prove that report order does not depend on
+        # executor completion order.
+        time.sleep({"game-a": 0.03, "game-b": 0.02, "game-c": 0.01}[item.session_id])
+        if on_progress is not None:
+            on_progress("fabledan_truth", item.session_id, 1, 1, "推荐 1/1")
+        row = {
+            "source": str(item.source),
+            "sessions_root": str(item.root),
+            "store_id": item.store_id,
+            "session_id": item.session_id,
+            "status": "completed",
+            "execution_status": "completed",
+            "frame_replay_status": "complete",
+            "opening_status": "recognized",
+            "listener_status": "complete",
+            "comparison_status": "diagnostic",
+            "truth_quality": "diagnostic",
+            "visual_quality": "passed",
+            "fabledan_quality": "passed",
+            "frames_processed": 1,
+            "indexed_frames": 1,
+            "truth_log": {"kind": "none"},
+            "fabledan": {},
+        }
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "summary.json").write_text(
+            json.dumps(row), encoding="utf-8"
+        )
+        return row
+
+    monkeypatch.setattr(service, "_audit_session", fake_audit)
+    run = service.audit(
+        [],
+        output=tmp_path / "reports",
+        run_id="parallel",
+        session_paths=sessions,
+        max_workers=3,
+        on_progress=lambda *values: progress.append(values),
+    )
+
+    assert [row["session_id"] for row in run.sessions] == [
+        "game-a", "game-b", "game-c"
+    ]
+    summary = json.loads(run.summary_path.read_text(encoding="utf-8"))
+    assert [row["session_id"] for row in summary["sessions"]] == [
+        "game-a", "game-b", "game-c"
+    ]
+    assert summary["parameters"]["max_workers"] == 3
+    assert summary["parameters"]["report_order"] == (
+        "original session selection order"
+    )
+    assert len([row for row in progress if row[0] == "session_done"]) == 3
+    assert (run.run_directory / "sessions.csv").is_file()
+    assert (run.run_directory / "verification.json").is_file()
 
 
 def test_listener_completion_does_not_equate_sealed_or_empty_listener(tmp_path: Path):

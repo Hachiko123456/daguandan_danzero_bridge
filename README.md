@@ -319,9 +319,22 @@ data/profiles/tencent_daguandan/sessions/game_YYYYMMDD_HHMMSS_<id>/
   --seed 20260912
 ```
 
+一次指定多个 session：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_listener_regression.py `
+  --session game_20260821_214641_6eed78 game_20260822_142942_e356d4 game_20260829_114157_a940ae
+```
+
+也可以重复使用 `--session`；两种写法会合并去重。多个 session 默认以 3 个有界线程并发处理，
+每局仍然逐帧读取，不会预加载全部视频。使用 `--workers 1` 可退回串行，`--workers 2` 或 `--workers 3`
+用于限制同时占用的识别、FableDan、OpenCV 和临时运行资源。报告会按命令行选择顺序合并生成，
+不会因为并发完成顺序变化而打乱 session 顺序。
+
 `--random-count 3` 表示从当前候选 verified session 中抽取 3 局；`--seed` 用于复现同一批抽样结果。
 如果不指定 `--seed`，脚本会自动生成随机种子，并在控制台和报告中记录，后续可用该种子重跑。
-`--session` 会先按指定 ID/路径过滤，随后 `--random-count` 可以在过滤结果中继续抽样。
+`--session` 会先按指定 ID/路径过滤，随后 `--random-count` 可以在过滤结果中继续抽样。`--workers` 只控制 session 级并发，
+默认值为 3，允许范围为 1～3；它不会把单个 session 的帧拆开并发，因此仍保持生产监听链路的逐帧顺序。
 
 报告会写到 `reports\listener-core-regression\<run_id>\`，优先查看：
 
