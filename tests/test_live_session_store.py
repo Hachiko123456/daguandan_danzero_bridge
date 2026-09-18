@@ -319,3 +319,38 @@ def test_recovery_does_not_abort_session_owned_by_a_live_process(tmp_path):
     manifest = json.loads(store.manifest_path.read_text("utf-8"))
     assert recovered == ()
     assert manifest["status"] == "running"
+
+
+def test_recovery_preserves_crashed_preopening_without_creating_a_game(tmp_path):
+    store = LiveSessionStore.for_opening_evidence(
+        tmp_path,
+        "tencent_daguandan",
+    )
+    store.start(
+        {
+            "owner_pid": 987654321,
+            "schema": "guandan.opening-evidence/1",
+            "recording_phase": "listening",
+            "initial_state_status": "unconfirmed",
+        }
+    )
+    video = store.directory / "video"
+    video.mkdir()
+    partial = video / "game.avi.part"
+    partial.write_bytes(b"recoverable-opening-video")
+
+    recovered = LiveSessionStore.recover_incomplete_sessions(
+        tmp_path,
+        "tencent_daguandan",
+    )
+
+    assert recovered == (store.directory,)
+    assert store.directory.parent.name == ".preopening"
+    assert store.directory.name.startswith("opening_")
+    assert partial.read_bytes() == b"recoverable-opening-video"
+    assert not tuple((tmp_path / "tencent_daguandan" / "sessions").glob("game_*"))
+    manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "aborted"
+    assert manifest["recording_phase"] == "aborted_before_initial_state"
+    assert manifest["initial_state_status"] == "unconfirmed"
+    assert manifest["termination_reason"] == "previous_process_did_not_seal"

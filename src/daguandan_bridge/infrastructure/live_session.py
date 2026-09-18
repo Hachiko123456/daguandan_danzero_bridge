@@ -28,6 +28,7 @@ from ..advisor_strategy import (
 from ..live.recorder import InMemorySessionRecorder
 from ..live.session_store import LiveSessionStore
 from ..runtime_identity import get_runtime_identity
+from ..storage import atomic_write_json
 from .live_v2_composition import build_production_live_v2_runtime
 from .process_session_recorder import ProcessSessionRecorder
 
@@ -94,6 +95,9 @@ class ListenerRecording:
     recorder: RecordingPort
     _recognition_sample_count: int = 0
     _closed: bool = False
+    _confirmed_callback: Callable[["ListenerRecording"], None] | None = None
+    _close_summary: dict[str, object] | None = None
+    _archived_directory: Path | None = None
 
     @property
     def closed(self) -> bool:
@@ -137,12 +141,19 @@ class ListenerRecording:
         if self._closed:
             return
         recording = self.recorder.close()
+        confirmed = str(reason) == "initial_state_confirmed"
         update_metadata = getattr(self.store, "update_session_metadata", None)
         if callable(update_metadata):
             update_metadata(
                 {
-                    "recording_phase": "ended_without_initial_state",
-                    "initial_state_status": "unconfirmed",
+                    "recording_phase": (
+                        "opening_confirmed"
+                        if confirmed
+                        else "ended_without_initial_state"
+                    ),
+                    "initial_state_status": (
+                        "confirmed" if confirmed else "unconfirmed"
+                    ),
                     "termination_reason": str(reason),
                     "recording_integrity": recording.integrity,
                 }
@@ -158,7 +169,76 @@ class ListenerRecording:
                 failure.to_dict() for failure in recording.incident_media_failures
             ),
         )
+        self._close_summary = {
+            "opening_id": str(getattr(self.store, "session_id", "")),
+            "frame_count": int(recording.frame_count),
+            "dropped_frames": int(recording.dropped_frames),
+            "recognition_sample_count": int(self._recognition_sample_count),
+            "recording_integrity": recording.integrity,
+            "termination_reason": str(reason),
+        }
         self._closed = True
+        if confirmed and self._confirmed_callback is not None:
+            self._confirmed_callback(self)
+
+    def archive_into(self, live_store: SessionPersistencePort) -> Path:
+        """Atomically attach sealed opening evidence below one formal game."""
+
+        if not self._closed or self._close_summary is None:
+            raise RuntimeError("开局监听证据尚未封存")
+        if self._close_summary.get("termination_reason") != "initial_state_confirmed":
+            raise RuntimeError("未确认的开局证据不能归档到正式对局")
+        source = Path(getattr(self.store, "directory"))
+        live_directory = Path(getattr(live_store, "directory"))
+        if source.parent.name != ".preopening":
+            raise RuntimeError("开局证据不在受管预开局目录")
+        if not source.is_dir() or not live_directory.is_dir():
+            raise RuntimeError("开局证据或正式对局目录不存在")
+        destination = live_directory / "opening"
+        if destination.exists():
+            raise FileExistsError(f"正式对局已包含开局证据：{destination}")
+        receipt = {
+            "schema": "guandan.opening-archive/1",
+            "status": "archived",
+            "opening_id": self._close_summary["opening_id"],
+            "formal_session_id": str(getattr(live_store, "session_id", "")),
+            "relative_path": "opening",
+            "frame_count": self._close_summary["frame_count"],
+            "dropped_frames": self._close_summary["dropped_frames"],
+            "recognition_sample_count": self._close_summary[
+                "recognition_sample_count"
+            ],
+            "recording_integrity": self._close_summary["recording_integrity"],
+        }
+        atomic_write_json(source / "archive_receipt.json", receipt)
+        source.replace(destination)
+        self._archived_directory = destination
+        try:
+            source.parent.rmdir()
+        except OSError:
+            pass
+        update_metadata = getattr(live_store, "update_session_metadata", None)
+        if callable(update_metadata):
+            try:
+                update_metadata({"opening_evidence": receipt})
+            except Exception as exc:
+                # The directory move is already the authoritative atomic
+                # publication.  Never turn a completed live start into a
+                # leaked half-started runtime only because manifest annotation
+                # failed afterwards; leave a local receipt beside the evidence.
+                try:
+                    atomic_write_json(
+                        destination / "archive_metadata_error.json",
+                        {
+                            "schema": "guandan.opening-archive-error/1",
+                            "status": "archived_manifest_update_failed",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    )
+                except OSError:
+                    pass
+        return destination
 
 
 class DefaultLiveSessionFactory:
@@ -181,14 +261,28 @@ class DefaultLiveSessionFactory:
             if advisor is not None
             else load_profile_advisor_strategy(capture.profiles_root, profile_name)
         )
+        self._pending_opening_recording: ListenerRecording | None = None
+        self._active_listener_recording: ListenerRecording | None = None
 
     def with_advisor(self, advisor: AdvicePort) -> "DefaultLiveSessionFactory":
-        return DefaultLiveSessionFactory(
+        replacement = DefaultLiveSessionFactory(
             self.capture,
             self.recognizer,
             advisor,
             profile_name=self.profile_name,
         )
+        replacement._pending_opening_recording = self._pending_opening_recording
+        replacement._active_listener_recording = self._active_listener_recording
+        if (
+            replacement._active_listener_recording is not None
+            and not replacement._active_listener_recording.closed
+        ):
+            replacement._active_listener_recording._confirmed_callback = (
+                replacement._remember_confirmed_opening
+            )
+        self._pending_opening_recording = None
+        self._active_listener_recording = None
+        return replacement
 
     def start_session(
         self,
@@ -199,16 +293,42 @@ class DefaultLiveSessionFactory:
         recognition_strategy: str,
         on_update: Callable[[Any], None] | None = None,
     ) -> LiveSessionConstruction:
-        recording = self._create_recording(recognition_strategy)
-        assert recording is not None
-        return self._start_session_with_recording(
-            recording,
-            round_level=round_level,
-            hand=hand,
-            lead_player=lead_player,
-            recognition_strategy=recognition_strategy,
-            on_update=on_update,
+        opening_recording, self._pending_opening_recording = (
+            self._pending_opening_recording,
+            None,
         )
+        try:
+            recording = self._create_recording(recognition_strategy)
+        except Exception:
+            if opening_recording is not None:
+                self._mark_opening_promotion_failed(
+                    opening_recording, reason="live_recording_create_failed"
+                )
+            raise
+        assert recording is not None
+        try:
+            construction = self._start_session_with_recording(
+                recording,
+                round_level=round_level,
+                hand=hand,
+                lead_player=lead_player,
+                recognition_strategy=recognition_strategy,
+                on_update=on_update,
+            )
+        except Exception:
+            if opening_recording is not None:
+                self._mark_opening_promotion_failed(
+                    opening_recording, reason="live_session_start_failed"
+                )
+            raise
+        if opening_recording is not None:
+            try:
+                opening_recording.archive_into(recording.store)
+            except Exception as exc:
+                self._record_opening_archive_failure(
+                    recording.store, opening_recording, exc
+                )
+        return construction
 
     def start_listener_recording(
         self,
@@ -226,7 +346,7 @@ class DefaultLiveSessionFactory:
         ):
             return None
         loaded = self.capture.load_profile(self.profile_name)
-        store = LiveSessionStore(
+        store = LiveSessionStore.for_opening_evidence(
             self.capture.profiles_root,
             self.profile_name,
             automatic_log_delivery_enabled=True,
@@ -241,6 +361,8 @@ class DefaultLiveSessionFactory:
         manifest.update(
             {
                 "recognition_strategy": recognition_strategy,
+                "schema": "guandan.opening-evidence/1",
+                "runtime": "opening_listener",
                 "recording_phase": "listening",
                 "initial_state_status": "unconfirmed",
                 "recording_mode": "all",
@@ -258,7 +380,68 @@ class DefaultLiveSessionFactory:
         except Exception:
             store.seal(frame_count=0, dropped_frames=0)
             raise
-        return ListenerRecording(store=store, recorder=recorder)
+        recording = ListenerRecording(
+            store=store,
+            recorder=recorder,
+            _confirmed_callback=self._remember_confirmed_opening,
+        )
+        self._active_listener_recording = recording
+        return recording
+
+    def _remember_confirmed_opening(self, recording: ListenerRecording) -> None:
+        if self._active_listener_recording is recording:
+            self._active_listener_recording = None
+        previous = self._pending_opening_recording
+        if previous is not None and previous is not recording:
+            self._mark_opening_promotion_failed(
+                previous, reason="superseded_opening"
+            )
+        self._pending_opening_recording = recording
+
+    @staticmethod
+    def _mark_opening_promotion_failed(
+        recording: ListenerRecording, *, reason: str
+    ) -> None:
+        directory = Path(getattr(recording.store, "directory"))
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.is_file():
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "opening_archive_status": "not_archived",
+                    "opening_archive_reason": str(reason),
+                }
+            )
+            atomic_write_json(manifest_path, manifest)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+
+    @staticmethod
+    def _record_opening_archive_failure(
+        live_store: SessionPersistencePort,
+        recording: ListenerRecording,
+        error: Exception,
+    ) -> None:
+        metadata = {
+            "opening_evidence": {
+                "schema": "guandan.opening-archive/1",
+                "status": "archive_failed",
+                "opening_id": str(getattr(recording.store, "session_id", "")),
+                "error_type": type(error).__name__,
+                "message": str(error),
+            }
+        }
+        update_metadata = getattr(live_store, "update_session_metadata", None)
+        if callable(update_metadata):
+            try:
+                update_metadata(metadata)
+            except Exception:
+                pass
+        DefaultLiveSessionFactory._mark_opening_promotion_failed(
+            recording, reason="archive_failed"
+        )
 
     def _start_session_with_recording(
         self,

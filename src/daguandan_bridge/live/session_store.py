@@ -38,6 +38,11 @@ def _new_session_id() -> str:
     return f"game_{stamp}_{uuid4().hex[:6]}"
 
 
+def _new_opening_id() -> str:
+    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    return f"opening_{stamp}_{uuid4().hex[:6]}"
+
+
 def _validate_session_id(session_id: str) -> str:
     value = session_id.strip()
     if not value or _SESSION_ID_PATTERN.fullmatch(value) is None:
@@ -115,7 +120,9 @@ class LiveSessionStore:
             return ()
 
         recovered: list[Path] = []
-        for manifest_path in sorted(sessions_root.glob("*/manifest.json")):
+        manifest_paths = set(sessions_root.glob("*/manifest.json"))
+        manifest_paths.update(sessions_root.glob(".preopening/*/manifest.json"))
+        for manifest_path in sorted(manifest_paths):
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -135,6 +142,14 @@ class LiveSessionStore:
                     "recovery_reason": "previous_process_did_not_seal",
                 }
             )
+            if manifest_path.parent.parent.name == ".preopening":
+                manifest.update(
+                    {
+                        "recording_phase": "aborted_before_initial_state",
+                        "initial_state_status": "unconfirmed",
+                        "termination_reason": "previous_process_did_not_seal",
+                    }
+                )
             atomic_write_json(manifest_path, manifest)
             recovered.append(manifest_path.parent)
         return tuple(recovered)
@@ -161,17 +176,19 @@ class LiveSessionStore:
         profile_name: str,
         *,
         session_id: str | None = None,
+        directory_group: str | None = None,
         automatic_log_delivery_enabled: bool = False,
         automatic_log_include_media: bool = False,
     ) -> None:
         self.profile_name = normalize_profile_name(profile_name)
         self.session_id = _validate_session_id(session_id or _new_session_id())
-        self.directory = (
-            Path(profiles_root)
-            / self.profile_name
-            / "sessions"
-            / self.session_id
-        )
+        sessions_root = Path(profiles_root) / self.profile_name / "sessions"
+        if directory_group is not None:
+            group = str(directory_group).strip()
+            if group != ".preopening":
+                raise ValueError("不支持的会话目录分组")
+            sessions_root = sessions_root / group
+        self.directory = sessions_root / self.session_id
         self.manifest_path = self.directory / "manifest.json"
         self.timeline_path = self.directory / "timeline.jsonl"
         self._timeline_markdown_path = self.directory / "timeline.md"
@@ -193,6 +210,26 @@ class LiveSessionStore:
             automatic_log_delivery_enabled
         )
         self.automatic_log_include_media = bool(automatic_log_include_media)
+
+    @classmethod
+    def for_opening_evidence(
+        cls,
+        profiles_root: Path,
+        profile_name: str,
+        *,
+        automatic_log_delivery_enabled: bool = False,
+        automatic_log_include_media: bool = False,
+    ) -> "LiveSessionStore":
+        """Create a non-game store for evidence captured before opening confirmation."""
+
+        return cls(
+            profiles_root,
+            profile_name,
+            session_id=_new_opening_id(),
+            directory_group=".preopening",
+            automatic_log_delivery_enabled=automatic_log_delivery_enabled,
+            automatic_log_include_media=automatic_log_include_media,
+        )
 
     def start(self, manifest: dict[str, object]) -> None:
         with self._lock:

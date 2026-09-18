@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from daguandan_bridge.advisor_strategy import (
     load_profile_automatic_log_include_media,
@@ -14,6 +15,7 @@ from daguandan_bridge.advisor_strategy import (
     save_profile_automatic_log_include_media,
     save_profile_recording_max_total_bytes,
     save_profile_recording_mode,
+    recording_media_usage_bytes,
     recording_storage_summary,
     save_profile_session_data_recording_enabled,
 )
@@ -22,7 +24,7 @@ from daguandan_bridge.infrastructure.live_session import (
     build_session_manifest,
 )
 from daguandan_bridge.live.recorder import InMemorySessionRecorder
-from daguandan_bridge.live.session_store import read_json_lines
+from daguandan_bridge.live.session_store import LiveSessionStore, read_json_lines
 
 
 HAND = tuple(
@@ -152,6 +154,9 @@ def test_full_recording_mode_persists_listener_frames_without_an_initial_hand(tm
     )
     recording.close(reason="listener_stopped")
 
+    assert recording.store.directory.parent.name == ".preopening"
+    assert recording.store.directory.name.startswith("opening_")
+    assert not tuple((profile / "sessions").glob("game_*"))
     manifest = json.loads((recording.store.directory / "manifest.json").read_text("utf-8"))
     assert manifest["status"] == "sealed"
     assert manifest["recording_mode"] == "all"
@@ -162,6 +167,193 @@ def test_full_recording_mode_persists_listener_frames_without_an_initial_hand(tm
     assert len(
         read_json_lines(recording.store.directory / "video" / "frame_index.jsonl")
     ) == 1
+
+
+
+def test_confirmed_opening_is_archived_under_the_only_formal_game_directory(tmp_path):
+    profile = _profile(tmp_path, save_session_data=True, recording_mode="all")
+    factory = DefaultLiveSessionFactory(
+        _Capture(tmp_path),
+        recognizer=object(),
+        advisor=None,
+        profile_name=profile.name,
+    )
+
+    opening = factory.start_listener_recording(
+        recognition_strategy="two_valid_streak",
+    )
+    assert opening is not None
+    opening.record_frame(
+        np.full((32, 64, 3), 127, dtype=np.uint8),
+        monotonic_ms=10,
+        wall_time="opening-frame",
+    )
+    opening.record_recognition(
+        SimpleNamespace(round_level="2", my_hand=HAND, diagnostics=())
+    )
+    opening.close(reason="initial_state_confirmed")
+
+    sessions_root = profile / "sessions"
+    preopening = opening.store.directory
+    assert preopening.is_dir()
+    assert not tuple(sessions_root.glob("game_*"))
+
+    constructed = factory.start_session(
+        round_level="2",
+        hand=HAND,
+        lead_player=None,
+        recognition_strategy="two_valid_streak",
+    )
+    formal = constructed.orchestrator.store.directory
+    opening_archive = formal / "opening"
+
+    assert len(tuple(sessions_root.glob("game_*"))) == 1
+    assert formal.name.startswith("game_")
+    assert opening_archive.is_dir()
+    assert not preopening.exists()
+    assert not (sessions_root / ".preopening").exists()
+    opening_manifest = json.loads(
+        (opening_archive / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert opening_manifest["status"] == "sealed"
+    assert opening_manifest["recording_phase"] == "opening_confirmed"
+    assert opening_manifest["initial_state_status"] == "confirmed"
+    assert opening_manifest["frame_count"] == 1
+    assert len(
+        read_json_lines(opening_archive / "video" / "frame_index.jsonl")
+    ) == 1
+    receipt = json.loads(
+        (opening_archive / "archive_receipt.json").read_text(encoding="utf-8")
+    )
+    formal_manifest = json.loads(
+        (formal / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert receipt["formal_session_id"] == formal.name
+    assert receipt["relative_path"] == "opening"
+    assert receipt["recording_integrity"]["writer_frame_count"] == 1
+    assert formal_manifest["opening_evidence"] == receipt
+
+    constructed.orchestrator.finish()
+
+
+
+def test_opening_archive_move_does_not_double_count_recording_capacity(tmp_path):
+    profile = _profile(tmp_path, save_session_data=True, recording_mode="all")
+    factory = DefaultLiveSessionFactory(
+        _Capture(tmp_path),
+        recognizer=object(),
+        advisor=None,
+        profile_name=profile.name,
+    )
+    opening = factory.start_listener_recording(
+        recognition_strategy="two_valid_streak",
+    )
+    assert opening is not None
+    opening.record_frame(
+        np.full((32, 64, 3), 31, dtype=np.uint8),
+        monotonic_ms=20,
+        wall_time="opening-frame",
+    )
+    opening.close(reason="initial_state_confirmed")
+    used_before = recording_media_usage_bytes(tmp_path, profile.name)
+    assert used_before > 0
+
+    formal = LiveSessionStore(tmp_path, profile.name)
+    formal.start({"runtime": "archive-capacity-test"})
+    opening.archive_into(formal)
+
+    assert recording_media_usage_bytes(tmp_path, profile.name) == used_before
+    formal.seal(frame_count=0, dropped_frames=0)
+
+
+
+def test_completed_opening_move_survives_formal_manifest_annotation_failure(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path, save_session_data=True, recording_mode="all")
+    factory = DefaultLiveSessionFactory(
+        _Capture(tmp_path),
+        recognizer=object(),
+        advisor=None,
+        profile_name=profile.name,
+    )
+    opening = factory.start_listener_recording(
+        recognition_strategy="two_valid_streak",
+    )
+    assert opening is not None
+    opening.record_frame(
+        np.full((32, 64, 3), 47, dtype=np.uint8),
+        monotonic_ms=25,
+        wall_time="opening-frame",
+    )
+    opening.close(reason="initial_state_confirmed")
+    source = opening.store.directory
+
+    formal = LiveSessionStore(tmp_path, profile.name)
+    formal.start({"runtime": "archive-metadata-failure-test"})
+
+    def fail_metadata(_metadata):
+        raise OSError("synthetic manifest update failure")
+
+    monkeypatch.setattr(formal, "update_session_metadata", fail_metadata)
+    destination = opening.archive_into(formal)
+
+    assert destination == formal.directory / "opening"
+    assert destination.is_dir()
+    assert not source.exists()
+    error = json.loads(
+        (destination / "archive_metadata_error.json").read_text(encoding="utf-8")
+    )
+    assert error["status"] == "archived_manifest_update_failed"
+    assert error["error_type"] == "OSError"
+    formal.seal(frame_count=0, dropped_frames=0)
+
+
+def test_live_start_failure_keeps_confirmed_opening_evidence_for_diagnosis(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path, save_session_data=True, recording_mode="all")
+    factory = DefaultLiveSessionFactory(
+        _Capture(tmp_path),
+        recognizer=object(),
+        advisor=None,
+        profile_name=profile.name,
+    )
+    opening = factory.start_listener_recording(
+        recognition_strategy="two_valid_streak",
+    )
+    assert opening is not None
+    opening.record_frame(
+        np.full((32, 64, 3), 63, dtype=np.uint8),
+        monotonic_ms=30,
+        wall_time="opening-frame",
+    )
+    opening.close(reason="initial_state_confirmed")
+    opening_directory = opening.store.directory
+
+    def fail_recording(_strategy):
+        raise RuntimeError("synthetic live recording failure")
+
+    monkeypatch.setattr(factory, "_create_recording", fail_recording)
+    with pytest.raises(RuntimeError, match="synthetic live recording failure"):
+        factory.start_session(
+            round_level="2",
+            hand=HAND,
+            lead_player=None,
+            recognition_strategy="two_valid_streak",
+        )
+
+    assert opening_directory.is_dir()
+    assert len(
+        read_json_lines(opening_directory / "video" / "frame_index.jsonl")
+    ) == 1
+    manifest = json.loads(
+        (opening_directory / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "sealed"
+    assert manifest["opening_archive_status"] == "not_archived"
+    assert manifest["opening_archive_reason"] == "live_recording_create_failed"
+    assert not tuple((profile / "sessions").glob("game_*"))
 
 
 def test_disabled_video_keeps_durable_rule_events_without_creating_media(tmp_path):
