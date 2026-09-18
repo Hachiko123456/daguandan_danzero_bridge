@@ -2327,7 +2327,12 @@ class LiveOrchestrator:
         try:
             from ..automatic_log_delivery import export_automatic_session_log
 
-            result = export_automatic_session_log(self.store.directory)
+            result = export_automatic_session_log(
+                self.store.directory,
+                include_media=bool(
+                    getattr(self.store, "automatic_log_include_media", False)
+                ),
+            )
             document = result.to_dict()
         except Exception as exc:
             _LOGGER.warning("自动对局日志导出失败", exc_info=True)

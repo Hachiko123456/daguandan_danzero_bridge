@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from daguandan_bridge.live_v2.game_state import SeatCardCount, TrustedGameSnapshot
+from daguandan_bridge.live_v2.game_state import (
+    GameAction, SeatCardCount, TrustedGameSnapshot,
+)
 from daguandan_bridge.live_v2.opportunity import OpportunityLifecycle, OpportunityState
 from daguandan_bridge.live_v2.types import (
     GapPhase,
@@ -10,7 +12,10 @@ from daguandan_bridge.live_v2.types import (
     GapState,
     OpportunityReason,
     OpportunityStatus,
+    ActionKind,
+    FrameIdentity,
     Seat,
+    StateVersion,
     VersionIdentity,
 )
 
@@ -64,6 +69,37 @@ def test_blocked_opportunity_becomes_ready_when_gap_recovers_before_deadline() -
     assert published.state.current.status is OpportunityStatus.READY
     assert published.state.current.reason is OpportunityReason.TRUSTED_STATE
     assert len(published.publications) == 1
+
+
+def test_unresolved_history_blocks_model_opportunity_until_repaired() -> None:
+    before = StateVersion("s", 0, 0)
+    after = StateVersion("s", 1, 1)
+    frame = FrameIdentity("s", 1, 1, 100, "roi", "window")
+    action = GameAction(
+        "unknown-right", before, after, Seat.RIGHT, ActionKind.PLAY,
+        ("3?",), (("3?", "3H", "3D"),), 0, ("e1", "e2"),
+        frame, frame, 0.9, 100,
+    )
+    current = version(state_revision=1, turn_index=1)
+    uncertain = snapshot(
+        current,
+        play_history=(action,),
+        current_trick=(action,),
+        remaining=tuple(
+            SeatCardCount(seat, 26 if seat is Seat.RIGHT else 27)
+            for seat in Seat
+        ),
+        lead_seat=Seat.RIGHT,
+    )
+
+    transition = OpportunityLifecycle().advance(
+        OpportunityState(), snapshot=uncertain, gap=gap(current),
+        version=current, processing_ms=200,
+    )
+
+    assert transition.state.current is not None
+    assert transition.state.current.status is OpportunityStatus.BLOCKED
+    assert transition.state.current.reason is OpportunityReason.OBSERVATION_UNCERTAIN
 
 
 def test_two_second_deadline_closes_only_opportunity_not_recovery() -> None:

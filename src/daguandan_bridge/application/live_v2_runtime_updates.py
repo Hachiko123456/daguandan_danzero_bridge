@@ -263,7 +263,17 @@ def consume_vision(
         }
         if repair_seats:
             kwargs["repair_seats"] = repair_seats
-        return (process_sync(**kwargs),), ()
+        try:
+            result = process_sync(**kwargs)
+        except TypeError as exc:
+            # Keep compatibility with lightweight test/legacy adapters that
+            # predate the optional correction-read parameter.
+            if repair_seats and "repair_seats" in str(exc):
+                kwargs.pop("repair_seats", None)
+                result = process_sync(**kwargs)
+            else:
+                raise
+        return (result,), ()
 
     process = getattr(vision, "process_frame", None)
     if callable(process):
@@ -275,7 +285,15 @@ def consume_vision(
         }
         if repair_seats:
             kwargs["repair_seats"] = repair_seats
-        return (process(**kwargs),), ()
+        try:
+            result = process(**kwargs)
+        except TypeError as exc:
+            if repair_seats and "repair_seats" in str(exc):
+                kwargs.pop("repair_seats", None)
+                result = process(**kwargs)
+            else:
+                raise
+        return (result,), ()
 
     submit = getattr(vision, "submit", None)
     if not callable(submit):
@@ -289,7 +307,14 @@ def consume_vision(
     }
     if repair_seats:
         submit_kwargs["repair_seats"] = repair_seats
-    values = list(submit(**submit_kwargs))
+    try:
+        values = list(submit(**submit_kwargs))
+    except TypeError as exc:
+        if repair_seats and "repair_seats" in str(exc):
+            submit_kwargs.pop("repair_seats", None)
+            values = list(submit(**submit_kwargs))
+        else:
+            raise
     drain = getattr(vision, "drain_results", None)
     if callable(drain):
         values.extend(drain())

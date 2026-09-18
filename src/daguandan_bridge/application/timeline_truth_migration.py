@@ -914,11 +914,6 @@ class TimelineTruthMigrationService:
                     "correction_before_target",
                     f"correction {correction.event_id} occurs before its target",
                 )
-            if target_id in corrections:
-                raise _BlockedMigration(
-                    "multiple_corrections",
-                    f"action {target_id} has more than one correction",
-                )
             if correction.event_type == "event_correction":
                 previous_actions = [
                     event
@@ -956,11 +951,6 @@ class TimelineTruthMigrationService:
                             "invalid_previous_action_followup_correction",
                             f"correction {correction.event_id} is not a valid visual expansion",
                         )
-                elif not previous_actions or previous_actions[-1].event_id != target_id:
-                    raise _BlockedMigration(
-                        "nonlatest_event_correction",
-                        f"event correction {correction.event_id} does not target the latest action",
-                    )
             elif target.event_type == "player_passed" or bool(
                 target.payload.get("is_pass", False)
             ):

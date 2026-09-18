@@ -23,9 +23,14 @@ from ..application.ports import (
 from ..advisor_strategy import (
     build_advisor,
     load_profile_advisor_strategy,
+    load_profile_automatic_log_include_media,
+    load_profile_recording_max_total_bytes,
     load_profile_recording_mode,
     normalize_advisor_strategy,
+    recording_storage_summary as get_recording_storage_summary,
     save_profile_advisor_strategy,
+    save_profile_automatic_log_include_media,
+    save_profile_recording_max_total_bytes,
     save_profile_recording_mode,
 )
 from ..capture_service import FrameSnapshot
@@ -238,6 +243,12 @@ class LiveAssistantController(QObject):
             self.profile_name,
         )
         self.session_data_recording_enabled = self.recording_mode != "none"
+        self.recording_max_total_bytes = load_profile_recording_max_total_bytes(
+            self.capture_service.profiles_root, self.profile_name
+        )
+        self.automatic_log_include_media = load_profile_automatic_log_include_media(
+            self.capture_service.profiles_root, self.profile_name
+        )
         self.orchestrator: LiveRuntimePort | None = None
         self._live_source = None
         self._capture_worker: WorkerHandle | None = None
@@ -394,6 +405,38 @@ class LiveAssistantController(QObject):
             mode,
         )
         self.session_data_recording_enabled = self.recording_mode != "none"
+
+    def set_recording_max_total_gb(self, gigabytes: object) -> int:
+        """Persist the total media budget for future sessions."""
+
+        if self.orchestrator is not None or self._listening_enabled:
+            raise RuntimeError("开始监听页面后不能切换录像容量")
+        try:
+            value = float(gigabytes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("录像容量必须是正数 GB") from exc
+        if value <= 0:
+            raise ValueError("录像容量必须是正数 GB")
+        bytes_value = int(round(value * 1024 ** 3))
+        self.recording_max_total_bytes = save_profile_recording_max_total_bytes(
+            self.capture_service.profiles_root, self.profile_name, bytes_value
+        )
+        return self.recording_max_total_bytes
+
+    def set_automatic_log_include_media(self, enabled: object) -> bool:
+        """Persist whether automatic sealed-session ZIPs include media."""
+
+        if self.orchestrator is not None or self._listening_enabled:
+            raise RuntimeError("开始监听页面后不能切换自动诊断媒体设置")
+        self.automatic_log_include_media = save_profile_automatic_log_include_media(
+            self.capture_service.profiles_root, self.profile_name, enabled
+        )
+        return self.automatic_log_include_media
+
+    def recording_storage_summary(self) -> dict[str, int | bool]:
+        return get_recording_storage_summary(
+            self.capture_service.profiles_root, self.profile_name
+        )
 
     def start_listening(self) -> bool:
         """Continuously inspect the current page and start only on a stable deal."""

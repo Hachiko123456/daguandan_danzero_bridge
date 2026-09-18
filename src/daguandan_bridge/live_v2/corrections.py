@@ -1,4 +1,4 @@
-"""Explicit, auditable corrections to the latest confirmed action."""
+"""Explicit, auditable corrections to confirmed actions."""
 
 from __future__ import annotations
 

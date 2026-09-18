@@ -17,6 +17,7 @@ from daguandan_bridge.gui.truth_log_editor import (
     _sort_hand_cards,
 )
 from daguandan_bridge.live.truth_log import TruthInitialState, TruthLog, TruthTurn
+from daguandan_bridge.domain.truth import TruthOutcome
 from daguandan_bridge.recognition_service import (
     PlayRegionResult,
     RecognitionResult,
@@ -1444,3 +1445,34 @@ def test_save_button_hard_blocks_impossible_double_deck_inventory(tmp_path, monk
     assert not (tmp_path / "truth_log.json").exists()
     assert "TruthLog 牌库数量校验未通过" in editor.save_status.text()
     assert "方块3（3D）共 3 张" in editor.save_status.text()
+
+
+
+def test_editor_uses_finish_anchors_to_skip_a_player_with_bad_start_count(tmp_path):
+    _app()
+    log = TruthLog(
+        "finish-anchor",
+        TruthInitialState(
+            "3", "right", tuple(f"{rank}S" for rank in (
+                "2", "3", "4", "5", "6", "7", "8", "9", "10",
+                "J", "Q", "K", "A", "2", "3", "4", "5", "6",
+                "7", "8", "9", "10", "J", "Q", "K", "A", "2",
+            )),
+            (("opposite", 28),),
+        ),
+        (
+            TruthTurn(1, "right", False, ("3S",) * 27, trick_id=1),
+            TruthTurn(2, "opposite", False, ("4S",) * 27, trick_id=1),
+            TruthTurn(3, "left", False, ("5S",), trick_id=1),
+            TruthTurn(4, "self", True, (), trick_id=1),
+        ),
+        outcome=TruthOutcome(
+            complete=False,
+            finish_order=("right", "opposite", "self", "left"),
+        ),
+    )
+    editor = TruthLogEditor(tmp_path, log)
+
+    assert editor._placement_finish_turns["right"] == 1
+    assert editor._placement_finish_turns["opposite"] == 2
+    assert editor._expected_player_at(4) == "left"

@@ -15,16 +15,20 @@ from ..live.truth_log import (
 )
 from ..live.turns import (
     TURN_ORDER,
+    WindCatchPolicy,
     next_active_seat,
     project_trick_turn,
     round_is_decided,
 )
 from ..storage import atomic_write_json
+from .truth_log_semantic_validation import require_valid_truth_log
 
 
 def next_actor_after_prefix(
     initial_state: TruthInitialState,
     turns: tuple[TruthTurn, ...] | list[TruthTurn],
+    *,
+    forced_finished_after_turn: Mapping[str, int] | None = None,
 ) -> str | None:
     """Validate a prefix and return the next expected actor.
 
@@ -45,6 +49,11 @@ def next_actor_after_prefix(
     trick_leader: str | None = None
     passed: set[str] = set()
     expected: str | None = str(lead)
+    forced_finished = {
+        str(seat): int(turn_id)
+        for seat, turn_id in (forced_finished_after_turn or {}).items()
+        if str(seat) in TURN_ORDER and int(turn_id) > 0
+    }
 
     for position, turn in enumerate(turns, start=1):
         actor = str(turn.actor)
@@ -68,6 +77,10 @@ def next_actor_after_prefix(
             passed.clear()
         elif trick_leader is not None:
             passed.add(actor)
+        for seat, anchor_turn_id in forced_finished.items():
+            if anchor_turn_id <= position:
+                finished.add(seat)
+                remaining[seat] = 0
         if round_is_decided(finished):
             expected = None
             continue
@@ -75,7 +88,10 @@ def next_actor_after_prefix(
         if trick_leader is None:
             expected = next_active_seat(actor, frozenset(finished))
             continue
-        projection = project_trick_turn(trick_leader, finished, passed)
+        projection = project_trick_turn(
+            trick_leader, finished, passed,
+            wind_catch_policy=WindCatchPolicy.AUTO_HANDOFF_TO_PARTNER,
+        )
         expected = projection.expected_after(actor)
         if projection.is_complete:
             trick_leader = None
@@ -99,30 +115,12 @@ def validate_turn_actor_chain(log: TruthLog) -> None:
 
 
 def validate_truth_log_with_live_reducer(log: TruthLog) -> None:
-    """Replay every TruthLog event through the production LiveReducer.
+    """Compatibility entry point for the shared production-rule validator."""
 
-    Actor-chain validation catches turn ownership errors, while the reducer also
-    validates the complete initial state, card quantities, pass-cycle semantics,
-    and the same event contract used by the live main flow.  This is deliberately
-    a separate gate so callers can retain the existing draft-only escape hatch.
-    """
-
-    if not isinstance(log, TruthLog):
-        raise TypeError("log must be a TruthLog")
-    validate_truth_log_card_inventory(log)
-    reducer = LiveReducer(log.source_session_id)
-    for event in log.to_events(session_id=log.source_session_id):
-        try:
-            reducer.apply(event)
-        except Exception as exc:
-            location = (
-                "初始状态"
-                if int(event.turn_id or 0) == 0
-                else f"第 {int(event.turn_id)} 条动作"
-            )
-            raise ValueError(
-                f"LiveReducer 全量回放失败（{location}）：{exc}"
-            ) from exc
+    try:
+        require_valid_truth_log(log, mode="logic", standard_playing=True)
+    except ValueError as exc:
+        raise ValueError(f"LiveReducer 全量回放失败：{exc}") from exc
 
 
 @dataclass(frozen=True)

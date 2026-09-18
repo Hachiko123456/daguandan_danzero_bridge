@@ -16,6 +16,7 @@ from daguandan_bridge.application.live_v2_recorded_replay import _opening_recogn
 
 from daguandan_bridge.application.session_replay_audit import (
     SessionReplayAuditService,
+    _first_divergence,
     _listener_completion,
     _row_quality_failures,
     _visual_advice_summary,
@@ -256,6 +257,20 @@ def test_visual_advice_summary_reports_listener_gap_separately(tmp_path: Path):
     assert summary["status"] == "withheld_due_listener_gap"
 
 
+def test_visual_advice_summary_uses_scoped_listener_completion_over_tail_runtime_status(tmp_path: Path):
+    result = _visual_result(
+        tmp_path, advice_requested=2, advice_ready=2,
+        status="review_required", completed=False,
+    )
+
+    summary = _visual_advice_summary(
+        result, _AuditAdvisor(), listener_status="complete"
+    )
+
+    assert summary["status"] == "passed"
+    assert summary["completed"] is True
+
+
 def test_visual_advice_summary_reports_passed_when_all_requests_succeed(tmp_path: Path):
     result = _visual_result(tmp_path, advice_requested=2, advice_ready=2)
 
@@ -302,6 +317,42 @@ def test_truth_reference_prefers_canonical_then_requested_staged_draft(tmp_path:
     assert selected is not None
     assert selected.kind == "canonical"
     assert selected.path == canonical
+
+
+def test_truth_metadata_records_current_truth_revision_identity(tmp_path: Path):
+    session = tmp_path / "game"
+    session.mkdir()
+    truth_path = session / "truth_log.json"
+    save_truth_log(
+        truth_path,
+        TruthLog("game", TruthInitialState("2", "self", ("2S",)), ()),
+    )
+    truth = audit_module.load_truth_log(truth_path, session_id="game")
+    truth_digest = audit_module.truth_log_sha256(truth)
+    (session / "truth_revision_manifest.json").write_text(
+        json.dumps({
+            "current_revision_id": "revision-000002",
+            "current_truth_sha256": truth_digest,
+            "current_semantic_sha256": "semantic-digest",
+            "revisions": [{
+                "revision_id": "revision-000002",
+                "created_at": "2026-09-14T02:17:35+00:00",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    reference = resolve_truth_audit_reference(session)
+    assert reference is not None
+    metadata = audit_module._truth_metadata(reference, truth)
+
+    assert metadata["revision_id"] == "revision-000002"
+    assert metadata["revision_truth_sha256"] == truth_digest
+    assert metadata["semantic_sha256"] == "semantic-digest"
+    assert metadata["revision_matches_truth"] is True
+    assert metadata["revision_created_at"] == "2026-09-14T02:17:35+00:00"
+    assert metadata["revision_manifest_path"] == str(
+        session / "truth_revision_manifest.json"
+    )
 
 
 def test_truth_reference_never_selects_staged_without_explicit_scan_id(tmp_path: Path):
@@ -400,6 +451,84 @@ def test_field_metrics_compare_ordered_actor_pass_and_card_multisets():
     assert metrics["actions"]["pass"]["errors"] == 1
     assert metrics["actions"]["cards"]["errors"] == 2
     assert metrics["actions"]["order"]["duplicate_actual_turn_ids"] == [1]
+
+
+def test_recommendation_scope_ignores_divergence_after_self_finishes():
+    truth = TruthLog(
+        "game",
+        TruthInitialState("2", "self", ("2S",)),
+        (
+            TruthTurn(1, "self", False, ("2S",)),
+            TruthTurn(2, "right", False, ("3S",)),
+            TruthTurn(3, "opposite", True, ()),
+        ),
+    )
+    visual = summarize_visual_events((
+        {
+            "event_id": "lead",
+            "event_type": "lead_player_confirmed",
+            "actor": "self",
+            "payload": {"lead_player": "self"},
+        },
+        {
+            "event_id": "self-finish",
+            "event_type": "player_played",
+            "turn_id": 1,
+            "actor": "self",
+            "payload": {"cards": ["2S"], "is_pass": False},
+        },
+        {
+            "event_id": "post-self-wrong",
+            "event_type": "player_played",
+            "turn_id": 2,
+            "actor": "right",
+            "payload": {"cards": ["AS"], "is_pass": False},
+        },
+    ))
+    opening = {
+        "reads": [{
+            "round_level": "2",
+            "hand": ["2S"],
+            "lead_player": "self",
+            "candidate_ready": True,
+        }]
+    }
+
+    metrics = compare_truth_visual_fields(truth, opening, visual)
+
+    assert metrics["recommendation_scope"]["self_finish_turn_id"] == 1
+    assert metrics["actions"]["changed"] == 0
+    assert metrics["actions"]["missing"] == 0
+    assert metrics["actions"]["added"] == 0
+    assert metrics["recommendation_scope"]["post_self_expected_count"] == 2
+    assert _first_divergence(truth, opening, visual) is None
+
+
+def test_visual_advice_summary_ignores_timeout_after_self_finish_scope(tmp_path: Path):
+    advice = tmp_path / "advice.jsonl"
+    advice.write_text(
+        "\n".join((
+            json.dumps({"turn_id": 1, "status": "requested"}),
+            json.dumps({"turn_id": 1, "status": "ready"}),
+            json.dumps({"turn_id": 2, "status": "requested"}),
+            json.dumps({"turn_id": 2, "status": "timeout"}),
+        )) + "\n",
+        encoding="utf-8",
+    )
+    result = _visual_result(
+        tmp_path,
+        advice_requested=2, advice_ready=1, advice_timeouts=1,
+        artifact_paths={"advice.jsonl": advice},
+    )
+
+    summary = _visual_advice_summary(
+        result, _AuditAdvisor(), listener_status="complete", scope_end_turn=1
+    )
+
+    assert summary["status"] == "passed"
+    assert summary["advice"]["requested"] == 1
+    assert summary["advice"]["ready"] == 1
+    assert summary["advice"]["timeout"] == 0
 
 
 def test_inventory_truth_metadata_is_presence_only_and_does_not_resolve(

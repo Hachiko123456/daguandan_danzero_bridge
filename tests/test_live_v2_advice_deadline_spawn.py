@@ -78,6 +78,46 @@ class _CapturingRuntime:
     def close(self, *, timeout=5.0): pass
 
 
+class _DelayedResultRuntime:
+    worker_generation = 1
+    worker_pid = 321
+
+    def __init__(self) -> None:
+        self.identity = None
+        self.results: list[AdviceRuntimeResult] = []
+        self._timers: list[threading.Timer] = []
+
+    def start(self, *, timeout=10.0): pass
+
+    def submit(self, snapshot, opportunity, *, request_sequence, timeout_ms=3_000):
+        self.identity = AdviceRequestIdentity(
+            opportunity.version, request_sequence, opportunity.opportunity_id
+        )
+        timer = threading.Timer(0.25, self._publish_result)
+        timer.daemon = True
+        self._timers.append(timer)
+        timer.start()
+        return ()
+
+    def _publish_result(self) -> None:
+        self.results.append(AdviceRuntimeResult(
+            self.identity, AdviceRuntimeStatus.ADVICE,
+            self.worker_generation, self.worker_pid, elapsed_ms=250.0,
+            advice=AdviceResult(
+                "delayed-result", (HAND[0],), "Single", False,
+                self.identity.version.state_revision, 1.0, "delayed-request",
+            ),
+        ))
+
+    def drain_results(self):
+        values, self.results = tuple(self.results), []
+        return values
+
+    def close(self, *, timeout=5.0):
+        for timer in self._timers:
+            timer.cancel()
+
+
 class _ManualClock:
     def __init__(self, value: int = 0) -> None:
         self._value = value
@@ -344,6 +384,33 @@ def test_real_fabledan_model_required_exact_first_turn_finishes_under_deadline()
         pump.close()
 
 
+def test_late_result_after_wall_hint_close_is_delivered_not_buffered_forever() -> None:
+    snapshot = _exact_snapshot("hint-wall-clock-race")
+    runtime = _DelayedResultRuntime()
+    delivered = []
+    store = _AuditStore()
+    pump = LiveV2AdvicePump(
+        runtime,
+        snapshot_provider=lambda: snapshot,
+        on_result=lambda result: delivered.append(result) is None,
+        store=store,
+        local_hint_window_ms=200,
+        request_timeout_ms=3_000,
+        # Keep capture time frozen to reproduce recorded-replay clock skew.
+        processing_clock_ms=lambda: 0,
+    )
+    try:
+        pump.start()
+        pump.publish(_opportunity(snapshot, "hint-wall-clock-race"))
+        assert pump.wait_idle(2)
+        assert delivered and delivered[0].status is AdviceRuntimeStatus.ADVICE
+        assert [row["status"] for row in store.records] == [
+            "requested", "worker_started", "ready",
+        ]
+    finally:
+        pump.close()
+
+
 def test_hint_window_update_sequence_advance_keeps_original_identity_and_reaches_child() -> None:
     snapshot = _exact_snapshot("hint-update-sequence")
     current = [snapshot]
@@ -399,7 +466,7 @@ def test_hint_window_update_sequence_advance_keeps_original_identity_and_reaches
         pump.close()
 
 
-def test_hint_window_formal_version_change_is_stale_without_worker_submit() -> None:
+def test_hint_window_formal_version_change_cancels_parallel_worker_as_stale() -> None:
     snapshot = _exact_snapshot("hint-formal-change")
     current = [snapshot]
     runtime = _CapturingRuntime()
@@ -422,15 +489,17 @@ def test_hint_window_formal_version_change_is_stale_without_worker_submit() -> N
         )
         assert pump.wait_idle(2)
 
-        assert runtime.timeouts == []
-        assert delivered and delivered[0].status is AdviceRuntimeStatus.SUPERSEDED
-        assert [row["status"] for row in store.records] == ["requested", "stale"]
+        assert runtime.timeouts == [3_000]
+        assert delivered == []
+        assert [row["status"] for row in store.records] == [
+            "requested", "worker_started", "stale",
+        ]
         assert store.records[-1]["failure_code"] == "snapshot_formal_state_changed"
     finally:
         pump.close()
 
 
-def test_local_hint_delay_is_deducted_from_the_original_opportunity_deadline() -> None:
+def test_parallel_local_hint_keeps_the_original_model_deadline() -> None:
     snapshot = _exact_snapshot("opportunity-deadline")
     runtime = _CapturingRuntime()
     clock = [0]
@@ -449,12 +518,12 @@ def test_local_hint_delay_is_deducted_from_the_original_opportunity_deadline() -
         deadline = time.monotonic() + 1
         while not runtime.timeouts and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert runtime.timeouts == [2_800]
+        assert runtime.timeouts == [3_000]
     finally:
         pump.close()
 
 
-def test_exhausted_local_hint_deadline_times_out_without_worker_submit() -> None:
+def test_model_is_submitted_even_when_timeout_equals_local_hint_window() -> None:
     snapshot = _exact_snapshot("opportunity-deadline-exhausted")
     runtime = _CapturingRuntime()
     clock = [0]
@@ -474,9 +543,11 @@ def test_exhausted_local_hint_deadline_times_out_without_worker_submit() -> None
         pump.publish(_opportunity(snapshot, "hint-window-expired"))
         clock[0] = 200
         assert pump.wait_idle(1)
-        assert runtime.timeouts == []
+        assert runtime.timeouts == [200]
         assert delivered[0].status is AdviceRuntimeStatus.WORKER_TIMEOUT
-        assert [row["status"] for row in store.records] == ["requested", "timeout"]
+        assert [row["status"] for row in store.records] == [
+            "requested", "worker_started", "timeout",
+        ]
     finally:
         pump.close()
 
@@ -568,7 +639,7 @@ def test_timeout_snapshots_partial_timing_before_cancel_clears_runtime_mapping()
         pump.close()
 
 
-def test_pump_deadline_terminalizes_waiting_hint_when_timer_never_fires(
+def test_pump_deadline_terminalizes_parallel_model_when_hint_timer_never_fires(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -595,9 +666,11 @@ def test_pump_deadline_terminalizes_waiting_hint_when_timer_never_fires(
         clock.advance(3_000)
         assert timeout_seen.wait(1)
         assert pump.wait_idle(0)
-        assert runtime.identity is None
-        assert not runtime.cancelled.is_set()
-        assert [row["status"] for row in store.records] == ["requested", "timeout"]
+        assert runtime.identity is not None
+        assert runtime.cancelled.is_set()
+        assert [row["status"] for row in store.records] == [
+            "requested", "worker_started", "timeout",
+        ]
     finally:
         pump.close()
 
@@ -768,9 +841,9 @@ def test_r3_multi_round_rebind_gives_each_request_exactly_one_terminal() -> None
             for name in ("turn-2", "turn-6", "turn-10", "turn-14")
         }
         assert by_opportunity == {
-            "turn-2": ["stale"],
+            "turn-2": ["cancelled"],
             "turn-6": ["ready"],
-            "turn-10": ["stale"],
+            "turn-10": ["cancelled"],
             "turn-14": ["timeout"],
         }
         assert pump.wait_idle(0)

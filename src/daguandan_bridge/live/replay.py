@@ -24,6 +24,7 @@ from .models import LiveEvent, LiveSnapshot
 from .orchestrator import LiveOrchestrator
 from .recorder import SessionRecorder
 from .reducer import LiveReducer
+from .turns import WindCatchPolicy
 from .session_store import LiveSessionStore, read_json_lines
 from .truth_log import TruthLog, load_truth_log
 
@@ -283,7 +284,10 @@ def replay_truth_through_live_advisor(
         )
         recorder = SessionRecorder(store.directory, size=(64, 32), fps=10)
         orchestrator = LiveOrchestrator(
-            reducer=LiveReducer("trusted-live"),
+            reducer=LiveReducer(
+                "trusted-live",
+                wind_catch_policy=WindCatchPolicy.AUTO_HANDOFF_TO_PARTNER,
+            ),
             store=store,
             recorder=recorder,
             recognition_service=object(),

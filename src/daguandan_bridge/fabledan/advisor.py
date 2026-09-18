@@ -24,7 +24,7 @@ from ..danzero.state import (
     Seat,
 )
 from ..domain.advice import AdviceResult, StrategyExecutionTrace
-from ..live.turns import TURN_ORDER, project_trick_turn, round_is_decided
+from ..live.turns import TURN_ORDER, WindCatchPolicy, project_trick_turn, round_is_decided
 from ._vendor.fabledan.agents import NumpyAgent, RuleAgent
 from ._vendor.fabledan.cards import RANK_NAMES, is_wildcard, order_of, rank_of
 from ._vendor.fabledan.combos import (
@@ -728,7 +728,10 @@ class FableDanAdvisor:
                 continue
             if trick_leader is None:
                 raise FableDanStateError(f"第 {index} 条历史后缺少当前墩首出玩家")
-            projection = project_trick_turn(trick_leader, done, passed)
+            projection = project_trick_turn(
+                trick_leader, done, passed,
+                wind_catch_policy=WindCatchPolicy.AUTO_HANDOFF_TO_PARTNER,
+            )
             expected = projection.expected_after(event.player)
             if projection.is_complete:
                 trick_lead = None

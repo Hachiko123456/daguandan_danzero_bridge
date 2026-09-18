@@ -78,9 +78,12 @@ class AdviceOpportunityLedger:
         with self._idle:
             self._timers[identity] = timer
 
-    def begin_model(self, identity: AdviceRequestIdentity) -> bool:
+    def clear_timer(self, identity: AdviceRequestIdentity) -> None:
         with self._idle:
             self._timers.pop(identity, None)
+
+    def begin_model(self, identity: AdviceRequestIdentity) -> bool:
+        with self._idle:
             if (
                 identity not in self._pending
                 or self._phases.get(identity)
@@ -116,7 +119,7 @@ class AdviceOpportunityLedger:
         *,
         now_ms: int,
         window_ms: int,
-    ) -> AdviceRequestIdentity | None:
+    ) -> tuple[AdviceRequestIdentity, LocalPassOpportunityPhase] | None:
         with self._idle:
             identity = next(
                 (
@@ -130,14 +133,22 @@ class AdviceOpportunityLedger:
             if identity is None:
                 return None
             elapsed = max(0, now_ms - self._requested_ms.get(identity, now_ms))
-            if (
-                self._phases.get(identity)
-                is not LocalPassOpportunityPhase.WAITING_HINT
-                or elapsed > window_ms
-            ):
+            phase = self._phases.get(identity)
+            if phase not in {
+                LocalPassOpportunityPhase.WAITING_HINT,
+                LocalPassOpportunityPhase.MODEL_SUBMITTED,
+            } or elapsed > window_ms:
                 return None
             self._complete_locked(identity)
-            return identity
+            return identity, phase
+
+    def result_pending(self, identity: AdviceRequestIdentity) -> bool:
+        with self._idle:
+            return (
+                identity in self._pending
+                and self._phases.get(identity)
+                is LocalPassOpportunityPhase.MODEL_SUBMITTED
+            )
 
     def accept_result(self, identity: AdviceRequestIdentity) -> bool:
         with self._idle:

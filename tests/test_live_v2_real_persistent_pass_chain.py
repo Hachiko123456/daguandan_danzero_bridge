@@ -22,7 +22,7 @@ from test_live_v2_low_confidence_chain import HAND, TRUTH
 
 SESSION = PROFILES_ROOT / "tencent_daguandan/sessions/game_20260814_004447_aab3dc"
 EXPECTED = TRUTH[6:11]
-FRAME_WINDOWS = ((254, 262), (262, 266), (266, 279), (280, 292), (290, 300))
+FRAME_WINDOWS = ((254, 262), (262, 266), (266, 280), (280, 292), (290, 300))
 
 
 class _Vision:

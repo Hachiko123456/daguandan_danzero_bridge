@@ -436,6 +436,35 @@ def test_first_play_uses_the_matching_seat_region():
     assert service.recognize_lead_player(image) == "right"
 
 
+def test_real_manual_session_first_play_marker_is_recognized_before_first_action():
+    """The visible self marker at frame 0 must seed the opening gate."""
+    video_path = (
+        PROFILE_ROOT / "sessions" / "manual_20260830_125844_6e1a1f11"
+        / "video" / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"missing local regression video: {video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("unable to decode manual session frame 0")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    result = service.recognize(frame)
+
+    assert len(result.my_hand) == 27
+    assert result.current_player == "self"
+    assert result.lead_player == "self"
+    assert result.events == ()
+
+
 def test_first_play_marker_requires_at_least_080_confidence(monkeypatch):
     """A sub-0.8 first-play hit must not select a lead seat."""
     from daguandan_bridge import recognition_service as rs_module
@@ -1086,3 +1115,61 @@ def test_fast_signals_are_narrow_and_keep_expected_player():
     assert signals.expected_player == "left"
     assert signals.active_player == "left"
     assert not signals.pass_visible
+
+
+def test_fanned_black_suits_keep_ten_spade_when_rank_box_overlaps_suit_crop():
+    """Regression for 200355 frame 1618: 10S must not become 10?."""
+    video_path = (
+        PROFILE_ROOT / "sessions" / "game_20260821_200355_81b7ee"
+        / "video" / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"missing local regression video: {video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 1618)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("unable to decode 200355 frame 1618")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    result = service.recognize_play_region(
+        frame, "opposite", wild_rank="3",
+        allow_unknown_suit=True, allow_pass=False,
+    )
+
+    assert result.cards == ("8S", "9S", "10S", "JH", "QC")
+
+
+def test_fanned_black_suits_remove_rank_descenders_before_shape_resolution():
+    """Regression for b523b5 frame 1237: Q tail must not pollute spade HOG."""
+    video_path = (
+        PROFILE_ROOT / "sessions" / "game_20260817_002012_b523b5"
+        / "video" / "game.avi"
+    )
+    if not video_path.is_file():
+        pytest.skip(f"missing local regression video: {video_path}")
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 1237)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        pytest.skip("unable to decode b523b5 frame 1237")
+
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+    result = service.recognize_play_region(
+        frame, "left", wild_rank="5",
+        allow_unknown_suit=True, allow_pass=False,
+    )
+
+    assert result.cards == ("10S", "JS", "QS", "KS", "AS")

@@ -266,94 +266,83 @@ def test_pass_evidence_must_be_strictly_after_formal_action_boundary() -> None:
     assert candidate.first_frame.captured_ms > boundary.captured_ms
 
 
-def test_persistent_pass_rearms_after_formal_turnover_not_marker_alone() -> None:
+def test_persistent_pass_rearms_after_marker_clear_not_formal_turnover() -> None:
     fake = FakeRecognition()
     fake.pass_seats = {Seat.RIGHT}
-    fake.active_player = Seat.RIGHT
     pipeline = make_pipeline(fake)
     process(pipeline, table(), 1, expected=Seat.RIGHT)
     initial = process(pipeline, table(), 2, expected=Seat.RIGHT)
     assert any(item.seat is Seat.RIGHT for item in initial.candidates)
 
+    # A formal turn change while the marker stays visible is not a new PASS.
     marker_only = process(
         pipeline, table(), 3, expected=Seat.RIGHT, revision=1, turn=1
     )
     assert not marker_only.candidates
-    fake.active_player = Seat.OPPOSITE
+
+    fake.pass_seats.clear()
+    process(pipeline, table(), 4, expected=Seat.RIGHT, revision=1, turn=1)
+    cleared = process(pipeline, table(), 5, expected=Seat.RIGHT, revision=1, turn=1)
+    assert not cleared.candidates
+
+    fake.pass_seats = {Seat.RIGHT}
     first = process(
-        pipeline, table(), 4, expected=Seat.RIGHT, revision=1, turn=1
+        pipeline, table(), 6, expected=Seat.RIGHT, revision=1, turn=1
     )
     assert not first.candidates
     boundary = process(
-        pipeline, table(), 5, expected=Seat.RIGHT, revision=1, turn=1
+        pipeline, table(), 7, expected=Seat.RIGHT, revision=1, turn=1
     )
     candidate = next(item for item in boundary.candidates if item.seat is Seat.RIGHT)
     assert candidate.action_epoch == 1
-    assert candidate.first_frame.frame_sequence == 4
-    assert candidate.last_frame.frame_sequence == 5
-    assert "persistent_pass_rearmed:right" in first.diagnostics
+    assert candidate.first_frame.frame_sequence == 6
+    assert candidate.last_frame.frame_sequence == 7
+    assert "pass_marker_rearmed:right" in cleared.diagnostics
 
 
-def test_turnover_can_rearm_multiple_persistent_pass_seats_independently() -> None:
+def test_later_active_seat_is_narrow_fallback_when_marker_never_clears() -> None:
     fake = FakeRecognition()
-    fake.pass_seats = {Seat.RIGHT, Seat.OPPOSITE, Seat.LEFT}
-    fake.active_player = Seat.RIGHT
+    fake.pass_seats = {Seat.RIGHT}
     pipeline = make_pipeline(fake)
     process(pipeline, table(), 1, expected=Seat.RIGHT)
     initial = process(pipeline, table(), 2, expected=Seat.RIGHT)
     assert {item.seat for item in initial.candidates} == {Seat.RIGHT}
-    fake.active_player = Seat.OPPOSITE
-    process(pipeline, table(), 3, expected=Seat.OPPOSITE, revision=1, turn=1)
-    opposite = process(
-        pipeline, table(), 4, expected=Seat.OPPOSITE, revision=1, turn=1
-    )
-    assert {item.seat for item in opposite.candidates} == {Seat.OPPOSITE}
-    fake.active_player = Seat.LEFT
-    process(pipeline, table(), 5, expected=Seat.LEFT, revision=2, turn=2)
-    left = process(pipeline, table(), 6, expected=Seat.LEFT, revision=2, turn=2)
-    assert {item.seat for item in left.candidates} == {Seat.LEFT}
 
-    fake.active_player = Seat.SELF
+    # Formal version changes alone do nothing.
+    marker_only = process(
+        pipeline, table(), 3, expected=Seat.RIGHT, revision=1, turn=1
+    )
+    assert not marker_only.candidates
+    assert not any(
+        item.startswith("pass_marker_rearmed:")
+        for item in marker_only.diagnostics
+    )
+
+    # If the marker never clears, a later active seat proves RIGHT already
+    # completed its turn.  This re-arms once and still needs two PASS frames.
+    fake.active_player = Seat.OPPOSITE
     first = process(
-        pipeline, table(), 7, expected=Seat.RIGHT, revision=3, turn=3
-    )
-    assert not first.candidates
-    boundary = process(
-        pipeline, table(), 8, expected=Seat.RIGHT, revision=3, turn=3
-    )
-    assert [item.seat for item in boundary.candidates] == [
-        Seat.RIGHT, Seat.OPPOSITE, Seat.LEFT,
-    ]
-    assert all(item.action_epoch == 1 for item in boundary.candidates)
-    assert all(item.first_frame.frame_sequence == 7 for item in boundary.candidates)
-    assert all(item.last_frame.frame_sequence == 8 for item in boundary.candidates)
-    assert set(first.diagnostics) >= {
-        "persistent_pass_rearmed:right",
-        "persistent_pass_rearmed:opposite",
-        "persistent_pass_rearmed:left",
-    }
-
-
-def test_animation_or_old_turn_cannot_rearm_persistent_pass() -> None:
-    fake = FakeRecognition()
-    fake.pass_seats = {Seat.RIGHT}
-    fake.active_player = Seat.RIGHT
-    pipeline = make_pipeline(fake)
-    process(pipeline, table(), 1, expected=Seat.RIGHT)
-    process(pipeline, table(), 2, expected=Seat.RIGHT)
-    fake.active_player = Seat.OPPOSITE
-    fake.effect_seats = {Seat.RIGHT}
-    animated = process(
-        pipeline, table(), 3, expected=Seat.RIGHT, revision=2, turn=2
-    )
-    assert not animated.candidates
-    assert not any("persistent_pass_rearmed" in item for item in animated.diagnostics)
-    fake.effect_seats.clear()
-    stale = process(
         pipeline, table(), 4, expected=Seat.RIGHT, revision=1, turn=1
     )
-    assert not stale.candidates
+    assert not first.candidates
+    assert "pass_marker_rearmed:right" in first.diagnostics
+    second = process(
+        pipeline, table(), 5, expected=Seat.RIGHT, revision=1, turn=1
+    )
+    assert {item.seat for item in second.candidates} == {Seat.RIGHT}
 
+    # Immediate previous-seat wraparound is deliberately not accepted.
+    fake.pass_seats.clear()
+    process(pipeline, table(), 6, expected=Seat.RIGHT, revision=2, turn=2)
+    process(pipeline, table(), 7, expected=Seat.RIGHT, revision=2, turn=2)
+    fake.pass_seats = {Seat.RIGHT}
+    process(pipeline, table(), 8, expected=Seat.RIGHT, revision=2, turn=2)
+    process(pipeline, table(), 9, expected=Seat.RIGHT, revision=2, turn=2)
+    fake.active_player = Seat.SELF
+    wrapped = process(
+        pipeline, table(), 10, expected=Seat.RIGHT, revision=3, turn=3
+    )
+    assert not wrapped.candidates
 
 def test_nonempty_low_confidence_result_stays_unknown_even_on_stable_blank_probe() -> None:
     class LowConfidenceRecognition(FakeRecognition):

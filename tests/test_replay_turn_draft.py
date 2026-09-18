@@ -252,3 +252,26 @@ def test_scan_comparison_keeps_card_multisets_and_turns_50_to_53_explicit():
         "scan_draft": [{"placement": "head", "actor": "right", "anchor_turn_id": 50}],
         "identical": True,
     }
+
+
+
+def test_prefix_can_use_verified_finish_anchor_to_skip_bad_hand_count():
+    initial = TruthInitialState(
+        "3", "right", HAND,
+        (("opposite", 28),),
+    )
+    prefix = (
+        TruthTurn(1, "right", False, ("3S",) * 27, trick_id=1),
+        TruthTurn(2, "opposite", False, ("4S",) * 27, trick_id=1),
+        TruthTurn(3, "left", False, ("5S",), trick_id=1),
+        TruthTurn(4, "self", True, (), trick_id=1),
+    )
+
+    # Pure card counts still think opposite has one card and would expect it.
+    assert next_actor_after_prefix(initial, prefix) == "opposite"
+    # A verified second-place/finish anchor makes the downstream turn skip it.
+    assert next_actor_after_prefix(
+        initial,
+        prefix,
+        forced_finished_after_turn={"right": 1, "opposite": 2},
+    ) == "left"

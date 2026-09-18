@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 from time import perf_counter
@@ -19,17 +18,15 @@ from ..application.live_v2_advice_protocol import (
     AdvisorReady,
 )
 from ..application.live_v2_worker_protocol import WorkerRequest
-from ..danzero.state import GuanDanState, PlayEvent
 from ..domain.advice import AdviceResult
-from ..live_v2.events import ActionKind
-from ..live_v2.game_state import GameAction, TrustedGameSnapshot
-from ..live_v2.identity import Seat
+from ..live_v2.game_state import TrustedGameSnapshot
 from ..live_v2.results import OpportunityStatus
+from .live_v2_legacy_gateway import replay_trusted_snapshot
 
 
 class _Advisor(Protocol):
     def recommend(
-        self, state: GuanDanState, *, request_id: str = ""
+        self, state: object, *, request_id: str = ""
     ) -> AdviceResult: ...
 
 
@@ -124,6 +121,12 @@ def run_live_v2_advice_worker(
         )
     try:
         _validate_request(request, payload)
+    except Exception as exc:
+        return _failure(
+            request, payload, AdviceFailureKind.INVALID_REQUEST,
+            "request_validation_failed", exc, started,
+        )
+    try:
         state = replay_trusted_snapshot(payload.snapshot)
     except Exception as exc:
         return _failure(
@@ -161,51 +164,26 @@ def run_live_v2_advice_worker(
     )
 
 
-def replay_trusted_snapshot(snapshot: TrustedGameSnapshot) -> GuanDanState:
-    """Project the authoritative LiveV2 snapshot directly for FableDan.
+def _validate_request(request: WorkerRequest, payload: AdviceWorkerPayload) -> None:
+    """Validate the worker envelope without rebuilding game state.
 
-    ``TrustedGameSnapshot`` has already been cross-checked against the rule
-    backend before it reaches the advice pump.  Replaying it through a second
-    ``LiveReducer`` used to normalize unknown-suit options differently and
-    produced false ``history/current_trick`` mismatches.  This projection has
-    one source of truth: the immutable snapshot itself.
+    This check is intentionally separate from ``replay_trusted_snapshot``:
+    it protects the request/version contract, while the latter only projects
+    the already-authoritative snapshot for the advisor.
     """
 
-    if not isinstance(snapshot, TrustedGameSnapshot):
-        raise TypeError("snapshot must be a TrustedGameSnapshot")
-    if not snapshot.trusted or snapshot.terminal:
-        raise ValueError("advice requires a trusted active snapshot")
-    if snapshot.current_seat is None or snapshot.lead_seat is None:
-        raise ValueError("advice snapshot requires current and lead seats")
-
-    events_by_action_id: dict[str, PlayEvent] = {}
-    history: list[PlayEvent] = []
-    for action in snapshot.play_history:
-        event = _project_action(action)
-        history.append(event)
-        events_by_action_id[action.action_id] = event
-    try:
-        current_trick = [
-            events_by_action_id[action.action_id]
-            for action in snapshot.current_trick
-        ]
-    except KeyError as exc:
-        raise ValueError("current_trick is not part of play_history") from exc
-
-    return GuanDanState(
-        round_level=snapshot.round_level,
-        wild_rank=snapshot.wild_rank,
-        phase="playing",
-        current_player=snapshot.current_seat.value,
-        lead_player=snapshot.lead_seat.value,
-        my_hand=tuple(snapshot.my_hand),
-        trick_plays=current_trick,
-        play_history=history,
-        remaining_cards={
-            item.seat.value: int(item.count) for item in snapshot.remaining
-        },
-        revision=snapshot.version.state_revision,
-    )
+    snapshot, opportunity = payload.snapshot, payload.opportunity
+    if opportunity.status is not OpportunityStatus.READY:
+        raise ValueError("worker accepts READY opportunities only")
+    if snapshot.current_seat is not opportunity.seat:
+        raise ValueError("opportunity seat and snapshot current seat differ")
+    if opportunity.version != snapshot.version:
+        raise ValueError("opportunity and snapshot versions differ")
+    version = snapshot.version
+    if (request.session_id, request.capture_generation, request.state_revision) != (
+        version.session_id, version.capture_generation, version.state_revision,
+    ):
+        raise ValueError("worker request and snapshot versions differ")
 
 
 def _project_action(action: GameAction) -> PlayEvent:

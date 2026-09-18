@@ -37,6 +37,10 @@ class FakeRuntime(QObject):
         super().__init__()
         self.recording_mode = "game"
         self.recording_mode_updates = []
+        self.recording_max_total_bytes = 20 * 1024 ** 3
+        self.automatic_log_include_media = False
+        self.recording_capacity_updates = []
+        self.automatic_log_media_updates = []
         self.session_data_recording_enabled = True
         self.session_data_recording_updates = []
         self.started = None
@@ -105,6 +109,24 @@ class FakeRuntime(QObject):
         self.recording_mode = str(mode)
         self.recording_mode_updates.append(self.recording_mode)
         self.session_data_recording_enabled = self.recording_mode != "none"
+
+    def set_recording_max_total_gb(self, value):
+        self.recording_max_total_bytes = int(float(value) * 1024 ** 3)
+        self.recording_capacity_updates.append(int(value))
+        return self.recording_max_total_bytes
+
+    def set_automatic_log_include_media(self, enabled):
+        self.automatic_log_include_media = bool(enabled)
+        self.automatic_log_media_updates.append(bool(enabled))
+        return self.automatic_log_include_media
+
+    def recording_storage_summary(self):
+        return {
+            "limit_bytes": self.recording_max_total_bytes,
+            "used_bytes": 4 * 1024 ** 3,
+            "remaining_bytes": 16 * 1024 ** 3,
+            "capacity_exhausted": False,
+        }
 
     def shutdown(self):
         pass
@@ -348,6 +370,23 @@ def test_live_page_persists_selected_recording_mode_for_the_next_listener():
     assert runtime.recording_mode_updates == ["all"]
     assert runtime.recording_mode == "all"
     assert runtime.session_data_recording_enabled is True
+    page.close()
+
+
+def test_live_page_persists_recording_capacity_and_auto_media_preferences():
+    app = _app()
+    runtime = FakeRuntime()
+    page = LiveAssistantPage(runtime)
+
+    page.recording_capacity_spin.setValue(30)
+    page.recording_capacity_spin.editingFinished.emit()
+    assert runtime.recording_capacity_updates == [30]
+    assert runtime.recording_max_total_bytes == 30 * 1024 ** 3
+
+    page.automatic_log_media_check.setChecked(True)
+    assert runtime.automatic_log_media_updates == [True]
+    assert runtime.automatic_log_include_media is True
+    assert "已用" in page.recording_storage_status.text()
     page.close()
 
 

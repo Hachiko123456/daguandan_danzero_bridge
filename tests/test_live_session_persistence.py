@@ -7,9 +7,14 @@ from types import SimpleNamespace
 import numpy as np
 
 from daguandan_bridge.advisor_strategy import (
+    load_profile_automatic_log_include_media,
+    load_profile_recording_max_total_bytes,
     load_profile_recording_mode,
     load_profile_session_data_recording_enabled,
+    save_profile_automatic_log_include_media,
+    save_profile_recording_max_total_bytes,
     save_profile_recording_mode,
+    recording_storage_summary,
     save_profile_session_data_recording_enabled,
 )
 from daguandan_bridge.infrastructure.live_session import (
@@ -76,6 +81,26 @@ def test_session_data_preference_defaults_on_and_persists_false(tmp_path):
     ) is False
     assert load_profile_session_data_recording_enabled(tmp_path, profile.name) is False
     assert json.loads((profile / "profile.json").read_text("utf-8"))["save_session_data"] is False
+
+
+def test_recording_capacity_and_automatic_media_preferences_persist(tmp_path):
+    profile = _profile(tmp_path, save_session_data=True, recording_mode="all")
+
+    assert load_profile_recording_max_total_bytes(tmp_path, profile.name) > 0
+    assert save_profile_recording_max_total_bytes(
+        tmp_path, profile.name, 20 * 1024 ** 3
+    ) == 20 * 1024 ** 3
+    assert save_profile_automatic_log_include_media(
+        tmp_path, profile.name, True
+    ) is True
+    saved = json.loads((profile / "profile.json").read_text("utf-8"))
+    assert saved["recording_max_total_bytes"] == 20 * 1024 ** 3
+    assert saved["automatic_log_include_media"] is True
+    assert load_profile_automatic_log_include_media(tmp_path, profile.name) is True
+    summary = recording_storage_summary(tmp_path, profile.name)
+    assert summary["limit_bytes"] == 20 * 1024 ** 3
+    assert summary["used_bytes"] == 0
+    assert summary["capacity_exhausted"] is False
 
 
 def test_session_manifest_contains_runtime_identity_on_first_write(tmp_path):

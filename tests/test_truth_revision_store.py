@@ -203,3 +203,26 @@ def test_revision_store_rejects_impossible_inventory_even_for_draft(tmp_path: Pa
 
     assert not (session / "truth_log.json").exists()
     assert not (session / "truth_revisions").exists()
+
+
+
+def test_publish_normalizes_stale_trick_ids_before_versioning(tmp_path: Path):
+    session = tmp_path / "normalize-tricks"
+    _immutable_source(session)
+    log = TruthLog(
+        source_session_id="normalize-tricks",
+        initial_state=TruthInitialState("2", "self", HAND),
+        turns=(
+            TruthTurn(1, "self", False, ("2S",), trick_id=8),
+            TruthTurn(2, "right", True, (), trick_id=8),
+            TruthTurn(3, "opposite", True, (), trick_id=8),
+            TruthTurn(4, "left", True, (), trick_id=8),
+            TruthTurn(5, "self", False, ("2H",), trick_id=9),
+        ),
+    )
+
+    revision = TruthRevisionStore(session).publish(log, author="test")
+    saved = load_truth_log(session / "truth_log.json", session_id="normalize-tricks")
+
+    assert revision.label_status == "verified"
+    assert [turn.trick_id for turn in saved.turns] == [1, 1, 1, 1, 2]

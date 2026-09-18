@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from threading import Event, Thread, Timer
+from threading import Event, Lock, Thread, Timer
 from time import monotonic_ns
 from typing import Callable, Protocol
 
@@ -69,7 +69,7 @@ class LiveV2AdvicePump:
     def __init__(
         self, runtime: AdviceRuntimeLike, *,
         snapshot_provider: Callable[[], TrustedGameSnapshot],
-        on_result: Callable[[AdviceRuntimeResult], bool],
+        on_result: Callable[[AdviceRuntimeResult], bool | str],
         on_local_pass: Callable[[AdviceOpportunity, object], bool] | None = None,
         on_failure: Callable[[str], None] | None = None,
         store: SessionPersistencePort | None = None,
@@ -98,6 +98,9 @@ class LiveV2AdvicePump:
         self._clock_ms = processing_clock_ms or (lambda: monotonic_ns() // 1_000_000)
         self._stop = Event()
         self._thread: Thread | None = None
+        self._buffer_lock = Lock()
+        self._buffered_results: dict[AdviceRequestIdentity, AdviceRuntimeResult] = {}
+        self._hint_open: set[AdviceRequestIdentity] = set()
         self._ledger = AdviceOpportunityLedger()
         self._audit = AdviceAuditJournal(
             store, metrics, self._on_failure, self._ledger.requested_ms
@@ -115,6 +118,9 @@ class LiveV2AdvicePump:
             return
         retired = self._ledger.retire_superseded(opportunity)
         for identity, phase in retired:
+            with self._buffer_lock:
+                self._hint_open.discard(identity)
+                self._buffered_results.pop(identity, None)
             timing_extra = self._timing_extra(identity)
             if phase is LocalPassOpportunityPhase.MODEL_SUBMITTED:
                 cancel = getattr(self._runtime, "cancel", None)
@@ -125,7 +131,7 @@ class LiveV2AdvicePump:
                         self._on_failure(f"cancel:{type(exc).__name__}: {exc}")
             self._record(
                 identity,
-                "stale",
+                "cancelled",
                 failure_code=f"opportunity_{opportunity.status.value}",
                 discard_reason="opportunity_superseded",
                 **timing_extra,
@@ -140,18 +146,25 @@ class LiveV2AdvicePump:
         )
         if identity is None:
             return
-        self._record(identity, "requested")
+        self._record(
+            identity, "requested",
+            local_hint_window_ms=self._local_hint_window_ms,
+            submission_policy="parallel_local_hint_race",
+        )
         self._increment("opportunity_total")
+        # Start the prewarmed model immediately.  A concurrent timer closes the
+        # local-hint race and releases any early model result.
         if self._local_hint_window_ms:
             timer = Timer(
                 self._local_hint_window_ms / 1000,
-                self._submit,
+                self._finish_hint_window,
                 args=(identity, opportunity),
             )
             timer.daemon = True
             self._ledger.set_timer(identity, timer)
+            with self._buffer_lock:
+                self._hint_open.add(identity)
             timer.start()
-            return
         self._submit(identity, opportunity)
 
     def _submit(
@@ -213,13 +226,33 @@ class LiveV2AdvicePump:
             self._on_failure(f"{type(exc).__name__}: {exc}")
 
     def confirm_local_pass(self, opportunity: AdviceOpportunity, hint: object) -> bool:
-        identity = self._ledger.take_local_pass(
-            opportunity,
-            now_ms=self._clock_ms(),
-            window_ms=self._local_hint_window_ms,
-        )
-        if identity is None:
-            return False
+        with self._buffer_lock:
+            open_identity = next((
+                identity for identity in self._hint_open
+                if identity.opportunity_id == opportunity.opportunity_id
+                and same_formal_advice_version(
+                    identity.version, opportunity.version
+                )
+            ), None)
+            if open_identity is None:
+                return False
+            selected = self._ledger.take_local_pass(
+                opportunity,
+                now_ms=self._clock_ms(),
+                window_ms=self._local_hint_window_ms,
+            )
+            if selected is None:
+                return False
+            identity, phase = selected
+            self._hint_open.discard(identity)
+            self._buffered_results.pop(identity, None)
+        if phase is LocalPassOpportunityPhase.MODEL_SUBMITTED:
+            cancel = getattr(self._runtime, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel(identity, reason="local_pass_won_race")
+                except Exception as exc:
+                    self._on_failure(f"cancel:{type(exc).__name__}: {exc}")
         try:
             accepted = bool(self._on_local_pass(opportunity, hint))
         except Exception as exc:
@@ -236,16 +269,64 @@ class LiveV2AdvicePump:
         return True
 
     def poll(self) -> None:
-        self._expire_due(self._clock_ms())
+        # Drain completed worker results before expiring deadlines. A fast
+        # result that is already in the pipe must win over the timeout check,
+        # especially when replay/capture time and worker wall time advance at
+        # different rates.
         try:
             for result in self._runtime.drain_results():
                 self._deliver(result)
         except Exception as exc:
             self._on_failure(f"{type(exc).__name__}: {exc}")
+        self._expire_due(self._clock_ms())
 
     def wait_idle(self, timeout: float) -> bool:
+        # Results may already be available in the worker pipe while the replay
+        # clock has advanced beyond the logical opportunity deadline. Drain
+        # them before expiring the ledger, otherwise a completed fast model
+        # response is falsely reported as a timeout.
+        try:
+            for result in self._runtime.drain_results():
+                self._deliver(result)
+        except Exception as exc:
+            self._on_failure(f"{type(exc).__name__}: {exc}")
         self._expire_due(self._clock_ms())
         return self._ledger.wait_idle(timeout)
+
+    def cancel_pending(self, *, reason: str) -> None:
+        """Cancel all in-flight requests before a formal state rewrite.
+
+        A visual correction supersedes the old opportunity.  Terminalizing the
+        old identities before applying the correction prevents their late
+        worker results from being misreported as ordinary ``stale`` advice.
+        The caller can then rebuild the opportunity and submit advice against
+        the corrected state revision.
+        """
+
+        pending = self._ledger.pending()
+        with self._buffer_lock:
+            for identity in pending:
+                self._hint_open.discard(identity)
+                self._buffered_results.pop(identity, None)
+        cancel = getattr(self._runtime, "cancel", None)
+        timing_by_identity = {
+            identity: self._timing_extra(identity) for identity in pending
+        }
+        for identity in pending:
+            if callable(cancel):
+                try:
+                    cancel(identity, reason=reason)
+                except Exception as exc:
+                    self._on_failure(f"cancel:{type(exc).__name__}: {exc}")
+            if self._complete(identity):
+                self._record(
+                    identity, "cancelled",
+                    failure_code=reason,
+                    discard_reason="opportunity_superseded_by_correction",
+                    **timing_by_identity[identity],
+                )
+                self._increment("opportunity_no_result")
+        self._ledger.notify_idle()
 
     def close(self, *, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -255,6 +336,9 @@ class LiveV2AdvicePump:
         if thread is not None:
             thread.join(max(0.0, timeout))
         pending = self._ledger.pending()
+        with self._buffer_lock:
+            self._hint_open.clear()
+            self._buffered_results.clear()
         timing_by_identity = {
             identity: self._timing_extra(identity) for identity in pending
         }
@@ -280,6 +364,9 @@ class LiveV2AdvicePump:
     def _expire_due(self, now_ms: int) -> None:
         expired = self._ledger.expire_due(now_ms)
         for identity, phase, deadline_ms in expired:
+            with self._buffer_lock:
+                self._hint_open.discard(identity)
+                self._buffered_results.pop(identity, None)
             timing_extra = self._timing_extra(identity)
             requested_ms = self._ledger.requested_ms(identity)
             elapsed_ms = max(0, now_ms - requested_ms) if requested_ms is not None else 0
@@ -317,7 +404,21 @@ class LiveV2AdvicePump:
         if expired:
             self._ledger.notify_idle()
 
-    def _deliver(self, result: AdviceRuntimeResult) -> None:
+    def _deliver(
+        self, result: AdviceRuntimeResult, *, allow_hint_buffer: bool = True
+    ) -> None:
+        if (
+            allow_hint_buffer
+            and self._local_hint_window_ms
+            and result.status is AdviceRuntimeStatus.ADVICE
+        ):
+            with self._buffer_lock:
+                if (
+                    result.identity in self._hint_open
+                    and self._ledger.result_pending(result.identity)
+                ):
+                    self._buffered_results[result.identity] = result
+                    return
         timing_extra = self._timing_extra(result.identity)
         if not self._ledger.accept_result(result.identity):
             return
@@ -331,7 +432,13 @@ class LiveV2AdvicePump:
             self._increment("opportunity_no_result")
             return
         try:
-            accepted = bool(self._on_result(result))
+            acceptance = self._on_result(result)
+            accepted = acceptance is True
+            rejection_code = (
+                str(acceptance)
+                if isinstance(acceptance, str) and acceptance
+                else "session_rejected_result"
+            )
         except Exception as exc:
             self._record(
                 result.identity, "failed", worker_generation=result.worker_generation,
@@ -343,17 +450,67 @@ class LiveV2AdvicePump:
             self._increment("opportunity_no_result")
             self._on_failure(f"session_callback:{type(exc).__name__}: {exc}")
             return
-        status = terminal_status(result.status) if accepted else "stale"
+        known_supersession = {
+            "opportunity_closed",
+            "superseded_by_state_change",
+            "superseded_by_self_action",
+            "capture_generation_changed",
+            "session_terminal",
+        }
+        status = (
+            terminal_status(result.status)
+            if accepted
+            else "cancelled"
+            if rejection_code in known_supersession
+            else "stale"
+        )
         self._record(
             result.identity, status,
             worker_generation=result.worker_generation,
             worker_pid=result.worker_pid, elapsed_ms=result.elapsed_ms,
-            failure_code=(result.failure_code or ("" if accepted else "session_rejected_result")),
+            failure_code=(result.failure_code or ("" if accepted else rejection_code)),
             failure_type=result.failure_type,
             message=result.message,
             **timing_extra,
         )
         self._increment(metric_for(status))
+
+    def _finish_hint_window(
+        self, identity: AdviceRequestIdentity, opportunity: AdviceOpportunity
+    ) -> None:
+        self._ledger.clear_timer(identity)
+        with self._buffer_lock:
+            self._hint_open.discard(identity)
+            buffered = self._buffered_results.pop(identity, None)
+        if not self._ledger.result_pending(identity):
+            return
+        try:
+            snapshot = self._snapshot_provider()
+        except Exception as exc:
+            self._on_failure(f"snapshot_provider:{type(exc).__name__}: {exc}")
+            snapshot = None
+        if snapshot is None or not same_formal_advice_version(
+            snapshot.version, opportunity.version
+        ):
+            with self._buffer_lock:
+                self._hint_open.discard(identity)
+                self._buffered_results.pop(identity, None)
+            cancel = getattr(self._runtime, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel(identity, reason="snapshot_formal_state_changed")
+                except Exception as exc:
+                    self._on_failure(f"cancel:{type(exc).__name__}: {exc}")
+            if self._complete(identity):
+                self._record(
+                    identity, "stale",
+                    failure_code="snapshot_formal_state_changed",
+                    discard_reason="local_hint_window_state_changed",
+                )
+                self._increment("opportunity_no_result")
+            return
+        if buffered is not None:
+            self._deliver(buffered, allow_hint_buffer=False)
 
     def _complete(self, identity: AdviceRequestIdentity) -> bool:
         return self._ledger.complete(identity)

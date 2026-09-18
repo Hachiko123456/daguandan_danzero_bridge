@@ -18,6 +18,7 @@ from .card_uncertainty import normalized_suit_options
 from .turns import (
     TURN_ORDER,
     next_active_seat,
+    WindCatchPolicy,
     project_trick_turn,
     round_is_decided,
 )
@@ -36,12 +37,19 @@ class LiveReducer:
         self,
         session_id: str,
         *,
-        wind_receiver_must_pass: bool = True,
+        wind_catch_policy: WindCatchPolicy = WindCatchPolicy.PARTNER_MUST_EXPLICITLY_PASS,
+        wind_receiver_must_pass: bool | None = None,
     ) -> None:
         if not str(session_id).strip():
             raise ValueError("session_id 不能为空")
         self.session_id = str(session_id)
-        self._wind_receiver_must_pass = wind_receiver_must_pass
+        self._wind_catch_policy = (
+            WindCatchPolicy(wind_catch_policy)
+            if wind_receiver_must_pass is None
+            else WindCatchPolicy.PARTNER_MUST_EXPLICITLY_PASS
+            if wind_receiver_must_pass
+            else WindCatchPolicy.LEGACY_SKIP_RECEIVER
+        )
         self._events: list[LiveEvent] = []
         self._reset_semantic_state()
 
@@ -294,12 +302,11 @@ class LiveReducer:
         target = next((event for event in actions if event.event_id == target_event_id), None)
         if target is None:
             raise GameStateError("待纠正的正式动作不存在")
-        if any(
-            event.event_type == "event_correction"
-            and str(event.payload.get("target_event_id", "")) == target_event_id
-            for event in self._events
-        ):
-            raise GameStateError("该动作已经被纠正")
+        # Corrections are append-only audit records. A later reread may refine
+        # the effective value of the same action again, including after one or
+        # more following actions have already been committed. ``_rebuild``
+        # exposes the last correction for this target while preserving the full
+        # correction history for audit.
         normalized = () if is_pass else self._normalize_cards(cards)
         event = self._new_event(
             "event_correction",
@@ -617,7 +624,7 @@ class LiveReducer:
             leader,
             frozenset(self._finished_seats),
             passed,
-            wind_receiver_must_pass=self._wind_receiver_must_pass,
+            wind_catch_policy=self._wind_catch_policy,
         )
 
     def _pending_wind_receiver(self) -> Seat | None:
@@ -710,7 +717,7 @@ class LiveReducer:
     def clone_empty(self) -> "LiveReducer":
         return LiveReducer(
             self.session_id,
-            wind_receiver_must_pass=self._wind_receiver_must_pass,
+            wind_catch_policy=self._wind_catch_policy,
         )
 
     def adopt_staged(self, staged: "LiveReducer") -> None:

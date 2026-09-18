@@ -162,6 +162,7 @@ class LiveSessionStore:
         *,
         session_id: str | None = None,
         automatic_log_delivery_enabled: bool = False,
+        automatic_log_include_media: bool = False,
     ) -> None:
         self.profile_name = normalize_profile_name(profile_name)
         self.session_id = _validate_session_id(session_id or _new_session_id())
@@ -191,6 +192,7 @@ class LiveSessionStore:
         self.automatic_log_delivery_enabled = bool(
             automatic_log_delivery_enabled
         )
+        self.automatic_log_include_media = bool(automatic_log_include_media)
 
     def start(self, manifest: dict[str, object]) -> None:
         with self._lock:
@@ -760,6 +762,7 @@ class InMemoryLiveSessionStore:
 
     persistence_enabled = False
     automatic_log_delivery_enabled = False
+    automatic_log_include_media = False
 
     def __init__(self, profiles_root: Path, profile_name: str) -> None:
         self.profile_name = normalize_profile_name(profile_name)

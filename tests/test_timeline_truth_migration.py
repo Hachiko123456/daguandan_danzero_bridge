@@ -154,6 +154,33 @@ def test_timeline_migration_accepts_only_the_adjacent_visual_expansion_scope(
     assert truth.turns[1].is_pass
 
 
+def test_timeline_migration_accepts_nonlatest_and_repeated_action_corrections(
+    tmp_path: Path,
+):
+    session = tmp_path / "sessions" / "generic-reread"
+    reducer = LiveReducer("generic-reread")
+    initial = reducer.confirm_initial_state(
+        round_level="8", hand=HAND, lead_player="self"
+    )
+    played = reducer.record_play("self", ("2S",))
+    followed = reducer.record_pass("right")
+    first = reducer.correct_event(
+        played.event_id, cards=("3S",), is_pass=False, reason="visual_reread"
+    )
+    second = reducer.correct_event(
+        played.event_id, cards=("4S",), is_pass=False, reason="visual_reread"
+    )
+    _write_timeline(session, [initial, played, followed, first, second])
+
+    result = TimelineTruthMigrationService().migrate_session(session)
+    truth = load_truth_log(session / "truth_log.json", session_id="generic-reread")
+
+    assert result.status == "migrated"
+    assert truth.turns[0].cards == ("4S",)
+    assert truth.turns[1].actor == "right"
+    assert truth.turns[1].is_pass
+
+
 def test_action_sequence_mismatch_blocks_without_truth_output(tmp_path: Path):
     session = tmp_path / "sessions" / "bad-sequence"
     events = _valid_events("bad-sequence")

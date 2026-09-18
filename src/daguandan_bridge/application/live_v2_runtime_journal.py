@@ -197,7 +197,12 @@ class LiveV2LifecycleMixin:
     def _deliver_automatic_log(self) -> None:
         try:
             from ..automatic_log_delivery import export_automatic_session_log
-            document = export_automatic_session_log(self.store.directory).to_dict()
+            document = export_automatic_session_log(
+                self.store.directory,
+                include_media=bool(
+                    getattr(self.store, "automatic_log_include_media", False)
+                ),
+            ).to_dict()
         except Exception as exc:
             document = {"status": "FAIL", "error": f"{type(exc).__name__}: {exc}"}
         self.automatic_log_delivery_result = document

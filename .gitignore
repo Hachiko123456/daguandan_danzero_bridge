@@ -86,7 +86,6 @@ Desktop.ini
 
 .codex/
 .agents/
-AGENTS.md
 
 .cache/
 *.pid

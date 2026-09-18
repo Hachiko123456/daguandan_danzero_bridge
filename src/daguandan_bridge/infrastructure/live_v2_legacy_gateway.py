@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from collections import Counter
 
 from ..action_semantics import canonical_fabledan_type
@@ -13,12 +14,13 @@ from ..danzero.rules import (
     play_beats_table,
     wildcard_substitutions,
 )
-from ..danzero.state import GameStateError
+from ..danzero.state import GameStateError, GuanDanState, PlayEvent
 from ..domain.live import LiveEvent
 from ..fabledan._vendor.fabledan.cards import RANK_NAMES, is_wildcard
 from ..fabledan._vendor.fabledan.combos import Move, TYPE_NAMES, beats, gen_moves
 from ..live.card_uncertainty import feasible_action_variants
 from ..live.reducer import LiveReducer
+from ..live.turns import WindCatchPolicy
 from ..live_v2.action_semantics import ActionInterpretation, ActionSemantics
 from ..live_v2.corrections import ConfirmedCorrection, CorrectionCommand
 from ..live_v2.game_state import GameAction, TrustedGameSnapshot
@@ -52,7 +54,10 @@ class _NeedMoreEvidence(Exception):
 
 
 def create_legacy_reducer(session_id: str) -> object:
-    return LiveReducer(session_id)
+    return LiveReducer(
+        session_id,
+        wind_catch_policy=WindCatchPolicy.AUTO_HANDOFF_TO_PARTNER,
+    )
 
 
 def is_legacy_reducer(value: object) -> bool:
@@ -125,62 +130,71 @@ def confirm_lead_reducer(
     return staged, event
 
 
-def replay_trusted_snapshot(snapshot: TrustedGameSnapshot):
-    """Rebuild an adviser state entirely behind the legacy gateway."""
+def replay_trusted_snapshot(snapshot: TrustedGameSnapshot) -> GuanDanState:
+    """Project the authoritative LiveV2 snapshot directly for an advisor.
 
-    state, _projection = replay_trusted_snapshot_projection(snapshot)
-    return state
+    This gateway remains the sole infrastructure boundary that knows the
+    legacy advisor DTO. It deliberately does not create a second LiveReducer:
+    the immutable trusted snapshot is the only source of game history.
+    """
 
-
-def replay_trusted_snapshot_projection(snapshot: TrustedGameSnapshot):
-    """Return adviser state plus an opaque legacy snapshot for audit."""
-
+    if not isinstance(snapshot, TrustedGameSnapshot):
+        raise TypeError("snapshot must be a TrustedGameSnapshot")
     if not snapshot.trusted or snapshot.terminal:
         raise ValueError("advice requires a trusted active snapshot")
-    if snapshot.wild_rank != snapshot.round_level:
-        raise ValueError("legacy reducer requires wild_rank to equal round_level")
-    initial_hand = list(snapshot.my_hand)
-    initial_hand.extend(
-        card
-        for action in snapshot.play_history
-        if action.seat is Seat.SELF and action.kind is ActionKind.PLAY
-        for card in action.cards
-    )
-    lead = snapshot.play_history[0].seat if snapshot.play_history else snapshot.lead_seat
-    reducer = LiveReducer(snapshot.version.session_id)
-    reducer.confirm_initial_state(
-        round_level=snapshot.round_level,
-        hand=initial_hand,
-        lead_player=None if lead is None else lead.value,
-        source="live_v2_snapshot_replay",
-        monotonic_ms=0,
-    )
+    if snapshot.current_seat is None or snapshot.lead_seat is None:
+        raise ValueError("advice snapshot requires current and lead seats")
+
+    events_by_action_id: dict[str, PlayEvent] = {}
+    history: list[PlayEvent] = []
     for action in snapshot.play_history:
-        _replay_action(reducer, action)
-    return reducer.to_guandan_state(), reducer.snapshot()
+        event = _project_snapshot_action(action)
+        history.append(event)
+        events_by_action_id[action.action_id] = event
+    try:
+        current_trick = [
+            events_by_action_id[action.action_id]
+            for action in snapshot.current_trick
+        ]
+    except KeyError as exc:
+        raise ValueError("current_trick is not part of play_history") from exc
 
-
-def _replay_action(reducer: LiveReducer, action: GameAction) -> None:
-    kwargs = dict(
-        confidence=action.confidence,
-        source="live_v2_snapshot_replay",
-        evidence_refs=action.evidence_ids,
-        monotonic_ms=action.captured_ms,
+    return GuanDanState(
+        round_level=snapshot.round_level,
+        wild_rank=snapshot.wild_rank,
+        phase="playing",
+        current_player=snapshot.current_seat.value,
+        lead_player=snapshot.lead_seat.value,
+        my_hand=tuple(snapshot.my_hand),
+        trick_plays=current_trick,
+        play_history=history,
+        remaining_cards={
+            item.seat.value: int(item.count) for item in snapshot.remaining
+        },
+        revision=snapshot.version.state_revision,
     )
-    if action.kind is ActionKind.PASS:
-        reducer.record_pass(action.seat.value, **kwargs)
-    else:
-        reducer.record_play(
-            action.seat.value,
-            action.cards,
-            suit_options=action.suit_options,
-            action_metadata=(
-                None
-                if action.semantics is None
-                else {"move_semantics": action.semantics.to_metadata()}
-            ),
-            **kwargs,
-        )
+
+
+def _project_snapshot_action(action: GameAction) -> PlayEvent:
+    semantics = None if action.semantics is None else action.semantics.to_metadata()
+    audit = {
+        "action_id": action.action_id,
+        "action_epoch": action.action_epoch,
+        "captured_ms": action.captured_ms,
+        "evidence_ids": list(action.evidence_ids),
+    }
+    metadata = audit if semantics is None else {**audit, **semantics}
+    return PlayEvent(
+        player=action.seat.value,
+        cards=tuple(action.cards),
+        is_pass=action.kind is ActionKind.PASS,
+        observed_at=datetime.fromtimestamp(
+            action.captured_ms / 1000, tz=timezone.utc
+        ),
+        source="live_v2_snapshot_projection",
+        suit_options=tuple(tuple(options) for options in action.suit_options),
+        action_metadata=metadata,
+    )
 
 
 def _require_reducer(value: object) -> LiveReducer:
@@ -845,7 +859,6 @@ __all__ = [
     "legacy_identity",
     "legacy_snapshot",
     "replay_trusted_snapshot",
-    "replay_trusted_snapshot_projection",
     "stage_latest_correction",
     "stage_reducer",
 ]

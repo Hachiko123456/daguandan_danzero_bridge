@@ -18,7 +18,12 @@ from ..application.ports import (
     SessionPersistencePort,
 )
 from ..advisor_strategy import (
-    advisor_strategy_id, load_profile_advisor_strategy, load_profile_recording_mode,
+    advisor_strategy_id,
+    load_profile_advisor_strategy,
+    load_profile_automatic_log_include_media,
+    load_profile_recording_max_total_bytes,
+    load_profile_recording_mode,
+    recording_media_usage_bytes,
 )
 from ..live.recorder import InMemorySessionRecorder
 from ..live.session_store import LiveSessionStore
@@ -225,6 +230,9 @@ class DefaultLiveSessionFactory:
             self.capture.profiles_root,
             self.profile_name,
             automatic_log_delivery_enabled=True,
+            automatic_log_include_media=load_profile_automatic_log_include_media(
+                self.capture.profiles_root, self.profile_name
+            ),
         )
         manifest = build_session_manifest(
             loaded.paths.profile_config_path,
@@ -304,6 +312,9 @@ class DefaultLiveSessionFactory:
             self.capture.profiles_root,
             self.profile_name,
             automatic_log_delivery_enabled=True,
+            automatic_log_include_media=load_profile_automatic_log_include_media(
+                self.capture.profiles_root, self.profile_name
+            ),
         )
         manifest = build_session_manifest(
             loaded.paths.profile_config_path,
@@ -348,23 +359,17 @@ class DefaultLiveSessionFactory:
         points are not followed. Existing generations/exports remain untouched.
         """
         config = json.loads(Path(profile_config_path).read_text(encoding="utf-8"))
-        limit = config.get("recording_max_total_bytes", 2 * 1024 ** 3)
+        limit = config.get(
+            "recording_max_total_bytes",
+            load_profile_recording_max_total_bytes(
+                self.capture.profiles_root, self.profile_name
+            ),
+        )
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("recording_max_total_bytes must be a non-negative integer")
-        root = Path(self.capture.profiles_root) / self.profile_name / "sessions"
-        used = 0
-        pending = [root] if root.exists() else []
-        while pending:
-            directory = pending.pop()
-            if directory.is_symlink() or directory.is_junction():
-                continue
-            for path in directory.iterdir():
-                if path.is_symlink() or path.is_junction():
-                    continue
-                if path.is_dir():
-                    pending.append(path)
-                elif path.suffix.lower() in {".avi", ".mp4", ".png", ".jpg", ".jpeg", ".bmp"}:
-                    used += path.stat().st_size
+        used = recording_media_usage_bytes(
+            self.capture.profiles_root, self.profile_name
+        )
         return max(0, limit - used)
 
     def _advisor_manifest(self) -> dict[str, object]:

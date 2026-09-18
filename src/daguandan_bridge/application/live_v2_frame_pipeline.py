@@ -117,10 +117,15 @@ class LiveV2FramePipeline:
             pass_seats=_pass_seats(fast),
             effect_seats=(fast_seat,) if fast.effect_visible else (),
         )
-        turnovers = _persistent_pass_turnovers(expected, fast)
-        rearmed = self.dispatcher.arm_persistent_passes(version, turnovers)
+        pass_markers = _pass_seats(fast)
+        marker_rearmed = self.dispatcher.observe_pass_markers(pass_markers)
+        turnover_seats = _pass_turnover_fallback(expected, fast)
+        turnover_rearmed = self.dispatcher.rearm_passes_after_turnover(
+            turnover_seats
+        )
+        rearmed = tuple(dict.fromkeys(marker_rearmed + turnover_rearmed))
         diagnostics.extend(
-            f"persistent_pass_rearmed:{seat.value}" for seat in rearmed
+            f"pass_marker_rearmed:{seat.value}" for seat in rearmed
         )
         self_opportunity = bool(
             fast.active_player == Seat.SELF.value
@@ -139,7 +144,7 @@ class LiveV2FramePipeline:
             wild_rank=wild_rank,
             expected_seat=expected,
             self_opportunity=self_opportunity,
-            pass_eligible_seats=_pass_eligible_seats(expected, turnovers),
+            pass_eligible_seats=_pass_eligible_seats(expected, turnover_seats),
             formal_action_boundary=formal_action_boundary,
             repair_seats=repair_targets,
             processing_base=processing_base,
@@ -248,14 +253,24 @@ def _pass_seats(fast: FastSignalResult) -> tuple[Seat, ...]:
     return tuple(values)
 
 
-def _persistent_pass_turnovers(
+def _pass_turnover_fallback(
     expected: Seat | None, fast: FastSignalResult
 ) -> tuple[Seat, ...]:
+    """Use an existing active-seat transition only as a narrow PASS fallback.
+
+    The normal path is the marker disappearance/reappearance edge.  This
+    fallback handles a real UI case where Tencent keeps an old PASS badge
+    visible while the next seat has already become active.  It never fires
+    when the active seat is missing, and it deliberately does not wrap around
+    to the immediately previous seat.
+    """
+
     if (
         expected is None
         or fast.active_player is None
         or fast.effect_visible
         or fast.game_end_control is not None
+        or expected not in _pass_seats(fast)
     ):
         return ()
     try:
@@ -264,30 +279,22 @@ def _persistent_pass_turnovers(
         return ()
     if active is expected:
         return ()
-    marked = set(_pass_seats(fast))
     order = tuple(Seat)
-    crossed: list[Seat] = []
     cursor = expected
-    for _ in range(len(order) - 1):
-        if cursor is active:
-            break
-        crossed.append(cursor)
+    for steps in range(1, len(order) - 1):
         cursor = order[(order.index(cursor) + 1) % len(order)]
         if cursor is active:
-            # The active-seat jump may cross players that have already
-            # finished and therefore never display a PASS marker.  Rearm only
-            # crossed seats whose own marker is visible; never manufacture a
-            # pass for an unmarked intermediate seat.  SeatTracker still
-            # requires a newer formal turn, and the dispatcher still requires
-            # two observations strictly after the formal action boundary.
-            return tuple(seat for seat in crossed if seat in marked)
+            return (expected,)
     return ()
 
 
 def _pass_eligible_seats(
-    expected: Seat | None, turnovers: tuple[Seat, ...]
+    expected: Seat | None, turnover_seats: tuple[Seat, ...] = ()
 ) -> tuple[Seat, ...]:
-    return tuple(dict.fromkeys((() if expected is None else (expected,)) + turnovers))
+    return tuple(dict.fromkeys(
+        (() if expected is None else (expected,)) + tuple(turnover_seats)
+    ))
+
 
 
 def _stream(frame: FrameIdentity) -> tuple[str, int, str, str]:

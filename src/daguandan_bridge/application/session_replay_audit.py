@@ -36,6 +36,8 @@ from ..live.truth_log import TruthLog, load_truth_log
 from ..recognition_service import ScreenshotRecognitionService
 from ..storage import atomic_write_json
 from ..template_service import TemplateService
+from .truth_log_semantic_validation import validate_truth_log_semantics
+from .truth_revision_store import truth_log_sha256
 
 _ACTION_TYPES = frozenset({"player_played", "player_passed", "manual_confirmed_event"})
 _GAP_TYPES = frozenset({"terminal_history_gap", "history_gap_detected"})
@@ -423,6 +425,13 @@ class SessionReplayAuditService:
             if legacy_probe is None:
                 opening = dict(getattr(result, "opening", {}) or {})
 
+            truth_validation = (
+                validate_truth_log_semantics(
+                    truth, mode="logic", standard_playing=True
+                )
+                if truth is not None
+                else None
+            )
             if truth is not None:
                 row["truth_log"] = _truth_metadata(
                     reference,
@@ -430,6 +439,7 @@ class SessionReplayAuditService:
                     trusted=item.session_id in self._trusted_session_ids,
                 )
                 row["truth_log"]["loaded_before_visual_replay"] = False  # type: ignore[index]
+                row["truth_log"]["validation"] = truth_validation.to_dict()
             events = _read_replay_events(result.output_path)
             visual = summarize_visual_events(events)
             frame_inventory = inventory.get("frame_index", {})
@@ -447,6 +457,18 @@ class SessionReplayAuditService:
             )
             metrics = _field_metrics(truth, opening, visual) if truth else _na_metrics()
             divergence = _first_divergence(truth, opening, visual)
+            runtime_listener_status = listener_status
+            runtime_listener_status_reason = listener_status_reason
+            scope = metrics.get("recommendation_scope", {}) if isinstance(metrics, dict) else {}
+            if (
+                truth is not None
+                and isinstance(scope, dict)
+                and scope.get("self_finish_turn_id") is not None
+                and complete
+                and _strict_quality(metrics) == "passed"
+            ):
+                listener_status = "complete"
+                listener_status_reason = "self_finished_recommendation_scope"
             evidence = (
                 _write_evidence(
                     item.source,
@@ -459,8 +481,10 @@ class SessionReplayAuditService:
                 if divergence
                 else None
             )
+            scope_end_turn = _recommendation_scope_end(truth) if truth is not None else None
             visual_fabledan = _visual_advice_summary(
-                result, visual_advisor, listener_status=listener_status
+                result, visual_advisor, listener_status=listener_status,
+                scope_end_turn=scope_end_turn,
             )
             report("fabledan_truth", 0, len(truth.turns) if truth is not None else 0, "完整 TruthLog 驱动 FableDan")
             truth_fabledan = self._truth_advice(
@@ -485,6 +509,8 @@ class SessionReplayAuditService:
                 if reference
                 and reference.kind == "canonical"
                 and truth is not None
+                and truth_validation is not None
+                and truth_validation.valid
                 and (
                     truth.label_status == "verified"
                     or item.session_id in self._trusted_session_ids
@@ -499,11 +525,16 @@ class SessionReplayAuditService:
                     "opening_status": str(opening.get("status", "recognized" if opening else "not_observable")),
                     "listener_status": listener_status,
                     "listener_status_reason": listener_status_reason,
+                    "runtime_listener_status": runtime_listener_status,
+                    "runtime_listener_status_reason": runtime_listener_status_reason,
+                    "recommendation_scope": metrics.get("recommendation_scope") if isinstance(metrics, dict) else None,
                     "comparison_status": strict,
                     "truth_quality": strict,
                     "truth_qualification": (
                         "trusted_for_run"
                         if item.session_id in self._trusted_session_ids
+                        else "invalid_semantic_baseline"
+                        if truth_validation is not None and not truth_validation.valid
                         else "verified_label"
                         if truth is not None and truth.label_status == "verified"
                         else "reference_only"
@@ -564,8 +595,21 @@ class SessionReplayAuditService:
         if reference is None:
             return {"available": False, "quality": "not_available", "reason": "no explicitly selected truth log"}
         try:
+            truth = load_truth_log(reference.path, session_id=_session_id(session))
+            validation = validate_truth_log_semantics(
+                truth, mode="logic", standard_playing=True
+            )
+            if not validation.valid:
+                return {
+                    "available": True,
+                    "completed": False,
+                    "status": "invalid_truth",
+                    "status_reason": "truth_semantic_validation_failed",
+                    "quality": "failed",
+                    "validation": validation.to_dict(),
+                    "error": validation.format_errors(),
+                }
             advisor = self._advisor(session)
-            load_truth_log(reference.path, session_id=_session_id(session))
             advice_kwargs: dict[str, object] = {}
             if on_progress is not None:
                 advice_kwargs["on_progress"] = (
@@ -761,16 +805,45 @@ def _opening_evidence(opening: dict[str, object]) -> dict[str, object]:
     return {}
 
 
+def _self_finish_turn(truth: TruthLog) -> int | None:
+    """Return the formal turn where self has no cards left, if observed."""
+
+    remaining = len(truth.initial_state.my_hand)
+    for turn in truth.turns:
+        if turn.actor == "self" and not turn.is_pass:
+            remaining -= len(turn.cards)
+            if remaining <= 0:
+                return turn.index
+    return None
+
+
+def _recommendation_scope_end(truth: TruthLog) -> int:
+    return _self_finish_turn(truth) or len(truth.turns)
+
+
+def _action_row(turn: object) -> dict[str, object]:
+    return {
+        "turn_id": turn.index,
+        "trick_id": turn.trick_id,
+        "actor": turn.actor,
+        "is_pass": turn.is_pass,
+        "cards": sorted(turn.cards),
+        "frame_index": turn.frame_index,
+        "monotonic_ms": turn.monotonic_ms,
+    }
+
+
 def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str, object]) -> dict[str, object]:
     actual_open = _opening_evidence(opening)
     expected_hand = Counter(truth.initial_state.my_hand)
     actual_hand = Counter(str(card) for card in actual_open.get("hand", ()) or ())
     hand_matches = sum((expected_hand & actual_hand).values())
-    expected = [
-        {"turn_id": t.index, "trick_id": t.trick_id, "actor": t.actor, "is_pass": t.is_pass, "cards": sorted(t.cards), "frame_index": t.frame_index, "monotonic_ms": t.monotonic_ms}
-        for t in truth.turns
-    ]
-    actual = list(visual.get("actions", {}).get("rows", ()))
+    all_expected = [_action_row(turn) for turn in truth.turns]
+    all_actual = list(visual.get("actions", {}).get("rows", ()))
+    scope_end = _recommendation_scope_end(truth)
+    self_finish = _self_finish_turn(truth)
+    expected = all_expected[:scope_end]
+    actual = all_actual[:scope_end]
     compared = min(len(expected), len(actual))
     actor_ok = pass_ok = cards_ok = identical = 0
     changed: list[dict[str, object]] = []
@@ -798,7 +871,7 @@ def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str
     actual_lead = confirmations[0].get("lead_player") if confirmations else None
     finish_expected = list(truth.outcome.finish_order)
     finish_actual = [row.get("actor") for row in visual.get("rankings", ())]
-    ranking_comparable = bool(truth.outcome.complete)
+    ranking_comparable = bool(truth.outcome.complete) and self_finish is None
     ranking_status = (
         "strict" if ranking_comparable and finish_expected
         else "diagnostic_only_outcome_incomplete" if finish_expected
@@ -814,6 +887,15 @@ def _field_metrics(truth: TruthLog, opening: dict[str, object], visual: dict[str
             "exact": expected_hand == actual_hand, "missing": list((expected_hand - actual_hand).elements()), "added": list((actual_hand - expected_hand).elements()),
         },
         "lead_player": _metric(1, int(actual_lead == truth.initial_state.lead_player), truth.initial_state.lead_player, actual_lead),
+        "recommendation_scope": {
+            "kind": "through_self_finish" if self_finish is not None else "full_truth",
+            "end_turn_id": scope_end,
+            "self_finish_turn_id": self_finish,
+            "post_self_expected_count": max(0, len(all_expected) - scope_end),
+            "post_self_actual_count": max(0, len(all_actual) - scope_end),
+            "post_self_expected_rows": all_expected[scope_end:],
+            "post_self_actual_rows": all_actual[scope_end:],
+        },
         "actions": {
             "expected": len(expected), "actual": len(actual), "identical": identical,
             "missing": max(0, len(expected) - len(actual)), "added": max(0, len(actual) - len(expected)), "changed": len(changed),
@@ -846,7 +928,8 @@ def _first_divergence(truth: TruthLog | None, opening: dict[str, object], visual
     if expected_open["round_level"] != actual_open.get("round_level") or Counter(expected_open["hand"]) != Counter(actual_open.get("hand", ())):
         return {"kind": "initial_state", "field": "round_level_or_hand", "frame_index": _int_or_none(actual_open.get("frame_index")) or 0, "monotonic_ms": _int_or_none(actual_open.get("monotonic_ms")), "expected": expected_open, "actual": actual_open}
     actions = list(visual.get("actions", {}).get("rows", ()))
-    for index in range(max(len(truth.turns), len(actions))):
+    scope_end = _recommendation_scope_end(truth)
+    for index in range(scope_end):
         exp = truth.turns[index] if index < len(truth.turns) else None
         act = actions[index] if index < len(actions) else None
         if exp and act and exp.actor == act.get("actor") and exp.is_pass == act.get("is_pass") and Counter(exp.cards) == Counter(act.get("cards", ())):
@@ -861,7 +944,12 @@ def _first_divergence(truth: TruthLog | None, opening: dict[str, object], visual
     expected_ranking = list(truth.outcome.finish_order)
     actual_ranking_rows = list(visual.get("rankings", ()))
     actual_ranking = [row.get("actor") for row in actual_ranking_rows]
-    if truth.outcome.complete and expected_ranking and expected_ranking != actual_ranking:
+    if (
+        _self_finish_turn(truth) is None
+        and truth.outcome.complete
+        and expected_ranking
+        and expected_ranking != actual_ranking
+    ):
         first_rank = actual_ranking_rows[0] if actual_ranking_rows else {}
         fallback_frame = truth.turns[-1].frame_index if truth.turns else 0
         return {
@@ -1203,6 +1291,7 @@ def _visual_advice_summary(
     advisor: Any,
     *,
     listener_status: str | None = None,
+    scope_end_turn: int | None = None,
 ) -> dict[str, object]:
     """Summarize visual advice without treating an empty run as success.
 
@@ -1212,12 +1301,31 @@ def _visual_advice_summary(
     successful advice run distinct.
     """
 
-    requested = int(result.advice_requested or 0)
-    ready = int(result.advice_ready or 0)
-    failed = int(result.advice_failed or 0)
-    stale = int(result.advice_stale or 0)
-    timeouts = int(result.advice_timeouts or 0)
-    withheld = int(result.advice_withheld or 0)
+    status_counts = Counter(result.advice_statuses)
+    if not status_counts:
+        status_counts.update({
+            "requested": int(result.advice_requested or 0),
+            "ready": int(result.advice_ready or 0),
+            "failed": int(result.advice_failed or 0),
+            "stale": int(result.advice_stale or 0),
+            "timeout": int(result.advice_timeouts or 0),
+            "withheld": int(result.advice_withheld or 0),
+        })
+    if scope_end_turn is not None:
+        advice_path = result.artifact_paths.get("advice.jsonl")
+        if advice_path is not None and Path(advice_path).is_file():
+            status_counts = Counter(
+                str(row.get("status", ""))
+                for row in read_json_lines(Path(advice_path))
+                if int(row.get("turn_id", 0) or 0) <= scope_end_turn
+            )
+    requested = int(status_counts.get("requested", 0))
+    ready = int(status_counts.get("ready", 0))
+    failed = int(status_counts.get("failed", 0))
+    stale = int(status_counts.get("stale", 0))
+    timeouts = int(status_counts.get("timeout", 0))
+    withheld = int(status_counts.get("withheld", 0))
+    cancelled = int(status_counts.get("cancelled", 0))
     identity = getattr(result, "runtime_identity", {}) or {}
     identity = identity if isinstance(identity, dict) else {}
     effective_listener_status = listener_status or identity.get("listener_status")
@@ -1226,8 +1334,14 @@ def _visual_advice_summary(
         effective_listener_status in {
             "incomplete", "blocked", "review_required", "error", "not_started"
         }
-        or result_status in {"incomplete", "blocked", "review_required", "error"}
+        or (
+            effective_listener_status in {None, ""}
+            and result_status in {"incomplete", "blocked", "review_required", "error"}
+        )
         or withheld > 0
+    )
+    channel_completed = bool(getattr(result, "completed", False)) or (
+        effective_listener_status == "complete"
     )
 
     if failed > 0 or timeouts > 0:
@@ -1243,10 +1357,13 @@ def _visual_advice_summary(
     elif requested == 0:
         status = "not_exercised"
         status_reason = "no_advice_requests"
-    elif bool(getattr(result, "completed", False)) and ready == requested and stale == 0:
+    elif channel_completed and ready == requested and stale == 0 and cancelled == 0:
         status = "passed"
         status_reason = "advice_requests_completed"
-    elif bool(getattr(result, "completed", False)) and ready + stale >= requested:
+    elif channel_completed and ready + cancelled >= requested and stale == 0:
+        status = "completed_with_cancelled"
+        status_reason = "advice_requests_completed_or_cancelled"
+    elif channel_completed and ready + stale + cancelled >= requested:
         # ``stale`` means the production advice result was superseded before
         # consumption. It is an explicit visual-channel advisory, not a
         # FableDan failure and must never be hidden or relabeled as passed.
@@ -1260,7 +1377,7 @@ def _visual_advice_summary(
         "available": True,
         "status": status,
         "status_reason": status_reason,
-        "completed": bool(result.completed),
+        "completed": channel_completed,
         "listener_status": effective_listener_status,
         "processed_turn_count": result.processed_turn_count,
         "run_directory": str(result.run_directory) if result.run_directory else None,
@@ -1269,10 +1386,12 @@ def _visual_advice_summary(
             "ready": ready,
             "failed": failed,
             "stale": stale,
+            "cancelled": cancelled,
             "timeout": timeouts,
             "timeouts": timeouts,
             "withheld": withheld,
-            "statuses": dict(result.advice_statuses),
+            "statuses": dict(status_counts),
+            "scope_end_turn": scope_end_turn,
         },
         "advisor": _advisor_info(advisor),
         "artifacts": {name: str(path) for name, path in result.artifact_paths.items()},
@@ -1703,19 +1822,54 @@ def _truth_metadata(
     if not reference or not truth:
         return {"kind": "none", "path": None, "sha256": None, "schema": None, "provenance": None}
     raw = json.loads(reference.path.read_text(encoding="utf-8"))
-    return {
+    metadata: dict[str, object] = {
         # ``kind`` describes where the reference came from.  Do not replace
         # canonical with ``verified`` here: the CLI uses the separate
         # ``truth_qualification`` field to decide whether it is strict.
-        "kind": reference.kind,
+        "kind": (
+            "trusted_draft"
+            if trusted and truth.label_status != "verified"
+            else reference.kind
+        ),
         "reference_kind": reference.kind,
         "trusted_session": trusted,
         "path": str(reference.path),
         "sha256": _sha_file(reference.path),
+        "canonical_sha256": truth_log_sha256(truth),
         "schema": raw.get("schema", raw.get("schema_version")),
         "provenance": truth.provenance.to_dict(),
         "label_status": truth.label_status,
     }
+    revision_manifest = reference.path.parent / "truth_revision_manifest.json"
+    if revision_manifest.is_file():
+        try:
+            revision = json.loads(revision_manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            revision = {}
+        if isinstance(revision, dict):
+            metadata["revision_manifest_path"] = str(revision_manifest)
+            revision_id = revision.get("current_revision_id")
+            revision_truth_sha256 = revision.get("current_truth_sha256")
+            metadata["revision_id"] = revision_id
+            metadata["semantic_sha256"] = revision.get("current_semantic_sha256")
+            metadata["revision_truth_sha256"] = revision_truth_sha256
+            metadata["revision_matches_truth"] = (
+                isinstance(revision_truth_sha256, str)
+                and revision_truth_sha256 == metadata["canonical_sha256"]
+            )
+            revisions = revision.get("revisions", ())
+            if isinstance(revisions, list):
+                current = next(
+                    (
+                        item for item in revisions
+                        if isinstance(item, dict)
+                        and item.get("revision_id") == revision_id
+                    ),
+                    None,
+                )
+                if current is not None:
+                    metadata["revision_created_at"] = current.get("created_at")
+    return metadata
 
 
 def _session_id(session: Path) -> str:
@@ -1938,13 +2092,13 @@ def _advice_quality(truth: dict[str, object], visual: dict[str, object]) -> str:
         # completed visual run with stale responses remains an advisory issue,
         # not an overall failure; an unexercised/withheld visual path remains
         # visible through its nested status and is not called a visual pass.
-        if visual_status in {"", "passed", "completed_with_stale"}:
+        if visual_status in {"", "passed", "completed_with_stale", "completed_with_cancelled"}:
             return "passed"
         return "advisory"
 
     if visual_status == "passed":
         return "passed"
-    if visual_status in {"completed_with_stale", "withheld_due_listener_gap", "not_exercised"}:
+    if visual_status in {"completed_with_stale", "completed_with_cancelled", "withheld_due_listener_gap", "not_exercised"}:
         return "advisory"
     return "not_available"
 

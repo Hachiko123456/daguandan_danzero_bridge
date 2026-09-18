@@ -12,7 +12,6 @@ from daguandan_bridge.annotation_service import AnnotationService
 from daguandan_bridge.application.live_v2_frame_pipeline import (
     FramePipelineConfig,
     LiveV2FramePipeline,
-    _persistent_pass_turnovers,
 )
 from daguandan_bridge.application.live_v2_session_runtime import LiveV2SessionRuntime
 from daguandan_bridge.application.live_v2_vision_protocol import VisionWorkerConfig
@@ -100,20 +99,40 @@ class HistoricalFrameRecognition:
         return self.delegate.recognize_play_region(image, seat, **kwargs)
 
 
-def test_turnover_rearms_only_marked_expected_seat_across_finished_player():
-    fast = FastSignalResult(
-        expected_player="self",
-        active_player="opposite",
-        pass_visible=True,
-        self_action_buttons_visible=False,
-        effect_visible=False,
-        pass_marker_player="self",
-        pass_marker_players=("self",),
+def test_persistent_pass_does_not_rearm_without_marker_clear():
+    # The fast marker lifecycle, not active-player/clock recognition, controls
+    # whether a repeated PASS may be emitted.
+    from daguandan_bridge.live_v2.seat_tracker import SeatTracker
+    from daguandan_bridge.live_v2.types import ObservationKind
+
+    tracker = SeatTracker(Seat.LEFT)
+    assert tracker.observe_pass_marker(True) is False
+    assert tracker.observe_pass_marker(True) is False
+    assert tracker.ingest(
+        _pass_observation(1),
+        version=_pass_version(),
+    ) is None
+    assert tracker.ingest(
+        _pass_observation(2),
+        version=_pass_version(),
+    ) is not None
+    assert tracker.observe_pass_marker(True) is False
+    assert tracker.observe_pass_marker(False) is False
+    assert tracker.observe_pass_marker(False) is True
+
+
+def _pass_version():
+    from daguandan_bridge.live_v2.identity import VersionIdentity
+    return VersionIdentity("pass-test", 1, 0, 0, 0)
+
+def _pass_observation(sequence: int):
+    from daguandan_bridge.live_v2.identity import FrameIdentity
+    from daguandan_bridge.live_v2.types import ObservationKind, ObservationReason, SeatObservation
+    frame = FrameIdentity("pass-test", 1, sequence, sequence * 100, "roi", "source")
+    return SeatObservation(
+        f"pass-{sequence}", frame, Seat.LEFT, ObservationKind.PASS, (),
+        0.9, ObservationReason.PASS_MARKER, sequence * 100 + 1, (), ()
     )
-
-    assert _persistent_pass_turnovers(Seat.SELF, fast) == (Seat.SELF,)
-    assert Seat.RIGHT not in _persistent_pass_turnovers(Seat.SELF, fast)
-
 
 def test_real_async_frames_rearm_turn80_pass_after_formal_turn79_boundary():
     video = SESSION / "video/game.avi"

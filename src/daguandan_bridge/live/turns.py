@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable
 
 from ..danzero.state import GameStateError, Seat
@@ -15,6 +16,14 @@ PARTNER_SEAT: dict[Seat, Seat] = {
     "right": "left",
     "left": "right",
 }
+
+class WindCatchPolicy(str, Enum):
+    """How a finished leader hands the next trick to their partner."""
+
+    AUTO_HANDOFF_TO_PARTNER = "auto_handoff_to_partner"
+    PARTNER_MUST_EXPLICITLY_PASS = "partner_must_explicitly_pass"
+    LEGACY_SKIP_RECEIVER = "legacy_skip_receiver"
+
 
 TEAMS: tuple[frozenset[Seat], ...] = (
     frozenset({"self", "opposite"}),
@@ -61,7 +70,8 @@ class TrickTurnProjection:
     wind_receiver: Seat | None
     next_leader: Seat | None
     required_passers: frozenset[Seat]
-    wind_receiver_must_pass: bool = True
+    wind_receiver_must_pass: bool = False
+    skip_wind_receiver_while_incomplete: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -80,7 +90,10 @@ class TrickTurnProjection:
             next_player = next_active_seat(actor, self.finished)
         except GameStateError:
             return None
-        if not self.wind_receiver_must_pass and next_player == self.wind_receiver:
+        # The future wind receiver still takes its natural turn when another
+        # opponent later in seat order has not responded yet.  Historical
+        # pre-policy timelines may explicitly request the former skip behavior.
+        if self.skip_wind_receiver_while_incomplete and next_player == self.wind_receiver:
             try:
                 return next_active_seat(next_player, self.finished)
             except GameStateError:
@@ -100,7 +113,8 @@ def project_trick_turn(
     finished: Iterable[Seat],
     passed: Iterable[Seat] = (),
     *,
-    wind_receiver_must_pass: bool = True,
+    wind_catch_policy: WindCatchPolicy = WindCatchPolicy.PARTNER_MUST_EXPLICITLY_PASS,
+    wind_receiver_must_pass: bool | None = None,
 ) -> TrickTurnProjection:
     """Project one trick's turn ownership, including the full 接风 rule.
 
@@ -108,12 +122,26 @@ def project_trick_turn(
     seats and responders that have already PASSed.  They must not separately
     implement partner handoff or response counts.  In a wind catch, the
     receiver takes the next trick only after every active seat has responded.
-    ``wind_receiver_must_pass=False`` exists solely for replaying pre-policy
-    timeline artifacts which omitted that historical response.
+    Tencent automatically hands the next lead to the finished player's partner;
+    that partner does not need to emit an artificial PASS.  The explicit-pass
+    policy remains available only for replaying older timelines that recorded it.
     """
 
     if leader not in TURN_ORDER:
         raise GameStateError("当前墩领出座位不在逆时针座位表中")
+    policy = WindCatchPolicy(wind_catch_policy)
+    if wind_receiver_must_pass is not None:
+        # Preserve the legacy bool API: False meant unconditionally skipping
+        # the future receiver, while True required its explicit PASS.
+        policy = (
+            WindCatchPolicy.PARTNER_MUST_EXPLICITLY_PASS
+            if wind_receiver_must_pass
+            else WindCatchPolicy.LEGACY_SKIP_RECEIVER
+        )
+    require_receiver_pass = (
+        policy is WindCatchPolicy.PARTNER_MUST_EXPLICITLY_PASS
+    )
+    legacy_skip_receiver = policy is WindCatchPolicy.LEGACY_SKIP_RECEIVER
     finished_seats = frozenset(finished)
     passed_seats = frozenset(passed)
     active = frozenset(seat for seat in TURN_ORDER if seat not in finished_seats)
@@ -148,8 +176,12 @@ def project_trick_turn(
 
     required_passers = (
         active
-        if wind_receiver is not None and wind_receiver_must_pass
-        else active - {next_leader} if next_leader is not None else frozenset()
+        if wind_receiver is not None and require_receiver_pass
+        else active - {wind_receiver}
+        if wind_receiver is not None
+        else active - {next_leader}
+        if next_leader is not None
+        else frozenset()
     )
     return TrickTurnProjection(
         leader=leader,
@@ -158,5 +190,6 @@ def project_trick_turn(
         wind_receiver=wind_receiver,
         next_leader=next_leader,
         required_passers=required_passers,
-        wind_receiver_must_pass=wind_receiver_must_pass,
+        wind_receiver_must_pass=require_receiver_pass,
+        skip_wind_receiver_while_incomplete=legacy_skip_receiver,
     )

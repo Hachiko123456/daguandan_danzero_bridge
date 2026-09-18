@@ -21,11 +21,13 @@ from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     CardWidget,
+    CheckBox,
     ComboBox,
     LineEdit,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
+    SpinBox,
     StrongBodyLabel,
     TitleLabel,
     isDarkTheme,
@@ -216,6 +218,32 @@ class LiveAssistantPage(ScrollArea):
             "对局录制：确认起手牌后开始保存。\n"
             "完整牌桌录制：保存准备、发牌与对局；大厅和结算仅监听。"
         )
+        self.recording_capacity_spin = SpinBox(self)
+        self.recording_capacity_spin.setRange(1, 1024)
+        self.recording_capacity_spin.setSuffix(" GB")
+        configured_bytes = int(
+            getattr(self.runtime, "recording_max_total_bytes", 20 * 1024 ** 3)
+        )
+        self.recording_capacity_spin.setValue(
+            max(1, int(round(configured_bytes / 1024 ** 3)))
+        )
+        self.recording_capacity_spin.setToolTip(
+            "限制 sessions 中视频、截图和事故媒体的总容量。"
+            "达到上限后识别与推荐继续，但录像会停止。"
+        )
+        self.automatic_log_media_check = CheckBox("自动诊断包含视频和截图", self)
+        self.automatic_log_media_check.setChecked(
+            bool(getattr(self.runtime, "automatic_log_include_media", False))
+        )
+        self.automatic_log_media_check.setToolTip(
+            "开启后每局封存时自动生成含 game.avi 的完整诊断 ZIP；"
+            "文件较大。关闭时仍可点击“导出最近一局完整诊断”。"
+        )
+        self.recording_storage_status = CaptionLabel()
+        self.recording_storage_status.setWordWrap(True)
+        self.recording_storage_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         # Internal normalized codes remain here for the state machine; the
         # user edits the visible card strip through the existing picker.
         self.hand_edit = LineEdit(self)
@@ -247,6 +275,9 @@ class LiveAssistantPage(ScrollArea):
         form.addRow("识别策略", self.recognition_strategy_combo)
         form.addRow("建议模型", self.advisor_strategy_combo)
         form.addRow("保存方式", self.recording_mode_combo)
+        form.addRow("录像总容量", self.recording_capacity_spin)
+        form.addRow("自动诊断", self.automatic_log_media_check)
+        form.addRow("录像容量状态", self.recording_storage_status)
         form.addRow("起手牌", self.initial_hand_scroll)
         initial_layout.addLayout(form)
         initial_actions = QHBoxLayout()
@@ -315,7 +346,7 @@ class LiveAssistantPage(ScrollArea):
         log_row.addWidget(self.open_log_directory_button)
         log_row.addWidget(self.export_full_diagnostic_button)
         state_layout.addLayout(log_row)
-        self.log_delivery_status = CaptionLabel("封局后会自动生成不含截图和视频的诊断 ZIP")
+        self.log_delivery_status = CaptionLabel(self._automatic_log_description())
         self.log_delivery_status.setWordWrap(True)
         self.log_delivery_status.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -427,6 +458,13 @@ class LiveAssistantPage(ScrollArea):
         self.recording_mode_combo.currentIndexChanged.connect(
             self._update_recording_mode
         )
+        self.recording_capacity_spin.editingFinished.connect(
+            self._update_recording_capacity
+        )
+        self.automatic_log_media_check.toggled.connect(
+            self._update_automatic_log_media
+        )
+        self._refresh_recording_storage_status()
         self._update_recognition_strategy()
         self._set_live_controls(False)
 
@@ -577,6 +615,79 @@ class LiveAssistantPage(ScrollArea):
                 self.recording_mode_combo.setCurrentIndex(index)
                 self.recording_mode_combo.blockSignals(False)
 
+    def _update_recording_capacity(self) -> None:
+        if self._session_active:
+            return
+        setter = getattr(self.runtime, "set_recording_max_total_gb", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self.recording_capacity_spin.value())
+            self._refresh_recording_storage_status()
+        except Exception as exc:
+            self.show_error(str(exc))
+            configured = int(
+                getattr(self.runtime, "recording_max_total_bytes", 20 * 1024 ** 3)
+            )
+            self.recording_capacity_spin.blockSignals(True)
+            self.recording_capacity_spin.setValue(
+                max(1, int(round(configured / 1024 ** 3)))
+            )
+            self.recording_capacity_spin.blockSignals(False)
+
+    def _update_automatic_log_media(self, checked: bool) -> None:
+        if self._session_active:
+            return
+        setter = getattr(self.runtime, "set_automatic_log_include_media", None)
+        if not callable(setter):
+            return
+        try:
+            setter(bool(checked))
+            self.log_delivery_status.setText(self._automatic_log_description())
+            self._apply_log_delivery_availability()
+        except Exception as exc:
+            self.show_error(str(exc))
+            restored = bool(
+                getattr(self.runtime, "automatic_log_include_media", False)
+            )
+            self.automatic_log_media_check.blockSignals(True)
+            self.automatic_log_media_check.setChecked(restored)
+            self.automatic_log_media_check.blockSignals(False)
+
+    def _refresh_recording_storage_status(self) -> None:
+        provider = getattr(self.runtime, "recording_storage_summary", None)
+        if not callable(provider):
+            self.recording_storage_status.setText("当前运行时未提供容量统计")
+            return
+        try:
+            value = provider()
+        except Exception as exc:
+            self.recording_storage_status.setText(f"容量统计失败：{exc}")
+            return
+        if not isinstance(value, dict):
+            self.recording_storage_status.setText("容量统计不可用")
+            return
+        used = int(value.get("used_bytes", 0) or 0)
+        limit = int(value.get("limit_bytes", 0) or 0)
+        remaining = int(value.get("remaining_bytes", 0) or 0)
+        exhausted = bool(value.get("capacity_exhausted", False))
+        prefix = "⚠ 录像配额已用完；新对局将没有完整视频。" if exhausted else "录像配额正常。"
+        self.recording_storage_status.setText(
+            f"{prefix} 已用 {self._format_gib(used)} / "
+            f"上限 {self._format_gib(limit)}，剩余 {self._format_gib(remaining)}"
+        )
+
+    def _automatic_log_description(self) -> str:
+        return (
+            "封局后会自动生成包含截图和视频的完整诊断 ZIP"
+            if bool(getattr(self.runtime, "automatic_log_include_media", False))
+            else "封局后会自动生成不含截图和视频的诊断 ZIP"
+        )
+
+    @staticmethod
+    def _format_gib(value: int) -> str:
+        return f"{max(0, int(value)) / 1024 ** 3:.2f} GB"
+
     def _apply_log_delivery_availability(self) -> None:
         """Keep log actions honest when the user selected no persistence."""
 
@@ -587,7 +698,7 @@ class LiveAssistantPage(ScrollArea):
             self.log_delivery_status.setText("当前已关闭对局数据保存，日志功能不可用")
         elif "日志功能不可用" in self.log_delivery_status.text():
             self.export_full_diagnostic_button.setEnabled(True)
-            self.log_delivery_status.setText("封局后会自动生成不含截图和视频的诊断 ZIP")
+            self.log_delivery_status.setText(self._automatic_log_description())
 
     def _log_delivery_enabled(self) -> bool:
         mode = str(
@@ -640,6 +751,8 @@ class LiveAssistantPage(ScrollArea):
         self.recognition_strategy_combo.setEnabled(enabled)
         self.advisor_strategy_combo.setEnabled(enabled)
         self.recording_mode_combo.setEnabled(enabled)
+        self.recording_capacity_spin.setEnabled(enabled)
+        self.automatic_log_media_check.setEnabled(enabled)
 
     def _render_initial_hand_cards(self, cards: tuple[str, ...]) -> None:
         while self.initial_hand_cards_layout.count():

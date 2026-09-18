@@ -41,6 +41,7 @@ from ..application.placement_projection import (
     derive_finish_order,
 )
 from ..application.truth_revision_store import TruthRevisionStore
+from ..application.truth_log_semantic_validation import normalize_truth_log_trick_ids
 from ..config import PROFILES_ROOT
 from ..storage import atomic_write_json
 from ..danzero.state import RANKS, SEATS, SUITS
@@ -218,6 +219,11 @@ class TruthLogEditor(QWidget):
         self._last_recognized_frame: int | None = None
         self._placements = self._load_placements(truth_log)
         self._placement_badges_by_turn = self._placement_badges(self._placements)
+        self._placement_finish_turns = {
+            item.actor: item.anchor_turn_id
+            for item in self._placements
+            if item.anchor_turn_id is not None
+        }
         self._suit_correction_tracker = SuitCorrectionTracker()
         self.setObjectName("truthLogEditor")
         layout = QVBoxLayout(self)
@@ -491,6 +497,7 @@ class TruthLogEditor(QWidget):
         if not self._placement_badges_by_turn:
             return
         self._placement_badges_by_turn = {}
+        self._placement_finish_turns = {}
         for row in range(self.table.rowCount()):
             self.table.setCellWidget(
                 row,
@@ -935,7 +942,14 @@ class TruthLogEditor(QWidget):
         return out
 
     def _out_players_before(self, stop_row: int) -> set[str]:
-        return self._finished_players(self._played_card_counts_before(stop_row))
+        finished = self._finished_players(
+            self._played_card_counts_before(stop_row)
+        )
+        finished.update(
+            actor for actor, turn_id in self._placement_finish_turns.items()
+            if turn_id <= stop_row
+        )
+        return finished
 
     def _out_players(self) -> set[str]:
         """已出完（手牌打光）的玩家：累计出牌数达到起始手牌数。
@@ -989,6 +1003,7 @@ class TruthLogEditor(QWidget):
             return next_actor_after_prefix(
                 self._current_initial_state(),
                 self._prefix_turns(row),
+                forced_finished_after_turn=self._placement_finish_turns,
             )
         except ValueError:
             return None
@@ -1469,6 +1484,9 @@ class TruthLogEditor(QWidget):
             validate_truth_log_card_inventory(log)
             validate_turn_actor_chain(log)
             validate_truth_log_with_live_reducer(log)
+            log = normalize_truth_log_trick_ids(
+                log, standard_playing=True
+            )
         except TruthLogCardInventoryError as exc:
             self.save_status.setText(f"保存失败：{exc}")
             QLabel(str(exc), self).show()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from time import sleep
 
 import pytest
@@ -19,7 +20,7 @@ from daguandan_bridge.domain.recognition import FastSignalResult
 from daguandan_bridge.domain.recording import RecordingResult
 from daguandan_bridge.infrastructure.live_v2_rule_session import ProductionRuleSession
 from daguandan_bridge.live_v2.candidates import (
-    ActionCandidate, ActionKind, CandidateReason,
+    ActionCandidate, ActionKind, CandidateReason, EvidenceOrigin,
 )
 from daguandan_bridge.live_v2.identity import FrameIdentity, Seat
 from daguandan_bridge.live_v2.observations import ObservationKind, ObservationReason, SeatObservation
@@ -378,9 +379,9 @@ class VisualCountCorrectionVision:
             )
         observation = SeatObservation(
             f"reread-four-aces-{self.calls}", frame, Seat.RIGHT,
-            ObservationKind.PLAY, ("AH", "AH", "AD", "AC"), 0.95,
+            ObservationKind.PLAY, ("AH", "AD", "AD", "AC"), 0.95,
             ObservationReason.CARDS_RECOGNIZED, int(now_ms),
-            (("AH",), ("AH",), ("AD",), ("AC",)),
+            (("AH",), ("AD",), ("AD",), ("AC",)),
         )
         return FramePipelineResult(
             frame, fast, (), (observation,), (), (), (), 0
@@ -407,7 +408,7 @@ def test_visual_reread_can_repair_rank_suit_and_card_count_in_place():
     clock.value = 100
     first = live.analyze_frame(object(), monotonic_ms=100)
     assert first.event and first.event.event_type == "player_played"
-    assert live.snapshot.play_history[-1].cards == ("A?", "AH")
+    assert live.snapshot.play_history[-1].cards == ("AH", "A?")
 
     clock.value = 200
     assert live.analyze_frame(object(), monotonic_ms=200).event is None
@@ -416,10 +417,129 @@ def test_visual_reread_can_repair_rank_suit_and_card_count_in_place():
 
     assert repaired.event and repaired.event.event_type == "event_correction"
     assert repaired.event.payload["correction_reason"] == "visual_reread"
-    assert tuple(repaired.event.payload["cards"]) == ("AC", "AD", "AH", "AH")
-    assert live.snapshot.play_history[-1].cards == ("AC", "AD", "AH", "AH")
+    assert tuple(repaired.event.payload["cards"]) == ("AH", "AD", "AD", "AC")
+    assert live.snapshot.play_history[-1].cards == ("AH", "AD", "AD", "AC")
     assert len(live.snapshot.play_history) == 1
     assert live.snapshot.current_player == "opposite"
+
+
+
+class QueuedVisualCorrectionVision(VisualCorrectionVision):
+    def process_frame(
+        self, image, *, frame, version, wild_rank, expected_seat=None,
+        now_ms=None, formal_action_boundary=None, repair_seats=(),
+    ):
+        if self.calls == 0:
+            result = super().process_frame(
+                image, frame=frame, version=version, wild_rank=wild_rank,
+                expected_seat=expected_seat, now_ms=now_ms,
+                formal_action_boundary=formal_action_boundary,
+                repair_seats=repair_seats,
+            )
+            self.calls = 1
+            return result
+        self.calls += 1
+        reread_frame = FrameIdentity(
+            frame.session_id, frame.capture_generation, self.calls + 1,
+            7_900 if self.calls == 2 else 7_999,
+            frame.roi_version, frame.source_id,
+        )
+        observation = SeatObservation(
+            "queued-reread-5S", reread_frame, Seat.RIGHT, ObservationKind.PLAY,
+            ("5S",), 0.95, ObservationReason.CARDS_RECOGNIZED,
+            int(now_ms), (("5S",),),
+        )
+        return FramePipelineResult(
+            frame, _fast(expected_seat.value if expected_seat else "right"),
+            (), (observation,), (), (), (), 0,
+        )
+
+
+def test_visual_repair_window_uses_turn_boundary_not_eight_second_timeout():
+    store = MemoryStore(); recorder = MemoryRecorder(); store.start({"schema": "test.live-v2/1"})
+    clock = ManualClock(); vision = QueuedVisualCorrectionVision()
+
+    live = LiveV2SessionRuntime(
+        rule_session=ProductionRuleSession(store), store=store, recorder=recorder,
+        recognition_service=FakeRecognition(), vision_factory=lambda _version: vision,
+        advice_runtime_factory=lambda _version: FakeAdviceRuntime(),
+        processing_clock_ms=clock,
+    )
+    _LIVE_RUNTIMES.append(live)
+    live.start(
+        round_level="2", hand=HAND, lead_player="right", monotonic_ms=0,
+        wall_time="2026-09-13T00:00:00+08:00",
+    )
+    live.bind_capture_generation(1)
+
+    clock.value = 100
+    first = live.analyze_frame(object(), monotonic_ms=100)
+    assert first.snapshot.play_history[-1].cards == ("5?",)
+
+    clock.value = 7_900
+    assert live.analyze_frame(object(), monotonic_ms=7_900).event is None
+
+    # The second matching reread was captured before the old eight-second
+    # deadline but delivered later. Natural turn boundaries, not wall time,
+    # decide whether the repair still belongs to the original action.
+    clock.value = 8_101
+    repaired = live.analyze_frame(object(), monotonic_ms=8_101)
+
+    assert repaired.event and repaired.event.event_type == "event_correction"
+    assert repaired.snapshot.play_history[-1].cards == ("5S",)
+
+
+def test_visual_repair_priority_rotates_between_pending_seats():
+    live, _first, _store, _recorder, _clock, _visions, _advisers = runtime()
+    for seat in (Seat.RIGHT, Seat.OPPOSITE):
+        live._register_visual_correction(SimpleNamespace(
+            action_id=f"repair-{seat.value}",
+            kind=ActionKind.PLAY,
+            evidence_origin=EvidenceOrigin.VISUAL,
+            seat=seat,
+            cards=("3?",),
+            suit_options=(("3D", "3C"),),
+            confidence=0.5,
+            diagnostics=("play_confidence",),
+        ))
+
+    assert live._ordered_visual_repair_seats() == (Seat.RIGHT, Seat.OPPOSITE)
+    assert live._ordered_visual_repair_seats() == (Seat.OPPOSITE, Seat.RIGHT)
+    assert live._ordered_visual_repair_seats() == (Seat.RIGHT, Seat.OPPOSITE)
+
+
+
+def test_complete_high_confidence_action_opens_expansion_only_watch():
+    live, _first, _store, _recorder, _clock, _visions, _advisers = runtime()
+    live._register_visual_correction(SimpleNamespace(
+        action_id="complete",
+        kind=ActionKind.PLAY,
+        evidence_origin=EvidenceOrigin.VISUAL,
+        seat=Seat.RIGHT,
+        cards=("3D",),
+        suit_options=(("3D",),),
+        confidence=0.95,
+        diagnostics=(),
+    ))
+    assert live._visual_corrections["complete"].allow_expansion
+    assert not live._visual_corrections["complete"].allow_complete_rewrite
+
+
+def test_terminal_state_closes_all_auto_correction_windows():
+    live, _first, _store, _recorder, _clock, _visions, _advisers = runtime()
+    live._register_visual_correction(SimpleNamespace(
+        action_id="uncertain",
+        kind=ActionKind.PLAY,
+        evidence_origin=EvidenceOrigin.VISUAL,
+        seat=Seat.RIGHT,
+        cards=("3?",),
+        suit_options=(("3D", "3C"),),
+        confidence=0.5,
+        diagnostics=("play_confidence",),
+    ))
+    assert live._visual_corrections
+    live._expire_visual_corrections(None)
+    assert live._visual_corrections == {}
 
 
 def test_complete_multi_seat_chain_reaches_self_and_publishes_advice_once() -> None:
@@ -634,7 +754,7 @@ def test_late_model_result_after_state_change_is_not_published() -> None:
     assert not delivered
     assert not (live.latest_advice and live.latest_advice.visible)
     assert [row["status"] for row in _store.advice] == [
-        "requested", "worker_started", "stale",
+        "requested", "worker_started", "cancelled",
     ]
     assert live._opportunity_metrics["opportunity_valid"] == 0
     assert live._opportunity_metrics["opportunity_no_result"] == 1
@@ -742,7 +862,7 @@ def test_finish_drains_pending_advice_to_one_terminal_before_store_seal() -> Non
     assert observed == [(True, ["cancelled"])]
 
 
-def test_confirmed_cannot_beat_short_circuits_model_without_committing_pass() -> None:
+def test_confirmed_cannot_beat_wins_race_against_speculative_model_without_committing_pass() -> None:
     delivered = []
     live, _first, store, _recorder, clock, _visions, advisers = runtime(
         lead="self", advice_immediate=False, local_hint_window_ms=200
@@ -764,12 +884,14 @@ def test_confirmed_cannot_beat_short_circuits_model_without_committing_pass() ->
     )
     assert update and update.advice.visible and update.advice.advice.is_pass
     assert delivered and delivered[-1].advice.advice.is_pass
-    assert not advisers[0].submissions
+    assert len(advisers[0].submissions) == 1
     assert live.snapshot.revision == before.revision
     assert live.snapshot.play_history == before.play_history
-    assert [row["status"] for row in store.advice] == ["requested", "local_pass"]
+    assert [row["status"] for row in store.advice] == [
+        "requested", "worker_started", "local_pass",
+    ]
     sleep(0.25)
-    assert not advisers[0].submissions
+    assert len(advisers[0].submissions) == 1
 
 
 def test_hint_just_after_window_is_ui_only_and_model_remains_terminal() -> None:
@@ -798,13 +920,15 @@ def test_hint_just_after_window_is_ui_only_and_model_remains_terminal() -> None:
     assert [row["status"] for row in store.advice][-2:] == ["worker_started", "ready"]
 
 
-def test_model_starts_after_bounded_local_hint_window_when_no_button_appears() -> None:
+def test_model_starts_immediately_but_result_waits_for_local_hint_window() -> None:
     live, _first, store, _recorder, _clock, _visions, advisers = runtime(
         lead="self", advice_immediate=True, local_hint_window_ms=150
     )
-    assert not advisers[0].submissions
-    sleep(0.2)
     assert len(advisers[0].submissions) == 1
+    assert [row["status"] for row in store.advice] == [
+        "requested", "worker_started",
+    ]
+    sleep(0.2)
     assert [row["status"] for row in store.advice] == [
         "requested", "worker_started", "ready",
     ]
@@ -862,7 +986,7 @@ def test_hint_13_seconds_late_cannot_resurrect_timed_out_opportunity() -> None:
     assert update and update.local_rule_hint is not None
     assert all(row["status"] != "local_pass" for row in store.advice)
     assert live.wait_for_advice_idle(timeout=1)
-    assert advisers[0].submissions == []
+    assert len(advisers[0].submissions) == 1
     terminals = [
         row for row in store.advice
         if row["status"] in {"ready", "local_pass", "failed", "timeout", "withheld"}
@@ -897,8 +1021,10 @@ def test_stale_generation_effect_and_terminal_controls_cannot_short_circuit() ->
         unsafe[0], captured_ms=clock.value, capture_generation=0,
         frame_size=(1280, 720),
     ) is None
-    assert not advisers[0].submissions
-    assert [row["status"] for row in store.advice] == ["requested"]
+    assert len(advisers[0].submissions) == 1
+    assert [row["status"] for row in store.advice] == [
+        "requested", "worker_started",
+    ]
 
 
 def test_explicit_correction_rebuilds_the_same_generation() -> None:
@@ -938,7 +1064,7 @@ def test_visual_correction_matches_same_rank_and_narrows_unknown_suit():
     assert corrected == ("5S", "3S")
 
 
-def test_visual_correction_accepts_rank_and_card_count_changes():
+def test_visual_correction_only_accepts_information_improvement():
     target = (("5?", "5S", "5C"),)
     assert _resolve_visual_correction(
         ("5?",), target, ("6S",), (("6S",),)
@@ -949,6 +1075,24 @@ def test_visual_correction_accepts_rank_and_card_count_changes():
         ("AH", "AH", "AD", "AC"),
         (("AH",), ("AH",), ("AD",), ("AC",)),
     ) == ("AH", "AH", "AD", "AC")
+    assert _resolve_visual_correction(
+        ("3H", "4H", "5H", "6H", "7H"),
+        (("3H",), ("4H",), ("5H",), ("6H",), ("7H",)),
+        ("3H", "4D"), (("3H",), ("4D",)),
+        allow_complete_rewrite=True, allow_expansion=True,
+    ) is None
+    assert _resolve_visual_correction(
+        ("small_joker",), ((),),
+        ("QH", "QH", "8H", "8C"),
+        (("QH",), ("QH",), ("8H",), ("8C",)),
+        allow_complete_rewrite=True,
+    ) is None
+    assert _resolve_visual_correction(
+        ("7D", "7C"), (("7D",), ("7C",)),
+        ("7D", "7C", "7S", "8H", "8C", "8S"),
+        (("7D",), ("7C",), ("7S",), ("8H",), ("8C",), ("8S",)),
+        allow_expansion=True,
+    ) == ("7D", "7C", "7S", "8H", "8C", "8S")
 
 
 def test_visual_correction_rejects_another_incomplete_reread():

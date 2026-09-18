@@ -2473,6 +2473,54 @@
         1280,
         720
       ]
+    },
+    {
+      "sample_id": "status_wind_catch_001",
+      "kind": "status",
+      "label": "wind_catch",
+      "file": "templates/status/wind_catch.png",
+      "source_image": "sessions/game_20260816_193531_f94cbf/video/game.avi#frame=1405",
+      "source_role": "generic",
+      "abs_box": [
+        548,
+        180,
+        132,
+        78
+      ],
+      "ratio_box": [
+        0.428125,
+        0.25,
+        0.103125,
+        0.108333
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
+    },
+    {
+      "sample_id": "status_wind_catch_002",
+      "kind": "status",
+      "label": "wind_catch",
+      "file": "templates/status/wind_catch_002.png",
+      "source_image": "sessions/game_20260816_193531_f94cbf/video/game.avi#frame=1406",
+      "source_role": "generic",
+      "abs_box": [
+        675,
+        180,
+        122,
+        78
+      ],
+      "ratio_box": [
+        0.527344,
+        0.25,
+        0.095312,
+        0.108333
+      ],
+      "base_size": [
+        1280,
+        720
+      ]
     }
   ]
 }

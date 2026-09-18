@@ -230,14 +230,20 @@ def test_correction_persistence_failure_does_not_advance_any_authority(tmp_path,
     assert tuple(read_json_lines(store.timeline_path)) == records
 
 
-def test_correction_rejects_nonlatest_and_cross_session_targets(tmp_path):
+def test_correction_allows_nonlatest_target_and_rejects_cross_session_targets(tmp_path):
     session = ProductionRuleSession(_store(tmp_path))
     session.initialize(round_level="2", hand=_hand(), lead_player=Seat.RIGHT, monotonic_ms=1)
     first = _commit(session, _candidate(session, "right-3", Seat.RIGHT, "3D", 100))
     _commit(session, _candidate(session, "opposite-4", Seat.OPPOSITE, "4D", 130))
 
-    with pytest.raises(RuleSessionRejected):
-        session.correct_latest(_correction(session, first.action_id, "5D", 200))
+    correction = session.correct_latest(
+        _correction(session, first.action_id, "3C", 200)
+    )
+    snapshot = session.snapshot(captured_ms=200)
+    assert correction.target_action_id == first.action_id
+    assert snapshot.play_history[0].cards == ("3C",)
+    assert snapshot.current_seat is Seat.LEFT
+
     command = _correction(session, session.confirmed_actions[-1].action_id, "5D", 210)
     foreign = replace(
         command,

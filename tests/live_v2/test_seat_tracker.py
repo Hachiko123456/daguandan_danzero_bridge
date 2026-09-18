@@ -119,21 +119,22 @@ def test_unknown_and_animating_do_not_clear_or_infer_pass() -> None:
     assert tracker.action_epoch == 0
 
 
-def test_persistent_pass_rearms_only_for_new_turn_with_confirmed_turnover() -> None:
+def test_pass_marker_must_disappear_before_reemission() -> None:
     tracker = SeatTracker(Seat.RIGHT)
     tracker.ingest(observation(1, ObservationKind.PASS, seat=Seat.RIGHT), version=version())
     first = tracker.ingest(
         observation(2, ObservationKind.PASS, seat=Seat.RIGHT), version=version()
     )
     assert first is not None
+
+    # A formal turn change alone never re-arms a still-visible PASS.
     next_turn = version(revision=1)
-    assert not tracker.arm_persistent_pass(
-        next_turn, turnover_confirmed=False
-    )
     assert tracker.ingest(
         observation(3, ObservationKind.PASS, seat=Seat.RIGHT), version=next_turn
     ) is None
-    assert tracker.arm_persistent_pass(next_turn, turnover_confirmed=True)
+
+    assert not tracker.observe_pass_marker(False)
+    assert tracker.observe_pass_marker(False)
     assert tracker.ingest(
         observation(4, ObservationKind.PASS, seat=Seat.RIGHT), version=next_turn
     ) is None
@@ -144,19 +145,22 @@ def test_persistent_pass_rearms_only_for_new_turn_with_confirmed_turnover() -> N
     assert second.evidence_ids == ("e-right-4", "e-right-5")
 
 
-def test_old_turn_cannot_rearm_or_contribute_persistent_pass_evidence() -> None:
+def test_old_turn_pass_evidence_is_ignored_until_marker_clear() -> None:
     tracker = SeatTracker(Seat.LEFT)
     tracker.ingest(observation(1, ObservationKind.PASS), version=version())
     tracker.ingest(observation(2, ObservationKind.PASS), version=version())
     current = version(revision=2)
-    assert tracker.arm_persistent_pass(current, turnover_confirmed=True)
-    assert not tracker.arm_persistent_pass(version(revision=1), turnover_confirmed=True)
+
+    # Old PASS evidence cannot be reused just because the formal version changed.
     assert tracker.ingest(
         observation(3, ObservationKind.PASS), version=version(revision=1)
     ) is None
     assert tracker.ingest(
-        observation(4, ObservationKind.ANIMATING), version=current
+        observation(4, ObservationKind.PASS), version=current
     ) is None
+
+    tracker.observe_pass_marker(False)
+    tracker.observe_pass_marker(False)
     assert tracker.ingest(
         observation(5, ObservationKind.PASS), version=current
     ) is None
@@ -165,7 +169,6 @@ def test_old_turn_cannot_rearm_or_contribute_persistent_pass_evidence() -> None:
     )
     assert candidate is not None
     assert candidate.evidence_ids == ("e-left-5", "e-left-6")
-
 
 def test_stable_different_surface_opens_cycle_if_empty_was_missed() -> None:
     tracker = SeatTracker(Seat.OPPOSITE)

@@ -108,7 +108,7 @@ class SeatTracker:
         self._latest_version: VersionIdentity | None = None
         self._pending_turn: tuple[str, int, int, int] | None = None
         self._emitted_turn: tuple[str, int, int, int] | None = None
-        self._armed_pass_turn: tuple[str, int, int, int] | None = None
+        self._pass_absent_count = 0
 
     @property
     def action_epoch(self) -> int:
@@ -142,29 +142,44 @@ class SeatTracker:
         self._latest_version = None
         self._pending_turn = None
         self._emitted_turn = None
-        self._armed_pass_turn = None
+        self._pass_absent_count = 0
 
-    def arm_persistent_pass(
-        self, version: VersionIdentity, *, turnover_confirmed: bool
-    ) -> bool:
-        """Rearm a latched PASS only for a crossed, newer formal turn."""
+    def observe_pass_marker(self, visible: bool) -> bool:
+        """Rearm a latched PASS only after its marker visibly disappears.
 
-        if not turnover_confirmed or not self._version_is_current(version):
+        The fast detector reports all four PASS markers on every frame.  This
+        edge is the authoritative lifecycle signal: formal turn changes alone
+        never turn a still-visible old marker into a new PASS.  A separate,
+        narrow turnover fallback is used only when a later active seat proves
+        the UI kept the marker visible.  Two absent frames use the same
+        debounce as ordinary empty observations.
+        """
+
+        if not isinstance(visible, bool):
+            raise TypeError("visible must be bool")
+        if visible:
+            self._pass_absent_count = 0
             return False
-        self._latest_version = version
-        turn = self._turn_key(version)
-        if (
-            turn == self._armed_pass_turn
-            or self._emitted_turn is not None and turn == self._emitted_turn
-        ):
-            return False
-        if self._emitted_signature == (ObservationKind.PASS,):
-            self._open_next_epoch()
-        else:
+
+        self._pass_absent_count += 1
+        if self._pending_signature == (ObservationKind.PASS,):
             self._pending_signature = None
             self._pending.clear()
             self._pending_turn = None
-        self._armed_pass_turn = turn
+        if (
+            self._emitted_signature == (ObservationKind.PASS,)
+            and self._pass_absent_count >= self.empty_confirmations
+        ):
+            self._open_next_epoch()
+            return True
+        return False
+
+    def rearm_pass_after_turnover(self) -> bool:
+        """Fallback rearm after a later active seat proves the turn advanced."""
+
+        if self._emitted_signature != (ObservationKind.PASS,):
+            return False
+        self._open_next_epoch()
         return True
 
     def ingest(
@@ -283,7 +298,7 @@ class SeatTracker:
         self._empty_count = 0
         self._pending_turn = None
         self._emitted_turn = None
-        self._armed_pass_turn = None
+        self._pass_absent_count = 0
 
     def _remember_frame(self, key: tuple[object, ...]) -> None:
         self._seen.add(key)

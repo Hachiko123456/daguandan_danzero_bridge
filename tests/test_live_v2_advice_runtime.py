@@ -429,6 +429,30 @@ def test_complete_snapshot_is_replayed_before_adviser_and_cache_is_reused() -> N
         worker_module._ADVISORS.pop(key, None)
 
 
+def test_worker_request_validation_is_separate_from_snapshot_projection() -> None:
+    snapshot = _snapshot()
+    config = AdviceWorkerConfig(
+        str(Path.cwd()), "fabledan", fabledan_runtime_policy="rule_only"
+    )
+    opportunity = _opportunity(snapshot)
+    payload = AdviceWorkerPayload(
+        config, snapshot, opportunity, request_id(
+            AdviceRequestIdentity(snapshot.version, 1, opportunity.opportunity_id)
+        )
+    )
+    request = WorkerRequest(
+        snapshot.version.session_id, snapshot.version.capture_generation,
+        1, snapshot.version.state_revision + 1, 1, payload,
+        DeliveryMode.LATEST_ONLY, 1000,
+    )
+
+    result = run_fabledan_advice_worker(request)
+
+    assert result.kind.value == "invalid_request"
+    assert result.code == "request_validation_failed"
+    assert result.error_type == "ValueError"
+
+
 def test_cross_generation_two_trick_snapshot_replays_and_advises(
     tmp_path: Path,
 ) -> None:

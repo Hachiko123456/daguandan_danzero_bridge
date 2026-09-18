@@ -91,14 +91,21 @@ class FrameReadDispatcher:
             tracker.reset()
         self._last_deep_read_ms = {seat: None for seat in SEATS}
 
-    def arm_persistent_passes(
-        self, version: VersionIdentity, seats: tuple[Seat, ...]
+    def observe_pass_markers(self, marked_seats: tuple[Seat, ...]) -> tuple[Seat, ...]:
+        """Advance the four PASS latches from the cheap all-seat marker read."""
+
+        marked = set(marked_seats)
+        return tuple(
+            seat for seat in SEATS
+            if self.trackers[seat].observe_pass_marker(seat in marked)
+        )
+
+    def rearm_passes_after_turnover(
+        self, seats: tuple[Seat, ...]
     ) -> tuple[Seat, ...]:
         return tuple(
             seat for seat in seats
-            if self.trackers[seat].arm_persistent_pass(
-                version, turnover_confirmed=True
-            )
+            if self.trackers[seat].rearm_pass_after_turnover()
         )
 
     def drop_cursor(self) -> DropCursor:

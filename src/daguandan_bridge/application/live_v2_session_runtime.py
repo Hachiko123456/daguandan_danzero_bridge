@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from threading import RLock
+from collections import Counter
 from time import monotonic_ns
 from typing import Any, Callable
 
@@ -52,7 +53,9 @@ class _VisualCorrection:
     rejected_signature: tuple[object, ...] | None
     streak: int
     last_frame: FrameIdentity | None
-    expires_ms: int
+    original_confidence: float
+    allow_complete_rewrite: bool
+    allow_expansion: bool
 
 
 def _normalized_options(
@@ -88,14 +91,15 @@ def _repair_signature(
 def _resolve_visual_correction(
     target_cards: tuple[str, ...], target_options: tuple[tuple[str, ...], ...],
     observed_cards: tuple[str, ...], observed_options: tuple[tuple[str, ...], ...],
+    *, allow_complete_rewrite: bool = False, allow_expansion: bool = False,
 ) -> tuple[str, ...] | None:
-    """Return a complete later reread whenever it changes the formal action.
+    """Return only a reread that improves an uncertain formal action.
 
-    Visual repair is intentionally action-wide rather than suit-only.  A later
-    stable reread may correct ranks, suits and card count together; legality and
-    all downstream state are validated atomically by ``RuleSession.correct_latest``.
-    Unknown cards are not accepted as a repair target because they do not improve
-    the canonical physical action.
+    Automatic visual repair is not a general history editor.  It may resolve
+    unknown cards, add cards to an explicitly incomplete action, or replace a
+    low-confidence complete action with an equally-sized stronger reread.  It
+    must never shrink a complete surface or reinterpret settlement cards as an
+    old play.
     """
 
     target = tuple(str(card) for card in target_cards)
@@ -105,6 +109,26 @@ def _resolve_visual_correction(
     if _repair_signature(target, target_options) == _repair_signature(
         observed, observed_options
     ):
+        return None
+    target_partial = any(card.endswith("?") for card in target) or any(
+        len(choices) != 1 for choices in _normalized_options(target, target_options)
+    )
+    if len(observed) < len(target):
+        return None
+    observed_counter = Counter(observed)
+    known_target = Counter(card for card in target if not card.endswith("?"))
+    if target_partial and known_target - observed_counter:
+        return None
+    if allow_expansion and len(observed) > len(target):
+        # The old action must be a physical subset of the newer surface; this
+        # accepts an early animation read such as 77 -> 777888, but rejects
+        # settlement surfaces such as small_joker -> QQ88.
+        exact_target = Counter(card for card in target if not card.endswith("?"))
+        if not exact_target - observed_counter:
+            return observed
+    if not target_partial and not allow_complete_rewrite:
+        return None
+    if allow_complete_rewrite and not target_partial and len(observed) != len(target):
         return None
     return observed
 
@@ -152,6 +176,7 @@ class LiveV2SessionRuntime(
         self._status_before_pause: LiveStatus | None = None
         self._opening_required = False
         self._visual_corrections: dict[str, _VisualCorrection] = {}
+        self._last_visual_repair_seat: Seat | None = None
         self._suppressed_correction_surfaces: dict[Seat, tuple[str, ...]] = {}
 
     @property
@@ -205,6 +230,7 @@ class LiveV2SessionRuntime(
             self._frame_sequence = 0
             self._hint.reset()
             self._visual_corrections.clear()
+            self._last_visual_repair_seat = None
             self._suppressed_correction_surfaces.clear()
             self._install_workers(binding)
             self.store.update_runtime_identity(self._identity())
@@ -216,40 +242,71 @@ class LiveV2SessionRuntime(
         trace_context: dict[str, object] | None = None,
     ) -> LiveUpdate:
         del metrics
+        # Snapshot the formal state under the session lock, but do not hold that
+        # lock during synchronous image analysis.  Advice results can then be
+        # accepted while the next frame is being recognized instead of waiting
+        # behind a long sequence of frame calls and becoming artificially stale.
         with self._lock:
             self._require_engine()
             if self.status == "paused":
                 return self._plain_update(block_reason="paused")
             if self.status in {"finalizing", "sealed"}:
+                self._visual_corrections.clear()
                 return self._plain_update(block_reason=self.status)
             self._ensure_engine_current()
             identity = self._capture_identity(trace_context, monotonic_ms)
             if identity is None:
                 return self._plain_update(block_reason="stale_capture_identity")
             snapshot = self._engine.state.snapshot
+            version = self._engine.state.version
             expected = snapshot.current_seat
-            self._expire_visual_corrections(identity.captured_ms, expected)
+            self._expire_visual_corrections(expected)
             formal_action_boundary = (
                 snapshot.play_history[-1].last_frame
                 if snapshot.play_history else None
             )
-            results, faults = consume_vision(
-                self._vision, frame, frame=identity, version=self._engine.state.version,
-                wild_rank=snapshot.wild_rank,
-                expected_seat=expected, processing_ms=self._clock.processing_ms(),
-                formal_action_boundary=formal_action_boundary,
-                repair_seats=tuple(
-                    dict.fromkeys(
-                        item.seat
-                        for item in reversed(tuple(self._visual_corrections.values()))
-                    )
-                ),
-                synchronous=self._synchronous_vision,
-            )
+            repair_seats = self._ordered_visual_repair_seats()
+            vision = self._vision
+            processing_ms = self._clock.processing_ms()
+
+        results, faults = consume_vision(
+            vision, frame, frame=identity, version=version,
+            wild_rank=snapshot.wild_rank,
+            expected_seat=expected, processing_ms=processing_ms,
+            formal_action_boundary=formal_action_boundary,
+            repair_seats=repair_seats,
+            synchronous=self._synchronous_vision,
+        )
+
+        with self._lock:
+            self._require_engine()
+            if self.status in {"finalizing", "sealed"}:
+                self._visual_corrections.clear()
+                return self._plain_update(block_reason=self.status)
+            self._ensure_engine_current()
+            current = self._engine.state.version
+            if (
+                current.session_id,
+                current.capture_generation,
+                current.state_revision,
+                current.turn_index,
+            ) != (
+                version.session_id,
+                version.capture_generation,
+                version.state_revision,
+                version.turn_index,
+            ):
+                return self._plain_update(block_reason="state_changed_during_frame_analysis")
             for fault in faults:
-                self._safe_fault("vision_runtime", fault, monotonic_ms=identity.captured_ms)
-            observations = tuple(item for result in results for item in result.observations)
-            candidates = tuple(item for result in results for item in result.candidates)
+                self._safe_fault(
+                    "vision_runtime", fault, monotonic_ms=identity.captured_ms
+                )
+            observations = tuple(
+                item for result in results for item in result.observations
+            )
+            candidates = tuple(
+                item for result in results for item in result.candidates
+            )
             repaired = self._try_visual_corrections(
                 observations,
                 expected_seat=expected,
@@ -262,8 +319,6 @@ class LiveV2SessionRuntime(
             )
             gated = gate_visual_candidates(snapshot, candidates)
             if self._opening_required and not snapshot.play_history:
-                # Opening is a hard barrier.  A seed lead or several static
-                # seat reads must never reach the normal engine/advice path.
                 opening = (
                     self._commit_visual_opening(gated.selected)
                     if len(gated.selected) == 1 and snapshot.lead_seat is None
@@ -278,17 +333,17 @@ class LiveV2SessionRuntime(
                 )
             selected = gated.selected
             if selected:
-                # A new formal action for the same seat closes any older repair
-                # window that never produced a valid correction.  It must not
-                # block the new turn or fabricate a second action.
                 selected_seats = {item.seat for item in selected}
                 for action_id, pending in tuple(self._visual_corrections.items()):
                     if pending.seat in selected_seats:
                         self._visual_corrections.pop(action_id, None)
             self._pending.update((item.candidate_id, item) for item in selected)
             return self._process(
-                EngineInput(observations=observations, candidates=selected,
-                            captured_watermark_ms=identity.captured_ms),
+                EngineInput(
+                    observations=observations,
+                    candidates=selected,
+                    captured_watermark_ms=identity.captured_ms,
+                ),
                 fast=results[-1].fast_signals if results else None,
             )
 
@@ -298,6 +353,16 @@ class LiveV2SessionRuntime(
             or getattr(action, "evidence_origin", None) is not EvidenceOrigin.VISUAL
         ):
             return
+        partial = bool(getattr(action, "partial_suits", False)) or any(
+            str(card).endswith("?") for card in tuple(action.cards)
+        )
+        source_candidate = getattr(action, "source_candidate", action)
+        confidence = float(getattr(source_candidate, "confidence", 1.0))
+        diagnostics = set(getattr(source_candidate, "diagnostics", ()) or ())
+        low_confidence = confidence < 0.80 or bool(diagnostics & {
+            "play_confidence", "play_quality", "play_annotation_count",
+            "play_annotation_min_confidence",
+        })
         action_id = str(action.action_id)
         # At most one repair window per seat is useful.  A newer formal play
         # supersedes an older surface that was never repaired.
@@ -313,14 +378,35 @@ class LiveV2SessionRuntime(
             rejected_signature=None,
             streak=0,
             last_frame=None,
-            expires_ms=int(action.captured_ms) + 8_000,
+            original_confidence=confidence,
+            allow_complete_rewrite=low_confidence and not partial,
+            allow_expansion=True,
         )
 
-    def _expire_visual_corrections(
-        self, captured_ms: int, expected_seat: Seat | None
-    ) -> None:
+    def _ordered_visual_repair_seats(self) -> tuple[Seat, ...]:
+        """Rotate bounded repair priority so no pending seat is starved."""
+
+        seats = tuple(dict.fromkeys(
+            item.seat for item in self._visual_corrections.values()
+        ))
+        if not seats:
+            self._last_visual_repair_seat = None
+            return ()
+        if self._last_visual_repair_seat in seats:
+            start = seats.index(self._last_visual_repair_seat) + 1
+            seats = seats[start:] + seats[:start]
+        self._last_visual_repair_seat = seats[0]
+        return seats
+
+    def _expire_visual_corrections(self, expected_seat: Seat | None) -> None:
+        """Close old repair windows at a seat boundary or terminal state."""
+
+        if expected_seat is None:
+            self._visual_corrections.clear()
+            self._last_visual_repair_seat = None
+            return
         for action_id, pending in tuple(self._visual_corrections.items()):
-            if captured_ms > pending.expires_ms or pending.seat is expected_seat:
+            if pending.seat is expected_seat:
                 self._visual_corrections.pop(action_id, None)
 
     def _try_visual_corrections(
@@ -353,7 +439,16 @@ class LiveV2SessionRuntime(
                     pending.suit_options,
                     observed_cards,
                     observed_options,
+                    allow_complete_rewrite=pending.allow_complete_rewrite,
+                    allow_expansion=pending.allow_expansion,
                 )
+                if (
+                    corrected is not None
+                    and pending.allow_complete_rewrite
+                    and float(observation.confidence)
+                    <= pending.original_confidence + 0.05
+                ):
+                    corrected = None
                 if corrected is None:
                     pending.last_signature = None
                     pending.streak = 0
@@ -441,11 +536,20 @@ class LiveV2SessionRuntime(
             self._safe_fault(
                 "visual_correction", str(exc),
                 target_action_id=pending.action_id,
+                old_cards=list(pending.cards),
+                proposed_cards=list(corrected),
+                observation_confidence=float(observation.confidence),
+                rejection_type=type(exc).__name__,
             )
             # A rejected reread is only non-authoritative visual evidence.
             # Keep listening for a different stable reread instead of blocking
             # the whole session.
             return None
+        # The correction is now durable. Terminalize advice requests bound to
+        # the pre-correction opportunity before rebuilding the state/opportunity
+        # and installing a fresh advice pump.
+        if self._advice_pump is not None:
+            self._advice_pump.cancel_pending(reason="visual_correction_superseded")
         self._visual_corrections.pop(pending.action_id, None)
         self._suppressed_correction_surfaces[pending.seat] = tuple(corrected)
         detached = self._detach_workers()
@@ -544,8 +648,12 @@ class LiveV2SessionRuntime(
             status=self.status, latest_advice=self.latest_advice,
             sequence=self._sequence, fast_signals=fast,
         )
-        for action in confirmed:
-            self._register_visual_correction(action)
+        if self._engine.state.snapshot.current_seat is None:
+            self._visual_corrections.clear()
+            self._last_visual_repair_seat = None
+        else:
+            for action in confirmed:
+                self._register_visual_correction(action)
         return projected
 
     def _commit_trusted(
@@ -571,14 +679,27 @@ class LiveV2SessionRuntime(
                 candidates=(candidate,), captured_watermark_ms=captured_ms,
             ))
 
-    def _accept_advice(self, result: AdviceRuntimeResult) -> bool:
+    def _accept_advice(self, result: AdviceRuntimeResult) -> bool | str:
         with self._lock:
-            if self.status in {"finalizing", "sealed"} or self._engine is None:
-                return False
+            if self.status in {"finalizing", "sealed"}:
+                return "session_terminal"
+            if self._engine is None:
+                return "advice_runtime_unavailable"
             opportunity = self._engine.state.opportunity.current
             current = self._engine.state.version
             if not result_matches_opportunity(result, current, opportunity):
-                return False
+                snapshot = self._engine.state.snapshot
+                if (
+                    current.state_revision > result.identity.version.state_revision
+                    and snapshot.play_history
+                    and snapshot.play_history[-1].seat is Seat.SELF
+                ):
+                    return "superseded_by_self_action"
+                if current.state_revision != result.identity.version.state_revision:
+                    return "superseded_by_state_change"
+                if current.capture_generation != result.identity.version.capture_generation:
+                    return "capture_generation_changed"
+                return "opportunity_closed"
             self.latest_advice = runtime_result_to_advice(
                 result, self._engine.state.snapshot
             )

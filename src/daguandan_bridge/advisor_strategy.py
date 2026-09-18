@@ -21,6 +21,8 @@ DEFAULT_ADVISOR_STRATEGY = "fabledan"
 DEFAULT_FABLEDAN_DEBUG = False
 DEFAULT_FABLEDAN_DIAGNOSTICS = "off"
 DEFAULT_SESSION_DATA_RECORDING_ENABLED = True
+DEFAULT_RECORDING_MAX_TOTAL_BYTES = 20 * 1024 ** 3
+DEFAULT_AUTOMATIC_LOG_INCLUDE_MEDIA = False
 RECORDING_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("none", "不保存"),
     ("game", "对局录制"),
@@ -117,6 +119,93 @@ def load_profile_recording_mode(
         "save_session_data", DEFAULT_SESSION_DATA_RECORDING_ENABLED
     )
     return "game" if legacy is not False else "none"
+
+
+def normalize_recording_max_total_bytes(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("录像总容量必须为正整数")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("录像总容量必须为正整数") from exc
+    if normalized <= 0:
+        raise ValueError("录像总容量必须为正整数")
+    return normalized
+
+
+def load_profile_recording_max_total_bytes(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> int:
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_RECORDING_MAX_TOTAL_BYTES
+    if not isinstance(raw, dict):
+        return DEFAULT_RECORDING_MAX_TOTAL_BYTES
+    try:
+        return normalize_recording_max_total_bytes(
+            raw.get("recording_max_total_bytes", DEFAULT_RECORDING_MAX_TOTAL_BYTES)
+        )
+    except ValueError:
+        return DEFAULT_RECORDING_MAX_TOTAL_BYTES
+
+
+def save_profile_recording_max_total_bytes(
+    profiles_root: Path | str,
+    profile_name: str,
+    value: object,
+) -> int:
+    normalized = normalize_recording_max_total_bytes(value)
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"缺少 profile 配置：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"profile 配置已损坏：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("profile.json 顶层结构必须是 JSON 对象")
+    raw["recording_max_total_bytes"] = normalized
+    atomic_write_json(path, raw)
+    return normalized
+
+
+def load_profile_automatic_log_include_media(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> bool:
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_AUTOMATIC_LOG_INCLUDE_MEDIA
+    if not isinstance(raw, dict):
+        return DEFAULT_AUTOMATIC_LOG_INCLUDE_MEDIA
+    value = raw.get("automatic_log_include_media", DEFAULT_AUTOMATIC_LOG_INCLUDE_MEDIA)
+    return value if isinstance(value, bool) else DEFAULT_AUTOMATIC_LOG_INCLUDE_MEDIA
+
+
+def save_profile_automatic_log_include_media(
+    profiles_root: Path | str,
+    profile_name: str,
+    enabled: object,
+) -> bool:
+    if not isinstance(enabled, bool):
+        raise ValueError("自动诊断媒体开关必须为布尔值")
+    path = Path(profiles_root) / profile_name / "profile.json"
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"缺少 profile 配置：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"profile 配置已损坏：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("profile.json 顶层结构必须是 JSON 对象")
+    raw["automatic_log_include_media"] = enabled
+    atomic_write_json(path, raw)
+    return enabled
 
 
 def normalize_fabledan_diagnostics(value: object) -> str:
@@ -217,6 +306,52 @@ def save_profile_recording_mode(
     raw["save_session_data"] = normalized != "none"
     atomic_write_json(path, raw)
     return normalized
+
+
+def recording_media_usage_bytes(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> int:
+    """Return media bytes owned by recorded sessions without following links."""
+
+    root = Path(profiles_root) / profile_name / "sessions"
+    used = 0
+    pending = [root] if root.is_dir() else []
+    media_suffixes = {".avi", ".mp4", ".png", ".jpg", ".jpeg", ".bmp"}
+    while pending:
+        directory = pending.pop()
+        if directory.is_symlink() or directory.is_junction():
+            continue
+        try:
+            entries = tuple(directory.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if path.is_symlink() or path.is_junction():
+                continue
+            try:
+                if path.is_dir():
+                    pending.append(path)
+                elif path.suffix.lower() in media_suffixes:
+                    used += path.stat().st_size
+            except OSError:
+                continue
+    return used
+
+
+def recording_storage_summary(
+    profiles_root: Path | str = PROFILES_ROOT,
+    profile_name: str = "tencent_daguandan",
+) -> dict[str, int | bool]:
+    limit = load_profile_recording_max_total_bytes(profiles_root, profile_name)
+    used = recording_media_usage_bytes(profiles_root, profile_name)
+    return {
+        "limit_bytes": limit,
+        "used_bytes": used,
+        "remaining_bytes": max(0, limit - used),
+        "capacity_exhausted": used >= limit,
+    }
+
 
 
 def build_advisor(

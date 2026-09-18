@@ -110,7 +110,9 @@ class ScreenshotRecognitionService:
     # a clear card into ``?`` solely because of a fixed score margin.
     _BLACK_SUIT_HOG_SIZE = 32
     _BLACK_SUIT_HOG_MIN_SCORE = 0.82
-    _BLACK_SUIT_HOG_MIN_MARGIN = 0.06
+    # After rank-overlap removal, a smaller global margin is safe for the
+    # compact black suit glyphs while still requiring a strong HOG winner.
+    _BLACK_SUIT_HOG_MIN_MARGIN = 0.05
     _LEVEL_THRESHOLD = 0.60
     _STATUS_THRESHOLD = 0.62
     # Placement badges mutate the player lifecycle and can end the round.
@@ -1132,6 +1134,7 @@ class ScreenshotRecognitionService:
                      round(image.shape[0] / 720 * self._FIRST_PLAY_SEARCH_MARGIN))
                     if prefix == "first_play" else (0, 0)
                 ),
+                foreground_shape=prefix == "first_play",
             )
             if match[0] and match[3] is not None:
                 candidates.append((seat, match[3]))
@@ -1172,6 +1175,7 @@ class ScreenshotRecognitionService:
         kind: str = "status",
         threshold: float | None = None,
         search_margin: tuple[int, int] = (0, 0),
+        foreground_shape: bool = False,
     ) -> tuple[bool, float, str, _TemplateMatch | None]:
         matches = self._matches_for_region(
             image,
@@ -1187,6 +1191,7 @@ class ScreenshotRecognitionService:
             ),
             limit=1,
             search_margin=search_margin,
+            foreground_shape=foreground_shape,
         )
         if not matches:
             return False, 0.0, "", None
@@ -1650,6 +1655,19 @@ class ScreenshotRecognitionService:
             255,
             cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
         )
+        # A card rank can slightly intrude into the suit template ROI.  The
+        # intrusion is usually a tiny disconnected component at the top of
+        # the crop (the Q tail in the historical regression is one example).
+        # Keep the primary connected glyph instead of deleting a fixed number
+        # of rows based on the rank box.  This is rank-agnostic and also keeps
+        # the same normalization path for real cards and suit templates.
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            mask, 8
+        )
+        if component_count <= 1:
+            return None
+        primary = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = np.where(labels == primary, 255, 0).astype(np.uint8)
         points = cv2.findNonZero(mask)
         if points is None:
             return None
@@ -1716,7 +1734,12 @@ class ScreenshotRecognitionService:
         bottom = min(image.shape[0], selected.y + selected.h + padding)
         if right <= left or bottom <= top:
             return None
-        mask = self._normalized_dark_suit_mask(image[top:bottom, left:right])
+        # Normalize the whole matched suit crop.  The normalizer removes
+        # small disconnected rank intrusions by connected-component selection;
+        # do not blank a fixed number of top rows here because the rank box and
+        # suit box may overlap by a few legitimate anti-aliased suit pixels.
+        glyph_image = image[top:bottom, left:right]
+        mask = self._normalized_dark_suit_mask(glyph_image)
         if mask is None:
             return None
         query = self._black_suit_hog(mask)
@@ -1912,6 +1935,7 @@ class ScreenshotRecognitionService:
         limit: int,
         use_color: bool = False,
         search_margin: tuple[int, int] = (0, 0),
+        foreground_shape: bool = False,
     ) -> list[_TemplateMatch]:
         if region is None:
             return []
@@ -1962,6 +1986,23 @@ class ScreenshotRecognitionService:
                 gray_template,
                 cv2.TM_CCOEFF_NORMED,
             )
+            if foreground_shape and not use_color:
+                # First-play markers are text glyphs rendered over different
+                # player-card backgrounds. Keep raw grayscale matching for
+                # exact synthetic/template cases, and use the foreground shape
+                # score as a background-invariant fallback.
+                _, shape_search = cv2.threshold(
+                    gray_search, 0, 255,
+                    cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+                )
+                _, shape_template = cv2.threshold(
+                    gray_template, 0, 255,
+                    cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+                )
+                shape_scores = cv2.matchTemplate(
+                    shape_search, shape_template, cv2.TM_CCOEFF_NORMED
+                )
+                scores = np.maximum(scores, shape_scores)
             for iteration in range(limit):
                 _, score, _, location = cv2.minMaxLoc(scores)
                 x, y = location

@@ -9,6 +9,7 @@ from .game_state import GameAction, TrustedGameSnapshot
 from .protocols import AdviceConsumer, EventJournal, RuleStateProvider
 
 from .types import (
+    ActionKind,
     AdviceOpportunity,
     ConfirmedAction,
     GapPhase,
@@ -262,7 +263,7 @@ class OpportunityLifecycle:
             return OpportunityStatus.CLOSED, OpportunityReason.TERMINAL_STATE
         if snapshot.current_seat is not Seat.SELF:
             return OpportunityStatus.BLOCKED, OpportunityReason.NOT_LOCAL_TURN
-        if not snapshot.trusted:
+        if not snapshot.trusted or _has_unresolved_physical_cards(snapshot):
             return OpportunityStatus.BLOCKED, OpportunityReason.OBSERVATION_UNCERTAIN
         if gap.phase is not GapPhase.CLEAR:
             return OpportunityStatus.BLOCKED, OpportunityReason.HISTORY_GAP
@@ -308,3 +309,18 @@ class OpportunityLifecycle:
             return state
         keys = tuple(dict.fromkeys(state.closed_keys + (key,)))[-self.closed_key_capacity :]
         return replace(state, closed_keys=keys)
+
+
+def _has_unresolved_physical_cards(snapshot: TrustedGameSnapshot) -> bool:
+    """Return whether FableDan would need to guess a physical card."""
+
+    if any(str(card).endswith("?") for card in snapshot.my_hand):
+        return True
+    return any(
+        action.kind is ActionKind.PLAY
+        and (
+            any(str(card).endswith("?") for card in action.cards)
+            or any(len(options) > 1 for options in action.suit_options)
+        )
+        for action in snapshot.play_history
+    )

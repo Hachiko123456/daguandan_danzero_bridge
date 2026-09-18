@@ -308,7 +308,6 @@ def _validate_correction_timeline(
     )
     expected = records[0].version_before
     effective: dict[str, tuple[ActionKind, tuple[str, ...], tuple[tuple[str, ...], ...], str | None]] = {}
-    latest_action_id: str | None = None
     for record in records:
         if record.version_before != expected:
             raise ValueError(
@@ -316,7 +315,6 @@ def _validate_correction_timeline(
             )
         expected = record.version_after
         if isinstance(record, GameAction):
-            latest_action_id = record.action_id
             first_correction = next(
                 (
                     item
@@ -336,8 +334,11 @@ def _validate_correction_timeline(
                 None,
             )
             continue
-        if record.target_action_id != latest_action_id:
-            raise ValueError("correction must target the latest action at that revision")
+        # A correction is appended at the current revision, but it may target
+        # any earlier committed action. The reducer is rebuilt atomically and
+        # the effective value below is then checked against the full history.
+        # Requiring the target to be the latest action would reject the normal
+        # delayed visual-reread case where a follower has already acted.
         previous = effective.get(record.target_action_id)
         if previous is None or previous[:3] != (
             record.previous_kind,

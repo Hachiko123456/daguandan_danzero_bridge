@@ -30,6 +30,7 @@ from ..live.truth_log import (
     truth_log_from_dict,
     validate_truth_log_card_inventory,
 )
+from .truth_log_semantic_validation import normalize_truth_log_trick_ids
 from .replay_turn_draft import (
     validate_truth_log_with_live_reducer,
     validate_turn_actor_chain,
@@ -374,6 +375,7 @@ class TruthRevisionStore:
         # machine before a log is marked verified.
         validate_turn_actor_chain(log)
         validate_truth_log_with_live_reducer(log)
+        log = normalize_truth_log_trick_ids(log, standard_playing=True)
         return self._save(
             replace(log, label_status="verified"),
             changed_fields=changed_fields,

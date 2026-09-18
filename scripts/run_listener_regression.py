@@ -565,6 +565,9 @@ def _write_llm_artifacts(
     failures = quality.get("blocking_failures", [])
     advisory = quality.get("advisory_results", [])
     fabledan = raw_summary.get("fabledan", {})
+    session_rows = tuple(
+        row for row in raw_summary.get("sessions", ()) if isinstance(row, dict)
+    )
     summary_path = run_directory / "01_run_summary.json"
     atomic_write_json(summary_path, raw_summary)
     failures_path = run_directory / "03_failures.json"
@@ -597,6 +600,20 @@ def _write_llm_artifacts(
         "",
         "说明：旧 LiveOrchestrator 仅保留兼容路径，不属于主验收链。",
         "",
+        "## TruthLog 基线版本",
+        "",
+    ]
+    for row in session_rows:
+        truth = row.get("truth_log")
+        truth = truth if isinstance(truth, dict) else {}
+        lines.append(
+            f"- `{row.get('session_id')}`：revision="
+            f"`{truth.get('revision_id') or 'unversioned'}`，semantic_sha256="
+            f"`{truth.get('semantic_sha256') or 'unknown'}`，文件匹配="
+            f"`{truth.get('revision_matches_truth')}`"
+        )
+    lines.extend([
+        "",
         "## 首先读取",
         "",
         "1. `00_llm_summary.md`（本文件）",
@@ -611,7 +628,7 @@ def _write_llm_artifacts(
         "",
         "## 严格失败",
         "",
-    ]
+    ])
     if isinstance(failures, list) and failures:
         for item in failures:
             if not isinstance(item, dict):

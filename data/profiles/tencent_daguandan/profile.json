@@ -12,7 +12,7 @@
   "schema_version": 2,
   "advisor_strategy": "fabledan",
   "save_session_data": true,
-  "recording_mode": "game",
+  "recording_mode": "all",
   "fabledan_debug": true,
   "aspect_ratio_tolerance": 0.03,
   "capture_backend": "auto",
@@ -49,5 +49,7 @@
     "count_region_roles": [
       "play"
     ]
-  }
+  },
+  "recording_max_total_bytes": 21474836480,
+  "automatic_log_include_media": false
 }
