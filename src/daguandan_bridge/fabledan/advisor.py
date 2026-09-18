@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from hashlib import sha256
+from itertools import product
 import json
 import logging
 from pathlib import Path
@@ -53,6 +54,8 @@ ADAPTER_SCHEMA = "fabledan-adapter/v1"
 STANDARD_NO_TRIBUTE = True
 DECISION_TRACE_SCHEMA = "fabledan-trace/1"
 DEFAULT_WEIGHTS_FILENAME = "best.npz"
+MAX_UNKNOWN_SUIT_VARIANTS = 8
+MAX_UNKNOWN_SUIT_SEARCH = 256
 DiagnosticsMode = Literal["off", "basic", "full"]
 _SEAT_TO_PLAYER: dict[Seat, int] = {
     seat: index for index, seat in enumerate(TURN_ORDER)
@@ -259,6 +262,7 @@ class FableDanAdvisor:
         *,
         request_id: str = "",
         trace: StrategyExecutionTrace | None = None,
+        _resolved_snapshot: LocalStrategySnapshot | None = None,
     ) -> FableDanDecisionResult:
         started = perf_counter()
         execution_trace = trace or StrategyExecutionTrace(request_id)
@@ -269,7 +273,93 @@ class FableDanAdvisor:
         base_audit["request_id"] = request_id
         execution_trace.set_engine_input(base_audit)
         try:
-            snapshot = state.local_snapshot()
+            snapshot = (
+                _resolved_snapshot
+                if _resolved_snapshot is not None
+                else state.local_snapshot()
+            )
+            if _resolved_snapshot is None and _has_unresolved_suit_history(snapshot):
+                variants = _resolve_unknown_suit_snapshots(snapshot)
+                execution_trace.begin("fabledan_unknown_suit_consensus")
+                results = tuple(
+                    self.recommend_detailed(
+                        state,
+                        request_id=_variant_request_id(request_id, index),
+                        _resolved_snapshot=variant,
+                    )
+                    for index, variant in enumerate(variants, start=1)
+                )
+                recommendation_keys = {
+                    _normalized_recommendation_key(result)
+                    for result in results
+                }
+                if len(recommendation_keys) != 1:
+                    raise FableDanStateError(
+                        "未知花色候选产生不一致的 FableDan 推荐；"
+                        "需要补充花色确认，不能猜测",
+                        diagnostic={
+                            "code": "unknown_suit_recommendation_disagreement",
+                            "candidate_count": len(variants),
+                            "recommendations": [
+                                _recommendation_audit(result) for result in results
+                            ],
+                        },
+                    )
+                chosen = results[0]
+                engine_input = dict(chosen.advice.engine_input or {})
+                for key in (
+                    "fabledan_training_input", "encoding", "q_values",
+                    "fabledan_trace", "decision_log_path",
+                ):
+                    engine_input.pop(key, None)
+                engine_input["request_id"] = request_id
+                engine_input["project_snapshot"] = _snapshot_audit(snapshot)
+                engine_input["training_eligible"] = False
+                engine_input["training_block_reason"] = (
+                    "unknown_suit_candidate_consensus"
+                )
+                engine_input["unknown_suit_resolution"] = {
+                    "status": "consensus",
+                    "candidate_count": len(variants),
+                    "max_candidate_count": MAX_UNKNOWN_SUIT_VARIANTS,
+                    "canonical_history_resolved": False,
+                    "recommendation": _recommendation_audit(chosen),
+                    "candidates": [
+                        {
+                            "index": index,
+                            "play_history": [
+                                event.to_dict() for event in variant.play_history
+                            ],
+                            "recommendation": _recommendation_audit(result),
+                        }
+                        for index, (variant, result) in enumerate(
+                            zip(variants, results, strict=True), start=1
+                        )
+                    ],
+                }
+                elapsed_ms = (perf_counter() - started) * 1_000
+                advice = replace(
+                    chosen.advice,
+                    state_revision=snapshot.revision,
+                    elapsed_ms=elapsed_ms,
+                    request_id=request_id,
+                    engine_input=engine_input,
+                    timings={
+                        **chosen.advice.timings,
+                        "fabledan_policy": sum(
+                            float(result.advice.timings.get("fabledan_policy", 0.0))
+                            for result in results
+                        ),
+                        "unknown_suit_variants": float(len(variants)),
+                        "total": elapsed_ms,
+                    },
+                )
+                warnings = tuple(dict.fromkeys(
+                    warning for result in results for warning in result.warnings
+                ))
+                execution_trace.set_engine_input(engine_input)
+                execution_trace.end()
+                return replace(chosen, advice=advice, warnings=warnings)
             mapped = self._map_snapshot(snapshot, request_id=request_id)
         except Exception as exc:
             blocked = dict(base_audit)
@@ -873,6 +963,224 @@ class FableDanAdvisor:
             "feature_schema": "fabledan-token48-feat80/v1",
         }
         return _MappedState(observation, legal, hand_ids, lead_owner, audit)
+
+
+
+def _has_unresolved_suit_history(snapshot: LocalStrategySnapshot) -> bool:
+    return any(
+        not event.is_pass
+        and (
+            any(card.endswith("?") for card in event.cards)
+            or any(len(options) > 1 for options in event.suit_options)
+        )
+        for event in snapshot.play_history
+    )
+
+
+def _resolve_unknown_suit_snapshots(
+    snapshot: LocalStrategySnapshot,
+) -> tuple[LocalStrategySnapshot, ...]:
+    """Enumerate bounded exact worlds; never select one as canonical truth."""
+
+    if snapshot.round_level not in RANKS or snapshot.wild_rank not in RANKS:
+        raise FableDanStateError("未知花色枚举需要已确认的级牌与百搭牌")
+    if snapshot.round_level != snapshot.wild_rank:
+        raise FableDanStateError("未知花色枚举仅支持 standard 同级百搭")
+    if any(card.endswith("?") for card in snapshot.my_hand):
+        raise FableDanStateError("当前手牌含未知花色；不能枚举或猜测我方手牌")
+    invalid_hand = [card for card in snapshot.my_hand if not _is_known_card(card)]
+    if invalid_hand:
+        raise FableDanStateError("当前手牌含无效牌码：" + "、".join(invalid_hand))
+    _validate_trick_suffix(snapshot)
+
+    fixed_counts = Counter(snapshot.my_hand)
+    slots: list[tuple[int, int, tuple[str, ...]]] = []
+    unresolved_events: set[int] = set()
+    for event_index, event in enumerate(snapshot.play_history):
+        if event.is_pass:
+            continue
+        if event.suit_options and len(event.suit_options) != len(event.cards):
+            raise FableDanStateError(
+                f"第 {event_index + 1} 条历史的花色候选与牌数不对齐"
+            )
+        for card_index, card in enumerate(event.cards):
+            options = tuple(event.suit_options[card_index]) if event.suit_options else ()
+            if card.endswith("?") or len(options) > 1:
+                choices = _exact_suit_choices(card, options)
+                if not choices:
+                    raise FableDanStateError(
+                        f"第 {event_index + 1} 条历史的未知花色 {card} 没有精确候选"
+                    )
+                slots.append((event_index, card_index, choices))
+                unresolved_events.add(event_index)
+            else:
+                if not _is_known_card(card):
+                    raise FableDanStateError(
+                        f"第 {event_index + 1} 条历史含无效牌码：{card}"
+                    )
+                fixed_counts[card] += 1
+
+    if not slots:
+        return (snapshot,)
+    overflow = sorted(card for card, count in fixed_counts.items() if count > 2)
+    if overflow:
+        raise FableDanStateError(
+            "已确认手牌与历史违反双副牌物理上限：" + "、".join(overflow)
+        )
+
+    variants: list[LocalStrategySnapshot] = []
+    signatures: set[tuple[tuple[object, ...], ...]] = set()
+    world_signatures: set[tuple[tuple[object, ...], ...]] = set()
+    examined = 0
+    for assignment in product(*(choices for _e, _c, choices in slots)):
+        examined += 1
+        if examined > MAX_UNKNOWN_SUIT_SEARCH:
+            raise FableDanStateError(
+                f"未知花色候选搜索超过安全上限 {MAX_UNKNOWN_SUIT_SEARCH}；"
+                "需要先确认花色"
+            )
+        counts = fixed_counts.copy()
+        for card in assignment:
+            counts[card] += 1
+        if any(count > 2 for count in counts.values()):
+            continue
+        cards_by_event = [list(event.cards) for event in snapshot.play_history]
+        for (event_index, card_index, _choices), card in zip(
+            slots, assignment, strict=True
+        ):
+            cards_by_event[event_index][card_index] = card
+        resolved_history: list[PlayEvent] = []
+        for event, cards in zip(snapshot.play_history, cards_by_event, strict=True):
+            exact_cards = tuple(cards)
+            exact_options = () if event.is_pass else tuple(
+                (card[-1],)
+                if _is_known_card(card) and card not in {"small_joker", "big_joker"}
+                else ()
+                for card in exact_cards
+            )
+            resolved_history.append(
+                replace(event, cards=exact_cards, suit_options=exact_options)
+            )
+        trick_count = len(snapshot.trick_plays)
+        resolved = replace(
+            snapshot,
+            play_history=tuple(resolved_history),
+            trick_plays=(tuple(resolved_history[-trick_count:]) if trick_count else ()),
+        )
+        world_signature = tuple(
+            (event.player, bool(event.is_pass), tuple(sorted(event.cards)))
+            for event in resolved.play_history
+        )
+        if world_signature in world_signatures:
+            continue
+        try:
+            signature = _unknown_suit_semantic_signature(
+                resolved, unresolved_events
+            )
+        except FableDanStateError:
+            continue
+        world_signatures.add(world_signature)
+        variants.append(resolved)
+        signatures.add(signature)
+        if len(variants) > MAX_UNKNOWN_SUIT_VARIANTS:
+            raise FableDanStateError(
+                f"未知花色合法候选超过安全上限 {MAX_UNKNOWN_SUIT_VARIANTS}；"
+                "需要先确认花色"
+            )
+
+    if not variants:
+        raise FableDanStateError(
+            "未知花色候选没有符合双副牌物理约束和动作语义的精确版本"
+        )
+    if len(signatures) != 1:
+        raise FableDanStateError(
+            "未知花色候选的点数、张数、牌型或大小语义不唯一，不能猜测",
+            diagnostic={
+                "code": "unknown_suit_semantics_not_unique",
+                "candidate_count": len(variants),
+                "semantic_signatures": [repr(item) for item in sorted(signatures, key=repr)],
+            },
+        )
+    return tuple(variants)
+
+
+def _unknown_suit_semantic_signature(
+    snapshot: LocalStrategySnapshot,
+    unresolved_events: set[int],
+) -> tuple[tuple[object, ...], ...]:
+    allocation = _PhysicalCards()
+    signature: list[tuple[object, ...]] = []
+    for event_index, event in enumerate(snapshot.play_history):
+        if event.is_pass:
+            continue
+        card_ids = tuple(allocation.allocate(card) for card in event.cards)
+        if event_index not in unresolved_events:
+            continue
+        move, _resolution = _unique_observed_move(
+            card_ids, snapshot.round_level, event_index + 1, event.action_metadata
+        )
+        signature.append((
+            len(event.cards),
+            tuple(sorted(_physical_rank(card) for card in event.cards)),
+            *_move_declaration(move),
+        ))
+    return tuple(signature)
+
+
+def _exact_suit_choices(card: str, options: tuple[str, ...]) -> tuple[str, ...]:
+    rank = card[:-1]
+    choices: set[str] = set()
+    for option in options:
+        raw = str(option).strip()
+        candidate = f"{rank}{raw}" if raw in _SUIT_TO_INDEX else raw
+        if _is_known_card(candidate) and candidate[:-1] == rank:
+            choices.add(candidate)
+    return tuple(sorted(choices))
+
+
+def _physical_rank(card: str) -> str:
+    return card if card in {"small_joker", "big_joker"} else card[:-1]
+
+
+def _normalized_recommendation_key(
+    result: FableDanDecisionResult,
+) -> tuple[object, ...]:
+    return (
+        bool(result.advice.is_pass),
+        tuple(sorted(result.advice.cards)),
+        canonical_fabledan_type(result.advice.play_type),
+        _move_declaration(result.best_action),
+    )
+
+
+def _recommendation_audit(result: FableDanDecisionResult) -> dict[str, object]:
+    return {
+        "is_pass": result.advice.is_pass,
+        "cards": list(sorted(result.advice.cards)),
+        "play_type": canonical_fabledan_type(result.advice.play_type),
+        "type_id": int(result.best_action.type),
+        "key": int(result.best_action.key),
+        "claim_rank_ids": sorted(int(rank) for rank in result.best_action.claim_ranks),
+    }
+
+
+def _variant_request_id(request_id: str, index: int) -> str:
+    return f"{request_id or 'fabledan'}:unknown-suit:{index}"
+
+
+def _snapshot_audit(snapshot: LocalStrategySnapshot) -> dict[str, object]:
+    return {
+        "round_level": snapshot.round_level,
+        "wild_rank": snapshot.wild_rank,
+        "phase": snapshot.phase,
+        "current_player": snapshot.current_player,
+        "lead_player": snapshot.lead_player,
+        "my_hand": list(snapshot.my_hand),
+        "remaining_cards": dict(snapshot.remaining_cards) if snapshot.remaining_cards is not None else None,
+        "play_history": [event.to_dict() for event in snapshot.play_history],
+        "trick_plays": [event.to_dict() for event in snapshot.trick_plays],
+        "revision": snapshot.revision,
+    }
 
 
 def _validate_standard_snapshot(snapshot: LocalStrategySnapshot) -> None:

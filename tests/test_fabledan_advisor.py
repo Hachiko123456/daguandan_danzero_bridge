@@ -84,6 +84,74 @@ def _following_state(cards: tuple[str, ...], *, level: str = "8") -> GuanDanStat
     return state
 
 
+
+REAL_OPENING_HAND = (
+    "10D", "10H", "10H", "10S", "2C", "2D", "2H", "3D",
+    "4C", "4D", "4H", "4S", "5H", "7H", "7S", "9C", "9D",
+    "9H", "AC", "AC", "AD", "JD", "KD", "QC", "QC", "QH",
+    "big_joker",
+)
+
+UNKNOWN_SUIT_HAND = tuple(
+    f"{rank}{suit}"
+    for rank in ("3", "4", "5")
+    for suit in "HDCS"
+    for _ in range(2)
+) + ("7H", "7D", "7S")
+
+NONUNIQUE_SUIT_HAND = tuple(
+    f"{rank}{suit}"
+    for rank in ("8", "9", "10")
+    for suit in "HDCS"
+    for _ in range(2)
+) + ("AH", "AD", "AS")
+
+
+def _unknown_suit_state(
+    cards: tuple[str, ...],
+    suit_options: tuple[tuple[str, ...], ...],
+    *,
+    level: str,
+    hand: tuple[str, ...] = UNKNOWN_SUIT_HAND,
+    action_metadata: dict[str, object] | None = None,
+) -> GuanDanState:
+    state = GuanDanState()
+    state.set_context(
+        round_level=level,
+        wild_rank=level,
+        current_player="self",
+        lead_player="left",
+    )
+    state.confirm_hand(hand)
+    state.record_play(
+        "left",
+        cards,
+        suit_options=suit_options,
+        action_metadata=action_metadata,
+    )
+    state.remaining_cards = {
+        "self": 27,
+        "right": 27,
+        "opposite": 27,
+        "left": 27 - len(cards),
+    }
+    return state
+
+
+def _full_house_semantics() -> dict[str, object]:
+    selected = {
+        "type_id": 4,
+        "key": 3,
+        "claim_ranks": ["6", "6", "6", "2", "2"],
+    }
+    return {
+        "interpretation_ambiguous": False,
+        "candidate_interpretations": [selected],
+        "selected_interpretation": selected,
+        "selection_source": "rules_unique",
+    }
+
+
 LEFT_55_HAND = (
     "6S", "6H", "7S", "7H", "8S", "8H", "9S", "9H", "9D", "9C",
     "AS", "AH", "AD", "AC", "KS", "KH", "KD", "KC", "QS", "QH",
@@ -468,6 +536,93 @@ def test_fabledan_input_fingerprint_merges_only_identical_encoded_inputs(tmp_pat
     ) != advisor.decision_input_fingerprint(
         _following_state(("3S", "4H", "5D", "6C", "7S")),
     )
+
+
+def test_unknown_suit_full_house_runs_both_candidates_and_returns_consensus(
+    tmp_path,
+    monkeypatch,
+):
+    state = _unknown_suit_state(
+        ("2?", "2?", "6?", "6?", "6?"),
+        (("H", "D"), ("H", "D"), ("H", "D"), ("H", "D"), ("S", "C")),
+        level="5",
+        hand=REAL_OPENING_HAND,
+        action_metadata=_full_house_semantics(),
+    )
+    advisor = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        runtime_policy="rule_only",
+        write_decision_log=False,
+    )
+    calls: list[dict[str, object]] = []
+
+    def choose_first(_runtime, observation):
+        calls.append(observation)
+        return 0, None, None, None
+
+    monkeypatch.setattr(advisor, "_evaluate_policy", choose_first)
+
+    result = advisor.recommend_detailed(state, request_id="unknown-suit-consensus")
+
+    assert len(calls) == 6
+    resolution = result.advice.engine_input["unknown_suit_resolution"]
+    assert resolution["status"] == "consensus"
+    assert resolution["candidate_count"] == 6
+    assert result.advice.request_id == "unknown-suit-consensus"
+    assert result.advice.engine_input["project_snapshot"]["play_history"][0][
+        "cards"
+    ] == ["2?", "2?", "6?", "6?", "6?"]
+    assert "fabledan_training_input" not in result.advice.engine_input
+    assert result.advice.engine_input["training_eligible"] is False
+
+
+def test_unknown_suit_candidate_disagreement_refuses_to_guess(tmp_path, monkeypatch):
+    state = _unknown_suit_state(
+        ("2?", "2H", "6H", "6H", "6S"),
+        (("H", "D"), ("H",), ("H",), ("H",), ("S",)),
+        level="3",
+        action_metadata=_full_house_semantics(),
+    )
+    advisor = FableDanAdvisor(
+        tmp_path,
+        "profile",
+        runtime_policy="rule_only",
+        write_decision_log=False,
+    )
+
+    def choose_by_exact_candidate(_runtime, observation):
+        move = observation["events"][0][2]
+        exact_cards = tuple(_card_code(int(card)) for card in move.cards)
+        return (0 if exact_cards.count("2H") == 2 else 1), None, None, None
+
+    monkeypatch.setattr(advisor, "_evaluate_policy", choose_by_exact_candidate)
+
+    with pytest.raises(FableDanStateError, match="不一致的 FableDan 推荐"):
+        advisor.recommend(state, request_id="unknown-suit-disagreement")
+
+
+def test_unknown_suit_candidate_rejects_illegal_third_physical_copy(tmp_path):
+    state = _unknown_suit_state(
+        ("2?", "2H", "2H"),
+        (("H",), ("H",), ("H",)),
+        level="3",
+    )
+
+    with pytest.raises(FableDanStateError, match="没有符合双副牌物理约束"):
+        FableDanAdvisor(tmp_path, "profile").recommend(state)
+
+
+def test_unknown_suit_candidate_requires_unique_type_and_size_semantics(tmp_path):
+    state = _unknown_suit_state(
+        ("3?", "4S", "5S", "6S", "7S"),
+        (("S", "H"), ("S",), ("S",), ("S",), ("S",)),
+        level="2",
+        hand=NONUNIQUE_SUIT_HAND,
+    )
+
+    with pytest.raises(FableDanStateError, match="牌型或大小语义不唯一"):
+        FableDanAdvisor(tmp_path, "profile").recommend(state)
 
 
 def test_unknown_suit_is_audited_and_blocked_before_policy(tmp_path, monkeypatch):

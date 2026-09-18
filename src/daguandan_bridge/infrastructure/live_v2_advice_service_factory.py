@@ -26,7 +26,7 @@ def create_advice_worker_host(
         session_id=session_id,
         capture_generation=capture_generation,
         state_revision=state_revision,
-        rebind_policy=RebindPolicy.TERMINATE_IN_FLIGHT,
+        rebind_policy=RebindPolicy.PRESERVE_IN_FLIGHT_WITHIN_STREAM,
     )
 
 

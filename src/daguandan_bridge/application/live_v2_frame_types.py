@@ -79,6 +79,7 @@ class FramePipelineConfig:
     evidence_max_age_ms: int = 3_000
     evidence_max_count: int = 512
     evidence_max_bytes: int = 2 * 1024 * 1024
+    pass_cross_max_delay_ms: int = 1_500
     strict_current_seat_only: bool = False
 
     def __post_init__(self) -> None:
@@ -91,6 +92,7 @@ class FramePipelineConfig:
             self.evidence_max_age_ms,
             self.evidence_max_count,
             self.evidence_max_bytes,
+            self.pass_cross_max_delay_ms,
         ) <= 0:
             raise ValueError("frame pipeline limits must be positive")
         if not isinstance(self.strict_current_seat_only, bool):

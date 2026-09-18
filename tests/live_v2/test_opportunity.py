@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from daguandan_bridge.live_v2.action_semantics import (
+    ActionInterpretation, ActionSemantics,
+)
 from daguandan_bridge.live_v2.game_state import (
     GameAction, SeatCardCount, TrustedGameSnapshot,
 )
@@ -69,6 +72,92 @@ def test_blocked_opportunity_becomes_ready_when_gap_recovers_before_deadline() -
     assert published.state.current.status is OpportunityStatus.READY
     assert published.state.current.reason is OpportunityReason.TRUSTED_STATE
     assert len(published.publications) == 1
+
+
+def test_semantically_unique_unknown_suit_history_keeps_opportunity_ready() -> None:
+    before = StateVersion("s", 0, 0)
+    after = StateVersion("s", 1, 1)
+    frame = FrameIdentity("s", 1, 1, 100, "roi", "window")
+    interpretation = ActionInterpretation(
+        move_type="", type_id=4, key=3,
+        claim_ranks=("6", "6", "6", "2", "2"),
+    )
+    action = GameAction(
+        "left-full-house", before, after, Seat.LEFT, ActionKind.PLAY,
+        ("2?", "2?", "6?", "6?", "6?"),
+        (("H", "D"), ("H", "D"), ("H", "D"), ("H", "D"), ("S", "C")),
+        0, ("e1",), frame, frame, 0.9, 100,
+        semantics=ActionSemantics(
+            selected=interpretation,
+            candidates=(interpretation,),
+            selection_source="rules_unique",
+        ),
+    )
+    hand = (
+        "10D", "10H", "10H", "10S", "2C", "2D", "2H", "3D",
+        "4C", "4D", "4H", "4S", "5H", "7H", "7S", "9C", "9D",
+        "9H", "AC", "AC", "AD", "JD", "KD", "QC", "QC", "QH",
+        "big_joker",
+    )
+    current = version(state_revision=1, turn_index=1)
+    first_response = snapshot(
+        current,
+        round_level="3", wild_rank="3",
+        current_seat=Seat.SELF, lead_seat=Seat.LEFT,
+        my_hand=hand,
+        play_history=(action,), current_trick=(action,),
+        remaining=tuple(
+            SeatCardCount(seat, 22 if seat is Seat.LEFT else 27)
+            for seat in Seat
+        ),
+    )
+
+    transition = OpportunityLifecycle().advance(
+        OpportunityState(), snapshot=first_response, gap=gap(current),
+        version=current, processing_ms=200,
+    )
+
+    assert transition.state.current is not None
+    assert transition.state.current.status is OpportunityStatus.READY
+    assert transition.state.current.reason is OpportunityReason.TRUSTED_STATE
+
+
+def test_nonunique_unknown_suit_semantics_remains_blocked() -> None:
+    before = StateVersion("s", 0, 0)
+    after = StateVersion("s", 1, 1)
+    frame = FrameIdentity("s", 1, 1, 100, "roi", "window")
+    straight = ActionInterpretation(move_type="STRAIGHT", key="7")
+    flush = ActionInterpretation(move_type="SFLUSH", key="7")
+    action = GameAction(
+        "left-ambiguous", before, after, Seat.LEFT, ActionKind.PLAY,
+        ("3?", "4S", "5S", "6S", "7S"),
+        (("S", "H"), ("S",), ("S",), ("S",), ("S",)),
+        0, ("e1",), frame, frame, 0.9, 100,
+        semantics=ActionSemantics(
+            selected=straight,
+            candidates=(straight, flush),
+            selection_source="unresolved",
+        ),
+    )
+    current = version(state_revision=1, turn_index=1)
+    uncertain = snapshot(
+        current,
+        play_history=(action,), current_trick=(action,),
+        remaining=tuple(
+            SeatCardCount(seat, 22 if seat is Seat.LEFT else 27)
+            for seat in Seat
+        ),
+        lead_seat=Seat.LEFT,
+    )
+
+    transition = OpportunityLifecycle().advance(
+        OpportunityState(), snapshot=uncertain, gap=gap(current),
+        version=current, processing_ms=200,
+    )
+
+    assert transition.state.current is not None
+    assert transition.state.current.status is OpportunityStatus.BLOCKED
+    assert transition.state.current.reason is OpportunityReason.OBSERVATION_UNCERTAIN
 
 
 def test_unresolved_history_blocks_model_opportunity_until_repaired() -> None:

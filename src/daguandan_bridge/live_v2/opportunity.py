@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from itertools import product
 
 from .game_state import GameAction, TrustedGameSnapshot
 from .protocols import AdviceConsumer, EventJournal, RuleStateProvider
@@ -311,16 +312,118 @@ class OpportunityLifecycle:
         return replace(state, closed_keys=keys)
 
 
+_MAX_UNKNOWN_SUIT_VARIANTS = 8
+_MAX_UNKNOWN_SUIT_SEARCH = 256
+_SUIT_CODES = frozenset({"H", "D", "S", "C"})
+
+
 def _has_unresolved_physical_cards(snapshot: TrustedGameSnapshot) -> bool:
-    """Return whether FableDan would need to guess a physical card."""
+    """Block only when bounded exact-world consensus would require guessing."""
 
     if any(str(card).endswith("?") for card in snapshot.my_hand):
         return True
-    return any(
-        action.kind is ActionKind.PLAY
-        and (
-            any(str(card).endswith("?") for card in action.cards)
-            or any(len(options) > 1 for options in action.suit_options)
+    fixed_counts: dict[str, int] = {}
+    for card in snapshot.my_hand:
+        text = str(card)
+        fixed_counts[text] = fixed_counts.get(text, 0) + 1
+    slots: list[tuple[tuple[int, str], tuple[str, ...]]] = []
+    for action_index, action in enumerate(snapshot.play_history):
+        if action.kind is not ActionKind.PLAY:
+            continue
+        unresolved = any(str(card).endswith("?") for card in action.cards) or any(
+            len(options) > 1 for options in action.suit_options
         )
-        for action in snapshot.play_history
+        if unresolved and not _action_semantics_are_unique(action):
+            return True
+        for card, options in zip(action.cards, action.suit_options, strict=True):
+            text = str(card)
+            if text.endswith("?") or len(options) > 1:
+                choices = _bounded_exact_suit_choices(text, options)
+                if not choices:
+                    return True
+                slots.append(((action_index, _card_rank(text)), choices))
+            else:
+                fixed_counts[text] = fixed_counts.get(text, 0) + 1
+    if not slots:
+        return False
+    if any(count > 2 for count in fixed_counts.values()):
+        return True
+    signatures: set[tuple[tuple[tuple[int, str], str], ...]] = set()
+    examined = 0
+    for assignment in product(*(choices for _group, choices in slots)):
+        examined += 1
+        if examined > _MAX_UNKNOWN_SUIT_SEARCH:
+            return True
+        if not _assignment_respects_double_deck(fixed_counts, assignment):
+            continue
+        # Unknown cards of the same rank within one action are exchangeable.
+        # Count unique physical worlds after this semantic deduplication, not
+        # raw slot permutations such as 2H/2D versus 2D/2H.
+        signature = tuple(sorted(
+            (group, card)
+            for (group, _choices), card in zip(slots, assignment, strict=True)
+        ))
+        signatures.add(signature)
+        if len(signatures) > _MAX_UNKNOWN_SUIT_VARIANTS:
+            return True
+    return not signatures
+
+
+def _action_semantics_are_unique(action: GameAction) -> bool:
+    semantics = action.semantics
+    if semantics is None:
+        return False
+    card_signature = (
+        len(action.cards),
+        tuple(sorted(_card_rank(card) for card in action.cards)),
     )
+    keys = {
+        (
+            item.type_id,
+            item.move_type.strip().casefold(),
+            str(item.key),
+            tuple(sorted(item.claim_ranks)),
+            *card_signature,
+        )
+        for item in semantics.candidates
+    }
+    selected = semantics.selected
+    selected_key = (
+        selected.type_id,
+        selected.move_type.strip().casefold(),
+        str(selected.key),
+        tuple(sorted(selected.claim_ranks)),
+        *card_signature,
+    )
+    return len(keys) == 1 and selected_key in keys
+
+
+def _bounded_exact_suit_choices(
+    card: str,
+    options: tuple[str, ...],
+) -> tuple[str, ...]:
+    rank = card[:-1]
+    choices: set[str] = set()
+    for option in options:
+        raw = str(option).strip()
+        candidate = f"{rank}{raw}" if raw in _SUIT_CODES else raw
+        if len(candidate) >= 2 and candidate[-1] in _SUIT_CODES and candidate[:-1] == rank:
+            choices.add(candidate)
+    return tuple(sorted(choices))
+
+
+def _assignment_respects_double_deck(
+    fixed_counts: dict[str, int],
+    assignment: tuple[str, ...],
+) -> bool:
+    counts = dict(fixed_counts)
+    for card in assignment:
+        counts[card] = counts.get(card, 0) + 1
+        if counts[card] > 2:
+            return False
+    return True
+
+
+def _card_rank(card: str) -> str:
+    text = str(card)
+    return text if text in {"small_joker", "big_joker"} else text[:-1]

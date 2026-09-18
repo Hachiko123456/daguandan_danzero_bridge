@@ -63,6 +63,8 @@ class LiveV2FramePipeline:
         self.vision_adapter = self.dispatcher.vision_adapter
         self._stream: tuple[str, int, str, str] | None = None
         self._last_frame: FrameIdentity | None = None
+        self._owner_turn_key: tuple[str, int, int, int, Seat | None] | None = None
+        self._expected_owner_seen = False
 
     def process_frame(
         self,
@@ -118,11 +120,36 @@ class LiveV2FramePipeline:
             effect_seats=(fast_seat,) if fast.effect_visible else (),
         )
         pass_markers = _pass_seats(fast)
-        rearmed = self.dispatcher.observe_pass_markers(pass_markers)
+        marker_rearmed = self.dispatcher.observe_pass_markers(pass_markers)
+        turnover_seats = _pass_turnover_fallback(expected, fast)
+        turnover_rearmed = self.dispatcher.rearm_passes_after_turnover(
+            turnover_seats
+        )
+        rearmed = tuple(dict.fromkeys(marker_rearmed + turnover_rearmed))
         diagnostics.extend(
             f"pass_marker_rearmed:{seat.value}" for seat in rearmed
         )
-        pass_cross_active = _pass_cross_active(expected, fast)
+        owner_key = (
+            version.session_id, version.capture_generation,
+            version.state_revision, version.turn_index, expected,
+        )
+        if owner_key != self._owner_turn_key:
+            self._owner_turn_key = owner_key
+            self._expected_owner_seen = False
+        if (
+            expected is not None
+            and _strictly_after_boundary(frame, formal_action_boundary)
+            and (
+                fast.active_player == expected.value
+                or (expected is Seat.SELF and fast.self_action_buttons_visible)
+            )
+        ):
+            self._expected_owner_seen = True
+        pass_cross_active = (
+            _pass_cross_active(expected, fast)
+            if self._expected_owner_seen
+            else None
+        )
         self_opportunity = bool(
             fast.active_player == Seat.SELF.value
             or fast.self_action_buttons_visible
@@ -140,7 +167,7 @@ class LiveV2FramePipeline:
             wild_rank=wild_rank,
             expected_seat=expected,
             self_opportunity=self_opportunity,
-            pass_eligible_seats=_pass_eligible_seats(expected),
+            pass_eligible_seats=_pass_eligible_seats(expected, turnover_seats),
             pass_cross_active=pass_cross_active,
             pass_cross_frame=frame if pass_cross_active is not None else None,
             formal_action_boundary=formal_action_boundary,
@@ -179,6 +206,8 @@ class LiveV2FramePipeline:
         self.dispatcher.bind_stream(frame, now_ms=now_ms)
         self.surface_probe.reset()
         self._stream = stream
+        self._owner_turn_key = None
+        self._expected_owner_seen = False
 
     def _stale_reason(self, frame: FrameIdentity) -> str | None:
         if self._stream is not None:
@@ -251,6 +280,52 @@ def _pass_seats(fast: FastSignalResult) -> tuple[Seat, ...]:
     return tuple(values)
 
 
+def _strictly_after_boundary(
+    frame: FrameIdentity, boundary: FrameIdentity | None
+) -> bool:
+    if boundary is None:
+        return True
+    return (
+        frame.session_id == boundary.session_id
+        and frame.capture_generation == boundary.capture_generation
+        and frame.frame_sequence > boundary.frame_sequence
+        and frame.captured_ms > boundary.captured_ms
+    )
+
+
+def _pass_turnover_fallback(
+    expected: Seat | None, fast: FastSignalResult
+) -> tuple[Seat, ...]:
+    """Rearm a latched PASS when a later active seat proves turnover.
+
+    This compatibility path does not confirm the PASS by itself: the tracker
+    still requires two fresh PASS observations. It is therefore suitable for
+    persistent Tencent PASS badges that do not visibly clear between turns.
+    """
+
+    if (
+        expected is None
+        or fast.active_player is None
+        or fast.effect_visible
+        or fast.game_end_control is not None
+        or expected not in _pass_seats(fast)
+    ):
+        return ()
+    try:
+        active = Seat(fast.active_player)
+    except ValueError:
+        return ()
+    if active is expected:
+        return ()
+    order = tuple(Seat)
+    cursor = expected
+    for _steps in range(1, len(order) - 1):
+        cursor = order[(order.index(cursor) + 1) % len(order)]
+        if cursor is active:
+            return (expected,)
+    return ()
+
+
 def _pass_cross_active(
     expected: Seat | None, fast: FastSignalResult
 ) -> Seat | None:
@@ -299,8 +374,12 @@ def _next_unfinished_seat(
     return None
 
 
-def _pass_eligible_seats(expected: Seat | None) -> tuple[Seat, ...]:
-    return () if expected is None else (expected,)
+def _pass_eligible_seats(
+    expected: Seat | None, turnover_seats: tuple[Seat, ...]
+) -> tuple[Seat, ...]:
+    return tuple(dict.fromkeys(
+        (() if expected is None else (expected,)) + turnover_seats
+    ))
 
 
 

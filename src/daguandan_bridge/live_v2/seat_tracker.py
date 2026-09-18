@@ -175,6 +175,14 @@ class SeatTracker:
             return True
         return False
 
+    def rearm_pass_after_turnover(self) -> bool:
+        """Rearm after an active-seat transition, but still require new PASS evidence."""
+
+        if self._emitted_signature != (ObservationKind.PASS,):
+            return False
+        self._open_next_epoch()
+        return True
+
     def ingest(
         self,
         observation: SeatObservation,

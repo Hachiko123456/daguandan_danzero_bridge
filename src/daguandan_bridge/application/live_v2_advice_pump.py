@@ -293,14 +293,16 @@ class LiveV2AdvicePump:
         self._expire_due(self._clock_ms())
         return self._ledger.wait_idle(timeout)
 
-    def cancel_pending(self, *, reason: str) -> None:
-        """Cancel all in-flight requests before a formal state rewrite.
+    def cancel_pending(
+        self, *, reason: str, preserve_worker: bool = False,
+    ) -> None:
+        """Cancel logical requests before a formal state rewrite.
 
-        A visual correction supersedes the old opportunity.  Terminalizing the
-        old identities before applying the correction prevents their late
-        worker results from being misreported as ordinary ``stale`` advice.
-        The caller can then rebuild the opportunity and submit advice against
-        the corrected state revision.
+        A visual correction supersedes the old opportunity. Terminalizing the
+        old identities prevents their late results from being reported as
+        ordinary ``stale`` advice. ``preserve_worker`` skips process-level
+        cancellation, so an in-flight same-stream result is merely ignored and
+        the prewarmed worker can bind the corrected revision on its next job.
         """
 
         pending = self._ledger.pending()
@@ -308,7 +310,9 @@ class LiveV2AdvicePump:
             for identity in pending:
                 self._hint_open.discard(identity)
                 self._buffered_results.pop(identity, None)
-        cancel = getattr(self._runtime, "cancel", None)
+        cancel = (
+            None if preserve_worker else getattr(self._runtime, "cancel", None)
+        )
         timing_by_identity = {
             identity: self._timing_extra(identity) for identity in pending
         }

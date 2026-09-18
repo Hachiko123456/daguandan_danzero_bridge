@@ -123,13 +123,16 @@ class LiveV2RuleCommandsMixin:
                 ))
             except RuleSessionError as exc:
                 return self._rule_failure("correction", exc)
-            detached = self._detach_workers()
-        self._close_detached(detached)
-        with self._lock:
+            if self._advice_pump is not None:
+                self._advice_pump.cancel_pending(
+                    reason="manual_correction_superseded", preserve_worker=True
+                )
             binding = self.rule_session.bind_generation(self._generation)
             if self._generation > 0:
-                self._install_workers(binding)
-                update = self._process(EngineInput(captured_watermark_ms=self._last_ms))
+                self._reset_engine(binding)
+                update = self._process(
+                    EngineInput(captured_watermark_ms=self._last_ms)
+                )
             else:
                 update = self._plain_update()
             event = correction_event(correction, snapshot=self._trusted_snapshot())

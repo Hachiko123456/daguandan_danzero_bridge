@@ -168,7 +168,11 @@ class LiveV2LifecycleMixin:
                 incident_media_failures=media_failures,
             )
             try:
-                report = self.rule_session.health(recording_integrity=integrity)
+                terminal_event = getattr(self, "_terminal_event", None)
+                report = self.rule_session.health(
+                    additional_events=(terminal_event,) if terminal_event is not None else (),
+                    recording_integrity=integrity,
+                )
             except Exception as exc:
                 report = {
                     "schema": "guandan.live-v2.health/1", "status": "FAIL",

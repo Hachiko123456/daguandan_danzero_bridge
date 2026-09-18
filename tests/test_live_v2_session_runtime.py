@@ -233,6 +233,68 @@ class DelayedVisionRuntime:
     def close(self, *, timeout=5.0): self.closed = True
 
 
+
+
+class TerminalVision:
+    def __init__(self, controls=("continue_game", "continue_game")) -> None:
+        self.controls = list(controls)
+        self.closed = False
+
+    def start(self):
+        pass
+
+    def process_frame(
+        self, image, *, frame, version, wild_rank, expected_seat=None,
+        now_ms=None, formal_action_boundary=None, repair_seats=(),
+    ):
+        del image, version, wild_rank, now_ms, formal_action_boundary, repair_seats
+        control = self.controls.pop(0) if self.controls else None
+        expected = expected_seat.value if expected_seat is not None else "self"
+        fast = FastSignalResult(
+            expected, None, False, False, False, game_end_control=control
+        )
+        return FramePipelineResult(frame, fast, (), (), (), (), (), 0)
+
+    def close(self):
+        self.closed = True
+
+
+def test_terminal_control_seals_history_even_when_runtime_is_in_review() -> None:
+    store = MemoryStore(); recorder = MemoryRecorder()
+    store.start({"schema": "test.live-v2/1"})
+    clock = ManualClock(); vision = TerminalVision(); advisers = []
+
+    def advice_factory(_version):
+        value = FakeAdviceRuntime(); advisers.append(value); return value
+
+    live = LiveV2SessionRuntime(
+        rule_session=ProductionRuleSession(store), store=store, recorder=recorder,
+        recognition_service=FakeRecognition(), vision_factory=lambda _version: vision,
+        advice_runtime_factory=advice_factory, processing_clock_ms=clock,
+    )
+    _LIVE_RUNTIMES.append(live)
+    live.start(
+        round_level="2", hand=HAND, lead_player="right", monotonic_ms=0,
+        wall_time="2026-09-18T00:00:00+08:00",
+    )
+    live.bind_capture_generation(1)
+    live.status = "review_required"
+
+    clock.value = 100
+    first = live.analyze_frame(object(), monotonic_ms=100)
+    assert first.event is None
+    # A clear engine tick may recover an artificial review status. Re-arm it
+    # to prove terminal evidence is accepted independently of a review/gap.
+    live.status = "review_required"
+
+    clock.value = 200
+    terminal = live.analyze_frame(object(), monotonic_ms=200)
+    assert terminal.event and terminal.event.event_type == "game_end_detected"
+    assert terminal.event.payload["control"] == "continue_game"
+    assert terminal.status == "finalizing"
+    assert live.status == "finalizing"
+    assert store.events[-1] == terminal.event
+
 def runtime(*, lead="right", recorder=None, store=None,
             advice_immediate=True, bind=True, local_hint_window_ms=0):
     store = store or MemoryStore()
@@ -269,12 +331,13 @@ def runtime(*, lead="right", recorder=None, store=None,
 class VisualCorrectionVision:
     def __init__(self) -> None:
         self.calls = 0
+        self.closed = False
 
     def start(self):
         pass
 
     def close(self):
-        pass
+        self.closed = True
 
     def process_frame(
         self, image, *, frame, version, wild_rank, expected_seat=None,
@@ -341,6 +404,9 @@ def test_visual_uncertain_action_is_repaired_without_creating_second_turn():
     assert live.snapshot.play_history[-1].cards == ("5S",)
     assert len(live.snapshot.play_history) == 1
     assert live.snapshot.current_player == "opposite"
+    assert len(advisers) == 1
+    assert not advisers[0].closed
+    assert not vision.closed
 
 class VisualCountCorrectionVision:
     def __init__(self) -> None:
@@ -1028,7 +1094,7 @@ def test_stale_generation_effect_and_terminal_controls_cannot_short_circuit() ->
 
 
 def test_explicit_correction_rebuilds_the_same_generation() -> None:
-    live, _first, _store, _recorder, _clock, _visions, _advisers = runtime()
+    live, _first, _store, _recorder, _clock, visions, advisers = runtime()
     live.commit_trusted_action(
         actor="right", cards=("3D",), is_pass=False, monotonic_ms=100,
     )
@@ -1038,6 +1104,8 @@ def test_explicit_correction_rebuilds_the_same_generation() -> None:
     assert live.snapshot.revision == before.revision + 1
     assert live.snapshot.play_history[-1].cards == ("4D",)
     assert result.capture_generation == 1
+    assert len(visions) == 1 and not visions[0].closed
+    assert len(advisers) == 1 and not advisers[0].closed
 
 
 def test_action_metadata_is_audit_only_and_does_not_override_rules() -> None:

@@ -100,6 +100,14 @@ class FrameReadDispatcher:
             if self.trackers[seat].observe_pass_marker(seat in marked)
         )
 
+    def rearm_passes_after_turnover(
+        self, seats: tuple[Seat, ...]
+    ) -> tuple[Seat, ...]:
+        return tuple(
+            seat for seat in seats
+            if self.trackers[seat].rearm_pass_after_turnover()
+        )
+
     def drop_cursor(self) -> DropCursor:
         return DropCursor(self.scheduler.drops, self.evidence_buffer.drops)
 
@@ -225,6 +233,7 @@ class FrameReadDispatcher:
                 active_seat=pass_cross_active,
                 cross_frame=pass_cross_frame,
                 formal_action_boundary=formal_action_boundary,
+                max_delay_ms=self.config.pass_cross_max_delay_ms,
             )
             if pass_corroboration_id is not None:
                 observation = replace(
@@ -334,6 +343,7 @@ def _pass_corroboration_id(
     active_seat: Seat | None,
     cross_frame: FrameIdentity | None,
     formal_action_boundary: FrameIdentity | None,
+    max_delay_ms: int,
 ) -> str | None:
     """Bind one PASS marker and one active-seat transition to one formal turn."""
 
@@ -345,6 +355,9 @@ def _pass_corroboration_id(
         or cross_frame is None
         or observation.frame != cross_frame
         or not _after_formal_boundary(observation.frame, formal_action_boundary)
+        or formal_action_boundary is None
+        or observation.frame.captured_ms - formal_action_boundary.captured_ms
+        > max_delay_ms
     ):
         return None
     return (

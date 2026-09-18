@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from threading import RLock
 from collections import Counter
 from time import monotonic_ns
 from typing import Any, Callable
 
-from ..domain.live import LiveSnapshot
+from ..domain.live import LiveEvent, LiveSnapshot
 from ..domain.live_runtime import LiveAdvice, LiveStatus, LiveUpdate
 from ..live.local_rule_hint import LocalRuleHintTracker
 from ..live_v2.action_semantics import ActionSemantics
@@ -178,6 +179,12 @@ class LiveV2SessionRuntime(
         self._visual_corrections: dict[str, _VisualCorrection] = {}
         self._last_visual_repair_seat: Seat | None = None
         self._suppressed_correction_surfaces: dict[Seat, tuple[str, ...]] = {}
+        self._terminal_control: str | None = None
+        self._terminal_streak = 0
+        self._terminal_last_frame: FrameIdentity | None = None
+        self._terminal_detected = False
+        self._terminal_event: LiveEvent | None = None
+        self._aux_event_sequence = 0
 
     @property
     def snapshot(self) -> LiveSnapshot:
@@ -301,6 +308,12 @@ class LiveV2SessionRuntime(
                 self._safe_fault(
                     "vision_runtime", fault, monotonic_ms=identity.captured_ms
                 )
+            fast = results[-1].fast_signals if results else None
+            terminal = self._observe_terminal_control(
+                fast, frame=(results[-1].frame if results else None),
+            )
+            if terminal is not None:
+                return terminal
             observations = tuple(
                 item for result in results for item in result.observations
             )
@@ -308,9 +321,7 @@ class LiveV2SessionRuntime(
                 item for result in results for item in result.candidates
             )
             repaired = self._try_visual_corrections(
-                observations,
-                expected_seat=expected,
-                fast=(results[-1].fast_signals if results else None),
+                observations, expected_seat=expected, fast=fast,
             )
             if repaired is not None:
                 return repaired
@@ -328,7 +339,7 @@ class LiveV2SessionRuntime(
                     self._opening_required = not bool(opening.snapshot.play_history)
                     return opening
                 return self._plain_update(
-                    fast=results[-1].fast_signals if results else None,
+                    fast=fast,
                     block_reason="opening_waiting_for_unique_visual_action",
                 )
             selected = gated.selected
@@ -344,8 +355,94 @@ class LiveV2SessionRuntime(
                     candidates=selected,
                     captured_watermark_ms=identity.captured_ms,
                 ),
-                fast=results[-1].fast_signals if results else None,
+                fast=fast,
             )
+
+    def _observe_terminal_control(
+        self, fast: Any | None, *, frame: FrameIdentity | None,
+    ) -> LiveUpdate | None:
+        """Persist one terminal event after two independent settlement frames.
+
+        Terminal evidence is intentionally independent of rule gaps: an
+        incomplete action history must never prevent sealing reproducible
+        evidence once Tencent's settlement controls are stably visible.
+        """
+
+        if fast is None or frame is None or self._terminal_detected:
+            return None
+        control = str(getattr(fast, "game_end_control", "") or "")
+        if control not in {"continue_game", "change_table"}:
+            self._terminal_control = None
+            self._terminal_streak = 0
+            self._terminal_last_frame = frame
+            return None
+        previous = self._terminal_last_frame
+        newer = bool(
+            previous is not None
+            and frame.session_id == previous.session_id
+            and frame.capture_generation == previous.capture_generation
+            and frame.frame_sequence > previous.frame_sequence
+            and frame.captured_ms > previous.captured_ms
+        )
+        if control == self._terminal_control and newer:
+            self._terminal_streak += 1
+        else:
+            self._terminal_control = control
+            self._terminal_streak = 1
+        self._terminal_last_frame = frame
+        if self._terminal_streak < 2:
+            return None
+
+        snapshot = self._trusted_snapshot()
+        self._aux_event_sequence += 1
+        event = LiveEvent(
+            event_id=f"AUX-LIVEV2-{self._aux_event_sequence:06d}",
+            event_type="game_end_detected",
+            session_id=snapshot.version.session_id,
+            seq=0,
+            monotonic_ms=frame.captured_ms,
+            wall_time=datetime.now().astimezone().isoformat(),
+            trick_id=max(1, snapshot.trick_index),
+            turn_id=max(1, snapshot.version.turn_index + 1),
+            actor=None,
+            payload={
+                "control": control,
+                "remaining_cards": {
+                    item.seat.value: int(item.count) for item in snapshot.remaining
+                },
+                "finished_seats": [seat.value for seat in snapshot.finished],
+            },
+            confidence=1.0,
+            source="live_v2_terminal_control",
+            state_revision_before=snapshot.version.state_revision,
+            state_revision_after=snapshot.version.state_revision,
+            evidence_refs=(
+                f"{frame.session_id}:{frame.capture_generation}:"
+                f"{frame.frame_sequence}:{frame.source_id}:game-end",
+            ),
+        )
+        try:
+            self.store.append_event(event)
+        except Exception as exc:
+            self._safe_fault(
+                "game_end_persistence_failed", str(exc), control=control,
+                frame_sequence=frame.frame_sequence,
+            )
+            return self._plain_update(
+                fast=fast, block_reason="game_end_persistence_failed"
+            )
+        if self._advice_pump is not None:
+            self._advice_pump.cancel_pending(reason="game_end_detected")
+        self._terminal_detected = True
+        self._terminal_event = event
+        self._visual_corrections.clear()
+        self.latest_advice = None
+        self.status = "finalizing"
+        self._sequence += 1
+        return live_update(
+            status=self.status, snapshot=snapshot, sequence=self._sequence,
+            advice=None, events=(event,), fast_signals=fast,
+        )
 
     def _register_visual_correction(self, action: Any) -> None:
         if (
@@ -545,35 +642,30 @@ class LiveV2SessionRuntime(
             # Keep listening for a different stable reread instead of blocking
             # the whole session.
             return None
-        # The correction is now durable. Terminalize advice requests bound to
-        # the pre-correction opportunity before rebuilding the state/opportunity
-        # and installing a fresh advice pump.
+        # The correction is now durable. Terminalize only the old logical
+        # opportunity; keep both prewarmed worker processes alive. Their hosts
+        # bind the new revision on the next request and discard old completions.
         if self._advice_pump is not None:
-            self._advice_pump.cancel_pending(reason="visual_correction_superseded")
+            self._advice_pump.cancel_pending(
+                reason="visual_correction_superseded", preserve_worker=True
+            )
         self._visual_corrections.pop(pending.action_id, None)
         self._suppressed_correction_surfaces[pending.seat] = tuple(corrected)
-        detached = self._detach_workers()
-        self._close_detached(detached)
-        with self._lock:
-            binding = self.rule_session.bind_generation(self._generation)
-            self._install_workers(binding)
-            update = self._process(
-                EngineInput(captured_watermark_ms=self._last_ms), fast=fast
-            )
-            event = correction_event(
-                correction, snapshot=self._trusted_snapshot()
-            )
-            target = next(
-                item
-                for item in self.rule_session.confirmed_actions
-                if item.action_id == pending.action_id
-            )
-            target_event = self.rule_session.events_for_actions((target,))[0]
-            event = replace(
-                event,
-                payload={**event.payload, "target_event_id": target_event.event_id},
-            )
-            return replace(update, event=event, events=(event,))
+        binding = self.rule_session.bind_generation(self._generation)
+        self._reset_engine(binding)
+        update = self._process(
+            EngineInput(captured_watermark_ms=self._last_ms), fast=fast
+        )
+        event = correction_event(correction, snapshot=self._trusted_snapshot())
+        target = next(
+            item for item in self.rule_session.confirmed_actions
+            if item.action_id == pending.action_id
+        )
+        target_event = self.rule_session.events_for_actions((target,))[0]
+        event = replace(
+            event, payload={**event.payload, "target_event_id": target_event.event_id},
+        )
+        return replace(update, event=event, events=(event,))
 
     def commit_trusted_action(
         self, *, actor: str, cards: tuple[str, ...] = (), is_pass: bool,
@@ -626,6 +718,7 @@ class LiveV2SessionRuntime(
         if self._advice_pump is None:
             raise RuntimeError("advice runtime is not active")
         self.latest_advice = None
+        self._pending.clear()
         self._engine = self._new_engine(binding, self._advice_pump)
 
     def _process(self, incoming: EngineInput, *, fast: Any = None) -> LiveUpdate:

@@ -334,6 +334,7 @@ def test_game181845_single_pass_frame_cross_confirms_after_active_moves() -> Non
 
     fake = FakeRecognition()
     pipeline = make_pipeline(fake)
+    fake.active_player = Seat.SELF
     process(pipeline, table(), 1, expected=Seat.SELF, revision=7, turn=57)
 
     fake.pass_seats = {Seat.SELF}
@@ -356,12 +357,16 @@ def test_game181845_single_pass_frame_cross_confirms_after_active_moves() -> Non
 
 def test_cross_confirm_skips_only_same_frame_visibly_finished_seats() -> None:
     fake = FakeRecognition()
-    fake.pass_seats = {Seat.SELF}
-    fake.active_player = Seat.OPPOSITE
     fake.placements = (
         PlacementSignal(Seat.RIGHT.value, "head", 0.99, "right-finished"),
     )
     pipeline = make_pipeline(fake)
+    fake.active_player = Seat.SELF
+    process(
+        pipeline, table(), 1, expected=Seat.SELF, revision=8, turn=58,
+    )
+    fake.pass_seats = {Seat.SELF}
+    fake.active_player = Seat.OPPOSITE
 
     result = process(
         pipeline, table(), 2, expected=Seat.SELF, revision=8, turn=58,
@@ -375,9 +380,13 @@ def test_cross_confirm_skips_only_same_frame_visibly_finished_seats() -> None:
 
 def test_cross_confirm_rejects_jump_without_finished_seat_proof() -> None:
     fake = FakeRecognition()
+    pipeline = make_pipeline(fake)
+    fake.active_player = Seat.SELF
+    process(
+        pipeline, table(), 1, expected=Seat.SELF, revision=8, turn=58,
+    )
     fake.pass_seats = {Seat.SELF}
     fake.active_player = Seat.OPPOSITE
-    pipeline = make_pipeline(fake)
 
     result = process(
         pipeline, table(), 2, expected=Seat.SELF, revision=8, turn=58,
@@ -405,14 +414,15 @@ def test_cross_confirm_never_reuses_latched_old_pass() -> None:
     assert not stale.candidates
 
     fake.pass_seats.clear()
+    fake.active_player = Seat.SELF
     process(pipeline, table(), 4, expected=Seat.SELF, revision=1, turn=1)
-    cleared = process(pipeline, table(), 5, expected=Seat.SELF, revision=1, turn=1)
-    assert "pass_marker_rearmed:self" in cleared.diagnostics
+    process(pipeline, table(), 5, expected=Seat.SELF, revision=1, turn=1)
 
     fake.pass_seats = {Seat.SELF}
+    fake.active_player = Seat.RIGHT
     fresh = process(
         pipeline, table(), 6, expected=Seat.SELF, revision=1, turn=1,
-        formal_action_boundary=frame(5),
+        formal_action_boundary=frame(2),
     )
     candidate = next(item for item in fresh.candidates if item.seat is Seat.SELF)
     assert candidate.reason is CandidateReason.CROSS_SOURCE_PASS
@@ -421,24 +431,29 @@ def test_cross_confirm_never_reuses_latched_old_pass() -> None:
 
 def test_cross_confirm_requires_strictly_post_boundary_current_turn_frame() -> None:
     fake = FakeRecognition()
-    fake.pass_seats = {Seat.SELF}
-    fake.active_player = Seat.RIGHT
     pipeline = make_pipeline(fake)
     boundary = frame(2)
-
+    fake.active_player = Seat.SELF
     at_boundary = process(
         pipeline, table(), 2, expected=Seat.SELF, revision=3, turn=9,
         formal_action_boundary=boundary,
     )
     assert not at_boundary.candidates
 
-    after = process(
+    owner_seen = process(
         pipeline, table(), 3, expected=Seat.SELF, revision=3, turn=9,
+        formal_action_boundary=boundary,
+    )
+    assert not owner_seen.candidates
+    fake.pass_seats = {Seat.SELF}
+    fake.active_player = Seat.RIGHT
+    after = process(
+        pipeline, table(), 4, expected=Seat.SELF, revision=3, turn=9,
         formal_action_boundary=boundary,
     )
     candidate = next(item for item in after.candidates if item.seat is Seat.SELF)
     assert candidate.reason is CandidateReason.CROSS_SOURCE_PASS
-    assert candidate.first_frame == candidate.last_frame == frame(3)
+    assert candidate.first_frame == candidate.last_frame == frame(4)
 
 
 @pytest.mark.parametrize("interference", ["effect", "terminal", "super_double"])
@@ -446,6 +461,11 @@ def test_cross_confirm_is_disabled_by_effect_or_terminal_interference(
     interference: str,
 ) -> None:
     fake = FakeRecognition()
+    pipeline = make_pipeline(fake)
+    fake.active_player = Seat.SELF
+    process(
+        pipeline, table(), 1, expected=Seat.SELF, revision=4, turn=10,
+    )
     fake.pass_seats = {Seat.SELF}
     fake.active_player = Seat.RIGHT
     if interference == "effect":
@@ -454,7 +474,6 @@ def test_cross_confirm_is_disabled_by_effect_or_terminal_interference(
         fake.game_end_control = "continue_game"
     else:
         fake.super_double = True
-    pipeline = make_pipeline(fake)
 
     result = process(
         pipeline, table(), 2, expected=Seat.SELF, revision=4, turn=10,
@@ -466,6 +485,24 @@ def test_cross_confirm_is_disabled_by_effect_or_terminal_interference(
         item.reason is not CandidateReason.CROSS_SOURCE_PASS
         for item in pipeline.pending_candidates(now_ms=200)
     )
+
+
+def test_cross_confirm_expires_when_active_transition_is_too_late() -> None:
+    fake = FakeRecognition()
+    pipeline = make_pipeline(fake)
+    fake.active_player = Seat.SELF
+    process(
+        pipeline, table(), 2, expected=Seat.SELF, revision=5, turn=11,
+        formal_action_boundary=frame(1),
+    )
+    fake.pass_seats = {Seat.SELF}
+    fake.active_player = Seat.RIGHT
+    late = process(
+        pipeline, table(), 20, expected=Seat.SELF, revision=5, turn=11,
+        formal_action_boundary=frame(1),
+    )
+    assert not late.candidates
+    assert pipeline.trackers[Seat.SELF].snapshot().pending_count == 1
 
 
 def test_nonempty_low_confidence_result_stays_unknown_even_on_stable_blank_probe() -> None:
