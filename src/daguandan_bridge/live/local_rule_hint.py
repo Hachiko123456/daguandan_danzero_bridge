@@ -52,6 +52,12 @@ class LocalRuleHintTracker:
         self._count = 0
         self._hint: LocalRuleHint | None = None
 
+    @property
+    def pending(self) -> bool:
+        """Whether one valid frame is waiting for the second confirmation."""
+
+        return self._count == 1 and self._hint is None
+
     def reset(self) -> None:
         self._identity = None
         self._epoch += 1

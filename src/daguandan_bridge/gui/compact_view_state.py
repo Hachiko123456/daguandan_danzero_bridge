@@ -76,8 +76,11 @@ def project_compact_view(update: object, *, now_ms: int) -> CompactViewState:
         return CompactViewState("blocked", "暂无法推荐", "请打开完整助手处理识别问题")
 
     hint = getattr(update, "local_rule_hint", None)
+    hint_pending = bool(getattr(update, "local_rule_hint_pending", False))
     generation = getattr(update, "capture_generation", None)
     session_id = str(getattr(snapshot, "session_id", "") or "")
+    if hint_pending and status == "running" and player == "self":
+        return CompactViewState("confirming", "确认中…")
     if isinstance(hint, LocalRuleHint) and status == "running" and hint.is_current(
         session_id=session_id, capture_generation=generation, now_ms=now_ms,
     ):
@@ -92,14 +95,23 @@ def project_compact_view(update: object, *, now_ms: int) -> CompactViewState:
     )
     # The canonical actor may be behind the visual actor; never call that a
     # harmless foreign turn. A stale withheld object cannot outrank new state.
+    withheld_reason = str(
+        getattr(update, "block_reason", "")
+        or getattr(raw, "withhold_reason", "")
+        or ""
+    )
+    # NOT_LOCAL_TURN is a normal waiting state, not a recognition failure.
+    # Actual recovery gaps retain priority even when the missing actor is a
+    # foreign seat; otherwise a real desynchronization would look harmless.
     if matches and getattr(raw, "status", None) == "withheld":
-        reason = str(getattr(update, "block_reason", "") or getattr(raw, "withhold_reason", "") or "")
-        if reason in {"previous_action_reread_pending", "turn_recovery_pending", "wind_catch_pass_recovery_pending"}:
+        if withheld_reason == "not_local_turn" and player != "self":
+            return CompactViewState("waiting", "等待自己回合")
+        if withheld_reason in {"previous_action_reread_pending", "turn_recovery_pending", "wind_catch_pass_recovery_pending"}:
             return CompactViewState("confirming", "确认中…")
         return CompactViewState(
             "blocked", "暂无法推荐",
             _blocked_detail(
-                reason, str(getattr(update, "missing_player", "") or ""),
+                withheld_reason, str(getattr(update, "missing_player", "") or ""),
                 str(getattr(update, "missing_action_kind", "") or ""),
             ),
         )

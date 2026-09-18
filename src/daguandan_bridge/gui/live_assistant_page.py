@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from time import monotonic_ns
 from typing import Any
 
 import cv2
@@ -44,6 +45,7 @@ from ..live.display_text import (
     seat_text,
 )
 from ..live.models import LiveEvent
+from ..live.local_rule_hint import LocalRuleHint
 from ..domain.live_runtime import LiveAdvice, LiveUpdate, ReviewRequest
 from ..live.recognition_strategy import RECOGNITION_STRATEGY_OPTIONS
 from ..live.truth_log import card_code_to_text, card_text_to_code
@@ -103,6 +105,9 @@ class LiveAssistantPage(ScrollArea):
         self._last_advice_timeline_key: tuple[object, ...] | None = None
         self._session_active = False
         self._geometry_terminal_error_visible = False
+        self._local_pass_ui_key: tuple[object, ...] | None = None
+        self._local_pass_ui_state = ""
+        self._local_pass_ui_until_ms = 0
         self.setObjectName("liveAssistantPage")
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -791,6 +796,9 @@ class LiveAssistantPage(ScrollArea):
         self._last_event_id = ""
         self._shown_event_ids.clear()
         self._last_advice_timeline_key = None
+        self._local_pass_ui_key = None
+        self._local_pass_ui_state = ""
+        self._local_pass_ui_until_ms = 0
         self.timeline.clear()
         self.review_bar.hide()
         self.lead_player_combo.setCurrentIndex(0)
@@ -954,6 +962,8 @@ class LiveAssistantPage(ScrollArea):
         self._show_advice(
             update.advice,
             update.fast_signals,
+            local_rule_hint=update.local_rule_hint,
+            local_rule_hint_pending=update.local_rule_hint_pending,
             live_status=update.status,
             snapshot=update.snapshot,
         )
@@ -996,23 +1006,86 @@ class LiveAssistantPage(ScrollArea):
             "确认后直接提示不出；单帧信号不会直接提交动作"
         )
 
+    def _local_pass_display_state(
+        self, *, snapshot: object | None, fast_signals: object | None,
+        live_status: object | None, local_rule_hint: object | None,
+        local_rule_hint_pending: bool,
+    ) -> tuple[bool, bool]:
+        """Apply UI hysteresis without changing formal PASS confirmation."""
+
+        if live_status != "running" or getattr(snapshot, "current_player", None) != "self":
+            self._local_pass_ui_key = None
+            self._local_pass_ui_state = ""
+            self._local_pass_ui_until_ms = 0
+            return False, False
+        key = (
+            getattr(snapshot, "session_id", ""),
+            getattr(snapshot, "turn_id", None),
+            getattr(snapshot, "revision", None),
+        )
+        now_ms = monotonic_ns() // 1_000_000
+        if key != self._local_pass_ui_key:
+            self._local_pass_ui_key = key
+            self._local_pass_ui_state = ""
+            self._local_pass_ui_until_ms = 0
+
+        active = getattr(fast_signals, "active_player", None)
+        invalidates = bool(
+            active in {"right", "opposite", "left"}
+            or getattr(fast_signals, "effect_visible", False)
+            or getattr(fast_signals, "super_double_visible", False)
+            or getattr(fast_signals, "game_end_control", None)
+        )
+        raw_candidate = self._cannot_beat_candidate(fast_signals)
+        if isinstance(local_rule_hint, LocalRuleHint):
+            self._local_pass_ui_state = "confirmed"
+            self._local_pass_ui_until_ms = max(
+                self._local_pass_ui_until_ms,
+                int(getattr(local_rule_hint, "expires_ms", now_ms)),
+            )
+        elif local_rule_hint_pending or raw_candidate:
+            self._local_pass_ui_state = "pending"
+            self._local_pass_ui_until_ms = max(
+                self._local_pass_ui_until_ms, now_ms + 500
+            )
+        elif invalidates or now_ms > self._local_pass_ui_until_ms:
+            self._local_pass_ui_state = ""
+            self._local_pass_ui_until_ms = 0
+        if self._local_pass_ui_state == "confirmed":
+            return False, True
+        if self._local_pass_ui_state == "pending":
+            return True, False
+        return False, False
+
     def _show_advice(
         self,
         raw: object | None,
         fast_signals: object | None = None,
         *,
+        local_rule_hint: object | None = None,
+        local_rule_hint_pending: bool = False,
         live_status: object | None = None,
         snapshot: object | None = None,
     ) -> None:
-        cannot_beat_visible = bool(
-            live_status == "running"
-            and getattr(snapshot, "current_player", None) == "self"
-            and self._cannot_beat_candidate(fast_signals)
+        # The raw fast signal is sampled every frame and is intentionally not
+        # a UI authority. Only the runtime's confirmed/pending local hint may
+        # change the PASS presentation.
+        local_pass_pending, local_pass_confirmed = self._local_pass_display_state(
+            snapshot=snapshot, fast_signals=fast_signals,
+            live_status=live_status, local_rule_hint=local_rule_hint,
+            local_rule_hint_pending=local_rule_hint_pending,
         )
         # Withheld states describe canonical recovery/history state and always
         # outrank a raw button match.  Outside those states, the current-frame
         # candidate outranks any advice object left from the preceding turn.
         if isinstance(raw, LiveAdvice) and raw.status == "withheld":
+            if raw.withhold_reason == "not_local_turn":
+                self.fabledan_debug_card.hide()
+                self.live_status.setText("状态：等待自己回合")
+                self.turn_status.setText(
+                    f"当前行动：{seat_text(getattr(snapshot, 'current_player', None), unknown='等待确认')}"
+                )
+                return
             if raw.withhold_reason == _WIND_CATCH_PASS_RECOVERY_PENDING:
                 self.live_status.setText("状态：正在确认接风前的不出")
                 self.turn_status.setText(
@@ -1033,8 +1106,13 @@ class LiveAssistantPage(ScrollArea):
             and getattr(raw.advice, "strategy", None) == "button_cannot_beat"
             and self._advice_matches_snapshot(raw, snapshot)
         )
-        if cannot_beat_visible and not button_ready:
+        if local_pass_pending:
             self._show_fast_cannot_beat_status()
+            return
+        if local_pass_confirmed and not button_ready:
+            self.fabledan_debug_card.hide()
+            self.live_status.setText("状态：建议不出")
+            self.turn_status.setText("按钮已连续确认；请点击不出")
             return
         if not isinstance(raw, LiveAdvice):
             return
@@ -1412,6 +1490,9 @@ class LiveAssistantPage(ScrollArea):
             if self._geometry_terminal_error_visible:
                 self.error_status.clear()
                 self._geometry_terminal_error_visible = False
+        self._local_pass_ui_key: tuple[object, ...] | None = None
+        self._local_pass_ui_state = ""
+        self._local_pass_ui_until_ms = 0
 
     def _session_finished(self, _value: object) -> None:
         self._session_active = False

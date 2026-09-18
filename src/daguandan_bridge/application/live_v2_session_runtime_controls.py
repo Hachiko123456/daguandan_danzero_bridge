@@ -20,16 +20,32 @@ class LiveV2ControlMixin:
                 now_ms=self._clock.processing_ms(), running=self.status == "running",
                 frame_size=frame_size,
             )
-            if hint is None:
-                return None
+            if hint is not None:
+                self._last_local_hint = hint
+            elif (
+                getattr(fast, "active_player", None) in {"right", "opposite", "left"}
+                or getattr(fast, "effect_visible", False)
+                or getattr(fast, "super_double_visible", False)
+                or getattr(fast, "game_end_control", None)
+            ):
+                # A known turn transition or animation invalidates the visual
+                # PASS display immediately; an unreadable single frame does not.
+                self._last_local_hint = None
             opportunity = self._engine.state.opportunity.current
             accepted = False
-            if opportunity is not None and self._advice_pump is not None:
+            if (
+                hint is not None
+                and opportunity is not None
+                and self._advice_pump is not None
+            ):
                 accepted = self._advice_pump.confirm_local_pass(opportunity, hint)
-            update = self._plain_update(fast=fast, local_rule_hint=hint)
-        if accepted and self._on_update:
+            update = self._plain_update(
+                fast=fast, local_rule_hint=(hint or self._last_local_hint),
+                local_rule_hint_pending=self._hint.pending,
+            )
+        if (hint is not None or self._last_local_hint is not None) and self._on_update:
             self._on_update(update)
-        return update
+        return update if (hint is not None or self._last_local_hint is not None) else None
 
     def _accept_local_pass(self, opportunity, hint: object) -> bool:
         with self._lock:

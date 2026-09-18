@@ -339,13 +339,17 @@ def project_engine_result(
     action_events: tuple[LiveEvent, ...], status: LiveStatus,
     latest_advice: LiveAdvice | None, sequence: int,
     fast_signals: object | None = None,
+    local_rule_hint: object | None = None,
+    local_rule_hint_pending: bool = False,
 ) -> tuple[LiveUpdate, LiveStatus, LiveAdvice | None, int]:
     update = result.update
     if update is None:
         sequence += 1
         projected = live_update(
             status=status, snapshot=snapshot, sequence=sequence,
-            advice=latest_advice, block_reason="engine_input_rejected",
+            advice=latest_advice, local_rule_hint=local_rule_hint,
+            local_rule_hint_pending=local_rule_hint_pending,
+            block_reason="engine_input_rejected",
         )
         return projected, status, latest_advice, sequence
     sequence = max(sequence, update.version.update_sequence)
@@ -368,7 +372,8 @@ def project_engine_result(
         status=status, snapshot=snapshot, sequence=sequence,
         advice=latest_advice,
         events=action_events,
-        fast_signals=fast_signals, block_reason=blocked,
+        fast_signals=fast_signals, local_rule_hint=local_rule_hint,
+        local_rule_hint_pending=local_rule_hint_pending, block_reason=blocked,
         missing_player=missing, missing_action_kind="action" if missing else "",
     )
     return projected, status, latest_advice, sequence
@@ -383,6 +388,7 @@ def live_update(
     events: tuple[LiveEvent, ...] = (),
     fast_signals: object | None = None,
     local_rule_hint: object | None = None,
+    local_rule_hint_pending: bool = False,
     block_reason: str = "",
     missing_player: str | None = None,
     missing_action_kind: str = "",
@@ -395,6 +401,7 @@ def live_update(
         advice=advice,
         fast_signals=fast_signals,
         local_rule_hint=local_rule_hint,
+        local_rule_hint_pending=bool(local_rule_hint_pending),
         capture_generation=snapshot.version.capture_generation,
         update_sequence=sequence,
         block_reason=block_reason,

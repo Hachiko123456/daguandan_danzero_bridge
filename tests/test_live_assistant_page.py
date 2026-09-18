@@ -581,7 +581,9 @@ def test_live_page_cannot_beat_candidate_hides_stale_ready_advice():
     )
     app.processEvents()
 
-    assert page.live_status.text() == "状态：运行中"
+    # A single missed button frame stays in the bounded UI grace window, so
+    # the presentation does not flicker back to an old model result.
+    assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
     assert page.fabledan_debug_card.isHidden()
     page.close()
 
@@ -611,24 +613,37 @@ def test_live_page_rejects_unsafe_cannot_beat_candidates_and_clears_status():
     app.processEvents()
     assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
 
-    unsafe_signals = (
+    # Transient recognition loss keeps the short UI grace state. A known turn
+    # transition explicitly clears it.
+    transient_signals = (
         _cannot_beat_fast(cannot_beat_confidence=0.79),
-        _cannot_beat_fast(active_player="right"),
-        _cannot_beat_fast(effect_visible=True),
-        _cannot_beat_fast(self_action_buttons_visible=False),
-        _cannot_beat_fast(cannot_beat_visible=False),
+        _cannot_beat_fast(active_player=None),
     )
-    for signal in unsafe_signals:
+    for signal in transient_signals:
         page.apply_update(
-            LiveUpdate(
-                status="running",
-                snapshot=snapshot,
-                fast_signals=signal,
-            )
+            LiveUpdate(status="running", snapshot=snapshot, fast_signals=signal)
         )
         app.processEvents()
-        assert page.live_status.text() == "状态：运行中"
-        assert "要不起" not in page.turn_status.text()
+        assert page.live_status.text() == "状态：检测到要不起，正在确认不出"
+
+    page.apply_update(
+        LiveUpdate(
+            status="running", snapshot=snapshot,
+            fast_signals=_cannot_beat_fast(active_player="right"),
+        )
+    )
+    app.processEvents()
+    assert page.live_status.text() == "状态：运行中"
+    assert "要不起" not in page.turn_status.text()
+
+    page.apply_update(
+        LiveUpdate(
+            status="running", snapshot=snapshot,
+            fast_signals=_cannot_beat_fast(effect_visible=True),
+        )
+    )
+    app.processEvents()
+    assert page.live_status.text() == "状态：运行中"
     page.close()
 
 

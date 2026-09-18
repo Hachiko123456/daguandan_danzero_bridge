@@ -93,6 +93,7 @@ class LiveV2LifecycleMixin:
     def pause(self):
         self._status_before_pause, self.status = self.status, "paused"
         self._hint.reset()
+        self._last_local_hint = None
         return self._plain_update()
 
     def resume(self, *, monotonic_ms: int):
@@ -109,10 +110,12 @@ class LiveV2LifecycleMixin:
         if self.status != "sealed":
             self.status = "finalizing"
         self._hint.reset()
+        self._last_local_hint = None
         return self._plain_update()
 
     def capture_interrupted(self, reason: str, *, monotonic_ms: int):
         self._hint.reset()
+        self._last_local_hint = None
         self._clock.advance(monotonic_ms)
         self._safe_fault("capture_interrupted", reason, monotonic_ms=monotonic_ms)
         return self._plain_update(block_reason=f"capture_interrupted:{reason}")

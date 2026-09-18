@@ -174,6 +174,7 @@ class LiveV2SessionRuntime(
         self._initialized = False
         self._generation = self._sequence = self._frame_sequence = self._last_ms = 0
         self._hint = LocalRuleHintTracker()
+        self._last_local_hint: Any | None = None
         self._status_before_pause: LiveStatus | None = None
         self._opening_required = False
         self._visual_corrections: dict[str, _VisualCorrection] = {}
@@ -236,6 +237,7 @@ class LiveV2SessionRuntime(
             self._generation = generation
             self._frame_sequence = 0
             self._hint.reset()
+            self._last_local_hint = None
             self._visual_corrections.clear()
             self._last_visual_repair_seat = None
             self._suppressed_correction_surfaces.clear()
@@ -736,10 +738,13 @@ class LiveV2SessionRuntime(
         events = self.rule_session.events_for_actions(confirmed) if confirmed else ()
         for action in confirmed:
             self._pending.pop(action.source_candidate.candidate_id, None)
+        local_hint, local_hint_pending = self._local_hint_projection()
         projected, self.status, self.latest_advice, self._sequence = project_engine_result(
             result=result, snapshot=self._engine.state.snapshot, action_events=events,
             status=self.status, latest_advice=self.latest_advice,
             sequence=self._sequence, fast_signals=fast,
+            local_rule_hint=local_hint,
+            local_rule_hint_pending=local_hint_pending,
         )
         if self._engine.state.snapshot.current_seat is None:
             self._visual_corrections.clear()
@@ -804,13 +809,19 @@ class LiveV2SessionRuntime(
     def _plain_update(
         self, *, block_reason: str = "", fast: Any = None,
         local_rule_hint: Any = None,
+        local_rule_hint_pending: bool | None = None,
     ) -> LiveUpdate:
         self._require_initialized()
         self._sequence += 1
+        if local_rule_hint is None and local_rule_hint_pending is None:
+            local_rule_hint, local_rule_hint_pending = self._local_hint_projection()
+        elif local_rule_hint_pending is None:
+            local_rule_hint_pending = self._hint.pending
         return live_update(
             status=self.status, snapshot=self._trusted_snapshot(),
             sequence=self._sequence, advice=self.latest_advice,
             fast_signals=fast, local_rule_hint=local_rule_hint,
+            local_rule_hint_pending=bool(local_rule_hint_pending),
             block_reason=block_reason,
         )
 
@@ -820,6 +831,32 @@ class LiveV2SessionRuntime(
             self._opening_required = True
         self._safe_fault("rule_session", str(exc), operation=operation)
         return self._plain_update(block_reason=f"rule_{operation}_failed")
+
+    def _local_hint_projection(self) -> tuple[Any | None, bool]:
+        """Return the stable local-pass presentation state.
+
+        The formal tracker may reject one unsafe frame immediately; the UI is
+        allowed to retain the last confirmed hint for its bounded TTL while
+        the canonical turn and capture generation remain unchanged.
+        """
+
+        if self._engine is None:
+            return None, False
+        snapshot = self._engine.state.snapshot
+        now_ms = self._clock.processing_ms()
+        if snapshot.current_seat is not Seat.SELF:
+            self._last_local_hint = None
+            return None, False
+        if self._last_local_hint is not None:
+            hint = self._last_local_hint
+            is_current = getattr(hint, "is_current", lambda **_: False)(
+                session_id=self.store.session_id,
+                capture_generation=self._generation,
+                now_ms=now_ms,
+            )
+            if not is_current:
+                self._last_local_hint = None
+        return self._last_local_hint, self._hint.pending
 
     def _trusted_snapshot(self):
         self._require_initialized()

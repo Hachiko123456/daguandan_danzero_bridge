@@ -91,6 +91,7 @@ class LiveUpdate:
     # Kept presentation-neutral so the domain contract does not import the
     # legacy visual tracker implementation.
     local_rule_hint: object | None = None
+    local_rule_hint_pending: bool = False
     capture_generation: int = 0
     update_sequence: int = 0
     block_reason: str = ""
