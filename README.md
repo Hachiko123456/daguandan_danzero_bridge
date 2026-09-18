@@ -26,6 +26,39 @@ EXE 会把发布目录中的 `data/` 当作不可写的资源种子；首次启�
 `%LOCALAPPDATA%\DaguandanAssistant` 下，不会修改 EXE 所在目录。测试或便携
 部署可用绝对路径环境变量 `DAGUANDAN_DATA_ROOT` 替换该根目录。
 
+### 把对局证据迁移到独立磁盘
+
+对局录像、帧索引和诊断文件可以单独迁移到例如 `D:\sessions`，模板、模型和
+profile 配置仍保留在当前数据根目录。迁移前必须退出助手并确认没有 `.part`
+文件正在写入。迁移命令只复制并校验文件，不删除旧目录；成功后会写入 profile
+级 sessions 指针，后续新对局、回放和容量统计统一使用目标目录：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\migrate_sessions.py migrate `
+  --profiles-root ".\data\profiles" `
+  --profile "tencent_daguandan" `
+  --target "D:\sessions"
+```
+
+查询当前目录：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\migrate_sessions.py status `
+  --profiles-root ".\data\profiles" `
+  --profile "tencent_daguandan"
+```
+
+撤销路径指针（不会删除 D 盘数据）：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\migrate_sessions.py rollback `
+  --profiles-root ".\data\profiles" `
+  --profile "tencent_daguandan"
+```
+
+打包版也支持直接调用：`DaguandanAssistant.exe --migrate-sessions "D:\sessions"`。
+迁移过程会保留源目录和回执，确认新目录运行正常后再人工清理旧数据。
+
 从旧便携版迁移时必须显式执行：
 
 ```powershell

@@ -7,6 +7,7 @@ from typing import Any
 from .application.ports import AdvicePort, CapturePort, RecognitionPort, SessionFactoryPort
 from .advisor_strategy import build_advisor, load_profile_advisor_strategy
 from .config import PROFILES_ROOT
+from .session_paths import resolve_sessions_root
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ def build_live_controller_dependencies(
     LiveSessionStore.recover_incomplete_sessions(
         capture_adapter.profiles_root,
         profile_name,
+        sessions_root=resolve_sessions_root(capture_adapter.profiles_root, profile_name),
     )
     annotation = AnnotationService(capture_adapter.profiles_root, profile_name)
     templates = TemplateService(capture_adapter.profiles_root, profile_name)
@@ -99,5 +101,5 @@ def build_application_dependencies(
     return ApplicationDependencies(
         live_runtime,
         AnnotationService(profiles_root, profile_name),
-        profiles_root / profile_name / "sessions",
+        resolve_sessions_root(profiles_root, profile_name),
     )

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import PROFILES_ROOT
+from .session_paths import resolve_sessions_root
 from .storage import atomic_write_json
 
 
@@ -311,10 +312,16 @@ def save_profile_recording_mode(
 def recording_media_usage_bytes(
     profiles_root: Path | str = PROFILES_ROOT,
     profile_name: str = "tencent_daguandan",
+    *,
+    sessions_root: Path | str | None = None,
 ) -> int:
     """Return media bytes owned by recorded sessions without following links."""
 
-    root = Path(profiles_root) / profile_name / "sessions"
+    root = (
+        Path(sessions_root).expanduser().resolve()
+        if sessions_root is not None
+        else resolve_sessions_root(profiles_root, profile_name)
+    )
     used = 0
     pending = [root] if root.is_dir() else []
     media_suffixes = {".avi", ".mp4", ".png", ".jpg", ".jpeg", ".bmp"}

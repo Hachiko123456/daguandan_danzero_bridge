@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from ..profiles import normalize_profile_name
 from ..storage import atomic_write_json
+from ..session_paths import resolve_sessions_root
 from .display_text import event_action_text, event_prefix, reasons_text
 from .models import LiveEvent
 from .pipeline_timing import PipelineTiming
@@ -107,6 +108,8 @@ class LiveSessionStore:
         cls,
         profiles_root: Path,
         profile_name: str,
+        *,
+        sessions_root: Path | None = None,
     ) -> tuple[Path, ...]:
         """Mark sessions left running by a previous process as aborted.
 
@@ -115,7 +118,9 @@ class LiveSessionStore:
         """
 
         profile = normalize_profile_name(profile_name)
-        sessions_root = Path(profiles_root) / profile / "sessions"
+        sessions_root = Path(sessions_root) if sessions_root is not None else resolve_sessions_root(
+            profiles_root, profile
+        )
         if not sessions_root.is_dir():
             return ()
 
@@ -177,12 +182,17 @@ class LiveSessionStore:
         *,
         session_id: str | None = None,
         directory_group: str | None = None,
+        sessions_root: Path | None = None,
         automatic_log_delivery_enabled: bool = False,
         automatic_log_include_media: bool = False,
     ) -> None:
         self.profile_name = normalize_profile_name(profile_name)
         self.session_id = _validate_session_id(session_id or _new_session_id())
-        sessions_root = Path(profiles_root) / self.profile_name / "sessions"
+        sessions_root = (
+            Path(sessions_root)
+            if sessions_root is not None
+            else resolve_sessions_root(profiles_root, self.profile_name)
+        )
         if directory_group is not None:
             group = str(directory_group).strip()
             if group != ".preopening":
@@ -217,6 +227,7 @@ class LiveSessionStore:
         profiles_root: Path,
         profile_name: str,
         *,
+        sessions_root: Path | None = None,
         automatic_log_delivery_enabled: bool = False,
         automatic_log_include_media: bool = False,
     ) -> "LiveSessionStore":
@@ -227,6 +238,7 @@ class LiveSessionStore:
             profile_name,
             session_id=_new_opening_id(),
             directory_group=".preopening",
+            sessions_root=sessions_root,
             automatic_log_delivery_enabled=automatic_log_delivery_enabled,
             automatic_log_include_media=automatic_log_include_media,
         )

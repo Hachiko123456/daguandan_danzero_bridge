@@ -60,6 +60,7 @@ from ..advisor_strategy import (
     save_profile_advisor_strategy,
 )
 from ..config import PROFILES_ROOT
+from ..session_paths import resolve_sessions_root
 from ..danzero.state import RANKS
 from ..domain.truth import LabelProvenance, TruthEvidence
 from ..image_io import save_image_unicode
@@ -641,7 +642,7 @@ class ReplayPage(QWidget):
         super().__init__(parent)
         self.sessions_root = Path(
             sessions_root
-            or (PROFILES_ROOT / "tencent_daguandan" / "sessions")
+            or resolve_sessions_root(PROFILES_ROOT, profile_name or "tencent_daguandan")
         )
         self.profiles_root = (
             Path(profiles_root).expanduser().resolve()

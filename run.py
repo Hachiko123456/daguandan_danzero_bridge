@@ -83,6 +83,27 @@ def main(argv: list[str] | None = None) -> int:
         help="按迁移回执恢复迁移前的数据 generation；若当前 pointer 已更新则拒绝覆盖。",
     )
     parser.add_argument(
+        "--migrate-sessions",
+        type=Path,
+        metavar="TARGET",
+        help="把当前 profile 的 sessions 安全复制、校验并切换到目标目录，例如 D:\\sessions。",
+    )
+    parser.add_argument(
+        "--migrate-sessions-source",
+        type=Path,
+        help="可选的旧 sessions 源目录；省略时使用当前生效目录。",
+    )
+    parser.add_argument(
+        "--rollback-sessions",
+        action="store_true",
+        help="撤销当前 sessions 路径指针，保留已迁移目标目录。",
+    )
+    parser.add_argument(
+        "--sessions-status",
+        action="store_true",
+        help="输出当前 sessions 根目录和迁移指针状态。",
+    )
+    parser.add_argument(
         "--_doctor-import-probe",
         help=argparse.SUPPRESS,
     )
@@ -193,6 +214,9 @@ def main(argv: list[str] | None = None) -> int:
             bool(args.doctor),
             args.migrate_portable_data is not None,
             args.restore_portable_migration is not None,
+            args.migrate_sessions is not None,
+            bool(args.rollback_sessions),
+            bool(args.sessions_status),
             args._doctor_import_probe is not None,
             args.export_support is not None,
             args.export_session_diagnostic is not None,
@@ -204,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if selected_modes > 1:
         parser.error(
-            "基准、模拟窗口、窗口 E2E、doctor、迁移、支持导出和复现模式不能同时启用"
+            "基准、模拟窗口、窗口 E2E、doctor、迁移、sessions 迁移、支持导出和复现模式不能同时启用"
         )
     if args.doctor_output is not None and not (
         args.doctor or args._doctor_import_probe is not None
@@ -229,6 +253,30 @@ def main(argv: list[str] | None = None) -> int:
         args.truth_input_sha256 is not None or args.truth_frame_seq is not None
     ):
         parser.error("外部 --repro-truth 已包含输入绑定，不能被命令行选择器覆盖")
+    if args.migrate_sessions is not None or args.rollback_sessions or args.sessions_status:
+        from daguandan_bridge.config import PROFILES_ROOT
+        from daguandan_bridge.sessions_migration import (
+            migrate_sessions, rollback_sessions, sessions_migration_status,
+        )
+
+        profile_name = "tencent_daguandan"
+        if args.migrate_sessions is not None:
+            result = migrate_sessions(
+                profiles_root=PROFILES_ROOT, profile_name=profile_name,
+                target_root=args.migrate_sessions,
+                source_root=args.migrate_sessions_source,
+            ).to_dict()
+        elif args.rollback_sessions:
+            result = rollback_sessions(
+                profiles_root=PROFILES_ROOT, profile_name=profile_name
+            ).to_dict()
+        else:
+            result = sessions_migration_status(
+                profiles_root=PROFILES_ROOT, profile_name=profile_name
+            )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
     if args._doctor_import_probe is not None:
         from daguandan_bridge.doctor import run_import_probe
 

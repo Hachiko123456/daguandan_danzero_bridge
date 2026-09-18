@@ -61,6 +61,7 @@ from ..live.replay import FrameIndexRecord, VideoReplaySource
 from ..live.session_store import read_json_lines
 from ..models import Box
 from ..recognition_service import RecognitionResult, ScreenshotRecognitionService
+from ..session_paths import resolve_sessions_root
 from ..template_service import SOURCE_ROLES, TEMPLATE_KINDS, TemplateService
 from .region_config_page import RegionConfigPage
 from .single_image_danzero_page import SingleImageDanzeroPage
@@ -327,7 +328,9 @@ class AnnotationPage(QWidget):
             if self.service.screenshots_root.is_dir()
             else None
         )
-        self.sessions_root = self.service.profile_root / "sessions"
+        self.sessions_root = resolve_sessions_root(
+            self.service.profiles_root, self.service.profile_name
+        )
         self.current_session: Path | None = None
         self._session_decode_thread: ReplayDecodeThread | None = None
         self._session_record = None

@@ -28,6 +28,7 @@ from ..advisor_strategy import (
 from ..live.recorder import InMemorySessionRecorder
 from ..live.session_store import LiveSessionStore
 from ..runtime_identity import get_runtime_identity
+from ..session_paths import resolve_sessions_root
 from ..storage import atomic_write_json
 from .live_v2_composition import build_production_live_v2_runtime
 from .process_session_recorder import ProcessSessionRecorder
@@ -263,6 +264,7 @@ class DefaultLiveSessionFactory:
         )
         self._pending_opening_recording: ListenerRecording | None = None
         self._active_listener_recording: ListenerRecording | None = None
+        self.sessions_root = resolve_sessions_root(capture.profiles_root, profile_name)
 
     def with_advisor(self, advisor: AdvicePort) -> "DefaultLiveSessionFactory":
         replacement = DefaultLiveSessionFactory(
@@ -349,6 +351,7 @@ class DefaultLiveSessionFactory:
         store = LiveSessionStore.for_opening_evidence(
             self.capture.profiles_root,
             self.profile_name,
+            sessions_root=self.sessions_root,
             automatic_log_delivery_enabled=True,
             automatic_log_include_media=load_profile_automatic_log_include_media(
                 self.capture.profiles_root, self.profile_name
@@ -366,6 +369,7 @@ class DefaultLiveSessionFactory:
                 "recording_phase": "listening",
                 "initial_state_status": "unconfirmed",
                 "recording_mode": "all",
+                "sessions_root": str(self.sessions_root),
                 "advisor": self._advisor_manifest(),
             }
         )
@@ -494,6 +498,7 @@ class DefaultLiveSessionFactory:
         store = LiveSessionStore(
             self.capture.profiles_root,
             self.profile_name,
+            sessions_root=self.sessions_root,
             automatic_log_delivery_enabled=True,
             automatic_log_include_media=load_profile_automatic_log_include_media(
                 self.capture.profiles_root, self.profile_name
@@ -511,6 +516,7 @@ class DefaultLiveSessionFactory:
                 "recording_phase": "live",
                 "initial_state_status": "pending",
                 "recording_mode": recording_mode,
+                "sessions_root": str(self.sessions_root),
                 "advisor": self._advisor_manifest(),
             }
         )
@@ -551,7 +557,8 @@ class DefaultLiveSessionFactory:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("recording_max_total_bytes must be a non-negative integer")
         used = recording_media_usage_bytes(
-            self.capture.profiles_root, self.profile_name
+            self.capture.profiles_root, self.profile_name,
+            sessions_root=self.sessions_root,
         )
         return max(0, limit - used)
 
