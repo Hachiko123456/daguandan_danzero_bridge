@@ -27,6 +27,7 @@ from daguandan_bridge.live_v2.types import (
     ConfirmedAction,
     FrameIdentity,
     GapPhase,
+    GapReason,
     ObservationKind,
     ObservationReason,
     OpportunityStatus,
@@ -215,6 +216,30 @@ def test_projection_failure_does_not_stop_later_observation_or_recovery() -> Non
     assert third.update.confirmed_actions
     assert third.update.gap.phase is GapPhase.CLEAR
     assert len(projector.calls[-1]) == 2
+
+
+def test_rule_rejected_candidate_is_recoverable_and_fresh_state_can_continue():
+    clock = Clock(200)
+    projector = Projector([ProjectionReason.RULE_REJECTED, ProjectionReason.ACCEPTED])
+    committer = Committer()
+    core = engine(clock, projector, committer, evidence_max_age_ms=100)
+
+    bad = candidate("bad", core.state.version, 100)
+    rejected = core.process(EngineInput(candidates=(bad,)))
+    assert rejected.update.gap.phase is GapPhase.RECOVERABLE
+    assert rejected.update.gap.reason is GapReason.RULE_REJECTION
+
+    # Once the provisional evidence ages out, a fresh candidate is projected
+    # independently and can clear the recoverable gap.
+    clock.value = 400
+    fresh = candidate("fresh", core.state.version, 350)
+    recovered = core.process(EngineInput(
+        candidates=(fresh,), captured_watermark_ms=350
+    ))
+    assert recovered.update.confirmed_actions
+    assert recovered.update.gap.phase is GapPhase.CLEAR
+    assert [item.candidate_id for item in projector.calls[-1]] == ["fresh"]
+
 
 
 def test_engine_retains_a_complete_provider_snapshot_from_initialization() -> None:

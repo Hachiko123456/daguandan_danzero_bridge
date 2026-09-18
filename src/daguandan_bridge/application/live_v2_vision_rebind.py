@@ -35,7 +35,9 @@ def salvage_vision_result(
     candidates = tuple(
         replace(candidate, version=current_version)
         for candidate in result.candidates
-        if same_state or _strictly_after(candidate.first_frame, formal_action_boundary)
+        if same_state or _candidate_crosses_boundary(
+            candidate.first_frame, candidate.last_frame, formal_action_boundary
+        )
     )
     return replace(
         result,
@@ -51,6 +53,24 @@ def _same_stream(left: VersionIdentity, right: VersionIdentity) -> bool:
     ) == (
         right.session_id,
         right.capture_generation,
+    )
+
+
+def _candidate_crosses_boundary(
+    first: FrameIdentity,
+    last: FrameIdentity,
+    boundary: FrameIdentity | None,
+) -> bool:
+    """Salvage a two-frame candidate that starts at, then crosses, a boundary."""
+
+    if boundary is None:
+        return True
+    return (
+        first.session_id == boundary.session_id
+        and first.capture_generation == boundary.capture_generation
+        and first.frame_sequence >= boundary.frame_sequence
+        and first.captured_ms >= boundary.captured_ms
+        and _strictly_after(last, boundary)
     )
 
 

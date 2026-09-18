@@ -84,7 +84,7 @@ class GapLifecycle:
                 GapReason.OUT_OF_ORDER_EVIDENCE,
             ),
             ProjectionReason.RULE_REJECTED: (
-                GapPhase.BLOCKING,
+                GapPhase.RECOVERABLE,
                 GapReason.RULE_REJECTION,
             ),
             ProjectionReason.VERSION_MISMATCH: (

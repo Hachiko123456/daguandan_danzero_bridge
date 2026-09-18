@@ -116,6 +116,26 @@ def test_self_priority_cannot_starve_other_seats() -> None:
     assert Seat.SELF in scheduler.snapshot().pending_seats
 
 
+def test_strict_preferred_never_reads_a_foreign_seat() -> None:
+    scheduler = ObservationScheduler(starvation_ms=1, raw_max_age_ms=1000)
+    scheduler.submit_raw(
+        seat=Seat.LEFT, frame=frame(1), enqueued_ms=100,
+        reason=ObservationReason.UNREADABLE,
+    )
+    scheduler.submit_raw(
+        seat=Seat.RIGHT, frame=frame(2), enqueued_ms=200,
+        reason=ObservationReason.UNREADABLE,
+    )
+    selected = scheduler.pop_next(
+        now_ms=500, expected_seat=Seat.RIGHT, strict_preferred=True
+    )
+    assert selected is not None and selected.seat is Seat.RIGHT
+    assert scheduler.pop_next(
+        now_ms=500, expected_seat=Seat.RIGHT, strict_preferred=True
+    ) is None
+    assert Seat.LEFT in scheduler.snapshot().pending_seats
+
+
 def test_oldest_request_wins_at_starvation_threshold() -> None:
     scheduler = ObservationScheduler(starvation_ms=100, raw_max_age_ms=1000)
     scheduler.submit_raw(

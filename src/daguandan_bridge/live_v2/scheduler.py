@@ -162,6 +162,7 @@ class ObservationScheduler:
         now_ms: int,
         expected_seat: Seat | None = None,
         self_opportunity: bool = False,
+        strict_preferred: bool = False,
     ) -> ScheduledRead | None:
         """Pop one read using priority boosts with bounded starvation."""
 
@@ -171,8 +172,16 @@ class ObservationScheduler:
         if expected_seat is not None:
             self._validate_seat(expected_seat)
 
-        oldest = self._raw.oldest()
         preferred = self._preferred(expected_seat, self_opportunity)
+        if strict_preferred and preferred is not None:
+            chosen = self._raw.get(preferred)
+            if chosen is None:
+                return None
+            item = self._raw.pop(chosen.seat)
+            self._update_burst(preferred, item.seat)
+            return item
+
+        oldest = self._raw.oldest()
         if max(0, now_ms - oldest.enqueued_ms) >= self.starvation_ms:
             chosen = oldest
         elif self._must_yield(preferred):

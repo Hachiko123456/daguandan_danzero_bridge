@@ -165,7 +165,11 @@ def test_consume_salvages_only_post_boundary_candidates_from_ancestor_state() ->
     pipeline = FramePipelineResult(
         frame(4, 1), FastSignalResult("opposite", None, False, False, False),
         (), (observation,),
-        (_candidate("overlap", old, 1, 3), _candidate("next", old, 3, 4)),
+        (
+            _candidate("overlap", old, 1, 3),
+            _candidate("boundary-witness", old, 2, 3),
+            _candidate("next", old, 3, 4),
+        ),
         (), (), 0, (),
     )
     runtime_result = VisionRuntimeResult(
@@ -180,5 +184,7 @@ def test_consume_salvages_only_post_boundary_candidates_from_ancestor_state() ->
     )
     assert failures == () and len(results) == 1
     assert results[0].observations == ()
-    assert [item.candidate_id for item in results[0].candidates] == ["next"]
+    assert [item.candidate_id for item in results[0].candidates] == [
+        "boundary-witness", "next"
+    ]
     assert results[0].candidates[0].version == current

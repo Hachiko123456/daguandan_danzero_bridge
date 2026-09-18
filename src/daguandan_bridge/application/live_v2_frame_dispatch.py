@@ -187,6 +187,7 @@ class FrameReadDispatcher:
                     self_opportunity
                     and repair_preferred is expected_seat
                 ),
+                strict_preferred=self.config.strict_current_seat_only,
             )
             if item is None:
                 break
@@ -205,8 +206,13 @@ class FrameReadDispatcher:
                 "pass_not_eligible_for_current_turn"
                 if item.seat not in pass_eligible_seats
                 else "pass_not_after_formal_action_boundary"
-                if not _after_formal_boundary(
-                    observation.frame, formal_action_boundary
+                if not (
+                    _after_formal_boundary(
+                        observation.frame, formal_action_boundary
+                    )
+                    or _at_formal_boundary(
+                        observation.frame, formal_action_boundary
+                    )
                 )
                 else ""
             ) if observation.kind is ObservationKind.PASS else ""
@@ -337,6 +343,14 @@ def _observation_size(item: SeatObservation) -> int:
 
 def _candidate_size(item: ActionCandidate) -> int:
     return 256 + sum(len(value) for value in item.cards + item.evidence_ids)
+
+
+def _at_formal_boundary(
+    frame: FrameIdentity, boundary: FrameIdentity | None
+) -> bool:
+    """Allow one same-capture witness; confirmation still needs a newer frame."""
+
+    return boundary is not None and frame == boundary
 
 
 def _after_formal_boundary(

@@ -850,6 +850,7 @@ class LiveAssistantController(QObject):
             "round_level_unresolved": "正在确认当前级牌",
             "hand_count_mismatch": f"正在确认起手牌，已识别{count}张",
             "hand_invalid": "起手牌识别有冲突，正在重新确认",
+            "hand_unresolved": "起手牌存在未确认花色，正在等待清晰画面",
             "missed_opening": f"错过完整开局，当前{count}张，本局暂无法推荐",
             "opening_seed_invalid": f"已识别{count}张，等待首出确认",
             "confirming_hand": f"已识别{count}张，正在确认起手牌",

@@ -167,9 +167,16 @@ class OpeningTracker:
             self.saw_action = True
             if self.started_ms is None:
                 self.started_ms = now
-        if 0 < len(hand) != 27 or evaluation.reason == "hand_invalid":
+        if (
+            0 < len(hand) != 27
+            or evaluation.reason in {"hand_invalid", "hand_unresolved"}
+        ):
             self.discard_candidates()
-            self.reason = "missed_opening" if 0 < len(hand) < 27 else "hand_invalid"
+            self.reason = (
+                "missed_opening"
+                if 0 < len(hand) < 27
+                else evaluation.reason
+            )
             return OpeningGateEvaluation(False, self.reason, None, None)
         if evaluation.normalized_hand is None:
             # Explicit seat/first-action evidence may arrive while the hand
@@ -268,6 +275,8 @@ def evaluate_opening_gate(
     hand = tuple(str(card) for card in tuple(getattr(result, "my_hand", ()) or ()))
     if len(hand) != 27:
         return OpeningGateEvaluation(False, "hand_count_mismatch", None, None)
+    if any(card.endswith("?") for card in hand):
+        return OpeningGateEvaluation(False, "hand_unresolved", None, None)
     try:
         state = GuanDanState()
         state.confirm_hand(hand)

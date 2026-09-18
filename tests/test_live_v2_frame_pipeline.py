@@ -266,6 +266,28 @@ def test_pass_evidence_must_be_strictly_after_formal_action_boundary() -> None:
     assert candidate.first_frame.captured_ms > boundary.captured_ms
 
 
+def test_pass_can_use_exact_boundary_frame_only_as_first_witness() -> None:
+    fake = FakeRecognition()
+    fake.pass_seats = {Seat.RIGHT}
+    pipeline = make_pipeline(fake)
+    boundary = frame(2)
+
+    first = process(
+        pipeline, table(), 2, expected=Seat.RIGHT,
+        formal_action_boundary=boundary,
+    )
+    assert not first.candidates
+    assert any(item.kind is ObservationKind.PASS for item in first.observations)
+
+    confirmed = process(
+        pipeline, table(), 3, expected=Seat.RIGHT,
+        formal_action_boundary=boundary,
+    )
+    candidate = next(item for item in confirmed.candidates if item.seat is Seat.RIGHT)
+    assert candidate.first_frame == boundary
+    assert candidate.last_frame == frame(3)
+
+
 def test_persistent_pass_rearms_after_marker_clear_not_formal_turnover() -> None:
     fake = FakeRecognition()
     fake.pass_seats = {Seat.RIGHT}

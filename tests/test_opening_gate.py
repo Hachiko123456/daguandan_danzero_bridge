@@ -24,6 +24,37 @@ def observe(tracker, item, tick, *, generation=0, identity=None):
                            monotonic_ms=tick, observation_id=tick if identity is None else identity)
 
 
+
+def test_unknown_suit_hand_never_confirms_and_fresh_exact_frames_can_recover():
+    tracker = OpeningTracker()
+    uncertain = list(HAND)
+    uncertain[0] = uncertain[0][:-1] + "?"
+    uncertain = tuple(uncertain)
+
+    first = observe(tracker, result(hand=uncertain, level="4"), 100)
+    second = observe(tracker, result(hand=uncertain, level="4"), 200)
+    assert not first.ready and first.reason == "hand_unresolved"
+    assert not second.ready and second.reason == "hand_unresolved"
+    assert tracker.candidate is None
+
+    assert not observe(tracker, result(level="3"), 300).ready
+    accepted = observe(tracker, result(level="3"), 400)
+    assert accepted.ready
+    assert accepted.seed is not None
+    assert accepted.seed.round_level == "3"
+    assert all(not card.endswith("?") for card in accepted.seed.hand)
+
+
+def test_gate_rejects_complete_count_with_unresolved_physical_card():
+    uncertain = list(HAND)
+    uncertain[0] = uncertain[0][:-1] + "?"
+    evaluation = evaluate_opening_gate(
+        result(hand=tuple(uncertain)), anchor_score=.95
+    )
+    assert not evaluation.ready
+    assert evaluation.reason == "hand_unresolved"
+    assert evaluation.normalized_hand is None
+
 def test_confidence_and_template_changes_are_not_different_actions():
     tracker = OpeningTracker()
     assert not observe(tracker, result(), 100).ready
