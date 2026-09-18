@@ -65,8 +65,10 @@ class SeatTrackerSnapshot:
 class SeatTracker:
     """Turn frame observations into at-most-once seat action candidates.
 
-    A candidate requires ``confirmations`` distinct frames. Once emitted, the
-    same visual action stays latched and cannot be emitted again until either:
+    A normal candidate requires ``confirmations`` distinct frames. PASS has
+    one narrow exception: the application layer may supply an independent,
+    same-frame active-seat transition as corroboration. Once emitted, the same
+    visual action stays latched and cannot be emitted again until either:
 
     * ``empty_confirmations`` distinct EMPTY frames prove that the old visual
       surface was cleared; or
@@ -149,10 +151,9 @@ class SeatTracker:
 
         The fast detector reports all four PASS markers on every frame.  This
         edge is the authoritative lifecycle signal: formal turn changes alone
-        never turn a still-visible old marker into a new PASS.  A separate,
-        narrow turnover fallback is used only when a later active seat proves
-        the UI kept the marker visible.  Two absent frames use the same
-        debounce as ordinary empty observations.
+        never turn a still-visible old marker into a new PASS. Cross-source
+        corroboration therefore cannot reuse an already emitted PASS latch.
+        Two absent frames use the same debounce as ordinary empty observations.
         """
 
         if not isinstance(visible, bool):
@@ -174,19 +175,12 @@ class SeatTracker:
             return True
         return False
 
-    def rearm_pass_after_turnover(self) -> bool:
-        """Fallback rearm after a later active seat proves the turn advanced."""
-
-        if self._emitted_signature != (ObservationKind.PASS,):
-            return False
-        self._open_next_epoch()
-        return True
-
     def ingest(
         self,
         observation: SeatObservation,
         *,
         version: VersionIdentity | None = None,
+        pass_corroboration_id: str | None = None,
     ) -> ActionCandidate | None:
         """Consume one observation and return a newly confirmed candidate."""
 
@@ -195,6 +189,16 @@ class SeatTracker:
                 f"observation seat {observation.seat!r} does not match tracker "
                 f"seat {self.seat!r}"
             )
+        if pass_corroboration_id is not None:
+            if observation.kind is not ObservationKind.PASS:
+                raise ValueError("PASS corroboration requires a PASS observation")
+            if (
+                not isinstance(pass_corroboration_id, str)
+                or not pass_corroboration_id.strip()
+            ):
+                raise ValueError("pass_corroboration_id must be non-empty text")
+            if pass_corroboration_id == observation.observation_id:
+                raise ValueError("PASS corroboration must be independent evidence")
         if version is not None and not version.belongs_to(observation.frame):
             raise ValueError("version and observation must belong to the same stream")
         if version is not None and not self._version_is_current(version):
@@ -257,6 +261,24 @@ class SeatTracker:
             self._pending.clear()
             return None
 
+        if pass_corroboration_id is not None:
+            if version is None:
+                raise ValueError("version is required when an action becomes confirmed")
+            if self._emitted_signature is not None:
+                self._action_epoch += 1
+            candidate = self._build_candidate(
+                [observation],
+                version=version,
+                reason=CandidateReason.CROSS_SOURCE_PASS,
+                evidence_ids=(observation.observation_id, pass_corroboration_id),
+            )
+            self._emitted_signature = signature
+            self._emitted_turn = self._turn_key(version)
+            self._pending_signature = None
+            self._pending = []
+            self._pending_turn = None
+            return candidate
+
         if signature != self._pending_signature:
             self._pending_signature = signature
             self._pending = [observation]
@@ -315,12 +337,14 @@ class SeatTracker:
         observations: list[SeatObservation],
         *,
         version: VersionIdentity,
+        reason: CandidateReason | None = None,
+        evidence_ids: tuple[str, ...] | None = None,
     ) -> ActionCandidate:
         first = observations[0]
         last = observations[-1]
         confidence = min(item.confidence for item in observations)
         kind = ActionKind.PASS if first.kind is ObservationKind.PASS else ActionKind.PLAY
-        reason = (
+        candidate_reason = reason or (
             CandidateReason.FRESH_PASS_EDGE
             if kind is ActionKind.PASS
             else CandidateReason.STABLE_PLAY
@@ -343,13 +367,17 @@ class SeatTracker:
             kind=kind,
             cards=first.cards,
             suit_options=first.suit_options,
-            evidence_ids=tuple(item.observation_id for item in observations),
+            evidence_ids=(
+                evidence_ids
+                if evidence_ids is not None
+                else tuple(item.observation_id for item in observations)
+            ),
             action_epoch=self._action_epoch,
             first_frame=first.frame,
             last_frame=last.frame,
             processing_ms=max(item.processing_ms for item in observations),
             confidence=confidence,
-            reason=reason,
+            reason=candidate_reason,
             diagnostics=diagnostics,
         )
 

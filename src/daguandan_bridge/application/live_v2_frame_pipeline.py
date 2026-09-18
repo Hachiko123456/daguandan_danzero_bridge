@@ -118,15 +118,11 @@ class LiveV2FramePipeline:
             effect_seats=(fast_seat,) if fast.effect_visible else (),
         )
         pass_markers = _pass_seats(fast)
-        marker_rearmed = self.dispatcher.observe_pass_markers(pass_markers)
-        turnover_seats = _pass_turnover_fallback(expected, fast)
-        turnover_rearmed = self.dispatcher.rearm_passes_after_turnover(
-            turnover_seats
-        )
-        rearmed = tuple(dict.fromkeys(marker_rearmed + turnover_rearmed))
+        rearmed = self.dispatcher.observe_pass_markers(pass_markers)
         diagnostics.extend(
             f"pass_marker_rearmed:{seat.value}" for seat in rearmed
         )
+        pass_cross_active = _pass_cross_active(expected, fast)
         self_opportunity = bool(
             fast.active_player == Seat.SELF.value
             or fast.self_action_buttons_visible
@@ -144,7 +140,9 @@ class LiveV2FramePipeline:
             wild_rank=wild_rank,
             expected_seat=expected,
             self_opportunity=self_opportunity,
-            pass_eligible_seats=_pass_eligible_seats(expected, turnover_seats),
+            pass_eligible_seats=_pass_eligible_seats(expected),
+            pass_cross_active=pass_cross_active,
+            pass_cross_frame=frame if pass_cross_active is not None else None,
             formal_action_boundary=formal_action_boundary,
             repair_seats=repair_targets,
             processing_base=processing_base,
@@ -253,47 +251,56 @@ def _pass_seats(fast: FastSignalResult) -> tuple[Seat, ...]:
     return tuple(values)
 
 
-def _pass_turnover_fallback(
+def _pass_cross_active(
     expected: Seat | None, fast: FastSignalResult
-) -> tuple[Seat, ...]:
-    """Use an existing active-seat transition only as a narrow PASS fallback.
+) -> Seat | None:
+    """Return the one proven active successor for same-frame PASS corroboration.
 
-    The normal path is the marker disappearance/reappearance edge.  This
-    fallback handles a real UI case where Tencent keeps an old PASS badge
-    visible while the next seat has already become active.  It never fires
-    when the active seat is missing, and it deliberately does not wrap around
-    to the immediately previous seat.
+    The marker and active-player reads come from independent screen regions.
+    Cross-confirmation is admitted only for the current expected seat and the
+    first seat in formal rotation that is not visibly finished. Unknown
+    finish state therefore fails closed to the immediate physical successor;
+    it can never justify a multi-seat jump.
     """
 
     if (
         expected is None
+        or expected not in _pass_seats(fast)
         or fast.active_player is None
         or fast.effect_visible
+        or fast.super_double_visible
         or fast.game_end_control is not None
-        or expected not in _pass_seats(fast)
     ):
-        return ()
+        return None
     try:
         active = Seat(fast.active_player)
     except ValueError:
-        return ()
-    if active is expected:
-        return ()
-    order = tuple(Seat)
+        return None
+    finished: set[Seat] = set()
+    for placement in fast.placements:
+        try:
+            finished.add(Seat(placement.player))
+        except ValueError:
+            continue
+    if expected in finished or active in finished:
+        return None
+    successor = _next_unfinished_seat(expected, finished)
+    return active if successor is active else None
+
+
+def _next_unfinished_seat(
+    expected: Seat, finished: set[Seat]
+) -> Seat | None:
     cursor = expected
-    for steps in range(1, len(order) - 1):
-        cursor = order[(order.index(cursor) + 1) % len(order)]
-        if cursor is active:
-            return (expected,)
-    return ()
+    for _ in range(len(SEATS) - 1):
+        cursor = SEATS[(SEATS.index(cursor) + 1) % len(SEATS)]
+        if cursor not in finished:
+            return cursor
+    return None
 
 
-def _pass_eligible_seats(
-    expected: Seat | None, turnover_seats: tuple[Seat, ...] = ()
-) -> tuple[Seat, ...]:
-    return tuple(dict.fromkeys(
-        (() if expected is None else (expected,)) + tuple(turnover_seats)
-    ))
+def _pass_eligible_seats(expected: Seat | None) -> tuple[Seat, ...]:
+    return () if expected is None else (expected,)
 
 
 

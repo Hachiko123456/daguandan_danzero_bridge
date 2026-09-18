@@ -30,6 +30,7 @@ class ActionKind(str, Enum):
 class CandidateReason(str, Enum):
     STABLE_PLAY = "stable_play"
     FRESH_PASS_EDGE = "fresh_pass_edge"
+    CROSS_SOURCE_PASS = "cross_source_pass"
     LOCAL_ACTION_CONFIRMED = "local_action_confirmed"
     OPENING_ACTION_CONFIRMED = "opening_action_confirmed"
     RECONCILIATION_EVIDENCE = "reconciliation_evidence"
@@ -107,12 +108,12 @@ class ActionCandidate:
             self.version.capture_generation != self.first_frame.capture_generation
         ):
             raise ValueError("candidate version must match its evidence stream")
-        visual_reasons = {
+        ordered_visual_reasons = {
             CandidateReason.STABLE_PLAY,
             CandidateReason.FRESH_PASS_EDGE,
             CandidateReason.RECONCILIATION_EVIDENCE,
         }
-        if self.reason in visual_reasons:
+        if self.reason in ordered_visual_reasons:
             if self.evidence_origin is not EvidenceOrigin.VISUAL:
                 raise ValueError("visual candidate reason requires VISUAL evidence origin")
             if len(self.evidence_ids) < 2:
@@ -123,6 +124,17 @@ class ActionCandidate:
                 raise ValueError("candidate evidence frame_sequence must strictly increase")
             if self.last_frame.captured_ms <= self.first_frame.captured_ms:
                 raise ValueError("candidate evidence captured_ms must strictly increase")
+        elif self.reason is CandidateReason.CROSS_SOURCE_PASS:
+            if self.evidence_origin is not EvidenceOrigin.VISUAL:
+                raise ValueError("cross-source pass requires VISUAL evidence origin")
+            if self.kind is not ActionKind.PASS:
+                raise ValueError("cross-source pass reason requires a PASS candidate")
+            if len(self.evidence_ids) != 2:
+                raise ValueError("cross-source pass requires exactly two evidence IDs")
+            if self.audit_evidence_ids:
+                raise ValueError("cross-source pass cannot claim audit evidence")
+            if self.first_frame != self.last_frame:
+                raise ValueError("cross-source pass evidence must use one frame")
         elif self.reason is CandidateReason.VISUAL_CORRECTION:
             if self.evidence_origin is not EvidenceOrigin.VISUAL:
                 raise ValueError("visual correction requires VISUAL evidence origin")

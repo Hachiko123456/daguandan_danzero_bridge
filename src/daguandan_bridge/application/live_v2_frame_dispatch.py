@@ -100,14 +100,6 @@ class FrameReadDispatcher:
             if self.trackers[seat].observe_pass_marker(seat in marked)
         )
 
-    def rearm_passes_after_turnover(
-        self, seats: tuple[Seat, ...]
-    ) -> tuple[Seat, ...]:
-        return tuple(
-            seat for seat in seats
-            if self.trackers[seat].rearm_pass_after_turnover()
-        )
-
     def drop_cursor(self) -> DropCursor:
         return DropCursor(self.scheduler.drops, self.evidence_buffer.drops)
 
@@ -166,6 +158,8 @@ class FrameReadDispatcher:
         expected_seat: Seat | None,
         self_opportunity: bool,
         pass_eligible_seats: tuple[Seat, ...],
+        pass_cross_active: Seat | None,
+        pass_cross_frame: FrameIdentity | None,
         formal_action_boundary: FrameIdentity | None,
         processing_base: int,
         started_clock: int,
@@ -224,6 +218,22 @@ class FrameReadDispatcher:
                     reason=ObservationReason.UNREADABLE,
                     diagnostics=observation.diagnostics + (pass_problem,),
                 )
+            pass_corroboration_id = _pass_corroboration_id(
+                observation,
+                version=version,
+                expected_seat=expected_seat,
+                active_seat=pass_cross_active,
+                cross_frame=pass_cross_frame,
+                formal_action_boundary=formal_action_boundary,
+            )
+            if pass_corroboration_id is not None:
+                observation = replace(
+                    observation,
+                    diagnostics=observation.diagnostics + (
+                        "pass_cross_source_confirmed:"
+                        f"{observation.seat.value}->{pass_cross_active.value}",
+                    ),
+                )
             self._last_deep_read_ms[item.seat] = item.frame.captured_ms
             observations.append(observation)
             processed_ms = max(
@@ -239,7 +249,11 @@ class FrameReadDispatcher:
             # retained as evidence but must not create a new tracker candidate.
             if item.seat in repair_seats and item.seat is not expected_seat:
                 continue
-            candidate = self.trackers[item.seat].ingest(observation, version=version)
+            candidate = self.trackers[item.seat].ingest(
+                observation,
+                version=version,
+                pass_corroboration_id=pass_corroboration_id,
+            )
             if candidate is None:
                 continue
             retained = self.scheduler.retain_candidate(candidate, now_ms=processed_ms)
@@ -310,6 +324,36 @@ class FrameReadDispatcher:
     def _is_starved(self, seat: Seat, captured_ms: int) -> bool:
         previous = self._last_deep_read_ms[seat]
         return previous is None or captured_ms - previous >= self.config.probe_starvation_ms
+
+
+def _pass_corroboration_id(
+    observation: SeatObservation,
+    *,
+    version: VersionIdentity,
+    expected_seat: Seat | None,
+    active_seat: Seat | None,
+    cross_frame: FrameIdentity | None,
+    formal_action_boundary: FrameIdentity | None,
+) -> str | None:
+    """Bind one PASS marker and one active-seat transition to one formal turn."""
+
+    if (
+        observation.kind is not ObservationKind.PASS
+        or expected_seat is None
+        or observation.seat is not expected_seat
+        or active_seat is None
+        or cross_frame is None
+        or observation.frame != cross_frame
+        or not _after_formal_boundary(observation.frame, formal_action_boundary)
+    ):
+        return None
+    return (
+        "fast-active-transition:"
+        f"{version.session_id}:{version.capture_generation}:"
+        f"{version.state_revision}:{version.turn_index}:"
+        f"{observation.frame.frame_sequence}:"
+        f"{expected_seat.value}->{active_seat.value}"
+    )
 
 
 def _schedule_reason(item: SeatSurfaceMetrics) -> ObservationReason:

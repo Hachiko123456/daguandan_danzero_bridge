@@ -243,13 +243,29 @@ def test_real_async_frames_rearm_turn80_pass_after_formal_turn79_boundary():
         assert turn80.first_frame.frame_sequence - 1 > 1473
         assert turn80.first_frame.frame_sequence > turn79.last_frame.frame_sequence
         assert turn80.first_frame.captured_ms > turn79.last_frame.captured_ms
-        for previous, current in zip(actual_actions, actual_actions[1:]):
-            assert current.first_frame.frame_sequence > previous.last_frame.frame_sequence
-            assert current.first_frame.captured_ms > previous.last_frame.captured_ms
-        for action in actual_actions:
+        # PASS may now complete from two independent same-frame sources: the
+        # expected seat marker and the strictly advanced active-player signal.
+        # Plays still require ordered multi-frame visual confirmation. A
+        # boundary frame may be the final witness for one seat and the first
+        # witness for its formal successor when both surfaces coexist.
+        pass_actions = tuple(
+            action for action in actual_actions if action.kind.value == "pass"
+        )
+        play_actions = tuple(
+            action for action in actual_actions if action.kind.value == "play"
+        )
+        assert len(pass_actions) == 4
+        for action in pass_actions:
+            assert len(action.evidence_ids) == 2
+            assert action.first_frame == action.last_frame
+            assert action.evidence_ids[1].startswith("fast-active-transition:")
+        for action in play_actions:
             assert len(action.evidence_ids) >= 2
             assert action.first_frame.frame_sequence < action.last_frame.frame_sequence
             assert action.first_frame.captured_ms < action.last_frame.captured_ms
+        for previous, current in zip(actual_actions, actual_actions[1:]):
+            assert current.first_frame.frame_sequence >= previous.last_frame.frame_sequence
+            assert current.first_frame.captured_ms >= previous.last_frame.captured_ms
     finally:
         capture.release()
         if runtime.status != "sealed":
