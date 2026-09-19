@@ -36,16 +36,79 @@ def _frame_key(frame: FrameIdentity) -> tuple[object, ...]:
     )
 
 
+def _card_rank(card: str) -> str:
+    if card in {"small_joker", "big_joker"}:
+        return card
+    return card[:-1] if card.endswith("?") or card[-1:] in "SHCD" else card
+
+
+def _full_option(rank: str, option: str) -> str:
+    if option in {"S", "H", "C", "D"} and rank not in {"small_joker", "big_joker"}:
+        return f"{rank}{option}"
+    return option
+
+
 def _signature(observation: SeatObservation) -> tuple[object, ...] | None:
     if observation.kind is ObservationKind.PASS:
         return (ObservationKind.PASS,)
     if observation.kind is ObservationKind.PLAY:
-        return (
-            ObservationKind.PLAY,
-            observation.cards,
-            observation.suit_options,
-        )
+        # Suit visibility is evidence, not action identity.  A later exact read
+        # must stay in the same confirmation streak as an earlier occluded read.
+        return (ObservationKind.PLAY, tuple(_card_rank(card) for card in observation.cards))
     return None
+
+
+def _merge_play_evidence(
+    observations: list[SeatObservation],
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]] | None:
+    if not observations:
+        return None
+    first = observations[0]
+    if first.kind is not ObservationKind.PLAY:
+        return (), ()
+    cards = tuple(first.cards)
+    option_sets = [
+        tuple(
+            value for value in (
+                _full_option(_card_rank(card), option)
+                for option in options
+            )
+            if not value.endswith("?")
+        )
+        for card, options in zip(first.cards, first.suit_options, strict=True)
+    ]
+    for observation in observations[1:]:
+        if observation.kind is not ObservationKind.PLAY or len(observation.cards) != len(cards):
+            return None
+        if tuple(_card_rank(card) for card in observation.cards) != tuple(
+            _card_rank(card) for card in cards
+        ):
+            return None
+        for index, (card, options) in enumerate(
+            zip(observation.cards, observation.suit_options, strict=True)
+        ):
+            current = tuple(
+                value for value in (
+                    _full_option(_card_rank(card), option)
+                    for option in options
+                )
+                if not value.endswith("?")
+            )
+            option_sets[index] = [
+                value for value in option_sets[index] if value in current
+            ]
+            if not option_sets[index]:
+                return None
+    merged_cards: list[str] = []
+    merged_options: list[tuple[str, ...]] = []
+    for card, options in zip(cards, option_sets, strict=True):
+        rank = _card_rank(card)
+        if len(options) == 1:
+            merged_cards.append(options[0])
+        else:
+            merged_cards.append(f"{rank}?")
+        merged_options.append(tuple(options))
+    return tuple(merged_cards), tuple(merged_options)
 
 
 @dataclass(frozen=True)
@@ -290,6 +353,11 @@ class SeatTracker:
         if signature != self._pending_signature:
             self._pending_signature = signature
             self._pending = [observation]
+        elif _merge_play_evidence(self._pending + [observation]) is None:
+            # Same ranks but contradictory physical evidence: retain only the
+            # newest observation and require a fresh independent confirmation.
+            self._pending_signature = signature
+            self._pending = [observation]
         else:
             self._pending.append(observation)
 
@@ -362,6 +430,13 @@ class SeatTracker:
             for observation in observations
             for detail in observation.diagnostics
         )) + (f"candidate_confidence={confidence:.3f}",)
+        merged = _merge_play_evidence(observations)
+        if kind is ActionKind.PLAY:
+            if merged is None:
+                raise ValueError("confirmed play observations have incompatible suit evidence")
+            cards, suit_options = merged
+        else:
+            cards, suit_options = (), ()
         return ActionCandidate(
             candidate_id=(
                 f"candidate:{first.frame.session_id}:"
@@ -373,8 +448,8 @@ class SeatTracker:
             version=version,
             seat=first.seat,
             kind=kind,
-            cards=first.cards,
-            suit_options=first.suit_options,
+            cards=cards,
+            suit_options=suit_options,
             evidence_ids=(
                 evidence_ids
                 if evidence_ids is not None

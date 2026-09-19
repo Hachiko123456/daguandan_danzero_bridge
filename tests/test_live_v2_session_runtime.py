@@ -289,11 +289,11 @@ def test_terminal_control_seals_history_even_when_runtime_is_in_review() -> None
 
     clock.value = 200
     terminal = live.analyze_frame(object(), monotonic_ms=200)
-    assert terminal.event and terminal.event.event_type == "game_end_detected"
-    assert terminal.event.payload["control"] == "continue_game"
-    assert terminal.status == "finalizing"
-    assert live.status == "finalizing"
-    assert store.events[-1] == terminal.event
+    assert terminal.event is None
+    assert terminal.block_reason == "terminal_suspected_inconsistent_rule_state"
+    assert terminal.status == "running"
+    assert live.status == "running"
+    assert not store.events
 
 def runtime(*, lead="right", recorder=None, store=None,
             advice_immediate=True, bind=True, local_hint_window_ms=0):
@@ -1104,8 +1104,8 @@ def test_explicit_correction_rebuilds_the_same_generation() -> None:
     assert live.snapshot.revision == before.revision + 1
     assert live.snapshot.play_history[-1].cards == ("4D",)
     assert result.capture_generation == 1
-    assert len(visions) == 1 and not visions[0].closed
-    assert len(advisers) == 1 and not advisers[0].closed
+    assert len(visions) == 2 and visions[0].closed == 1
+    assert len(advisers) == 2 and advisers[0].closed == 1
 
 
 def test_action_metadata_is_audit_only_and_does_not_override_rules() -> None:

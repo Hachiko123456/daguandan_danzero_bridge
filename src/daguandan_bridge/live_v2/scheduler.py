@@ -161,6 +161,7 @@ class ObservationScheduler:
         *,
         now_ms: int,
         expected_seat: Seat | None = None,
+        opening_lead_seat: Seat | None = None,
         self_opportunity: bool = False,
         strict_preferred: bool = False,
     ) -> ScheduledRead | None:
@@ -172,7 +173,9 @@ class ObservationScheduler:
         if expected_seat is not None:
             self._validate_seat(expected_seat)
 
-        preferred = self._preferred(expected_seat, self_opportunity)
+        preferred = self._preferred(
+            expected_seat, opening_lead_seat, self_opportunity
+        )
         if strict_preferred and preferred is not None:
             chosen = self._raw.get(preferred)
             if chosen is None:
@@ -227,11 +230,21 @@ class ObservationScheduler:
         return self._candidates.items
 
     def _preferred(
-        self, expected_seat: Seat | None, self_opportunity: bool
+        self,
+        expected_seat: Seat | None,
+        opening_lead_seat: Seat | None,
+        self_opportunity: bool,
     ) -> Seat | None:
+        # Opening evidence has its own explicit priority.  It is deliberately
+        # separate from expected_seat because the opening barrier may know the
+        # lead before the formal turn cursor has been established.
+        if opening_lead_seat is not None and self._raw.get(opening_lead_seat) is not None:
+            return opening_lead_seat
+        if expected_seat is not None:
+            return expected_seat
         if self_opportunity and self._raw.get(Seat.SELF) is not None:
             return Seat.SELF
-        return expected_seat
+        return None
 
     def _must_yield(self, preferred: Seat | None) -> bool:
         return bool(

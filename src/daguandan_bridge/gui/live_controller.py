@@ -51,6 +51,8 @@ from ..opening_gate import (
     evaluate_opening_gate,
     OpeningTracker,
     ListeningPageSignal,
+    OpeningSessionSeed,
+    opening_semantic_key,
 )
 from ..infrastructure.win32_hand_preselector import Win32HandPreselector
 from .hand_preselection import HandPreselectionPlanner, PreselectionResult
@@ -807,6 +809,7 @@ class LiveAssistantController(QObject):
                 self._publish_opening_status("waiting_table", result)
                 return
             self._table_anchor_observed = True
+        previous_waiting_candidate = self._waiting_candidate
         evaluation = self._opening_tracker.observe(
             result,
             anchor_score=self._TABLE_ANCHOR_READY_SCORE,
@@ -817,6 +820,32 @@ class LiveAssistantController(QObject):
         self._waiting_candidate = self._opening_tracker.candidate
         self._publish_opening_status(evaluation.reason, result)
         if not evaluation.ready or evaluation.seed is None:
+            # A complete but temporarily suit-obscured self hand may start a
+            # provisional listener session after two identical reads.  This is
+            # deliberately not an OpeningTracker confirmation: the formal
+            # runtime still carries the unresolved hand and waits for lead
+            # evidence/advice-world resolution.
+            hand_values = tuple(str(card) for card in getattr(result, "my_hand", ()) or ())
+            if (
+                evaluation.reason == "hand_unresolved"
+                and len(hand_values) == 27
+                and not getattr(result, "events", ())
+                and getattr(result, "lead_player", None) is None
+                and getattr(result, "current_player", None) is None
+            ):
+                provisional = OpeningSessionSeed(
+                    round_level=str(getattr(result, "round_level", "") or ""),
+                    hand=hand_values, lead_player=None,
+                )
+                if (
+                    isinstance(previous_waiting_candidate, OpeningSessionSeed)
+                    and opening_semantic_key(previous_waiting_candidate)
+                    == opening_semantic_key(provisional)
+                ):
+                    self._waiting_candidate = None
+                    self._start_detected_session(provisional)
+                else:
+                    self._waiting_candidate = provisional
             return
         self._waiting_candidate = None
         self._start_detected_session(result)
@@ -909,12 +938,17 @@ class LiveAssistantController(QObject):
         if not self.start_session(
             round_level=pending.round_level,
             hand=pending.hand,
-            # Automatic sessions always re-confirm lead + opening play in the
-            # live-v2 opening barrier.  The waiting tracker seed is only a
-            # trigger, never authoritative action history.
-            lead_player=None,
+            # The waiting tracker has already required bounded, independent
+            # opening evidence. Preserve that seed when handing off to the
+            # formal runtime so a visible self button cannot steal turn zero.
+            lead_player=(
+                pending.lead_player.value
+                if hasattr(pending.lead_player, "value")
+                else str(pending.lead_player)
+                if pending.lead_player is not None else None
+            ),
             recognition_strategy=self._recognition_strategy,
-            opening_action=None,
+            opening_action=pending.opening_action,
         ):
             self._table_anchor_observed = False
             self._start_waiting_workers()
@@ -1539,6 +1573,7 @@ class LiveAssistantController(QObject):
                     monotonic_ms=monotonic_ns() // 1_000_000,
                     confidence=opening_action.confidence,
                     source=opening_action.source,
+                    suit_options=opening_action.suit_options,
                 )
             except Exception as exc:
                 self._abort_started_session(token, constructed.source)

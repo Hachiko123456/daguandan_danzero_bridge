@@ -122,8 +122,22 @@ def runtime_result_to_advice(
 ) -> LiveAdvice:
     key = request_key(snapshot)
     if result.status is AdviceRuntimeStatus.ADVICE:
+        resolution = (
+            dict(result.diagnostic)
+            if isinstance(result.diagnostic, dict)
+            else {}
+        )
+        if result.advice is not None and isinstance(result.advice.engine_input, dict):
+            raw = result.advice.engine_input.get("unknown_suit_resolution")
+            if isinstance(raw, dict):
+                resolution.update(raw)
+        provisional = resolution.get("recommendation_status") == "provisional_consensus"
+        count = int(resolution.get("world_count", 1) or 1)
         return LiveAdvice(
             key=key, status="ready", advice=result.advice, visible=True,
+            suit_uncertain=provisional, variant_count=count,
+            advice_agrees_across_variants=provisional,
+            suit_variant_count=count,
         )
     if result.status in {
         AdviceRuntimeStatus.SUPERSEDED,
@@ -132,9 +146,15 @@ def runtime_result_to_advice(
     }:
         return LiveAdvice(key=key, status="stale", visible=False)
     if result.status is AdviceRuntimeStatus.BLOCKED:
+        diagnostic = result.diagnostic if isinstance(result.diagnostic, dict) else {}
+        count = int(diagnostic.get("world_count", diagnostic.get("candidate_count", 1)) or 1)
+        pending_suits = result.failure_code == "suit_pending"
         return LiveAdvice(
             key=key, status="withheld", visible=False,
             withhold_reason=result.failure_code or result.message,
+            suit_uncertain=pending_suits, variant_count=count,
+            advice_agrees_across_variants=False if pending_suits else True,
+            suit_variant_count=count if pending_suits else 1,
         )
     return LiveAdvice(
         key=key, status="failed", visible=False,
@@ -248,6 +268,7 @@ def consume_vision(
     vision: VisionRuntimeLike, image: Any, *, frame: FrameIdentity,
     version: VersionIdentity, wild_rank: str, expected_seat: Seat | None,
     processing_ms: int, formal_action_boundary: FrameIdentity | None,
+    opening_lead_seat: Seat | None = None,
     repair_seats: tuple[Seat, ...] = (),
     synchronous: bool = False,
 ) -> tuple[tuple[FramePipelineResult, ...], tuple[str, ...]]:
@@ -258,6 +279,7 @@ def consume_vision(
         kwargs: dict[str, object] = {
             "image": image, "frame": frame, "version": version,
             "wild_rank": wild_rank, "expected_seat": expected_seat,
+            "opening_lead_seat": opening_lead_seat,
             "request_sequence": frame.frame_sequence,
             "formal_action_boundary": formal_action_boundary,
         }
@@ -268,7 +290,11 @@ def consume_vision(
         except TypeError as exc:
             # Keep compatibility with lightweight test/legacy adapters that
             # predate the optional correction-read parameter.
-            if repair_seats and "repair_seats" in str(exc):
+            if "opening_lead_seat" in str(exc):
+                kwargs.pop("opening_lead_seat", None)
+                kwargs.pop("repair_seats", None)
+                result = process_sync(**kwargs)
+            elif repair_seats and "repair_seats" in str(exc):
                 kwargs.pop("repair_seats", None)
                 result = process_sync(**kwargs)
             else:
@@ -280,6 +306,7 @@ def consume_vision(
         kwargs = {
             "image": image, "frame": frame, "version": version,
             "wild_rank": wild_rank, "expected_seat": expected_seat,
+            "opening_lead_seat": opening_lead_seat,
             "now_ms": processing_ms,
             "formal_action_boundary": formal_action_boundary,
         }
@@ -288,7 +315,11 @@ def consume_vision(
         try:
             result = process(**kwargs)
         except TypeError as exc:
-            if repair_seats and "repair_seats" in str(exc):
+            if "opening_lead_seat" in str(exc):
+                kwargs.pop("opening_lead_seat", None)
+                kwargs.pop("repair_seats", None)
+                result = process(**kwargs)
+            elif repair_seats and "repair_seats" in str(exc):
                 kwargs.pop("repair_seats", None)
                 result = process(**kwargs)
             else:
@@ -301,6 +332,7 @@ def consume_vision(
     submit_kwargs: dict[str, object] = {
         "image": image, "frame": frame, "version": version,
         "expected_seat": expected_seat,
+        "opening_lead_seat": opening_lead_seat,
         "visual_self_opportunity": expected_seat is Seat.SELF,
         "wild_rank": wild_rank, "request_sequence": frame.frame_sequence,
         "formal_action_boundary": formal_action_boundary,
@@ -310,7 +342,11 @@ def consume_vision(
     try:
         values = list(submit(**submit_kwargs))
     except TypeError as exc:
-        if repair_seats and "repair_seats" in str(exc):
+        if "opening_lead_seat" in str(exc):
+            submit_kwargs.pop("opening_lead_seat", None)
+            submit_kwargs.pop("repair_seats", None)
+            values = list(submit(**submit_kwargs))
+        elif repair_seats and "repair_seats" in str(exc):
             submit_kwargs.pop("repair_seats", None)
             values = list(submit(**submit_kwargs))
         else:

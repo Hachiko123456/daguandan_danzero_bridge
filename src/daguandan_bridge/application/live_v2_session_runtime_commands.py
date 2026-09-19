@@ -48,6 +48,7 @@ class LiveV2RuleCommandsMixin:
     def bootstrap_opening_action(
         self, *, actor: str, cards: tuple[str, ...], expected_next_player: str,
         monotonic_ms: int, confidence: float, source: str,
+        suit_options: tuple[tuple[str, ...], ...] = (),
     ):
         seat, order = Seat(actor), tuple(Seat)
         if Seat(expected_next_player) is not order[(order.index(seat) + 1) % len(order)]:
@@ -57,7 +58,7 @@ class LiveV2RuleCommandsMixin:
         update = self._commit_trusted(
             seat, cards, False, monotonic_ms, confidence, EvidenceOrigin.OPENING,
             CandidateReason.OPENING_ACTION_CONFIRMED,
-            (f"opening-{source}-{seat.value}-{monotonic_ms}",), (),
+            (f"opening-{source}-{seat.value}-{monotonic_ms}",), suit_options,
         )
         if update.snapshot.current_player != expected_next_player:
             return self._plain_update(block_reason="opening_next_player_mismatch")
@@ -125,11 +126,17 @@ class LiveV2RuleCommandsMixin:
                 return self._rule_failure("correction", exc)
             if self._advice_pump is not None:
                 self._advice_pump.cancel_pending(
-                    reason="manual_correction_superseded", preserve_worker=True
+                    reason="manual_correction_superseded", preserve_worker=False
                 )
             binding = self.rule_session.bind_generation(self._generation)
             if self._generation > 0:
-                self._reset_engine(binding)
+                # A manual correction changes the canonical replay input.
+                # Retire both old process identities, then install fresh
+                # workers bound to the corrected revision so no old advice or
+                # worker cache can be reused accidentally.
+                detached = self._detach_workers()
+                self._close_detached(detached)
+                self._install_workers(binding)
                 update = self._process(
                     EngineInput(captured_watermark_ms=self._last_ms)
                 )

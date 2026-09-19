@@ -15,6 +15,42 @@ DEFAULT_TABLE_ANCHOR_THRESHOLD = 0.85
 _SETTLEMENT_BUTTONS = frozenset({"change_table", "continue_game"})
 
 
+def _seat_value(value: object) -> str | None:
+    """Normalize legacy strings and live-v2 Seat values at the opening boundary."""
+    raw = getattr(value, "value", value)
+    if not isinstance(raw, str):
+        return None
+    if raw.startswith("Seat."):
+        raw = raw.split(".", 1)[1].lower()
+    return raw if raw in TURN_ORDER else None
+
+
+def _rank_only(card: object) -> str:
+    value = str(card)
+    return value[:-1] if value.endswith("?") or value[-1:] in "SHCD" else value
+
+
+def _opening_suit_options(cards: tuple[str, ...], raw_options: object) -> tuple[tuple[str, ...], ...]:
+    supplied = tuple(tuple(str(item) for item in choices) for choices in (raw_options or ()))
+    result: list[tuple[str, ...]] = []
+    for index, card in enumerate(cards):
+        rank = card[:-1] if card.endswith("?") or card[-1:] in "SHCD" else card
+        choices = supplied[index] if index < len(supplied) else ()
+        if choices:
+            result.append(tuple(dict.fromkeys(
+                f"{rank}{choice}" if choice in "SHCD" and rank not in {"small_joker", "big_joker"}
+                else choice
+                for choice in choices
+            )))
+        elif card.endswith("?"):
+            result.append(tuple(f"{rank}{suit}" for suit in "SHCD"))
+        elif card not in {"small_joker", "big_joker"} and card[-1:] in "SHCD":
+            result.append((card,))
+        else:
+            result.append((card,))
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class ListeningPageSignal:
     """Cheap page evidence; unknown pages never authorize media writes."""
@@ -38,6 +74,7 @@ class OpeningActionSeed:
     next_player: Seat
     confidence: float
     source: str
+    suit_options: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,9 +97,13 @@ def opening_semantic_key(seed: OpeningSessionSeed) -> tuple[object, ...]:
     """Compare game meaning; sorting tuples preserves duplicate deck cards."""
     action = seed.opening_action
     return (
-        seed.round_level, tuple(sorted(seed.hand)), seed.lead_player,
+        seed.round_level, tuple(sorted(seed.hand)), _seat_value(seed.lead_player),
         None if action is None else
-        (action.actor, tuple(sorted(action.cards)), action.next_player),
+        (
+            _seat_value(action.actor),
+            tuple(sorted(_rank_only(card) for card in action.cards)),
+            _seat_value(action.next_player),
+        ),
     )
 
 
@@ -150,7 +191,7 @@ class OpeningTracker:
         if self.evidence_level is not None and level in RANKS and level != self.evidence_level:
             self.discard_candidates()
         if not hand and self.candidate is not None:
-            current = getattr(result, "current_player", None)
+            current = _seat_value(getattr(result, "current_player", None))
             action = self.candidate.opening_action
             expected = action.next_player if action else self.candidate.lead_player
             if current in TURN_ORDER and expected in TURN_ORDER and current != expected:
@@ -181,7 +222,7 @@ class OpeningTracker:
         if evaluation.normalized_hand is None:
             # Explicit seat/first-action evidence may arrive while the hand
             # ROI is temporarily unreadable. Keep the marker stage separate.
-            marker = getattr(result, "lead_player", None)
+            marker = _seat_value(getattr(result, "lead_player", None))
             if marker in TURN_ORDER:
                 if marker != self.lead:
                     self.lead, self.lead_count = marker, 0
@@ -208,7 +249,7 @@ class OpeningTracker:
         self.last_observation = observation_id
         self.last_ms = now
         self.hand_count += 1
-        lead = getattr(result, "lead_player", None)
+        lead = _seat_value(getattr(result, "lead_player", None))
         if lead in TURN_ORDER:
             if lead != self.lead:
                 self.lead = lead
@@ -295,8 +336,8 @@ def build_opening_seed(
     round_level: str,
     hand: tuple[str, ...],
 ) -> OpeningSessionSeed | None:
-    lead_player = getattr(result, "lead_player", None)
-    current_player = getattr(result, "current_player", None)
+    lead_player = _seat_value(getattr(result, "lead_player", None))
+    current_player = _seat_value(getattr(result, "current_player", None))
     events = tuple(getattr(result, "events", ()) or ())
     if not events:
         if lead_player is None and current_player is None:
@@ -307,15 +348,16 @@ def build_opening_seed(
     if len(events) != 1 or lead_player not in TURN_ORDER:
         return None
     event = events[0]
-    actor = getattr(event, "player", None)
+    actor = _seat_value(getattr(event, "player", None))
     cards = tuple(str(card) for card in getattr(event, "cards", ()) or ())
+    next_player = _seat_value(current_player)
     if (
         actor != lead_player
         or actor not in TURN_ORDER
         or bool(getattr(event, "is_pass", False))
         or not cards
-        or any("?" in card for card in cards)
-        or current_player != next_active_seat(actor, frozenset())
+        or any(card == "?" for card in cards)
+        or next_player != next_active_seat(actor, frozenset())
     ):
         return None
     try:
@@ -331,9 +373,10 @@ def build_opening_seed(
         OpeningActionSeed(
             actor=actor,
             cards=cards,
-            next_player=current_player,
+            next_player=next_player,
             confidence=confidence,
             source=str(getattr(event, "source", "visual_opening_anchor")),
+            suit_options=_opening_suit_options(cards, getattr(event, "suit_options", ())),
         ),
     )
 

@@ -135,26 +135,30 @@ class SingleTurnObserver:
         reference = self._pending or self._first_changed
         if reference is None:
             raise RuntimeError("observer lost pending display reference")
-        reference_signature = (
-            reference.signature
-            if isinstance(reference, SeatDisplay)
-            else (reference.kind, reference.cards, reference.suit_options)
-        )
-        if display.signature != reference_signature:
+        reference_kind = reference.kind
+        reference_cards = reference.cards
+        reference_options = reference.suit_options
+        if not _semantically_compatible(
+            reference_kind, reference_cards, reference_options,
+            display.kind, display.cards, display.suit_options,
+        ):
             self._first_changed = display
             self._pending = None
             return ObservationResult(
                 ObservationDisposition.WAITING_CONFIRMATION,
                 reason="changed_before_confirmation",
             )
+        merged_cards, merged_options = _merge_card_evidence(
+            reference_cards, reference_options, display.cards, display.suit_options,
+        )
         if self._pending is None:
             assert self._first_changed is not None
             self._pending = PendingAction(
                 seat=display.seat,
                 turn_token=self._turn_token,
                 kind=display.kind,
-                cards=display.cards,
-                suit_options=display.suit_options,
+                cards=merged_cards,
+                suit_options=merged_options,
                 first_frame=self._first_changed.frame,
                 last_frame=display.frame,
                 confidence=max(self._first_changed.confidence, display.confidence),
@@ -163,6 +167,8 @@ class SingleTurnObserver:
         else:
             self._pending = self._pending.with_later_evidence(
                 last_frame=display.frame,
+                cards=merged_cards,
+                suit_options=merged_options,
                 confidence=max(self._pending.confidence, display.confidence),
             )
             self._confirmed_display = display
@@ -186,6 +192,67 @@ class SingleTurnObserver:
         self._confirmed_display = None
         self._pending = None
 
+
+
+def _card_rank(card: str) -> str:
+    if card in {"small_joker", "big_joker"}:
+        return card
+    return card[:-1] if card.endswith("?") or card[-1:] in "SHCD" else card
+
+
+def _semantically_compatible(
+    left_kind: ActionKind | None,
+    left_cards: tuple[str, ...],
+    left_options: tuple[tuple[str, ...], ...],
+    right_kind: ActionKind | None,
+    right_cards: tuple[str, ...],
+    right_options: tuple[tuple[str, ...], ...],
+) -> bool:
+    if left_kind is not right_kind or len(left_cards) != len(right_cards):
+        return False
+    if left_kind is not ActionKind.PLAY:
+        return True
+    if tuple(_card_rank(card) for card in left_cards) != tuple(
+        _card_rank(card) for card in right_cards
+    ):
+        return False
+    return all(
+        bool(set(left).intersection(right))
+        for left, right in zip(left_options, right_options, strict=True)
+    )
+
+
+def _normalize_option(rank: str, option: str) -> str:
+    if option in {"S", "H", "C", "D"} and rank not in {"small_joker", "big_joker"}:
+        return f"{rank}{option}"
+    return option
+
+
+def _merge_card_evidence(
+    left_cards: tuple[str, ...],
+    left_options: tuple[tuple[str, ...], ...],
+    right_cards: tuple[str, ...],
+    right_options: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    if len(left_cards) != len(right_cards):
+        raise ValueError("cannot merge card evidence with different lengths")
+    cards: list[str] = []
+    options: list[tuple[str, ...]] = []
+    for left_card, left_values, right_values in zip(
+        left_cards, left_options, right_options, strict=True
+    ):
+        rank = _card_rank(left_card)
+        left_normalized = tuple(_normalize_option(rank, value) for value in left_values)
+        right_normalized = tuple(_normalize_option(rank, value) for value in right_values)
+        narrowed = tuple(value for value in left_normalized if value in right_normalized)
+        if not narrowed:
+            raise ValueError("card evidence has no compatible suit candidate")
+        cards.append(narrowed[0] if len(narrowed) == 1 else f"{rank}?")
+        options.append(tuple(
+            value[-1] if value[-1:] in "SHCD" else value
+            for value in narrowed
+        ))
+    return tuple(cards), tuple(options)
 
 def _strictly_after(later: FrameIdentity, earlier: FrameIdentity) -> bool:
     return bool(

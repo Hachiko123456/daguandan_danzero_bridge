@@ -221,6 +221,7 @@ class LiveRuntimePort(Protocol):
         monotonic_ms: int,
         confidence: float,
         source: str,
+        suit_options: tuple[tuple[str, ...], ...] = (),
     ) -> LiveUpdate: ...
 
     def confirm_candidate(self, candidate_id: str) -> LiveUpdate: ...

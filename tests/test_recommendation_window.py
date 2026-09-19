@@ -13,6 +13,8 @@ from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.danzero.advisor import LocalAdvice
 from daguandan_bridge.gui.recommendation_window import RecommendationFloatWindow
+from daguandan_bridge.gui import main_window as main_window_module
+from daguandan_bridge.gui.main_window import DaguandanBridgeWindow
 from daguandan_bridge.live.orchestrator import AdviceRequestKey, LiveAdvice, LiveUpdate
 from daguandan_bridge.recognition_service import FastSignalResult
 from daguandan_bridge.live.local_rule_hint import LocalRuleHint
@@ -810,3 +812,60 @@ def test_float_window_prefers_a_non_overlapping_side_position():
     if safe:
         assert not window.geometry().intersects(target)
     window.hide()
+
+
+def test_float_window_no_safe_slot_never_accepts_overlap(monkeypatch):
+    _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    target = QRect(0, 0, 800, 500)
+
+    class Screen:
+        def availableGeometry(self):
+            return QRect(0, 0, 800, 500)
+        def name(self):
+            return "test-screen"
+        def devicePixelRatio(self):
+            return 1.0
+
+    screen = Screen()
+    # place_beside resolves QGuiApplication from its own module.
+    import daguandan_bridge.gui.recommendation_window as recommendation_module
+    monkeypatch.setattr(recommendation_module.QGuiApplication, "screens", staticmethod(lambda: (screen,)))
+    monkeypatch.setattr(recommendation_module.QGuiApplication, "screenAt", staticmethod(lambda _point: screen))
+
+    assert window.place_beside(target) is False
+    assert window.last_placement_diagnostic["reason"] == "no_safe_slot"
+    window.hide()
+
+
+def test_main_window_no_safe_slot_keeps_full_assistant_visible(monkeypatch):
+    class Runtime:
+        def target_client_rect(self):
+            return SimpleNamespace(left=0, top=0, width=800, height=500)
+
+    class Float:
+        def __init__(self):
+            self.place_calls = 0
+            self.show_calls = 0
+            self.raise_calls = 0
+        def place_beside(self, _target):
+            self.place_calls += 1
+            return False
+        def show(self): self.show_calls += 1
+        def raise_(self): self.raise_calls += 1
+
+    fake = DaguandanBridgeWindow.__new__(DaguandanBridgeWindow)
+    fake.live_runtime = Runtime()
+    fake.recommendation_window = Float()
+    calls = {"full": 0, "minimized": 0, "message": 0}
+    fake.show_full_assistant = lambda: calls.__setitem__("full", calls["full"] + 1)
+    fake.showMinimized = lambda: calls.__setitem__("minimized", calls["minimized"] + 1)
+    monkeypatch.setattr(main_window_module.QMessageBox, "information", staticmethod(lambda *args: calls.__setitem__("message", calls["message"] + 1)))
+
+    DaguandanBridgeWindow.show_compact_recommendation(fake)
+
+    assert fake.recommendation_window.place_calls == 1
+    assert fake.recommendation_window.show_calls == 0
+    assert fake.recommendation_window.raise_calls == 0
+    assert calls == {"full": 1, "minimized": 0, "message": 1}

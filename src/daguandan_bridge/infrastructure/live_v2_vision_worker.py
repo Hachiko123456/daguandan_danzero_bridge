@@ -70,11 +70,8 @@ def run_live_v2_vision_worker(request: WorkerRequest) -> VisionWorkerSuccess:
         frame=frame,
         version=version,
         wild_rank=payload.wild_rank,
-        expected_seat=(
-            Seat.SELF
-            if payload.visual_self_opportunity
-            else payload.expected_seat
-        ),
+        expected_seat=payload.expected_seat,
+        opening_lead_seat=payload.opening_lead_seat,
         formal_action_boundary=payload.formal_action_boundary,
         repair_seats=payload.repair_seats,
     )

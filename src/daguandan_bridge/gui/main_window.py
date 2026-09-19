@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QRect
+from PySide6.QtWidgets import QMessageBox
 from qfluentwidgets import FluentIcon, FluentWindow
 
 from .annotation_page import AnnotationPage
@@ -58,15 +59,23 @@ class DaguandanBridgeWindow(FluentWindow):
             rect = self.live_runtime.target_client_rect()
         except Exception:
             rect = None
-        if rect is not None:
-            self.recommendation_window.place_beside(
-                QRect(
-                    rect.left,
-                    rect.top,
-                    rect.width,
-                    rect.height,
-                )
+        if rect is None:
+            self.show_full_assistant()
+            QMessageBox.information(
+                self, "无法进入极简窗口",
+                "未能获得掼蛋窗口坐标，已保留完整助手窗口。",
             )
+            return
+        placed = self.recommendation_window.place_beside(
+            QRect(rect.left, rect.top, rect.width, rect.height)
+        )
+        if not placed:
+            self.show_full_assistant()
+            QMessageBox.information(
+                self, "无法进入极简窗口",
+                "当前屏幕工作区没有不遮挡掼蛋窗口的安全位置，已保留完整助手窗口。",
+            )
+            return
         self.recommendation_window.show()
         self.recommendation_window.raise_()
         self.showMinimized()

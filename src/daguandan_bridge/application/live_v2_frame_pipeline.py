@@ -74,6 +74,7 @@ class LiveV2FramePipeline:
         version: VersionIdentity,
         wild_rank: str,
         expected_seat: Seat | str | None = None,
+        opening_lead_seat: Seat | str | None = None,
         now_ms: int | None = None,
         formal_action_boundary: FrameIdentity | None = None,
         repair_seats: tuple[Seat | str, ...] = (),
@@ -83,6 +84,9 @@ class LiveV2FramePipeline:
         if not isinstance(wild_rank, str) or not wild_rank.strip():
             raise ValueError("wild_rank must be a non-empty string")
         expected = Seat(expected_seat) if expected_seat is not None else None
+        opening_lead = (
+            Seat(opening_lead_seat) if opening_lead_seat is not None else None
+        )
         repair_targets = tuple(dict.fromkeys(Seat(item) for item in repair_seats))
         processing_base = max(
             frame.captured_ms,
@@ -160,12 +164,14 @@ class LiveV2FramePipeline:
             metrics=metrics,
             self_opportunity=self_opportunity,
             expected_seat=(expected if self.config.strict_current_seat_only else None),
+            opening_lead_seat=opening_lead,
             repair_seats=repair_targets,
         )
         batch = self.dispatcher.drain(
             version=version,
             wild_rank=wild_rank,
             expected_seat=expected,
+            opening_lead_seat=opening_lead,
             self_opportunity=self_opportunity,
             pass_eligible_seats=_pass_eligible_seats(expected, turnover_seats),
             pass_cross_active=pass_cross_active,

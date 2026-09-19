@@ -72,6 +72,7 @@ class LiveV2VisionRuntime(VisionSyncMixin):
         version: VersionIdentity,
         expected_seat: Seat | str | None,
         visual_self_opportunity: bool,
+        opening_lead_seat: Seat | str | None = None,
         wild_rank: str,
         request_sequence: int,
         formal_action_boundary: FrameIdentity | None = None,
@@ -80,6 +81,9 @@ class LiveV2VisionRuntime(VisionSyncMixin):
     ) -> tuple[VisionRuntimeResult, ...]:
         identity = VisionRequestIdentity(frame, version, request_sequence)
         expected = Seat(expected_seat) if expected_seat is not None else None
+        opening_lead = (
+            Seat(opening_lead_seat) if opening_lead_seat is not None else None
+        )
         with self._lock:
             if self._closed:
                 return self._publish_local(identity, VisionRuntimeStatus.SERVICE_CLOSED)
@@ -119,6 +123,7 @@ class LiveV2VisionRuntime(VisionSyncMixin):
                     owned,
                     formal_action_boundary,
                     tuple(dict.fromkeys(Seat(item) for item in repair_seats)),
+                    opening_lead,
                 ),
                 delivery=DeliveryMode.LATEST_ONLY,
                 timeout_ms=timeout_ms,

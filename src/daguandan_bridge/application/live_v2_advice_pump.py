@@ -475,6 +475,7 @@ class LiveV2AdvicePump:
             failure_code=(result.failure_code or ("" if accepted else rejection_code)),
             failure_type=result.failure_type,
             message=result.message,
+            diagnostic=getattr(result, "diagnostic", {}),
             **timing_extra,
         )
         self._increment(metric_for(status))

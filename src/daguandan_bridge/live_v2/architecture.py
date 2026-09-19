@@ -108,7 +108,7 @@ STDLIB_IMPORT_ALLOWLIST: dict[str, frozenset[str]] = {
     "event_resolver": frozenset({"__future__", "dataclasses"}),
     "gap_lifecycle": frozenset({"__future__", "dataclasses", "enum"}),
     "input_lifecycle": frozenset({"__future__", "dataclasses", "enum"}),
-    "opportunity": frozenset({"__future__", "dataclasses", "enum"}),
+    "opportunity": frozenset({"__future__", "dataclasses", "enum", "itertools"}),
     "reconciliation": frozenset({"__future__", "dataclasses"}),
     "reducer_snapshot": frozenset({"__future__", "dataclasses"}),
     "reducer_transaction": frozenset({"__future__", "dataclasses", "typing"}),

@@ -534,16 +534,20 @@ class LiveV2AdviceRuntime:
                     value=value, elapsed_ms=payload.elapsed_ms, advice=payload.advice,
                     advisor_cache_hit=payload.advisor_cache_hit,
                     advisor_ready=payload.advisor_ready,
+                    diagnostic=payload.diagnostic,
                 )
             if isinstance(payload, AdviceWorkerFailure):
                 status = (
-                    AdviceRuntimeStatus.REJECTED
+                    AdviceRuntimeStatus.BLOCKED
+                    if payload.code == "suit_pending"
+                    else AdviceRuntimeStatus.REJECTED
                     if payload.kind is not AdviceFailureKind.MODEL_ERROR
                     else AdviceRuntimeStatus.WORKER_ERROR
                 )
                 return self._result(
                     identity, status, payload.code, payload.error_type,
                     payload.message, value=value, elapsed_ms=payload.elapsed_ms,
+                    diagnostic=payload.diagnostic,
                 )
             return self._result(
                 identity, AdviceRuntimeStatus.WORKER_ERROR,
@@ -580,6 +584,7 @@ class LiveV2AdviceRuntime:
         advice: object = None,
         advisor_cache_hit: bool = False,
         advisor_ready: AdvisorReady | None = None,
+        diagnostic: dict[str, object] | None = None,
     ) -> AdviceRuntimeResult:
         duration = elapsed_ms
         if duration is None and value is not None:
@@ -603,6 +608,7 @@ class LiveV2AdviceRuntime:
             message=message,
             advisor_cache_hit=advisor_cache_hit,
             advisor_ready=advisor_ready,
+            diagnostic=dict(diagnostic or {}),
         )
 
 

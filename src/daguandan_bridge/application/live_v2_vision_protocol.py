@@ -80,6 +80,7 @@ class VisionWorkerPayload:
     image: np.ndarray
     formal_action_boundary: FrameIdentity | None = None
     repair_seats: tuple[Seat, ...] = ()
+    opening_lead_seat: Seat | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, VisionWorkerConfig):
@@ -88,6 +89,10 @@ class VisionWorkerPayload:
             raise TypeError("identity must be VisionRequestIdentity")
         if self.expected_seat is not None and not isinstance(self.expected_seat, Seat):
             raise TypeError("expected_seat must be Seat or None")
+        if self.opening_lead_seat is not None and not isinstance(
+            self.opening_lead_seat, Seat
+        ):
+            raise TypeError("opening_lead_seat must be Seat or None")
         if not isinstance(self.repair_seats, tuple) or any(
             not isinstance(item, Seat) for item in self.repair_seats
         ):

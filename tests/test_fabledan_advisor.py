@@ -33,6 +33,7 @@ from daguandan_bridge.fabledan.advisor import (
     _base_card_id,
     _card_code,
     _unique_observed_move,
+    _resolve_unknown_suit_snapshots,
 )
 from daguandan_bridge.live.reducer import LiveReducer
 from daguandan_bridge.live.truth_log import truth_log_from_dict
@@ -1061,3 +1062,19 @@ def test_vendor_contains_only_approved_runtime_and_notice_files():
         "FABLEDAN_LICENSE",
         "FABLEDAN_REVISION",
     }
+
+
+def test_unknown_suit_worlds_are_mutually_exclusive_and_respect_hand_counts() -> None:
+    state = _unknown_suit_state(
+        ("7?",),
+        (("C", "D"),),
+        level="3",
+        hand=("7C", "7C") + tuple(card for card in HAND if card != "7C")[:25],
+    )
+    worlds = _resolve_unknown_suit_snapshots(state.local_snapshot())
+    assert worlds
+    assert all(world.play_history[0].cards[0] == "7D" for world in worlds)
+    assert all(
+        not (world.play_history[0].cards[0] == "7C" and "7C" in world.my_hand)
+        for world in worlds
+    )

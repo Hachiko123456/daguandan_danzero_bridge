@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -198,6 +198,7 @@ class AdviceWorkerSuccess:
     elapsed_ms: float
     advisor_cache_hit: bool = False
     advisor_ready: AdvisorReady | None = None
+    diagnostic: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,7 @@ class AdviceWorkerFailure:
     error_type: str
     message: str
     elapsed_ms: float
+    diagnostic: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +226,7 @@ class AdviceRuntimeResult:
     message: str = ""
     advisor_cache_hit: bool = False
     advisor_ready: AdvisorReady | None = None
+    diagnostic: dict[str, object] = field(default_factory=dict)
 
     @property
     def is_advice(self) -> bool:

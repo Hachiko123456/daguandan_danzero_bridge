@@ -293,16 +293,28 @@ class FableDanAdvisor:
                     _normalized_recommendation_key(result)
                     for result in results
                 }
+                world_set_fingerprint = _world_set_fingerprint(variants)
+                world_results = [
+                    {
+                        "world_index": index,
+                        "world_fingerprint": _world_fingerprint(variant),
+                        "recommendation": _recommendation_audit(result),
+                    }
+                    for index, (variant, result) in enumerate(
+                        zip(variants, results, strict=True), start=1
+                    )
+                ]
                 if len(recommendation_keys) != 1:
                     raise FableDanStateError(
                         "未知花色候选产生不一致的 FableDan 推荐；"
                         "需要补充花色确认，不能猜测",
                         diagnostic={
                             "code": "unknown_suit_recommendation_disagreement",
+                            "status": "suit_pending",
+                            "world_set_fingerprint": world_set_fingerprint,
+                            "world_count": len(variants),
                             "candidate_count": len(variants),
-                            "recommendations": [
-                                _recommendation_audit(result) for result in results
-                            ],
+                            "divergence": world_results,
                         },
                     )
                 chosen = results[0]
@@ -320,6 +332,9 @@ class FableDanAdvisor:
                 )
                 engine_input["unknown_suit_resolution"] = {
                     "status": "consensus",
+                    "recommendation_status": "provisional_consensus",
+                    "world_set_fingerprint": _world_set_fingerprint(variants),
+                    "world_count": len(variants),
                     "candidate_count": len(variants),
                     "max_candidate_count": MAX_UNKNOWN_SUIT_VARIANTS,
                     "canonical_history_resolved": False,
@@ -327,6 +342,7 @@ class FableDanAdvisor:
                     "candidates": [
                         {
                             "index": index,
+                            "world_fingerprint": _world_fingerprint(variant),
                             "play_history": [
                                 event.to_dict() for event in variant.play_history
                             ],
@@ -1163,6 +1179,22 @@ def _recommendation_audit(result: FableDanDecisionResult) -> dict[str, object]:
         "claim_rank_ids": sorted(int(rank) for rank in result.best_action.claim_ranks),
     }
 
+
+
+def _world_fingerprint(snapshot: LocalStrategySnapshot) -> str:
+    payload = {
+        "my_hand": list(snapshot.my_hand),
+        "play_history": [event.to_dict() for event in snapshot.play_history],
+        "current_player": snapshot.current_player,
+        "revision": snapshot.revision,
+    }
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _world_set_fingerprint(variants: tuple[LocalStrategySnapshot, ...]) -> str:
+    return sha256(json.dumps(
+        sorted(_world_fingerprint(variant) for variant in variants)
+    ).encode("ascii")).hexdigest()
 
 def _variant_request_id(request_id: str, index: int) -> str:
     return f"{request_id or 'fabledan'}:unknown-suit:{index}"

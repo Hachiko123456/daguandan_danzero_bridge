@@ -21,7 +21,7 @@ from ..live.replay import (
 from ..live.frame_pipeline import analyze_frame_envelope
 from ..live.recorder import InMemorySessionRecorder
 from ..live.session_store import LiveSessionStore, read_json_lines
-from ..opening_gate import OpeningTracker
+from ..opening_gate import OpeningSessionSeed, OpeningTracker
 from ..storage import append_json_line, atomic_write_json
 
 
@@ -202,30 +202,15 @@ def replay_video_through_production_live_v2(
                     on_update=None,
                     vision_delivery="synchronous",
                 )
-                runtime.start(
-                    round_level=str(seed.round_level),
-                    hand=tuple(seed.hand),
-                    lead_player=None,
-                    monotonic_ms=envelope.captured_monotonic_ms,
-                    wall_time=envelope.wall_time,
+                update = _start_runtime_from_opening_seed(
+                    runtime,
+                    seed,
+                    envelope=envelope,
+                    capture_generation=1,
                 )
-                runtime.bind_capture_generation(1)
                 runtime_started = True
                 runtime_start_frame = frame_index
                 runtime_start_reason = "ready"
-                # The production controller starts with lead_player=None and
-                # lets the runtime see the same confirming frame.  Do not turn
-                # OpeningTracker's candidate into a trusted action here.
-                update = _record_and_analyze_frame(
-                    runtime,
-                    envelope,
-                    trace_context={
-                        "capture_generation": 1,
-                        "capture_seq": envelope.capture_seq or frame_count,
-                        "roi_version": envelope.roi_version,
-                        "source_id": envelope.source_id,
-                    },
-                )
                 _append_frame(output, envelope, runtime, "visual", update)
                 continue
 
@@ -417,6 +402,55 @@ def _opening_recognition_fields(recognized: Any) -> tuple[str | None, list[str]]
     raw_hand = getattr(recognized, "my_hand", ()) or ()
     hand = [str(card) for card in tuple(raw_hand)]
     return level, hand
+
+
+def _seat_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    return str(raw)
+
+
+def _start_runtime_from_opening_seed(
+    runtime: Any,
+    seed: OpeningSessionSeed,
+    *,
+    envelope: FrameEnvelope,
+    capture_generation: int,
+) -> Any:
+    """Start, bind, and optionally bootstrap from one confirmed opening seed.
+
+    This mirrors the live controller boundary. The confirming frame is first
+    recorded as evidence, but is not sent through visual recognition again:
+    ``OpeningTracker`` has already consumed it and ``opening_action`` is the
+    authoritative handoff for that frame.
+    """
+
+    runtime.start(
+        round_level=str(seed.round_level),
+        hand=tuple(seed.hand),
+        lead_player=_seat_text(seed.lead_player),
+        monotonic_ms=envelope.captured_monotonic_ms,
+        wall_time=envelope.wall_time,
+    )
+    update = runtime.bind_capture_generation(capture_generation)
+    runtime.record_frame(
+        envelope.image,
+        monotonic_ms=envelope.captured_monotonic_ms,
+        wall_time=envelope.wall_time,
+    )
+    action = seed.opening_action
+    if action is None:
+        return update
+    return runtime.bootstrap_opening_action(
+        actor=_seat_text(action.actor),
+        cards=tuple(action.cards),
+        expected_next_player=_seat_text(action.next_player),
+        monotonic_ms=envelope.captured_monotonic_ms,
+        confidence=float(action.confidence),
+        source=str(action.source),
+        suit_options=tuple(tuple(value) for value in action.suit_options),
+    )
 
 
 def _record_and_analyze_frame(

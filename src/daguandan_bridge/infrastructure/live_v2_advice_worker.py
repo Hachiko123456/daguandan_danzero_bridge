@@ -145,10 +145,23 @@ def run_live_v2_advice_worker(
             request_id=payload.request_id,
         )
     except Exception as exc:
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, dict) and diagnostic.get("code") == (
+            "unknown_suit_recommendation_disagreement"
+        ):
+            return _failure(
+                request, payload, AdviceFailureKind.SNAPSHOT_MISMATCH,
+                "suit_pending", exc, started, diagnostic=diagnostic,
+            )
         return _failure(
             request, payload, AdviceFailureKind.MODEL_ERROR,
             "model_execution_failed", exc, started,
         )
+    resolution = {}
+    if isinstance(advice.engine_input, dict):
+        raw_resolution = advice.engine_input.get("unknown_suit_resolution")
+        if isinstance(raw_resolution, dict):
+            resolution = dict(raw_resolution)
     return AdviceWorkerSuccess(
         opportunity_id=payload.opportunity.opportunity_id,
         version=payload.snapshot.version,
@@ -156,6 +169,7 @@ def run_live_v2_advice_worker(
         replayed_actions=len(payload.snapshot.play_history),
         elapsed_ms=(perf_counter() - started) * 1000,
         advisor_cache_hit=cache_hit,
+        diagnostic=resolution,
         advisor_ready=(
             replace(_ADVISOR_READY[key], cache_hit=cache_hit)
             if key in _ADVISOR_READY
@@ -215,6 +229,7 @@ def _failure(
     code: str,
     exc: Exception,
     started: float,
+    diagnostic: dict[str, object] | None = None,
 ) -> AdviceWorkerFailure:
     opportunity = getattr(payload, "opportunity", None)
     snapshot = getattr(payload, "snapshot", None)
@@ -233,6 +248,7 @@ def _failure(
         error_type=type(exc).__name__,
         message=str(exc),
         elapsed_ms=(perf_counter() - started) * 1000,
+        diagnostic=dict(diagnostic or {}),
     )
 
 

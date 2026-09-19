@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 from time import monotonic_ns
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal, QTimer
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
@@ -164,6 +164,7 @@ class RecommendationFloatWindow(QWidget):
 
     def __init__(self, runtime: Any, parent=None) -> None:
         super().__init__(parent)
+        self.last_placement_diagnostic: dict[str, object] = {}
         self.runtime = runtime
         self._last_request_id = ""
         self._preselection_by_request_id: dict[str, object] = {}
@@ -475,33 +476,46 @@ class RecommendationFloatWindow(QWidget):
         self.cards_host.show()
 
     def place_beside(self, target: QRect) -> bool:
-        """Place outside the game client when the current screen has room."""
+        """Place in a work area without ever accepting an overlapping fallback."""
 
-        center = QPoint(target.center().x(), target.center().y())
-        screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
-        if screen is None:
+        self.last_placement_diagnostic = {"target": target.getRect()}
+        screens = tuple(QGuiApplication.screens())
+        if not screens:
+            self.last_placement_diagnostic["reason"] = "no_screen"
             return False
-        available = screen.availableGeometry()
-        width = max(self.minimumWidth(), min(self.width(), available.width()))
-        height = max(self.minimumHeight(), min(self.height(), available.height()))
-        candidates = (
-            QRect(target.right() + 8, target.top(), width, height),
-            QRect(target.left() - width - 8, target.top(), width, height),
-            QRect(target.left(), target.bottom() + 8, width, height),
-            QRect(target.left(), target.top() - height - 8, width, height),
-        )
-        for candidate in candidates:
-            if available.contains(candidate) and not candidate.intersects(target):
-                self.setGeometry(candidate)
-                return True
-        fallback = QRect(
-            available.right() - width + 1,
-            available.top(),
-            width,
-            height,
-        )
-        self.setGeometry(fallback)
-        return not fallback.intersects(target)
+        source = QGuiApplication.screenAt(target.center())
+        ordered = tuple(
+            screen for screen in screens if screen is source
+        ) + tuple(screen for screen in screens if screen is not source)
+        for screen in ordered:
+            available = screen.availableGeometry()
+            width = max(self.minimumWidth(), min(max(self.width(), self.minimumWidth()), available.width()))
+            height = max(self.minimumHeight(), min(max(self.height(), self.minimumHeight()), available.height()))
+            candidates = [
+                QRect(target.right() + 8, target.top(), width, height),
+                QRect(target.left() - width - 8, target.top(), width, height),
+                QRect(target.left(), target.bottom() + 8, width, height),
+                QRect(target.left(), target.top() - height - 8, width, height),
+            ]
+            if screen is not source:
+                candidates.insert(0, QRect(available.topLeft(), QSize(width, height)))
+            for candidate in candidates:
+                if available.contains(candidate) and not candidate.intersects(target):
+                    self.setGeometry(candidate)
+                    self.last_placement_diagnostic.update({
+                        "screen": screen.name(),
+                        "available": available.getRect(),
+                        "placed": candidate.getRect(),
+                        "dpi": screen.devicePixelRatio(),
+                        "reason": "placed",
+                    })
+                    return True
+        self.last_placement_diagnostic.update({
+            "reason": "no_safe_slot",
+            "screen_count": len(screens),
+            "dpi": [screen.devicePixelRatio() for screen in screens],
+        })
+        return False
 
     def closeEvent(self, event: QCloseEvent) -> None:
         event.ignore()

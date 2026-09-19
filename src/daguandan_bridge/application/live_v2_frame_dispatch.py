@@ -130,6 +130,7 @@ class FrameReadDispatcher:
         metrics: tuple[SeatSurfaceMetrics, ...],
         self_opportunity: bool,
         expected_seat: Seat | None = None,
+        opening_lead_seat: Seat | None = None,
         repair_seats: tuple[Seat, ...] = (),
     ) -> None:
         for item in metrics:
@@ -164,7 +165,8 @@ class FrameReadDispatcher:
         version: VersionIdentity,
         wild_rank: str,
         expected_seat: Seat | None,
-        self_opportunity: bool,
+        opening_lead_seat: Seat | None = None,
+        self_opportunity: bool = False,
         pass_eligible_seats: tuple[Seat, ...],
         pass_cross_active: Seat | None,
         pass_cross_frame: FrameIdentity | None,
@@ -185,9 +187,15 @@ class FrameReadDispatcher:
             item = self.scheduler.pop_next(
                 now_ms=self.processing_ms(processing_base, started_clock),
                 expected_seat=repair_preferred,
+                opening_lead_seat=(
+                    opening_lead_seat
+                    if repair_preferred is None or repair_preferred is opening_lead_seat
+                    else None
+                ),
                 self_opportunity=(
                     self_opportunity
                     and repair_preferred is expected_seat
+                    and opening_lead_seat is None
                 ),
                 strict_preferred=self.config.strict_current_seat_only,
             )

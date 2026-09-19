@@ -97,3 +97,24 @@ def test_pass_requires_a_fresh_surface_epoch() -> None:
     observer.observe(_display(Seat.SELF, 3, kind=ActionKind.PASS, epoch=3))
     fresh = observer.observe(_display(Seat.SELF, 4, kind=ActionKind.PASS, epoch=3))
     assert fresh.disposition is ObservationDisposition.CONFIRMED
+
+
+def test_unknown_suit_and_later_exact_suit_are_one_action_with_narrowed_options() -> None:
+    observer = SingleTurnObserver(current_seat=Seat.LEFT, turn_token=3)
+    observer.begin_turn(current_seat=Seat.LEFT, turn_token=3, baseline=_display(Seat.LEFT, 1))
+    observer.observe(
+        _display(
+            Seat.LEFT, 2, cards=("7?",), suits=(("C", "D"),),
+            kind=ActionKind.PLAY, epoch=1,
+        )
+    )
+    result = observer.observe(
+        _display(
+            Seat.LEFT, 3, cards=("7C",), suits=(("C",),),
+            kind=ActionKind.PLAY, epoch=1,
+        )
+    )
+    assert result.disposition is ObservationDisposition.CONFIRMED
+    assert result.pending is not None
+    assert result.pending.cards == ("7C",)
+    assert result.pending.suit_options == (("C",),)

@@ -263,3 +263,23 @@ def test_suit_uncertainty_must_stabilize_with_cards_before_candidate() -> None:
     candidate = tracker.ingest(stable, version=version())
     assert candidate is not None
     assert candidate.evidence_ids == ("uncertain-2", "uncertain-3")
+
+
+def test_unknown_suit_then_exact_read_keeps_one_confirmation_streak() -> None:
+    tracker = SeatTracker(Seat.LEFT)
+    first = SeatObservation(
+        "unknown-1", frame(1), Seat.LEFT, ObservationKind.PLAY, ("7?",),
+        0.9, ObservationReason.CARDS_RECOGNIZED, 101,
+        (("7?", "7C", "7D"),), (),
+    )
+    exact = SeatObservation(
+        "unknown-2", frame(2), Seat.LEFT, ObservationKind.PLAY, ("7C",),
+        0.9, ObservationReason.CARDS_RECOGNIZED, 201,
+        (("7C",),), (),
+    )
+    assert tracker.ingest(first) is None
+    candidate = tracker.ingest(exact, version=version())
+    assert candidate is not None
+    assert candidate.cards == ("7C",)
+    assert candidate.suit_options == (("7C",),)
+    assert candidate.evidence_ids == ("unknown-1", "unknown-2")

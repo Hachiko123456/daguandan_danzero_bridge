@@ -150,6 +150,7 @@ class PendingAction:
         self,
         *,
         last_frame: FrameIdentity,
+        cards: tuple[str, ...] | None = None,
         suit_options: tuple[tuple[str, ...], ...] | None = None,
         confidence: float | None = None,
     ) -> PendingAction:
@@ -158,6 +159,7 @@ class PendingAction:
         return replace(
             self,
             last_frame=last_frame,
+            cards=self.cards if cards is None else cards,
             suit_options=self.suit_options if suit_options is None else suit_options,
             confidence=self.confidence if confidence is None else confidence,
         )

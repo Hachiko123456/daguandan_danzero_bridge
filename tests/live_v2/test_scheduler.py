@@ -257,3 +257,19 @@ def test_scheduler_records_require_contract_enums() -> None:
             frame(1),
             0,
         )
+
+
+def test_formal_expected_seat_beats_self_opportunity_priority() -> None:
+    scheduler = ObservationScheduler()
+    scheduler.submit_raw(
+        seat=Seat.LEFT, frame=frame(1), enqueued_ms=100,
+        reason=ObservationReason.UNREADABLE,
+    )
+    scheduler.submit_raw(
+        seat=Seat.SELF, frame=frame(2), enqueued_ms=101,
+        reason=ObservationReason.UNREADABLE,
+    )
+    selected = scheduler.pop_next(
+        now_ms=110, expected_seat=Seat.LEFT, self_opportunity=True
+    )
+    assert selected is not None and selected.seat is Seat.LEFT

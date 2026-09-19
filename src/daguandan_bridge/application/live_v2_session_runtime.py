@@ -282,6 +282,9 @@ class LiveV2SessionRuntime(
             vision, frame, frame=identity, version=version,
             wild_rank=snapshot.wild_rank,
             expected_seat=expected, processing_ms=processing_ms,
+            opening_lead_seat=(
+                snapshot.lead_seat if not snapshot.play_history else None
+            ),
             formal_action_boundary=formal_action_boundary,
             repair_seats=repair_seats,
             synchronous=self._synchronous_vision,
@@ -396,6 +399,24 @@ class LiveV2SessionRuntime(
             return None
 
         snapshot = self._trusted_snapshot()
+        if not _terminal_state_matches_settlement(snapshot):
+            self._journal.lifecycle(
+                "terminal_suspected",
+                control=control,
+                reason="terminal_control_without_trusted_finished_state",
+                remaining_cards={
+                    item.seat.value: int(item.count) for item in snapshot.remaining
+                },
+                finished_seats=[seat.value for seat in snapshot.finished],
+                frame_sequence=frame.frame_sequence,
+            )
+            self.status = "running"
+            self._sequence += 1
+            return live_update(
+                status=self.status, snapshot=snapshot, sequence=self._sequence,
+                advice=self.latest_advice, events=(), fast_signals=fast,
+                block_reason="terminal_suspected_inconsistent_rule_state",
+            )
         self._aux_event_sequence += 1
         event = LiveEvent(
             event_id=f"AUX-LIVEV2-{self._aux_event_sequence:06d}",
@@ -640,9 +661,19 @@ class LiveV2SessionRuntime(
                 observation_confidence=float(observation.confidence),
                 rejection_type=type(exc).__name__,
             )
-            # A rejected reread is only non-authoritative visual evidence.
-            # Keep listening for a different stable reread instead of blocking
-            # the whole session.
+            # A correction that conflicts with already-confirmed downstream
+            # actions is not just a weak reread: adopting it would silently
+            # rewrite formal history. Stop in the explicit review state.
+            from .live_v2_rule_session_protocol import RuleSessionRejected
+            if isinstance(exc, RuleSessionRejected):
+                self.status = "review_required"
+                self._visual_corrections.pop(pending.action_id, None)
+                return self._plain_update(
+                    fast=fast,
+                    block_reason="visual_correction_requires_review",
+                )
+            # Other failures remain non-authoritative evidence; keep listening
+            # for a different stable reread.
             return None
         # The correction is now durable. Terminalize only the old logical
         # opportunity; keep both prewarmed worker processes alive. Their hosts
@@ -908,3 +939,12 @@ class LiveV2SessionRuntime(
 
 
 __all__ = ["LiveV2SessionRuntime"]
+
+
+def _terminal_state_matches_settlement(snapshot: Any) -> bool:
+    """Settlement UI is trusted only after the rule snapshot is terminal."""
+    if not bool(getattr(snapshot, "terminal", False)):
+        return False
+    finished = tuple(getattr(snapshot, "finished", ()) or ())
+    remaining = tuple(getattr(snapshot, "remaining", ()) or ())
+    return len(finished) >= 2 and sum(int(item.count) == 0 for item in remaining) >= 2

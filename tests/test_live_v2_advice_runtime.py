@@ -15,6 +15,7 @@ from daguandan_bridge.application.live_v2_advice_protocol import (
     request_id,
 )
 from daguandan_bridge.application.live_v2_advice_runtime import LiveV2AdviceRuntime
+from daguandan_bridge.application.live_v2_advice_pump import LiveV2AdvicePump
 from daguandan_bridge.application.live_v2_worker_protocol import (
     DeliveryMode, WorkerFailure, WorkerReady, WorkerRequest, WorkerResult,
     WorkerResultStatus,
@@ -22,7 +23,7 @@ from daguandan_bridge.application.live_v2_worker_protocol import (
 from daguandan_bridge.domain.advice import AdviceResult
 from daguandan_bridge.infrastructure import live_v2_advice_worker as worker_module
 from daguandan_bridge.infrastructure.live_v2_advice_worker import (
-    replay_trusted_snapshot, run_fabledan_advice_worker,
+    replay_trusted_snapshot, run_fabledan_advice_worker, run_live_v2_advice_worker,
 )
 from daguandan_bridge.infrastructure.live_v2_advice_service_factory import create_live_v2_advice_runtime
 from daguandan_bridge.live_v2.events import ActionKind
@@ -426,6 +427,177 @@ def test_complete_snapshot_is_replayed_before_adviser_and_cache_is_reused() -> N
         assert adviser.calls == 2
         assert worker_module._ADVISORS[key] is adviser
     finally:
+        worker_module._ADVISORS.pop(key, None)
+
+
+def test_worker_success_preserves_unknown_suit_consensus_diagnostic() -> None:
+    snapshot = _snapshot()
+    config = AdviceWorkerConfig(
+        str(Path.cwd()), "fabledan", fabledan_runtime_policy="rule_only"
+    )
+    opportunity = _opportunity(snapshot, "consensus-diagnostic")
+    identity = AdviceRequestIdentity(snapshot.version, 11, opportunity.opportunity_id)
+    payload = AdviceWorkerPayload(config, snapshot, opportunity, request_id(identity))
+    request = WorkerRequest(
+        snapshot.version.session_id, snapshot.version.capture_generation,
+        11, snapshot.version.state_revision, 120, payload,
+        DeliveryMode.LATEST_ONLY, 1000,
+    )
+
+    class StubAdvisor:
+        def recommend(self, state: object, *, request_id: str = "") -> AdviceResult:
+            return AdviceResult(
+                "stub", ("4H",), "single", False,
+                snapshot.version.state_revision, 1.0, request_id,
+                engine_input={
+                    "unknown_suit_resolution": {
+                        "status": "consensus",
+                        "recommendation_status": "provisional_consensus",
+                        "world_set_fingerprint": "world-set-success",
+                        "world_count": 2,
+                    }
+                },
+            )
+
+    key = worker_module._advisor_key(config)
+    worker_module._ADVISORS[key] = StubAdvisor()
+    try:
+        result = run_fabledan_advice_worker(request)
+        assert isinstance(result, AdviceWorkerSuccess)
+        assert result.diagnostic["world_set_fingerprint"] == "world-set-success"
+        assert result.diagnostic["world_count"] == 2
+    finally:
+        worker_module._ADVISORS.pop(key, None)
+
+
+def test_worker_suit_pending_failure_preserves_divergence_diagnostic() -> None:
+    from daguandan_bridge.fabledan.advisor import FableDanStateError
+
+    snapshot = _snapshot()
+    config = AdviceWorkerConfig(
+        str(Path.cwd()), "fabledan", fabledan_runtime_policy="rule_only"
+    )
+    opportunity = _opportunity(snapshot, "pending-diagnostic")
+    identity = AdviceRequestIdentity(snapshot.version, 12, opportunity.opportunity_id)
+    payload = AdviceWorkerPayload(config, snapshot, opportunity, request_id(identity))
+    request = WorkerRequest(
+        snapshot.version.session_id, snapshot.version.capture_generation,
+        12, snapshot.version.state_revision, 120, payload,
+        DeliveryMode.LATEST_ONLY, 1000,
+    )
+
+    class StubAdvisor:
+        def recommend(self, state: object, *, request_id: str = "") -> AdviceResult:
+            raise FableDanStateError(
+                "suit disagreement",
+                diagnostic={
+                    "code": "unknown_suit_recommendation_disagreement",
+                    "status": "suit_pending",
+                    "world_set_fingerprint": "world-set-failure",
+                    "world_count": 2,
+                    "divergence": [{"world_fingerprint": "a"}, {"world_fingerprint": "b"}],
+                },
+            )
+
+    key = worker_module._advisor_key(config)
+    worker_module._ADVISORS[key] = StubAdvisor()
+    try:
+        result = run_fabledan_advice_worker(request)
+        assert result.code == "suit_pending"
+        assert result.diagnostic["world_set_fingerprint"] == "world-set-failure"
+        assert result.diagnostic["divergence"]
+    finally:
+        worker_module._ADVISORS.pop(key, None)
+
+
+def test_real_worker_runtime_and_pump_preserve_suit_pending_diagnostic_to_audit() -> None:
+    from daguandan_bridge.fabledan.advisor import FableDanStateError
+
+    snapshot = _snapshot()
+    config = AdviceWorkerConfig(
+        str(Path.cwd()), "fabledan", fabledan_runtime_policy="rule_only"
+    )
+    opportunity = _opportunity(snapshot, "e2e-suit-pending")
+
+    class StubAdvisor:
+        def recommend(self, state: object, *, request_id: str = "") -> AdviceResult:
+            raise FableDanStateError(
+                "suit disagreement",
+                diagnostic={
+                    "code": "unknown_suit_recommendation_disagreement",
+                    "status": "suit_pending",
+                    "world_set_fingerprint": "e2e-world-set",
+                    "world_count": 2,
+                    "divergence": [{"world_fingerprint": "a"}, {"world_fingerprint": "b"}],
+                },
+            )
+
+    class Store:
+        def __init__(self) -> None:
+            self.advice: list[dict[str, object]] = []
+        def append_advice(self, record): self.advice.append(record)
+
+    class InlineHost:
+        def __init__(self) -> None:
+            self.worker_generation = 0
+            self.worker_pid = None
+            self.results: list[WorkerResult] = []
+        def start(self, *, timeout: float = 10.0):
+            del timeout
+            self.worker_generation = 1
+            self.worker_pid = 55_001
+            return WorkerReady(self.worker_generation, self.worker_pid, 0.1)
+        def bind_version(self, **kwargs): pass
+        def submit(self, request: WorkerRequest):
+            payload = run_live_v2_advice_worker(request)
+            if isinstance(payload, AdvisorReady):
+                payload = replace(
+                    payload, worker_generation=self.worker_generation,
+                    worker_pid=self.worker_pid,
+                )
+            self.results.append(WorkerResult.terminal(
+                request, status=WorkerResultStatus.SUCCESS,
+                worker_generation=self.worker_generation, worker_pid=self.worker_pid,
+                finished_processing_ms=2, payload=payload,
+            ))
+            return ()
+        def get_result(self, *, timeout=None):
+            del timeout
+            return self.results.pop(0)
+        def drain_results(self):
+            values, self.results = tuple(self.results), []
+            return values
+        def cancel_all(self, *, reason):
+            del reason
+            return ()
+        def close(self, *, timeout=5.0):
+            del timeout
+
+    key = worker_module._advisor_key(config)
+    worker_module._ADVISORS[key] = StubAdvisor()
+    store = Store()
+    host = InlineHost()
+    runtime = LiveV2AdviceRuntime(
+        config, session_id=snapshot.version.session_id,
+        capture_generation=snapshot.version.capture_generation,
+        state_revision=snapshot.version.state_revision,
+        host_factory=lambda **kwargs: host,
+    )
+    pump = LiveV2AdvicePump(
+        runtime, snapshot_provider=lambda: snapshot,
+        on_result=lambda result: True, store=store, local_hint_window_ms=0,
+    )
+    try:
+        pump.start()
+        pump.publish(opportunity)
+        pump.poll()
+        assert store.advice
+        record = store.advice[-1]
+        assert record["status"] == "withheld"
+        assert record["diagnostic"]["world_set_fingerprint"] == "e2e-world-set"
+        assert record["diagnostic"]["divergence"]
+    finally:
+        pump.close()
         worker_module._ADVISORS.pop(key, None)
 
 

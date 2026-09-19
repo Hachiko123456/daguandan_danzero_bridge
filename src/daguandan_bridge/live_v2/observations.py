@@ -45,12 +45,42 @@ def require_cards(cards: tuple[str, ...], *, allow_empty: bool) -> None:
         require_text(card, "card")
 
 
+_CARD_RANKS = frozenset({
+    "2", "3", "4", "5", "6", "7", "8", "9", "10",
+    "J", "Q", "K", "A",
+})
+_CARD_SUITS = frozenset("SHCD")
+_SPECIAL_CARDS = frozenset({"small_joker", "big_joker"})
+
+
+def _is_physical_card(value: str) -> bool:
+    return value in _SPECIAL_CARDS or (
+        len(value) >= 2
+        and value[:-1] in _CARD_RANKS
+        and value[-1] in _CARD_SUITS
+    )
+
+
+def _unknown_rank(card: str) -> str | None:
+    if not card.endswith("?"):
+        return None
+    rank = card[:-1]
+    return rank if rank in _CARD_RANKS else None
+
+
 def require_suit_options(
     cards: tuple[str, ...],
     suit_options: tuple[tuple[str, ...], ...],
     *,
     require_selected_card: bool = True,
 ) -> None:
+    """Validate aligned physical-card evidence.
+
+    A rank-only observation such as ``7?`` is intentionally not a physical
+    card and therefore cannot be required to occur literally in its options.
+    Its options must instead contain one or more concrete cards of rank 7.
+    Determined cards retain the stricter self-membership rule.
+    """
     require_tuple(suit_options, "suit_options")
     if len(suit_options) != len(cards):
         raise ValueError("PLAY suit_options must align one-to-one with cards")
@@ -58,6 +88,23 @@ def require_suit_options(
         require_unique_text_tuple(options, "suit option")
         if not options:
             raise ValueError("each PLAY card requires at least one physical option")
+        unknown_rank = _unknown_rank(card)
+        if unknown_rank is not None:
+            concrete = tuple(option for option in options if option != card)
+            # Some legacy candidate constructors carry only the unresolved
+            # marker until a later reread supplies physical options. Preserve
+            # that placeholder, but validate every non-marker option strictly.
+            if not concrete:
+                continue
+            if any(not _is_physical_card(option) for option in concrete):
+                raise ValueError(
+                    "unknown-suit card options must contain concrete physical cards"
+                )
+            if any(option[:-1] != unknown_rank for option in concrete):
+                raise ValueError(
+                    "unknown-suit card options must preserve the observed rank"
+                )
+            continue
         if require_selected_card and card not in options:
             raise ValueError("each PLAY card must occur in its physical options")
 

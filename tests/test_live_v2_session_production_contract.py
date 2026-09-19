@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from threading import enumerate as live_threads
 from time import sleep
 
@@ -18,7 +19,9 @@ from daguandan_bridge.domain.advice import AdviceResult
 from daguandan_bridge.domain.recognition import FastSignalResult
 from daguandan_bridge.domain.recording import RecordingResult
 from daguandan_bridge.infrastructure.live_v2_rule_session import ProductionRuleSession
-from daguandan_bridge.live_v2.candidates import ActionCandidate, ActionKind, CandidateReason
+from daguandan_bridge.live_v2.candidates import (
+    ActionCandidate, ActionKind, CandidateReason, EvidenceOrigin,
+)
 from daguandan_bridge.live_v2.identity import FrameIdentity, Seat
 
 
@@ -110,6 +113,7 @@ class StubVision:
         self.closed = 0
         self.calls = 0
         self.frames: list[FrameIdentity] = []
+        self.opening_leads: list[Seat | None] = []
         self.batches: list[tuple[dict[str, object], ...]] = []
 
     def start(self, **kwargs): self.started += 1
@@ -118,12 +122,13 @@ class StubVision:
 
     def process_frame(
         self, image, *, frame, version, wild_rank, expected_seat=None,
-        now_ms=None, formal_action_boundary=None,
+        now_ms=None, formal_action_boundary=None, opening_lead_seat=None,
     ):
         del formal_action_boundary
         del image, wild_rank
         self.calls += 1
         self.frames.append(frame)
+        self.opening_leads.append(opening_lead_seat)
         specs = self.batches.pop(0) if self.batches else ()
         candidates = []
         for offset, spec in enumerate(specs, 1):
@@ -158,16 +163,26 @@ class StubAdvice:
         self.submissions: list[tuple[object, object, int]] = []
         self.pending: list[AdviceRuntimeResult] = []
         self.release = False
+        self.next_status = AdviceRuntimeStatus.ADVICE
+        self.next_diagnostic: dict[str, object] = {}
 
     def start(self, **kwargs): self.started += 1
     def close(self, **kwargs): self.closed += 1
     def submit(self, snapshot, opportunity, *, request_sequence, timeout_ms=3000):
         self.submissions.append((snapshot, opportunity, request_sequence))
+        status = self.next_status
         result = AdviceRuntimeResult(
             AdviceRequestIdentity(opportunity.version, request_sequence, opportunity.opportunity_id),
-            AdviceRuntimeStatus.ADVICE, 1, 101, 1.0,
-            AdviceResult("stub", (snapshot.my_hand[0],), "Single", False,
-                         snapshot.version.state_revision, 1.0),
+            status, 1, 101, 1.0,
+            None if status is not AdviceRuntimeStatus.ADVICE else AdviceResult(
+                "stub", (snapshot.my_hand[0],), "Single", False,
+                snapshot.version.state_revision, 1.0,
+                engine_input={
+                    "unknown_suit_resolution": dict(self.next_diagnostic)
+                } if self.next_diagnostic else None,
+            ),
+            failure_code=("suit_pending" if status is AdviceRuntimeStatus.BLOCKED else ""),
+            diagnostic=dict(self.next_diagnostic),
         )
         self.pending.append(result)
         return ()
@@ -303,10 +318,13 @@ def test_conflicting_current_seat_candidates_are_not_retained_for_manual_guessin
 def test_opening_action_uses_one_audit_evidence_and_the_unified_commit(rigs) -> None:
     rig = _rig(rigs, lead=None); rig.bind()
     update = rig.live.bootstrap_opening_action(
-        actor="left", cards=("3D",), expected_next_player="self",
+        actor="left", cards=("7?",), expected_next_player="self",
+        suit_options=(("7C", "7D"),),
         monotonic_ms=100, confidence=0.99, source="opening-marker",
     )
     assert update.snapshot.current_player == "self"
+    assert update.snapshot.play_history[-1].cards == ("7?",)
+    assert update.snapshot.play_history[-1].suit_options == (("7C", "7D"),)
     assert [batch[0].event_type for batch in rig.store.batches] == [
         "initial_state_confirmed", "lead_player_confirmed", "player_played",
     ]
@@ -314,6 +332,121 @@ def test_opening_action_uses_one_audit_evidence_and_the_unified_commit(rigs) -> 
     assert event.event_type == "player_played"
     assert len(event.evidence_refs) == 1
     assert event.evidence_refs[0].startswith("opening-")
+
+
+def test_seeded_lead_priority_and_partial_suit_reach_production_pipeline(rigs) -> None:
+    rig = _rig(rigs, lead="left"); rig.bind(); vision = rig.visions[-1]
+    vision.queue(_play(
+        "partial-left-opening", "left", ("7?",),
+        suit_options=(("7C", "7D"),),
+    ))
+    update = rig.live.analyze_frame(object(), monotonic_ms=100)
+    assert vision.opening_leads[0] is Seat.LEFT
+    assert update.snapshot.current_player == "self"
+    assert update.snapshot.play_history[-1].cards == ("7?",)
+    assert update.snapshot.play_history[-1].suit_options == (("7C", "7D"),)
+
+
+def test_provisional_consensus_and_suit_pending_diagnostics_reach_ui_and_audit(rigs) -> None:
+    rig = _rig(rigs, lead="right"); rig.bind(); advice = rig.advisers[-1]
+    advice.next_status = AdviceRuntimeStatus.ADVICE
+    advice.release = True
+    advice.next_diagnostic = {
+        "status": "consensus",
+        "recommendation_status": "provisional_consensus",
+        "world_set_fingerprint": "world-set-1",
+        "world_count": 2,
+    }
+    rig.live.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=100,
+    )
+    rig.live.commit_trusted_action(
+        actor="opposite", is_pass=True, monotonic_ms=110,
+    )
+    rig.live.commit_trusted_action(
+        actor="left", is_pass=True, monotonic_ms=120,
+    )
+    ready = rig.live.poll_deadlines()
+    assert ready.advice is not None and ready.advice.visible
+    assert ready.advice.suit_uncertain is True
+    assert ready.advice.variant_count == 2
+
+    rig2 = _rig(rigs, lead="right"); rig2.bind(); blocked = rig2.advisers[-1]
+    blocked.next_status = AdviceRuntimeStatus.BLOCKED
+    blocked.release = True
+    blocked.next_diagnostic = {
+        "code": "unknown_suit_recommendation_disagreement",
+        "status": "suit_pending",
+        "world_set_fingerprint": "world-set-2",
+        "world_count": 2,
+        "divergence": [{"world_fingerprint": "a"}, {"world_fingerprint": "b"}],
+    }
+    rig2.live.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=100,
+    )
+    rig2.live.commit_trusted_action(
+        actor="opposite", is_pass=True, monotonic_ms=110,
+    )
+    rig2.live.commit_trusted_action(
+        actor="left", is_pass=True, monotonic_ms=120,
+    )
+    pending = rig2.live.poll_deadlines()
+    assert pending.snapshot.current_player == "self"
+    assert pending.advice is not None
+    assert pending.advice.status == "withheld"
+    assert pending.advice.suit_uncertain is True
+    audit = [row for row in rig2.store.advice if row.get("status") == "withheld"]
+    assert audit and audit[-1]["diagnostic"]["world_set_fingerprint"] == "world-set-2"
+
+
+def test_manual_correction_invalidates_old_advice_and_recomputes_new_revision(rigs) -> None:
+    rig = _rig(rigs, lead="right"); rig.bind(); advice = rig.advisers[-1]
+    advice.release = True
+    rig.live.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=100,
+    )
+    rig.live.commit_trusted_action(
+        actor="opposite", is_pass=True, monotonic_ms=110,
+    )
+    rig.live.commit_trusted_action(
+        actor="left", is_pass=True, monotonic_ms=120,
+    )
+    before = rig.live.snapshot
+    corrected = rig.live.correct_latest(cards=("4S",), is_pass=False)
+    assert corrected.snapshot.revision == before.revision + 1
+    assert rig.advisers[-1] is not advice
+    assert rig.advisers[-1].submissions[-1][0].version.state_revision == corrected.snapshot.revision
+    assert any(row.get("status") == "cancelled" for row in rig.store.advice)
+
+
+def test_visual_correction_rejected_by_downstream_state_enters_review(rigs, monkeypatch) -> None:
+    from daguandan_bridge.application.live_v2_rule_session_protocol import RuleSessionRejected
+    rig = _rig(rigs, lead="right"); rig.bind()
+    rig.live.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=100,
+    )
+    action = SimpleNamespace(
+        action_id="visual-action", kind=ActionKind.PLAY,
+        evidence_origin=EvidenceOrigin.VISUAL, seat=Seat.RIGHT,
+        cards=("3S",), suit_options=(("3S",),), confidence=0.9,
+        source_candidate=SimpleNamespace(confidence=0.9, diagnostics=()),
+    )
+    rig.live._register_visual_correction(action)
+    monkeypatch.setattr(
+        rig.live.rule_session, "correct_latest",
+        lambda command: (_ for _ in ()).throw(RuleSessionRejected("downstream conflict")),
+    )
+    from daguandan_bridge.live_v2.identity import FrameIdentity
+    observation = SimpleNamespace(
+        confidence=0.99,
+        frame=FrameIdentity(rig.store.session_id, 1, 99, 200, "roi", "source"),
+    )
+    pending = next(iter(rig.live._visual_corrections.values()))
+    result = rig.live._commit_visual_correction(
+        pending, ("4S",), observation,
+    )
+    assert result.status == "review_required"
+    assert result.block_reason == "visual_correction_requires_review"
 
 
 def test_waiting_lead_visual_play_atomically_confirms_lead_and_first_action(rigs) -> None:
@@ -432,6 +565,7 @@ def test_correct_latest_is_explicit_rule_correction_without_advancing_turn(rigs)
     assert corrected.snapshot.play_history[-1].cards == ("4S",)
     assert not (corrected.advice and corrected.advice.visible)
     assert old_vision.closed == old_advice.closed == 1
+    assert any(row.get("status") == "cancelled" for row in rig.store.advice)
     assert rig.visions[-1] is not old_vision and rig.advisers[-1] is not old_advice
 
 
