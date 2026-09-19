@@ -44,15 +44,44 @@ if ((Get-Content -LiteralPath $marker -Raw).Trim() -ne "guandan.wheelhouse-root/
 }
 
 Write-Host "Downloading the explicitly pinned release wheels..." -ForegroundColor Cyan
-& $Python -m pip download `
-    --isolated `
-    --ignore-requires-python `
-    --only-binary=:all: `
-    --no-deps `
-    --dest $wheelhouse `
-    -r (Join-Path $projectRoot "requirements-release.in")
-if ($LASTEXITCODE -ne 0) {
-    throw "Pinned wheel download failed with exit code $LASTEXITCODE."
+# rlcard 1.2.0 is published as a source distribution rather than a wheel.
+# Build that one pure-Python package into the isolated wheelhouse; all other
+# release inputs remain binary-only and are still verified by the committed
+# hashes below.
+$runtimeRequirements = Join-Path $wheelhouse "requirements-release.runtime.in"
+Get-Content -LiteralPath (Join-Path $projectRoot "requirements-release.in") |
+    Where-Object { $_ -notmatch '^\s*rlcard==' } |
+    Set-Content -LiteralPath $runtimeRequirements -Encoding utf8
+try {
+    & $Python -m pip download `
+        --isolated `
+        --ignore-requires-python `
+        --only-binary=:all: `
+        --no-deps `
+        --dest $wheelhouse `
+        -r $runtimeRequirements
+    if ($LASTEXITCODE -ne 0) {
+        throw "Pinned binary wheel download failed with exit code $LASTEXITCODE."
+    }
+
+    & $Python -m pip wheel `
+        --isolated `
+        --ignore-requires-python `
+        --no-deps `
+        --no-cache-dir `
+        --wheel-dir $wheelhouse `
+        rlcard==1.2.0
+    if ($LASTEXITCODE -ne 0) {
+        throw "Pinned rlcard source-to-wheel build failed with exit code $LASTEXITCODE."
+    }
+    & $Python (Join-Path $projectRoot "scripts\normalize_wheel.py") `
+        --wheel (Join-Path $wheelhouse "rlcard-1.2.0-py3-none-any.whl")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Deterministic rlcard wheel normalization failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    Remove-Item -LiteralPath $runtimeRequirements -Force -ErrorAction SilentlyContinue
 }
 
 $candidateRequirements = Join-Path $wheelhouse "requirements-release.candidate.lock"
