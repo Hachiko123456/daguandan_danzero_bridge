@@ -12,7 +12,13 @@ param(
     [string] $BootstrapPython = "",
 
     [Parameter()]
-    [switch] $AllowDirtyDevelopmentBuild
+    [switch] $AllowDirtyDevelopmentBuild,
+
+    [Parameter()]
+    [switch] $OverwriteExisting,
+
+    [Parameter()]
+    [switch] $Compact
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +107,45 @@ function Assert-DisjointRoots {
         (Test-IsSameOrBelow -Path $Second -Root $First)
     ) {
         throw "$Description must be disjoint: $First ; $Second"
+    }
+}
+
+function Clear-ManagedReleaseRoot {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][bool] $Overwrite
+    )
+    $fullRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if (-not [System.IO.Directory]::Exists($fullRoot)) {
+        return
+    }
+    if (-not $Overwrite) {
+        throw "ReleaseRoot already exists. Use -OverwriteExisting only for a managed current release root: $fullRoot"
+    }
+    Assert-NoReparseTree -LiteralPath $fullRoot
+    $markerPath = Join-Path $fullRoot ".daguandan-release-root"
+    if (-not [System.IO.File]::Exists($markerPath)) {
+        throw "Existing ReleaseRoot is not owned by this packaging system: $fullRoot"
+    }
+    if ((Get-Content -LiteralPath $markerPath -Raw).Trim() -ne "guandan.package-release-root/2") {
+        throw "Existing ReleaseRoot ownership marker is invalid: $fullRoot"
+    }
+    $managed = @(
+        "build", "build-env", "dist", "payload", "spec", "temp", "pyinstaller-config",
+        "DaguandanAssistant.zip", "DaguandanAssistant.zip.sha256", "DaguandanAssistant.release.json",
+        "source_identity.json", "release_input_audit.json", "bootstrap_python_audit.json"
+    )
+    foreach ($entry in Get-ChildItem -LiteralPath $fullRoot -Force) {
+        if ($entry.Name -eq ".daguandan-release-root") { continue }
+        if ($managed -notcontains $entry.Name) {
+            throw "Existing ReleaseRoot contains unmanaged content; refusing to delete: $($entry.FullName)"
+        }
+    }
+    foreach ($name in $managed) {
+        $candidate = Join-Path $fullRoot $name
+        if (Test-Path -LiteralPath $candidate) {
+            Remove-Item -LiteralPath $candidate -Recurse -Force
+        }
     }
 }
 
@@ -221,18 +266,39 @@ $appName = "DaguandanAssistant"
 $releaseRoot = [System.IO.Path]::GetFullPath($ReleaseRoot)
 $wheelhouseRoot = [System.IO.Path]::GetFullPath($WheelhouseRoot)
 $filesystemRoot = [System.IO.Path]::GetPathRoot($releaseRoot)
+$projectCurrentReleaseRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "release\current"))
+$isProjectCurrentRelease = $releaseRoot.TrimEnd('\').Equals($projectCurrentReleaseRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
 if (
     [string]::IsNullOrWhiteSpace($filesystemRoot) -or
-    $releaseRoot.TrimEnd('\') -eq $filesystemRoot.TrimEnd('\')
+$releaseRoot.TrimEnd('\') -eq $filesystemRoot.TrimEnd('\')
 ) {
-    throw "ReleaseRoot must be a unique dedicated directory, not a filesystem root."
+    throw "ReleaseRoot must not be a filesystem root."
 }
-if ([System.IO.File]::Exists($releaseRoot) -or [System.IO.Directory]::Exists($releaseRoot)) {
-    throw "ReleaseRoot must be unique and must not already exist: $releaseRoot"
+if ($isProjectCurrentRelease) {
+    if (-not $OverwriteExisting -and (Test-Path -LiteralPath $releaseRoot)) {
+        throw "In-project ReleaseRoot already exists. Use -OverwriteExisting: $releaseRoot"
+    }
+    if (Test-Path -LiteralPath $releaseRoot) {
+        Clear-ManagedReleaseRoot -Root $releaseRoot -Overwrite $OverwriteExisting
+    }
+    else {
+        [System.IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
+    }
+    Assert-NoReparsePathChain -LiteralPath $releaseRoot
 }
-Assert-NoReparsePathChain -LiteralPath $releaseRoot
+else {
+    if (Test-Path -LiteralPath $releaseRoot) {
+        if (-not $OverwriteExisting) {
+            throw "ReleaseRoot already exists. Use -OverwriteExisting: $releaseRoot"
+        }
+        Clear-ManagedReleaseRoot -Root $releaseRoot -Overwrite $true
+    }
+    Assert-NoReparsePathChain -LiteralPath $releaseRoot
+}
 Assert-NoReparseTree -LiteralPath $wheelhouseRoot
-Assert-DisjointRoots -First $releaseRoot -Second $projectRoot -Description "ReleaseRoot and project root"
+if (-not $isProjectCurrentRelease) {
+    Assert-DisjointRoots -First $releaseRoot -Second $projectRoot -Description "ReleaseRoot and project root"
+}
 Assert-DisjointRoots -First $wheelhouseRoot -Second $projectRoot -Description "WheelhouseRoot and project root"
 Assert-DisjointRoots -First $releaseRoot -Second $wheelhouseRoot -Description "ReleaseRoot and WheelhouseRoot"
 
@@ -559,6 +625,14 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
 Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
 $size = (Get-ChildItem -LiteralPath $bundlePath -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
+if ($Compact) {
+    foreach ($managedDirectory in @($distPath, $workPath, $buildEnvPath, $payloadPath, $specPath, $script:tempPath, $script:pyinstallerConfigPath)) {
+        if (Test-Path -LiteralPath $managedDirectory) {
+            Remove-Item -LiteralPath $managedDirectory -Recurse -Force
+        }
+    }
+    Write-Host "Compact mode removed build intermediates; archive and release records remain." -ForegroundColor Green
+}
 Write-Host ("Complete bundle: {0}" -f $bundlePath) -ForegroundColor Green
 Write-Host ("Archive: {0}" -f $archivePath) -ForegroundColor Green
 Write-Host ("Archive SHA256: {0}" -f $archiveChecksumPath) -ForegroundColor Green
