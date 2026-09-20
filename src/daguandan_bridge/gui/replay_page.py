@@ -84,6 +84,7 @@ from ..live.truth_log import (
 )
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
+from .offline_diagnostic_panel import OfflineDiagnosticPanel
 from .single_image_danzero_page import SingleImageDanzeroPage
 from .truth_log_editor import CardPickerDialog, TruthLogEditor
 from .video_playback import ReplayDecodeThread, SessionPlaybackToolbar
@@ -638,6 +639,7 @@ class ReplayPage(QWidget):
         profile_name: str | None = None,
         unverified_batch_service: UnverifiedBatchScanService | None = None,
         batch_output_root: Path | str | None = None,
+        can_start_offline_diagnostic: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self.sessions_root = Path(
@@ -650,6 +652,7 @@ class ReplayPage(QWidget):
             else PROFILES_ROOT
         )
         self.profile_name = str(profile_name or "tencent_daguandan")
+        self._external_can_start_offline_diagnostic = can_start_offline_diagnostic
         self.advisor_strategy = load_profile_advisor_strategy(
             self.profiles_root,
             self.profile_name,
@@ -660,6 +663,7 @@ class ReplayPage(QWidget):
         self._pure_scan_thread: PureVideoScanThread | None = None
         self._trusted_thread: TrustedAdviceReplayThread | None = None
         self._unverified_batch_thread: UnverifiedBatchScanThread | None = None
+        self._offline_diagnostic_busy = False
         self._unverified_batch_service = unverified_batch_service or UnverifiedBatchScanService()
         self._batch_descriptors: tuple[object, ...] = ()
         self._batch_selected_count = 0
@@ -722,6 +726,8 @@ class ReplayPage(QWidget):
         either value from ``session.parents``.
         """
 
+        if self._offline_diagnostic_busy:
+            raise RuntimeError("离线诊断运行中，不能切换对局或配置")
         self._stop_decode()
         if self._visual_thread is not None and self._visual_thread.isRunning():
             self._visual_thread.stop()
@@ -732,6 +738,8 @@ class ReplayPage(QWidget):
         self.sessions_root = Path(sessions_root).expanduser().resolve()
         self.profiles_root = Path(profiles_root).expanduser().resolve()
         self.profile_name = str(profile_name).strip()
+        self.offline_diagnostic_panel.profiles_root = self.profiles_root
+        self.offline_diagnostic_panel.profile_name = self.profile_name
         self._recognition_service = None
         self.advisor_strategy = load_profile_advisor_strategy(
             self.profiles_root,
@@ -775,7 +783,8 @@ class ReplayPage(QWidget):
             f" QScrollArea#replayContentScroll, QWidget#replayContentViewport,"
             f" QWidget#replayContentHost {{ background:{colors['background']};"
             " border:0; }}"
-            f" QWidget#replaySelectorCard, QWidget#replayVideoCard,"
+            f" QWidget#replaySelectorCard, QWidget#offlineDiagnosticPanel,"
+            f" QWidget#replayVideoCard,"
             f" QWidget#replayDiagnosticsCard, QStackedWidget#replayDiagnosticsStack,"
             f" QWidget#replayDiagnosticsPage, QWidget#replayEditorPage {{"
             f" background:{colors['surface']}; color:{colors['foreground']}; }}"
@@ -853,6 +862,7 @@ class ReplayPage(QWidget):
             widget.setAutoFillBackground(True)
         for widget in (
             self.selector_card,
+            self.offline_diagnostic_panel,
             self.video_card,
             self.diagnostics_card,
             self.diagnostics_stack,
@@ -904,6 +914,17 @@ class ReplayPage(QWidget):
         self.session_summary.setWordWrap(True)
         selector_layout.addWidget(self.session_summary)
         root.addWidget(selector)
+
+        self.offline_diagnostic_panel = OfflineDiagnosticPanel(
+            profiles_root=self.profiles_root,
+            profile_name=self.profile_name,
+            can_start=self._can_start_offline_diagnostic,
+            parent=self,
+        )
+        self.offline_diagnostic_panel.busy_changed.connect(
+            self._offline_diagnostic_busy_changed
+        )
+        root.addWidget(self.offline_diagnostic_panel)
 
         self.content_scroll = QScrollArea()
         self.content_scroll.setObjectName("replayContentScroll")
@@ -1165,6 +1186,8 @@ class ReplayPage(QWidget):
         self.content_layout.setStretch(1, 1 if vertical else 2)
 
     def refresh_sessions(self, *, preserve_current: bool = False) -> None:
+        if self._offline_diagnostic_busy:
+            return
         selected = self.current_session
         self._batch_descriptors = ()
         self.session_combo.blockSignals(True)
@@ -1243,6 +1266,8 @@ class ReplayPage(QWidget):
 
     @Slot()
     def _scan_unverified_sessions(self) -> None:
+        if self._offline_diagnostic_busy:
+            return
         thread = self._unverified_batch_thread
         if thread is not None and thread.isRunning():
             return
@@ -1364,6 +1389,8 @@ class ReplayPage(QWidget):
         self._update_unverified_batch_controls()
 
     def select_session(self, session: Path) -> None:
+        if self._offline_diagnostic_busy:
+            return
         session = Path(session).resolve()
         if self._visual_thread is not None and self._visual_thread.isRunning():
             self._visual_thread.stop()
@@ -1458,6 +1485,29 @@ class ReplayPage(QWidget):
         except Exception as exc:
             self._show_error(str(exc))
 
+    def _can_start_offline_diagnostic(self) -> bool:
+        """Allow only when injected runtime and page-level scans are idle."""
+        if (
+            self._external_can_start_offline_diagnostic is not None
+            and not self._external_can_start_offline_diagnostic()
+        ):
+            return False
+        threads = (
+            self._visual_thread,
+            self._pure_scan_thread,
+            self._trusted_thread,
+            self._unverified_batch_thread,
+        )
+        return not any(thread is not None and thread.isRunning() for thread in threads)
+
+    @Slot(bool)
+    def _offline_diagnostic_busy_changed(self, busy: bool) -> None:
+        self._offline_diagnostic_busy = bool(busy)
+        # Disable containers instead of overwriting each child's eligibility;
+        # completing/cancelling diagnostics restores the exact previous state.
+        self.selector_card.setEnabled(not busy)
+        self.content_host.setEnabled(not busy)
+
     def _set_session_actions(
         self,
         enabled: bool,
@@ -1489,7 +1539,6 @@ class ReplayPage(QWidget):
             self.speed_combo,
         ):
             widget.setEnabled(enabled and playable)
-
     def _ensure_decode(self) -> ReplayDecodeThread | None:
         if self.current_session is None:
             return None
@@ -2090,6 +2139,8 @@ class ReplayPage(QWidget):
         return self.truth_log
 
     def replay_truth(self) -> None:
+        if self._offline_diagnostic_busy:
+            return
         if self.current_session is None or self.truth_log is None:
             return
         try:
@@ -2133,6 +2184,8 @@ class ReplayPage(QWidget):
         self.play()
 
     def replay_trusted_advisor(self, truth_log: TruthLog) -> None:
+        if self._offline_diagnostic_busy:
+            return
         if self.current_session is None or self._trusted_thread is not None:
             return
         thread = TrustedAdviceReplayThread(
@@ -2238,6 +2291,8 @@ class ReplayPage(QWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def replay_state(self) -> None:
+        if self._offline_diagnostic_busy:
+            return
         if self.current_session is None:
             return
         try:
@@ -2300,6 +2355,8 @@ class ReplayPage(QWidget):
         self.diagnostics.setPlainText("\n".join(lines))
 
     def analyze_video_to_truth_log(self) -> None:
+        if self._offline_diagnostic_busy:
+            return
         if self.current_session is None or (
             self._visual_thread is not None and self._visual_thread.isRunning()
         ):
@@ -2522,6 +2579,8 @@ class ReplayPage(QWidget):
             )
 
     def _open_pure_scan_initial_state_review(self) -> None:
+        if self._offline_diagnostic_busy:
+            return
         """Let the user complete missing opening facts from the scan package."""
 
         if self._pure_scan_result is None:
@@ -3229,7 +3288,15 @@ class ReplayPage(QWidget):
     def _show_error(self, message: str) -> None:
         self.diagnostics.setPlainText(f"错误：{message}")
 
-    def shutdown(self) -> None:
+    def closeEvent(self, event) -> None:
+        if not self.offline_diagnostic_panel.request_close(self):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def shutdown(self) -> bool:
+        if not self.offline_diagnostic_panel.shutdown():
+            return False
         self._stop_decode()
         if self._truth_editor is not None:
             self._truth_editor.shutdown()
@@ -3245,3 +3312,4 @@ class ReplayPage(QWidget):
         if self._trusted_thread is not None and self._trusted_thread.isRunning():
             self._trusted_thread.stop()
             self._trusted_thread.wait(30_000)
+        return True

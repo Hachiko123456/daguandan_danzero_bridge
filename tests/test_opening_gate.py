@@ -162,12 +162,14 @@ def test_ordinary_clock_reversal_and_unknown_anchor_do_not_erase_history_fact():
 
 
 @pytest.mark.parametrize("weak", [result(cards=("?",)), result(confidence=.1), result(current="right")])
-def test_single_weak_or_contradictory_event_does_not_permanently_seal_opening(weak):
+def test_single_weak_or_contradictory_event_does_not_start_without_opening_action(weak):
     tracker = OpeningTracker()
     observe(tracker, weak, 100)
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 10000).ready
-    assert observe(tracker, empty, 10100).ready
+    assert not observe(tracker, empty, 10100).ready
+    assert not observe(tracker, result(), 10200).ready
+    assert observe(tracker, result(confidence=.95), 10300).ready
 
 
 def test_explicit_generation_or_settlement_boundary_may_start_a_new_phase():
@@ -176,11 +178,14 @@ def test_explicit_generation_or_settlement_boundary_may_start_a_new_phase():
     assert observe(tracker, result(), 200).ready
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 300, generation=1).ready
-    assert observe(tracker, empty, 400, generation=1).ready
+    assert not observe(tracker, empty, 400, generation=1).ready
+    assert not observe(tracker, result(), 500, generation=1).ready
+    assert observe(tracker, result(), 600, generation=1).ready
     terminal = serialized_result(round_level="5", hand=(), buttons=("continue_game", "change_table"))
-    assert observe(tracker, terminal, 450, generation=1).reason == "settlement_screen"
-    assert not observe(tracker, empty, 500, generation=1).ready
-    assert observe(tracker, empty, 600, generation=1).ready
+    assert observe(tracker, terminal, 650, generation=1).reason == "settlement_screen"
+    assert not observe(tracker, empty, 700, generation=1).ready
+    assert not observe(tracker, result(), 800, generation=1).ready
+    assert observe(tracker, result(), 900, generation=1).ready
 
 
 def test_action_or_level_conflict_requires_fresh_confirmation():

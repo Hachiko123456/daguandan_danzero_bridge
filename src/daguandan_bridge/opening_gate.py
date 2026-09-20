@@ -285,6 +285,12 @@ class OpeningTracker:
         if self.hand_count < 2 or self.candidate_count < 2:
             self.reason = "confirming_hand" if self.hand_count < 2 else "confirming_opening"
             return OpeningGateEvaluation(False, self.reason, None, normalized)
+        # A lead marker plus a stable hand is not enough to start formal
+        # live-v2. The opening action must be visible as well; otherwise a
+        # later self response can be promoted to turn zero.
+        if candidate.opening_action is None:
+            self.reason = "confirming_opening"
+            return OpeningGateEvaluation(False, self.reason, None, normalized)
         self.completed = True
         self.reason = "ready"
         return OpeningGateEvaluation(True, self.reason, candidate, normalized)

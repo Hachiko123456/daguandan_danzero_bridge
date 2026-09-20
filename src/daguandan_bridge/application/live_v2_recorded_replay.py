@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from ..advisor_strategy import load_profile_advisor_strategy
 from ..domain.frame import FrameEnvelope
@@ -39,6 +39,7 @@ def replay_video_through_production_live_v2(
     runtime_builder: RuntimeBuilder | None = None,
     advisor_backend: str | None = None,
     advisor: Any | None = None,
+    vision_delivery: Literal["latest", "synchronous"] = "synchronous",
 ) -> VisualPipelineReplayResult:
     """Replay AVI frames through the production LiveV2 runtime.
 
@@ -200,7 +201,7 @@ def replay_video_through_production_live_v2(
                     profile_name=profile_root.name,
                     advisor_backend=backend,
                     on_update=None,
-                    vision_delivery="synchronous",
+                    vision_delivery=vision_delivery,
                 )
                 update = _start_runtime_from_opening_seed(
                     runtime,

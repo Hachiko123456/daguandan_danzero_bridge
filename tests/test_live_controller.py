@@ -23,7 +23,7 @@ from daguandan_bridge.gui.live_controller import (
     _WaitingRecognitionEnvelope,
 )
 from daguandan_bridge.gui.recording_dispatcher import RecordingFrame
-from daguandan_bridge.opening_gate import ListeningPageSignal
+from daguandan_bridge.opening_gate import ListeningPageSignal, serialized_result
 from daguandan_bridge.capture_service import FrameSnapshot, LiveCaptureInterrupted
 from daguandan_bridge.danzero.advisor import LocalAdvice
 from daguandan_bridge.domain.recording import RecordingResult
@@ -285,6 +285,24 @@ def test_controller_warms_one_reusable_default_advisor_in_background(tmp_path):
 def _initial_recognition(hand, *, round_level="2"):
     return SimpleNamespace(my_hand=hand, round_level=round_level)
 
+
+
+def _opening_recognition(hand, *, round_level="2", cards=("2C",)):
+    return serialized_result(
+        round_level=round_level,
+        hand=hand,
+        lead_player="left",
+        current_player="self",
+        events=(
+            {
+                "player": "left",
+                "cards": tuple(cards),
+                "is_pass": False,
+                "confidence": 0.95,
+                "source": "test-opening",
+            },
+        ),
+    )
 
 @pytest.mark.parametrize("phase", ["opening_seed_invalid", "confirming_opening"])
 def test_opening_title_is_compact_without_losing_structured_state(tmp_path, phase):
@@ -661,8 +679,8 @@ def test_full_recording_seals_listener_clip_before_starting_a_confirmed_game(
         lambda: started.append(True),
     )
 
-    controller._consume_waiting_recognition(_initial_recognition(hand), None)
-    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+    controller._consume_waiting_recognition(_opening_recognition(hand), None)
+    controller._consume_waiting_recognition(_opening_recognition(hand), None)
 
     assert recording.closed_with == ["initial_state_confirmed"]
     assert started == [True]
@@ -714,8 +732,8 @@ def test_listener_starts_session_after_two_identical_complete_hands(tmp_path, mo
         lambda result: started.append((result.round_level, result.my_hand)),
     )
 
-    controller._consume_waiting_recognition(_initial_recognition(hand), None)
-    controller._consume_waiting_recognition(_initial_recognition(hand), None)
+    controller._consume_waiting_recognition(_opening_recognition(hand), None)
+    controller._consume_waiting_recognition(_opening_recognition(hand), None)
 
     assert started == [("2", hand)]
 
@@ -775,7 +793,7 @@ def test_listener_does_not_start_session_when_complete_hand_changes(tmp_path, mo
     controller._table_anchor_observed = True
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
-    controller._consume_waiting_recognition(_initial_recognition(first), None)
+    controller._consume_waiting_recognition(_opening_recognition(first), None)
     controller._consume_waiting_recognition(_initial_recognition(second), None)
 
     assert started == []
@@ -794,8 +812,8 @@ def test_listener_treats_different_recognition_order_as_the_same_hand(tmp_path, 
     controller._table_anchor_observed = True
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
-    controller._consume_waiting_recognition(_initial_recognition(first), None)
-    controller._consume_waiting_recognition(_initial_recognition(tuple(reversed(first))), None)
+    controller._consume_waiting_recognition(_opening_recognition(first), None)
+    controller._consume_waiting_recognition(_opening_recognition(tuple(reversed(first))), None)
 
     assert len(started) == 1
 
@@ -836,8 +854,8 @@ def test_listener_does_not_start_before_the_table_anchor(tmp_path, monkeypatch):
     monkeypatch.setattr(controller, "_table_anchor_score", lambda _snapshot: 0.8499)
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
-    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
-    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
+    controller._consume_waiting_recognition(_opening_recognition(hand), SimpleNamespace())
+    controller._consume_waiting_recognition(_opening_recognition(hand), SimpleNamespace())
 
     assert started == []
     assert controller._waiting_candidate is None
@@ -856,8 +874,8 @@ def test_listener_starts_after_a_single_085_table_anchor_frame(tmp_path, monkeyp
     monkeypatch.setattr(controller, "_table_anchor_score", lambda _snapshot: 0.85)
     monkeypatch.setattr(controller, "_start_detected_session", lambda result: started.append(result))
 
-    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
-    controller._consume_waiting_recognition(_initial_recognition(hand), SimpleNamespace())
+    controller._consume_waiting_recognition(_opening_recognition(hand), SimpleNamespace())
+    controller._consume_waiting_recognition(_opening_recognition(hand), SimpleNamespace())
 
     assert len(started) == 1
 
@@ -1158,10 +1176,21 @@ def test_geometry_move_or_resize_recovers_then_allows_opening_gate(
         for suit in "SHCD"
     )[:27]
     task = _WaitingAnalysisTask(frame, recovery_generation)
-    controller._consume_waiting_recognition(_initial_recognition(hand), task)
+    opening = SimpleNamespace(
+        my_hand=hand,
+        round_level="2",
+        lead_player="left",
+        current_player="self",
+        events=(SimpleNamespace(
+            player="left", cards=("2C",), is_pass=False,
+            confidence=0.95, source="geometry-recovery",
+        ),),
+        buttons=(),
+    )
+    controller._consume_waiting_recognition(opening, task)
     next_frame = replace(frame, captured_monotonic_ms=frame.captured_monotonic_ms + 200)
     controller._consume_waiting_recognition(
-        _initial_recognition(hand), _WaitingAnalysisTask(next_frame, recovery_generation)
+        opening, _WaitingAnalysisTask(next_frame, recovery_generation)
     )
     app.processEvents()
 
@@ -1460,19 +1489,21 @@ def test_current_analysis_task_uses_its_immutable_token_and_capture_metadata(tmp
 
     result = controller._analyze_live_frame(
         token,
-        _AnalysisFrameTask(token, _preselection_frame(), 17, 456),
+        _AnalysisFrameTask(token, replace(_preselection_frame(), captured_monotonic_ms=456), 17, 456),
     )
 
     assert isinstance(result, LiveUpdate)
     assert orchestrator.calls == 1
     monotonic_ms, trace_context = orchestrator.trace_contexts[-1]
     assert monotonic_ms == 456
-    assert trace_context == {
-        "worker_token": {"session_id": "session", "nonce": 4, "generation": 9},
-        "capture_seq": 17,
-        "captured_ms": 456,
-        "capture_generation": 9,
+    assert trace_context["worker_token"] == {
+        "session_id": "session", "nonce": 4, "generation": 9,
     }
+    assert trace_context["capture_seq"] == 17
+    assert trace_context["captured_ms"] == 456
+    assert trace_context["capture_generation"] == 9
+    assert trace_context["frame_source"] == "canonical_envelope"
+    assert trace_context["roi_version"] == "live-v2"
 
 
 def test_pipeline_gui_delivery_is_queued_and_rejects_changed_generation(tmp_path):
@@ -1820,7 +1851,7 @@ def test_real_core_start_binds_before_capture_and_waiting_lead_notices(real_cont
     _app().processEvents()
     assert rig.updates[-1].capture_generation == token.generation
     if lead_player is None:
-        frame = SimpleNamespace(image=np.zeros((32, 64, 3), np.uint8))
+        frame = _preselection_frame()
         update = rig.controller._analyze_live_frame(token, _AnalysisFrameTask(token, frame, 1, 1100))
         assert update.status == "waiting_lead"
         assert update.capture_generation == token.generation

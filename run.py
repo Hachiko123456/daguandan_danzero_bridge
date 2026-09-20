@@ -114,6 +114,17 @@ def main(argv: list[str] | None = None) -> int:
         help="导出脱敏支持包；默认不包含截图，需显式 --include-support-images。",
     )
     parser.add_argument(
+        "--replay-diagnostic",
+        type=Path,
+        metavar="ZIP_OR_DIR",
+        help="导入完整诊断 ZIP 或对局目录，离线复测 production live-v2；不需要新开对局。",
+    )
+    parser.add_argument(
+        "--replay-diagnostic-output",
+        type=Path,
+        help="可选：离线诊断报告输出目录。",
+    )
+    parser.add_argument(
         "--export-session-diagnostic",
         type=Path,
         metavar="SESSION",
@@ -219,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             bool(args.sessions_status),
             args._doctor_import_probe is not None,
             args.export_support is not None,
+            args.replay_diagnostic is not None,
             args.export_session_diagnostic is not None,
             args.repro_support is not None,
             args._repro_probe is not None,
@@ -228,8 +240,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if selected_modes > 1:
         parser.error(
-            "基准、模拟窗口、窗口 E2E、doctor、迁移、sessions 迁移、支持导出和复现模式不能同时启用"
+            "基准、模拟窗口、窗口 E2E、doctor、迁移、sessions 迁移、支持导出、离线诊断和复现模式不能同时启用"
         )
+    if args.replay_diagnostic_output is not None and args.replay_diagnostic is None:
+        parser.error("--replay-diagnostic-output 只能与 --replay-diagnostic 一起使用")
     if args.doctor_output is not None and not (
         args.doctor or args._doctor_import_probe is not None
     ):
@@ -291,6 +305,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report.get("status") == "PASS" else 2
+    if args.replay_diagnostic is not None:
+        from daguandan_bridge.application.offline_diagnostic_replay import (
+            OfflineDiagnosticReplayService,
+        )
+
+        service_kwargs = {}
+        if args.replay_diagnostic_output is not None:
+            service_kwargs["output_root"] = args.replay_diagnostic_output
+        result = OfflineDiagnosticReplayService(**service_kwargs).run(
+            args.replay_diagnostic
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.status == "complete" else 2
     if args.export_session_diagnostic is not None:
         from daguandan_bridge.automatic_log_delivery import (
             export_automatic_session_log,
