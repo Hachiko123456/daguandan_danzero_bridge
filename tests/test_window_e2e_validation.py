@@ -848,6 +848,19 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
     assert 'set "ReleaseRoot=%~dp0release\\current"' in launcher
     assert 'set "WheelhouseRoot=%LOCALAPPDATA%\\Daguandan\\wheelhouse"' in launcher
     assert 'set "OverwriteFlag=-OverwriteExisting"' in launcher
+    assert 'set "DefaultWheelhouse=0"' in launcher
+    assert 'set "NeedPrepareWheelhouse=0"' in launcher
+    assert '[1/3] 检查 wheelhouse' in launcher
+    assert '[2/3] 准备依赖' in launcher
+    assert '[3/3] 构建发布包' in launcher
+    assert 'scripts\\prepare_release_wheelhouse.ps1' in launcher
+    assert 'if not exist "%WheelhouseRoot%\\.daguandan-wheelhouse-root"' in launcher
+    assert 'if not exist "%WheelhouseRoot%\\wheelhouse.candidate.lock.json"' in launcher
+    assert 'Explicit wheelhouse was provided; it will not be replaced or prepared by this launcher.' in launcher
+    assert 'for %%I in ("%ReleaseRoot%") do set "ReleaseOutputDirectory=%%~fI"' in launcher
+    assert 'echo Release output directory: "%ReleaseOutputDirectory%"' in launcher
+    assert 'failed with exit code !StageExitCode!' in launcher
+    assert 'EnableDelayedExpansion' in launcher
     assert '-ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%"' in launcher
 
     help_completed = subprocess.run(
@@ -855,6 +868,7 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert help_completed.returncode == 0
