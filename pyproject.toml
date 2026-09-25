@@ -55,6 +55,7 @@ unit = [
   "tests/live_v2/test_game_state.py",
   "tests/live_v2/test_turn_core.py",
   "tests/test_run_test_layers.py",
+  "tests/test_all_script_help.py",
 ]
 contract = [
   "tests/live_v2/test_architecture.py",

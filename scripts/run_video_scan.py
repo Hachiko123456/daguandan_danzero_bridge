@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,13 +20,36 @@ from daguandan_bridge.recognition_service import ScreenshotRecognitionService
 from daguandan_bridge.template_service import TemplateService
 
 
-def main() -> int:
-    session = Path(sys.argv[1]).resolve()
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run one pure video scan for a session directory.",
+        epilog=(
+            "Reads the session video and optional frame_index.jsonl. "
+            "Writes scan artifacts under reports/video-scans by default."
+        ),
+    )
+    parser.add_argument(
+        "session_dir",
+        type=Path,
+        help="Input session directory to read; expects video/game.avi inside it.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("reports/video-scans"),
+        help="Directory where the timestamped scan output is written (default: %(default)s).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    session = args.session_dir.resolve()
     video = session / "video" / "game.avi"
     frame_index = session / "video" / "frame_index.jsonl"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = (
-        Path("reports/video-scans") / f"{session.name}_{stamp}"
+        args.output_root / f"{session.name}_{stamp}"
     ).resolve()
     profile = default_profile_context().profile_path
     recognition = ScreenshotRecognitionService(

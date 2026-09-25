@@ -100,7 +100,22 @@ CPython 工具链哈希完全一致：
   -WheelhouseRoot "C:\DaguandanBuildInputs\wheelhouse-cp312-win_amd64"
 ```
 
-随后指定一个尚不存在、位于仓库外部的唯一输出目录进行打包：
+随后可直接运行批处理入口完成常规本机构建；不传参数时默认输出到仓库内的
+`release\current`，并从 `%LOCALAPPDATA%\Daguandan\wheelhouse` 读取 wheelhouse。
+默认 `release\current` 会自动以受管方式覆盖重建，因此日常打包无需每次输入路径：
+
+```bat
+.\package_release.bat
+```
+
+如需保留某次候选构建，仍可显式指定一个尚不存在、位于仓库外部的唯一输出目录；
+显式传入 `ReleaseRoot` 时不会默认覆盖既有目录，第二个参数仍兼容自定义 wheelhouse：
+
+```bat
+.\package_release.bat C:\DaguandanBuilds\candidate-20260831-001 C:\DaguandanBuildInputs\wheelhouse-cp312-win_amd64
+```
+
+底层 PowerShell 打包脚本仍接受原有显式参数：
 
 ```powershell
 .\scripts\package_release.ps1 `

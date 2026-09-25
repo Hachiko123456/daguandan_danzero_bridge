@@ -1,5 +1,6 @@
 """Build saveable, evidence-backed TruthLog drafts for selected rescans."""
 from __future__ import annotations
+import argparse
 import copy, json, shutil
 from datetime import datetime
 from pathlib import Path
@@ -141,7 +142,41 @@ def repair(sid: str) -> tuple[list[dict[str,Any]],TruthInitialState,dict[str,Any
     return rows,st,{'session_id':sid,'changes':changes}
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build saveable, evidence-backed TruthLog drafts for the hard-coded selected rescans.",
+        epilog=(
+            "Reads the fixed source rescan batch and source session evidence. "
+            "Writes a replacement output batch; by default the existing output batch is removed first."
+        ),
+    )
+    parser.add_argument(
+        "--source-batch",
+        type=Path,
+        default=SOURCE_BATCH,
+        help="Read-only source rescan batch directory (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--output-batch",
+        type=Path,
+        default=OUT_BATCH,
+        help="Output batch directory to write/recreate (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--session-root",
+        type=Path,
+        default=SESSION_ROOT,
+        help="Read-only source session evidence root (default: %(default)s).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None):
+    args = build_parser().parse_args(argv)
+    global SOURCE_BATCH, OUT_BATCH, SESSION_ROOT
+    SOURCE_BATCH = args.source_batch
+    OUT_BATCH = args.output_batch
+    SESSION_ROOT = args.session_root
     if OUT_BATCH.exists(): shutil.rmtree(OUT_BATCH)
     OUT_BATCH.mkdir(parents=True)
     results=[];all_pass=True

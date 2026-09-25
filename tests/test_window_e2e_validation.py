@@ -802,7 +802,7 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
     assert '"--allow-dirty"' in script
     assert "DEVELOPMENT_BUILD_NOT_FORMALLY_QUALIFIED.txt" in script
     assert "if (-not $AllowDirtyDevelopmentBuild)" in script
-    assert "ReleaseRoot must be unique and must not already exist" in script
+    assert "ReleaseRoot already exists. Use -OverwriteExisting" in script
     assert "Assert-DisjointRoots" in script
     assert 'Resolve-ManagedChildPath -Root $releaseRoot' in script
     assert ".daguandan-release-root" in script
@@ -842,8 +842,25 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
     assert "Collect_Diagnostics.bat" in script
 
     launcher = (PROJECT_ROOT / "package_release.bat").read_text(encoding="utf-8")
-    assert "Usage: package_release.bat RELEASE_ROOT WHEELHOUSE_ROOT" in launcher
-    assert '-ReleaseRoot "%~1" -WheelhouseRoot "%~2"' in launcher
+    assert "Usage: package_release.bat [RELEASE_ROOT [WHEELHOUSE_ROOT]]" in launcher
+    assert 'if /I "%~1"=="--help" goto :usage' in launcher
+    assert 'if /I "%~1"=="-h" goto :usage' in launcher
+    assert 'set "ReleaseRoot=%~dp0release\\current"' in launcher
+    assert 'set "WheelhouseRoot=%LOCALAPPDATA%\\Daguandan\\wheelhouse"' in launcher
+    assert 'set "OverwriteFlag=-OverwriteExisting"' in launcher
+    assert '-ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%"' in launcher
+
+    help_completed = subprocess.run(
+        [str(PROJECT_ROOT / "package_release.bat"), "--help"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert help_completed.returncode == 0
+    assert "Usage: package_release.bat [RELEASE_ROOT [WHEELHOUSE_ROOT]]" in help_completed.stdout
+    assert r"%LOCALAPPDATA%\Daguandan\wheelhouse" in help_completed.stdout
+    assert "-OverwriteExisting" in help_completed.stdout
 
     gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "/artifacts/" in gitignore
