@@ -39,9 +39,118 @@ def _new_session_id() -> str:
     return f"game_{stamp}_{uuid4().hex[:6]}"
 
 
+def _new_episode_id() -> str:
+    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    return f"episode_{stamp}_{uuid4().hex[:6]}"
+
+
 def _new_opening_id() -> str:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     return f"opening_{stamp}_{uuid4().hex[:6]}"
+
+
+# ``opening_*`` and ``diagnostic_*`` were the two historical, parallel
+# lifecycles. New listener episodes use one ``episode_*`` directory, while
+# old directories remain readable through compatibility readers.
+EPISODE_LIFECYCLE_STATUSES = frozenset({
+    "opening",
+    "listening",
+    "waiting_first_action",
+    "running",
+    "paused",
+    "finished",
+    "aborted",
+})
+
+
+def _validate_lifecycle(status: str) -> str:
+    value = str(status).strip()
+    if value not in EPISODE_LIFECYCLE_STATUSES:
+        raise ValueError(
+            "episode lifecycle 必须是 opening/listening/waiting_first_action/"
+            "running/paused/finished/aborted 之一"
+        )
+    return value
+
+
+def _assert_safe_tree(path: Path) -> Path:
+    """Reject links/reparse points in a managed episode tree."""
+
+    value = Path(path).expanduser().absolute()
+    current = value
+    while True:
+        if current.exists():
+            if current.is_symlink():
+                raise ValueError(f"受管 episode 路径不能经过符号链接：{current}")
+            checker = getattr(current, "is_junction", None)
+            if callable(checker) and checker():
+                raise ValueError(f"受管 episode 路径不能经过 junction：{current}")
+            try:
+                attrs = current.lstat().st_file_attributes
+            except AttributeError:
+                attrs = 0
+            if attrs & 0x0400:
+                raise ValueError(f"受管 episode 路径不能经过重解析点：{current}")
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    if value.exists() and not value.is_dir():
+        raise ValueError(f"受管 episode 路径不是目录：{value}")
+    return value
+
+
+_PROMOTION_LOCKS: dict[str, RLock] = {}
+_PROMOTION_LOCKS_GUARD = RLock()
+
+
+def _assert_safe_file_path(path: Path) -> Path:
+    """Reject links/reparse points without requiring the leaf to be a directory."""
+
+    value = Path(path).expanduser().absolute()
+    _assert_safe_tree(value.parent)
+    if value.exists():
+        if value.is_symlink():
+            raise ValueError(f"受管文件不能是符号链接：{value}")
+        checker = getattr(value, "is_junction", None)
+        if callable(checker) and checker():
+            raise ValueError(f"受管文件不能是 junction：{value}")
+        try:
+            attrs = value.lstat().st_file_attributes
+        except AttributeError:
+            attrs = 0
+        if attrs & 0x0400:
+            raise ValueError(f"受管文件不能是重解析点：{value}")
+    return value
+
+
+def _promotion_lock(path: Path) -> RLock:
+    key = os.path.normcase(str(path.absolute()))
+    with _PROMOTION_LOCKS_GUARD:
+        return _PROMOTION_LOCKS.setdefault(key, RLock())
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Publish exact bytes with same-directory atomic replacement."""
+
+    path = _assert_safe_file_path(path)
+    parent = path.parent
+    temporary = parent / f".{path.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _file_bytes(path: Path) -> bytes:
+    path = _assert_safe_file_path(path)
+    if not path.is_file():
+        raise ValueError(f"受管文件不存在：{path}")
+    return path.read_bytes()
 
 
 def _validate_session_id(session_id: str) -> str:
@@ -186,8 +295,10 @@ class LiveSessionStore:
         automatic_log_delivery_enabled: bool = False,
         automatic_log_include_media: bool = False,
     ) -> None:
+        self.profiles_root = Path(profiles_root).expanduser().resolve()
         self.profile_name = normalize_profile_name(profile_name)
         self.session_id = _validate_session_id(session_id or _new_session_id())
+        self._is_episode = bool(directory_group in {".preopening", ".episodes"})
         sessions_root = (
             Path(sessions_root)
             if sessions_root is not None
@@ -195,10 +306,11 @@ class LiveSessionStore:
         )
         if directory_group is not None:
             group = str(directory_group).strip()
-            if group != ".preopening":
+            if group not in {".preopening", ".episodes"}:
                 raise ValueError("不支持的会话目录分组")
             sessions_root = sessions_root / group
-        self.directory = sessions_root / self.session_id
+        self.directory = _assert_safe_tree(sessions_root / self.session_id)
+        self.diagnostic_frames_directory = self.directory / "diagnostic_frames"
         self.manifest_path = self.directory / "manifest.json"
         self.timeline_path = self.directory / "timeline.jsonl"
         self._timeline_markdown_path = self.directory / "timeline.md"
@@ -222,6 +334,28 @@ class LiveSessionStore:
         self.automatic_log_include_media = bool(automatic_log_include_media)
 
     @classmethod
+    def for_episode(
+        cls,
+        profiles_root: Path,
+        profile_name: str,
+        *,
+        sessions_root: Path | None = None,
+        automatic_log_delivery_enabled: bool = False,
+        automatic_log_include_media: bool = False,
+    ) -> "LiveSessionStore":
+        """Create one managed listener episode directory."""
+
+        return cls(
+            profiles_root,
+            profile_name,
+            session_id=_new_episode_id(),
+            directory_group=".preopening",
+            sessions_root=sessions_root,
+            automatic_log_delivery_enabled=automatic_log_delivery_enabled,
+            automatic_log_include_media=automatic_log_include_media,
+        )
+
+    @classmethod
     def for_opening_evidence(
         cls,
         profiles_root: Path,
@@ -233,7 +367,9 @@ class LiveSessionStore:
     ) -> "LiveSessionStore":
         """Create a non-game store for evidence captured before opening confirmation."""
 
-        return cls(
+        # Legacy API: preserve the old path shape for old readers and data.
+        # New listener code uses ``for_episode`` instead.
+        store = cls(
             profiles_root,
             profile_name,
             session_id=_new_opening_id(),
@@ -242,6 +378,329 @@ class LiveSessionStore:
             automatic_log_delivery_enabled=automatic_log_delivery_enabled,
             automatic_log_include_media=automatic_log_include_media,
         )
+        # Legacy readers keep the historical storage semantics; only new
+        # ``for_episode`` stores participate in lifecycle promotion.
+        store._is_episode = False
+        return store
+
+    def start_episode(self, manifest: dict[str, object]) -> None:
+        """Start an episode with an explicit lifecycle state."""
+
+        document = dict(manifest)
+        document.setdefault("lifecycle", "opening")
+        document.setdefault("lifecycle_status", document["lifecycle"])
+        document.setdefault("lifecycle_reason", "listener_started")
+        self.start(document)
+
+    def set_lifecycle(self, status: str, *, reason: str | None = None) -> None:
+        """Publish a lifecycle transition without changing append-only evidence."""
+
+        lifecycle = _validate_lifecycle(status)
+        with self._lock:
+            self._ensure_writable()
+            changes: dict[str, object] = {
+                "lifecycle": lifecycle,
+                "lifecycle_status": lifecycle,
+            }
+            if self._is_episode:
+                changes["status"] = lifecycle
+            if reason is not None:
+                changes["lifecycle_reason"] = str(reason)
+            self._update_manifest(changes)
+
+    def _promotion_intent_path(self, formal_store: "LiveSessionStore") -> Path:
+        return Path(formal_store.directory).parent / (
+            f".{formal_store.directory.name}.episode-{self.session_id}.intent.json"
+        )
+
+    def _promotion_backup_directory(self, formal_store: "LiveSessionStore") -> Path:
+        return Path(formal_store.directory).parent / (
+            f".{formal_store.directory.name}.episode-{self.session_id}.backup"
+        )
+
+    @staticmethod
+    def _remove_created_paths(target: Path, intent: dict[str, object]) -> None:
+        for raw in reversed(tuple(intent.get("created_files", ()) or ())):
+            relative = Path(str(raw))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            path = target / relative
+            if path.exists() and path.is_file() and not path.is_symlink():
+                path.unlink()
+        for raw in reversed(tuple(intent.get("created_dirs", ()) or ())):
+            relative = Path(str(raw))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            path = target / relative
+            if path.exists() and path.is_dir() and not path.is_symlink():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+    def _rollback_promotion(
+        self,
+        formal_store: "LiveSessionStore",
+        intent_path: Path,
+        backup_directory: Path,
+        intent: dict[str, object],
+    ) -> None:
+        """Restore the exact target bytes published by one failed promotion."""
+
+        target = Path(formal_store.directory)
+        self._remove_created_paths(target, intent)
+        for relative in ("manifest.json", "recognition_trace.jsonl"):
+            backup = backup_directory / relative
+            if backup.is_file():
+                _atomic_write_bytes(target / relative, _file_bytes(backup))
+        shutil.rmtree(backup_directory, ignore_errors=True)
+        intent_path.unlink(missing_ok=True)
+
+    def _recover_promotion_intent(
+        self, formal_store: "LiveSessionStore", intent_path: Path
+    ) -> bool:
+        """Recover a prior interrupted transaction before a retry."""
+
+        _assert_safe_file_path(intent_path)
+        if not intent_path.is_file():
+            return False
+        try:
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            if not isinstance(intent, dict):
+                raise ValueError("episode promotion intent 必须是对象")
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"无法读取 episode 晋升事务：{intent_path}") from exc
+        backup = Path(str(intent.get("backup_directory", "")))
+        if not backup.is_absolute() or backup.parent != Path(formal_store.directory).parent:
+            raise RuntimeError("episode 晋升事务 backup 路径不安全")
+        if intent.get("state") == "target_committed":
+            manifest_path = Path(formal_store.directory) / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("已提交 episode 晋升但正式 manifest 不可读") from exc
+            promotion = manifest.get("episode_promotion") if isinstance(manifest, dict) else None
+            if (
+                isinstance(manifest, dict)
+                and isinstance(promotion, dict)
+                and manifest.get("episode_id") == self.session_id
+                and promotion.get("formal_session_id") == formal_store.session_id
+            ):
+                return True
+            self._rollback_promotion(formal_store, intent_path, backup, intent)
+            return False
+        self._rollback_promotion(formal_store, intent_path, backup, intent)
+        return False
+
+    def _promotion_after_trace(self) -> None:
+        """Failure-injection seam; production implementation is a no-op."""
+
+    def _promotion_after_media(self) -> None:
+        """Failure-injection seam; production implementation is a no-op."""
+
+    def promote_episode_into(self, formal_store: "LiveSessionStore") -> Path:
+        """Publish one episode into a formal session transactionally.
+
+        All source data is copied, never moved, until the target manifest is
+        committed.  Existing target files are preflighted for exact-byte
+        equality.  A durable intent plus exact manifest/trace backups makes a
+        failure after any publication step rollback-safe and retry-idempotent.
+        """
+
+        if not self._is_episode:
+            raise RuntimeError("只有 episode store 可以晋升")
+        target = _assert_safe_tree(Path(formal_store.directory))
+        intent_path = self._promotion_intent_path(formal_store)
+        backup_directory = self._promotion_backup_directory(formal_store)
+        _assert_safe_file_path(intent_path)
+        _assert_safe_tree(backup_directory)
+        promotion_receipt_path = target / "episode_promotion.json"
+        _assert_safe_file_path(promotion_receipt_path)
+        lock = _promotion_lock(target)
+        with lock:
+            # Recover an interrupted transaction before interpreting a receipt.
+            # A receipt without a committed manifest is not authoritative.
+            if self._recover_promotion_intent(formal_store, intent_path):
+                if self.directory.exists():
+                    _assert_safe_tree(self.directory)
+                    shutil.rmtree(self.directory)
+                backup = self._promotion_backup_directory(formal_store)
+                shutil.rmtree(backup, ignore_errors=True)
+                intent_path.unlink(missing_ok=True)
+                return target
+            if promotion_receipt_path.is_file():
+                try:
+                    receipt = json.loads(promotion_receipt_path.read_text(encoding="utf-8"))
+                    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("正式 session 的 episode receipt 无法读取") from exc
+                if (
+                    isinstance(receipt, dict)
+                    and isinstance(manifest, dict)
+                    and receipt.get("episode_id") == self.session_id
+                    and receipt.get("formal_session_id") == formal_store.session_id
+                    and manifest.get("episode_id") == self.session_id
+                ):
+                    if self.directory.exists():
+                        _assert_safe_tree(self.directory)
+                        shutil.rmtree(self.directory)
+                    return target
+                raise FileExistsError(f"正式对局已包含其他 episode：{promotion_receipt_path}")
+
+            source = _assert_safe_tree(self.directory)
+            if not source.is_dir() or not target.is_dir():
+                raise RuntimeError("episode 或正式 session 目录不存在")
+            if source.parent.name not in {".preopening", ".episodes"}:
+                raise RuntimeError("episode 不在受管目录中")
+            manifest_path = target / "manifest.json"
+            target_trace_path = target / "recognition_trace.jsonl"
+            source_trace_path = source / "recognition_trace.jsonl"
+            source_manifest_path = source / "manifest.json"
+            for required in (manifest_path, target_trace_path, source_manifest_path):
+                _assert_safe_file_path(required)
+                if not required.is_file():
+                    raise RuntimeError(f"晋升所需文件不存在：{required}")
+            # Preflight verifies the destination is writable before touching
+            # any target payload and serializes the merged manifest now.
+            probe = target / f".episode-promotion-probe-{uuid4().hex}.tmp"
+            try:
+                with probe.open("xb") as handle:
+                    handle.write(b"probe")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                probe.unlink(missing_ok=True)
+            target_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(target_manifest, dict):
+                raise ValueError("正式 session manifest 必须是对象")
+            source_trace = _file_bytes(source_trace_path) if source_trace_path.is_file() else b""
+            target_trace = _file_bytes(target_trace_path)
+            trace_needed = bool(source_trace and source_trace not in target_trace)
+            merged_trace = target_trace
+            if trace_needed:
+                separator = b"" if not merged_trace or merged_trace.endswith(b"\n") else b"\n"
+                merged_trace = merged_trace + separator + source_trace
+
+            media_plan: list[tuple[Path, Path, bytes]] = []
+            created_dirs: list[str] = []
+            video_conflicts: list[dict[str, str]] = []
+            for child_name in ("diagnostic_frames", "video"):
+                source_directory = source / child_name
+                if not source_directory.is_dir():
+                    continue
+                target_directory = target / child_name
+                if target_directory.exists() and not target_directory.is_dir():
+                    raise FileExistsError(f"目标媒体路径不是目录：{target_directory}")
+                if not target_directory.exists():
+                    created_dirs.append(child_name)
+                for source_file in sorted(source_directory.rglob("*")):
+                    if not source_file.is_file():
+                        continue
+                    relative = source_file.relative_to(source_directory)
+                    destination = target_directory / relative
+                    source_bytes = _file_bytes(source_file)
+                    if destination.exists():
+                        if destination.is_file() and _file_bytes(destination) == source_bytes:
+                            continue
+                        if child_name != "video":
+                            raise FileExistsError(f"episode 内容冲突：{destination}")
+                        # A formal recorder may already own game.avi and an
+                        # empty frame index. Preserve both exact byte streams
+                        # in the same video directory under a deterministic
+                        # episode-prefixed name instead of overwriting a live
+                        # recording or losing the opening evidence.
+                        destination = target_directory / relative.parent / (
+                            f"episode_{self.session_id}_{relative.name}"
+                        )
+                        if destination.exists():
+                            if not destination.is_file() or _file_bytes(destination) != source_bytes:
+                                raise FileExistsError(f"episode 内容冲突：{destination}")
+                            continue
+                        video_conflicts.append({
+                            "source": str(relative),
+                            "target": str(destination.relative_to(target_directory)),
+                        })
+                    media_plan.append((source_file, destination, source_bytes))
+
+            receipt = {
+                "schema": "guandan.episode-promotion/1",
+                "status": "promoted",
+                "episode_id": self.session_id,
+                "formal_session_id": formal_store.session_id,
+                "relative_diagnostic_frames": "diagnostic_frames",
+                "video_conflicts": video_conflicts,
+            }
+            merged_manifest = dict(target_manifest)
+            merged_manifest.update({
+                "episode_id": self.session_id,
+                "episode_directory": str(target),
+                "episode_promotion": receipt,
+                "lifecycle": "running",
+                "lifecycle_status": "running",
+                "lifecycle_reason": "episode_promoted",
+            })
+            # JSON serialization is part of preflight: no late formatting
+            # failure can occur after target publication begins.
+            json.dumps(merged_manifest, ensure_ascii=False, indent=2)
+
+            if backup_directory.exists():
+                shutil.rmtree(backup_directory)
+            backup_directory.mkdir(parents=True, exist_ok=False)
+            try:
+                _atomic_write_bytes(backup_directory / "manifest.json", _file_bytes(manifest_path))
+                _atomic_write_bytes(backup_directory / "recognition_trace.jsonl", target_trace)
+                planned_files = [
+                    str(destination.relative_to(target))
+                    for _, destination, _ in media_plan
+                ]
+                planned_files.append("episode_promotion.json")
+                intent: dict[str, object] = {
+                    "schema": "guandan.episode-promotion-intent/1",
+                    "state": "applying",
+                    "episode_id": self.session_id,
+                    "formal_session_id": formal_store.session_id,
+                    "backup_directory": str(backup_directory),
+                    "created_files": planned_files,
+                    "created_dirs": created_dirs,
+                }
+                atomic_write_json(intent_path, intent)
+            except BaseException:
+                shutil.rmtree(backup_directory, ignore_errors=True)
+                intent_path.unlink(missing_ok=True)
+                raise
+            try:
+                if trace_needed:
+                    _atomic_write_bytes(target_trace_path, merged_trace)
+                    self._promotion_after_trace()
+                for directory_name in created_dirs:
+                    (target / directory_name).mkdir(parents=True, exist_ok=True)
+                for source_file, destination, payload in media_plan:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    _atomic_write_bytes(destination, payload)
+                    atomic_write_json(intent_path, intent)
+                self._promotion_after_media()
+                _atomic_write_bytes(
+                    promotion_receipt_path,
+                    (json.dumps(receipt, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+                )
+                atomic_write_json(intent_path, intent)
+                formal_store._update_manifest({
+                    "episode_id": self.session_id,
+                    "episode_directory": str(target),
+                    "episode_promotion": receipt,
+                    "lifecycle": "running",
+                    "lifecycle_status": "running",
+                    "lifecycle_reason": "episode_promoted",
+                })
+                intent["state"] = "target_committed"
+                atomic_write_json(intent_path, intent)
+            except BaseException:
+                self._rollback_promotion(formal_store, intent_path, backup_directory, intent)
+                raise
+            shutil.rmtree(source)
+            shutil.rmtree(backup_directory, ignore_errors=True)
+            intent_path.unlink(missing_ok=True)
+            return target
 
     def start(self, manifest: dict[str, object]) -> None:
         with self._lock:
@@ -249,8 +708,10 @@ class LiveSessionStore:
                 raise RuntimeError("对局存储已经启动")
             if self.directory.exists():
                 raise FileExistsError(f"对局目录已经存在：{self.directory}")
+            _assert_safe_tree(self.directory.parent)
             self.directory.mkdir(parents=True)
             self.incidents_directory.mkdir()
+            self.diagnostic_frames_directory.mkdir()
             for path in (
                 self.timeline_path,
                 self.advice_path,
@@ -264,12 +725,20 @@ class LiveSessionStore:
                 encoding="utf-8",
             )
             document = dict(manifest)
+            lifecycle = _validate_lifecycle(
+                str(document.get("lifecycle", "listening" if self._is_episode else "running"))
+            )
             document.update(
                 {
                     "schema_version": SCHEMA_VERSION,
                     "session_id": self.session_id,
                     "profile": self.profile_name,
-                    "status": "running",
+                    # Keep legacy storage status for old readers; explicit
+                    # lifecycle fields carry the new state model.
+                    "status": lifecycle if self._is_episode else "running",
+                    "lifecycle": lifecycle,
+                    "lifecycle_status": lifecycle,
+                    "lifecycle_reason": str(document.get("lifecycle_reason", "started")),
                     "started_at": _now_text(),
                     "incidents": [],
                 }
@@ -430,7 +899,10 @@ class LiveSessionStore:
 
         with self._lock:
             self._ensure_writable()
-            self._update_manifest(dict(metadata))
+            changes = dict(metadata)
+            if self._is_episode and "lifecycle" in changes:
+                changes.setdefault("status", str(changes["lifecycle"]))
+            self._update_manifest(changes)
 
     def upsert_decision(self, record: dict[str, object]) -> None:
         """Atomically maintain one correlated training record per self decision."""
@@ -592,8 +1064,14 @@ class LiveSessionStore:
                 with gzip.open(self.observations_gzip_path, "wb") as target:
                     shutil.copyfileobj(source, target)
             self.observations_part_path.unlink()
+            current_manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            current_lifecycle = str(current_manifest.get("lifecycle", "finished"))
+            if current_lifecycle not in EPISODE_LIFECYCLE_STATUSES:
+                current_lifecycle = "finished"
             changes: dict[str, object] = {
-                    "status": "sealed",
+                    "status": current_lifecycle if self._is_episode else "sealed",
+                    "lifecycle": current_lifecycle,
+                    "lifecycle_status": current_lifecycle,
                     "finished_at": _now_text(),
                     "frame_count": frame_count,
                     "dropped_frames": dropped_frames,

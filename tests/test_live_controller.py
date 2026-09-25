@@ -14,6 +14,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
+from daguandan_bridge.application.opening_readiness import (
+    OpeningReadinessCode,
+    report_for_error,
+    report_for_phase,
+)
 from daguandan_bridge.gui.live_controller import (
     LiveAssistantController,
     _AnalysisDelivery,
@@ -312,11 +317,17 @@ def test_opening_title_is_compact_without_losing_structured_state(tmp_path, phas
     statuses = []
     controller.listening_status.connect(statuses.append)
     controller._publish_opening_status(phase, _initial_recognition(("2C",) * 27))
-    assert statuses == [{
-        "state": "opening", "phase": phase, "reason": phase,
-        "hand_count": 27, "generation": 3,
-        "message": "已识别27张，等待首出确认",
-    }]
+    assert len(statuses) == 1
+    status = statuses[0]
+    assert status["state"] == "opening"
+    assert status["phase"] == phase
+    assert status["hand_count"] == 27
+    assert status["generation"] == 3
+    assert status["status"] == "WAIT"
+    assert status["primary_reason"] == "OPENING_UNRESOLVED"
+    assert status["report"].primary_reason.value == "OPENING_UNRESOLVED"
+    assert status["readiness"]["compact_allowed"] is False
+    assert status["suggested_action"]
 
 
 def test_staged_opening_publishes_actual_progress_and_starts_once_with_action(tmp_path, monkeypatch):
@@ -2186,3 +2197,89 @@ def test_controller_never_schedules_pass_or_hidden_advice(tmp_path, monkeypatch)
     )
 
     assert scheduled == []
+
+
+def test_compact_request_guard_keeps_wait_separate_from_diagnostic_compact(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    calls = []
+    controller.capture_service.target_client_rect = (
+        lambda profile_name: calls.append(profile_name) or "rect"
+    )
+
+    # WAIT remains unsafe for recommendation compact mode, but is eligible for
+    # a separate future diagnostic/waiting compact surface.
+    assert controller.compact_request_allowed() is False
+    assert controller.can_show_compact_recommendation() is False
+    assert controller.diagnostic_compact_request_allowed() is True
+    assert controller.can_show_waiting_compact() is True
+    assert controller.target_client_rect() is None
+    assert calls == []
+
+    controller._emit_listening_status(
+        "opening",
+        report_for_error(SimpleNamespace(code="ROI_FATAL"), stage="recognition"),
+    )
+
+    assert controller.compact_request_allowed() is False
+    assert controller.diagnostic_compact_request_allowed() is False
+    assert controller.can_show_waiting_compact() is False
+    assert controller.compact_request_report().primary_reason is OpeningReadinessCode.ROI_FATAL
+    assert controller.target_client_rect() is None
+    assert calls == []
+
+
+def test_compact_request_guard_allows_only_ready_recommendation_compact(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    calls = []
+    controller.capture_service.target_client_rect = (
+        lambda profile_name: calls.append(profile_name) or "rect"
+    )
+    controller._emit_listening_status(
+        "opening",
+        report_for_phase("ready"),
+    )
+
+    assert controller.compact_request_allowed() is True
+    assert controller.can_show_compact_recommendation() is True
+    assert controller.target_client_rect() == "rect"
+    assert calls == ["tencent_daguandan"]
+
+
+def test_minimized_recovery_emits_structured_waiting_report_immediately(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    controller._listening_enabled = True
+    statuses = []
+    controller.listening_status.connect(statuses.append)
+
+    controller._begin_geometry_recovery(
+        LiveCaptureInterrupted("牌桌窗口已最小化", code="WINDOW-MINIMIZED")
+    )
+
+    assert statuses
+    status = statuses[-1]
+    assert status["state"] == "recovering"
+    assert status["status"] == "WAIT"
+    assert status["primary_reason"] == "WINDOW_MINIMIZED"
+    assert status["report"].primary_reason is OpeningReadinessCode.WINDOW_MINIMIZED
+    assert status["compact_allowed"] is False
+    assert status["diagnostic_compact_allowed"] is True
+    controller._cancel_geometry_recovery()
+
+
+def test_publish_ready_waiting_first_action_keeps_legacy_message_field(tmp_path):
+    _app()
+    controller = LiveAssistantController(_CaptureServiceStub(tmp_path))
+    statuses = []
+    controller.listening_status.connect(statuses.append)
+
+    controller._publish_opening_status(
+        "ready_waiting_first_action",
+        SimpleNamespace(my_hand=("3S",) * 27),
+    )
+
+    assert statuses[-1]["phase"] == "ready_waiting_first_action"
+    assert statuses[-1]["message"] == "已进入牌桌，等待自己首出"
+    assert statuses[-1]["primary_reason"] == "READY_WAITING_FIRST_ACTION"

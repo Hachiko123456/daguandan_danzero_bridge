@@ -41,6 +41,11 @@ ACTIVE_GENERATION_SCHEMA = "guandan.active-data-generation/1"
 DATA_SCHEMA_VERSION = 1
 DATA_SCHEMA_DIRECTORY = f"v{DATA_SCHEMA_VERSION}"
 RUNTIME_ROOT_MARKER = ".daguandan-user-data-root.json"
+CALIBRATION_DIRECTORY = "calibrations"
+WINDOW_BINDING_DIRECTORY = "window_bindings"
+PERSISTENT_PREFERENCES_SCHEMA = "v1"
+CALIBRATION_SCHEMA = "guandan.calibration/1"
+WINDOW_BINDING_SCHEMA = "guandan.window-binding/1"
 GENERATION_MARKER = "runtime_layout.json"
 ACTIVE_GENERATION_FILE = "active.json"
 
@@ -265,6 +270,10 @@ class RuntimeLayout:
     bundle_root: Path
     resource_data_dir: Path
     runtime_root: Path
+    # The application data root is deliberately separate from the immutable
+    # bundle root. In source mode it is the checkout (compatibility); in a
+    # frozen/portable run it is the user-selected external root.
+    app_data_root: Path
     runtime_root_source: str
     data_schema: int
     build_id: str
@@ -279,6 +288,8 @@ class RuntimeLayout:
     diagnostics_root_source: str
     preferences_root: Path
     cache_root: Path
+    calibration_root: Path
+    window_bindings_root: Path
     active_generation_path: Path | None
 
     def sanitized_identity(self) -> dict[str, object]:
@@ -325,7 +336,9 @@ def resolve_runtime_layout(
     if not is_frozen:
         diagnostics_root, diagnostics_source = _resolve_diagnostics_root(
             values,
-            data_override=None,
+            # Source mode keeps its historical checkout layout, but all
+            # writable domains still share the explicit application root.
+            data_override=application_root,
             diagnostics_override=diagnostics_override,
         )
         return RuntimeLayout(
@@ -333,6 +346,7 @@ def resolve_runtime_layout(
             bundle_root=application_root,
             resource_data_dir=resource_data,
             runtime_root=application_root,
+            app_data_root=application_root,
             runtime_root_source="source_checkout",
             data_schema=DATA_SCHEMA_VERSION,
             build_id="source",
@@ -347,6 +361,8 @@ def resolve_runtime_layout(
             diagnostics_root_source=diagnostics_source,
             preferences_root=application_root / "config",
             cache_root=application_root / ".cache",
+            calibration_root=application_root / "config" / CALIBRATION_DIRECTORY,
+            window_bindings_root=application_root / "config" / WINDOW_BINDING_DIRECTORY,
             active_generation_path=None,
         )
 
@@ -389,6 +405,7 @@ def resolve_runtime_layout(
         bundle_root=application_root,
         resource_data_dir=resource_data,
         runtime_root=runtime_root,
+        app_data_root=runtime_root,
         runtime_root_source=runtime_source,
         data_schema=DATA_SCHEMA_VERSION,
         build_id=build_id,
@@ -401,17 +418,22 @@ def resolve_runtime_layout(
         logs_root=runtime_root / "logs",
         diagnostics_root=diagnostics_root,
         diagnostics_root_source=diagnostics_source,
-        preferences_root=(
+        # Preferences and cache are user-owned, versioned namespaces rather
+        # than build generations. This keeps calibration/window bindings
+        # stable when a new EXE/build is installed.
+        preferences_root=runtime_root / "preferences" / PERSISTENT_PREFERENCES_SCHEMA,
+        cache_root=runtime_root / "cache" / PERSISTENT_PREFERENCES_SCHEMA,
+        calibration_root=(
             runtime_root
             / "preferences"
-            / DATA_SCHEMA_DIRECTORY
-            / _safe_segment(build_id, field="build id")
+            / PERSISTENT_PREFERENCES_SCHEMA
+            / CALIBRATION_DIRECTORY
         ),
-        cache_root=(
+        window_bindings_root=(
             runtime_root
-            / "cache"
-            / DATA_SCHEMA_DIRECTORY
-            / _safe_segment(build_id, field="build id")
+            / "preferences"
+            / PERSISTENT_PREFERENCES_SCHEMA
+            / WINDOW_BINDING_DIRECTORY
         ),
         active_generation_path=active_path,
     )
@@ -463,6 +485,8 @@ def _prepare_runtime_layout_locked(selected: RuntimeLayout) -> RuntimeLayout:
         selected.diagnostics_root,
         selected.preferences_root,
         selected.cache_root,
+        selected.calibration_root,
+        selected.window_bindings_root,
         selected.generation_root.parent,
     ):
         _ensure_safe_directory(path)
@@ -1246,16 +1270,160 @@ def _absolute_path_without_resolving(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
+
+def _stable_layout_segment(value: str, *, field: str) -> str:
+    """Validate a user/profile/binding name before joining it to app storage."""
+
+    return _safe_segment(str(value), field=field)
+
+
+def _layout_storage_path(root: Path, *segments: str, suffix: str = ".json") -> Path:
+    path = root
+    for index, segment in enumerate(segments):
+        path = path / _stable_layout_segment(segment, field=f"storage segment {index}")
+    return path.parent / f"{path.name}{suffix}"
+
+
+def calibration_path(
+    layout: RuntimeLayout,
+    profile_name: str,
+    *,
+    binding_id: str = "default",
+) -> Path:
+    """Return a stable calibration document path for one logical binding."""
+
+    return _layout_storage_path(layout.calibration_root, profile_name, binding_id)
+
+
+def window_binding_path(
+    layout: RuntimeLayout,
+    profile_name: str,
+    *,
+    binding_id: str = "default",
+) -> Path:
+    """Return a stable logical window-binding document path."""
+
+    return _layout_storage_path(layout.window_bindings_root, profile_name, binding_id)
+
+
+def stable_window_binding_id(
+    *,
+    application_id: str,
+    window_class: str = "",
+    title_role: str = "",
+    client_size: tuple[int, int] | None = None,
+) -> str:
+    """Create a portable id from semantic window identity, never an HWND/path."""
+
+    if not str(application_id).strip():
+        raise ValueError("application_id is required")
+    if client_size is not None:
+        if len(client_size) != 2 or any(isinstance(v, bool) or int(v) <= 0 for v in client_size):
+            raise ValueError("client_size must contain two positive integers")
+        size: list[int] | None = [int(client_size[0]), int(client_size[1])]
+    else:
+        size = None
+    document = {
+        "application_id": str(application_id).strip(),
+        "window_class": str(window_class).strip(),
+        "title_role": str(title_role).strip(),
+        "client_size": size,
+    }
+    encoded = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "binding-" + hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def save_calibration(
+    layout: RuntimeLayout,
+    profile_name: str,
+    calibration: Mapping[str, object],
+    *,
+    binding_id: str = "default",
+) -> Path:
+    """Atomically persist calibration below the stable application data root."""
+
+    if not isinstance(calibration, Mapping):
+        raise TypeError("calibration must be a mapping")
+    path = calibration_path(layout, profile_name, binding_id=binding_id)
+    payload = dict(calibration)
+    payload.setdefault("schema", CALIBRATION_SCHEMA)
+    payload.setdefault("profile", str(profile_name))
+    payload.setdefault("binding_id", str(binding_id))
+    atomic_write_json(path, payload)
+    return path
+
+
+def load_calibration(
+    layout: RuntimeLayout,
+    profile_name: str,
+    *,
+    binding_id: str = "default",
+) -> dict[str, object] | None:
+    """Load calibration, returning ``None`` before first calibration."""
+
+    path = calibration_path(layout, profile_name, binding_id=binding_id)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeLayoutError("calibration document is unreadable") from exc
+    if not isinstance(value, dict) or value.get("schema") != CALIBRATION_SCHEMA:
+        raise RuntimeLayoutError("calibration document schema is unsupported")
+    return value
+
+
+def save_window_binding(
+    layout: RuntimeLayout,
+    profile_name: str,
+    binding: Mapping[str, object],
+    *,
+    binding_id: str = "default",
+) -> Path:
+    """Atomically persist a portable window binding."""
+
+    if not isinstance(binding, Mapping):
+        raise TypeError("binding must be a mapping")
+    path = window_binding_path(layout, profile_name, binding_id=binding_id)
+    payload = dict(binding)
+    payload.setdefault("schema", WINDOW_BINDING_SCHEMA)
+    payload.setdefault("profile", str(profile_name))
+    payload.setdefault("binding_id", str(binding_id))
+    atomic_write_json(path, payload)
+    return path
+
+
+def load_window_binding(
+    layout: RuntimeLayout,
+    profile_name: str,
+    *,
+    binding_id: str = "default",
+) -> dict[str, object] | None:
+    path = window_binding_path(layout, profile_name, binding_id=binding_id)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeLayoutError("window binding document is unreadable") from exc
+    if not isinstance(value, dict) or value.get("schema") != WINDOW_BINDING_SCHEMA:
+        raise RuntimeLayoutError("window binding document schema is unsupported")
+    return value
+
 __all__ = [
     "ACTIVE_GENERATION_FILE",
     "ACTIVE_GENERATION_SCHEMA",
     "APP_DIRECTORY_NAME",
+    "CALIBRATION_DIRECTORY",
+    "CALIBRATION_SCHEMA",
     "BUILD_MANIFEST_FILENAME",
     "DATA_ROOT_ENV",
     "DATA_SCHEMA_VERSION",
     "GENERATION_MARKER",
     "GENERATION_SCHEMA",
     "RUNTIME_ROOT_MARKER",
+    "WINDOW_BINDING_DIRECTORY",
+    "WINDOW_BINDING_SCHEMA",
     "RuntimeLayout",
     "RuntimeLayoutError",
     "active_generation_pointer",
@@ -1270,6 +1438,13 @@ __all__ = [
     "make_active_generation_pointer",
     "prepare_runtime_layout",
     "resolve_runtime_layout",
+    "calibration_path",
+    "load_calibration",
+    "load_window_binding",
+    "save_calibration",
+    "save_window_binding",
+    "stable_window_binding_id",
+    "window_binding_path",
     "runtime_storage_lock",
     "runtime_storage_lock_owner_path",
     "runtime_storage_lock_path",

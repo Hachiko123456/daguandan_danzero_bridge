@@ -48,6 +48,7 @@ from ..danzero.rules import (
     wildcard_substitutions,
 )
 from ..danzero.state import GameStateError, GuanDanState, Seat
+from ..opening_gate import MIN_OPENING_ACTION_CONFIDENCE
 from ..session_health import audit_session_health
 from .action_uncertainty import state_variants_for_action_semantics
 from .consensus import (
@@ -716,6 +717,28 @@ class LiveOrchestrator:
             )
 
     @property
+    def first_action_pending(self) -> bool:
+        """Whether the confirmed initial state still lacks its first action."""
+
+        with self._state_lock:
+            snapshot = self.reducer.snapshot()
+            return bool(
+                self._first_action_pending
+                and snapshot.lead_player is not None
+                and snapshot.current_player == snapshot.lead_player
+            )
+
+    @property
+    def first_action_gate(self) -> dict[str, object]:
+        """Small presentation-neutral view of the opening-action gate."""
+
+        with self._state_lock:
+            return {
+                "pending": self.first_action_pending,
+                "reason": self._first_action_gate_reason,
+            }
+
+    @property
     def snapshot(self) -> LiveSnapshot:
         with self._state_lock:
             return self.reducer.snapshot()
@@ -749,6 +772,7 @@ class LiveOrchestrator:
         monotonic_ms: int,
         wall_time: str | None = None,
         historical_scan: bool = False,
+        opening_action: object | None = None,
     ) -> LiveUpdate:
         if self.status != "initializing":
             raise RuntimeError("实时对局已经启动")
@@ -782,6 +806,15 @@ class LiveOrchestrator:
         self._first_action_gate_reason = "not_started"
         self._lead_auto_confirmed_from_marker = False
         self._clear_first_action_candidates()
+        if opening_action is not None and lead_player is None:
+            raise ValueError("提供首出动作时必须同时提供有效首出座位")
+        normalized_opening_action = (
+            self._normalize_start_opening_action(
+                opening_action, lead_player=lead_player
+            )
+            if opening_action is not None and lead_player is not None
+            else None
+        )
         event = self.reducer.confirm_initial_state(
             round_level=round_level,
             hand=hand,
@@ -793,6 +826,7 @@ class LiveOrchestrator:
         event = self._publish_event(event)
         if lead_player is None:
             self.status = "waiting_lead"
+            self._first_action_gate_reason = "waiting_for_lead"
             self._lead_wait_started_ms = int(monotonic_ms)
             self._deal_complete_recorded = False
             self._opening_controls_seen = False
@@ -801,7 +835,14 @@ class LiveOrchestrator:
             waiting = self._append_lifecycle_event("waiting_for_lead", {})
             return self._update(event=event, events=(event, waiting))
         self.status = "running"
-        self._first_action_pending = True
+        # Historical replay with a persisted initial state is already entering
+        # from a trusted baseline.  Keep that compatibility path actionable;
+        # normal live starts and explicit opening_action=None still wait for
+        # the first real action.
+        self._first_action_pending = opening_action is None and not historical_scan
+        self._first_action_gate_reason = (
+            "awaiting_first_action" if opening_action is None else "opening_action_supplied"
+        )
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = lead_player != "self" or historical_scan
         self._activate_zone(int(monotonic_ms))
@@ -810,8 +851,96 @@ class LiveOrchestrator:
             {"player": lead_player},
             actor=lead_player,
         )
-        self._request_advice_if_needed()
-        return self._update(event=event, events=(event, turn_started))
+        if opening_action is None and not historical_scan:
+            # Initial metadata is enough to create a coherent session.  The
+            # first visual action is a separate evidence gate; do not ask the
+            # advisor to produce advice for a state whose opening trick has not
+            # been observed yet.
+            self._invalidate_button_advice()
+            return self._update(event=event, events=(event, turn_started))
+        if opening_action is None:
+            # A historical replay explicitly entered from a trusted initial
+            # timeline event.  Preserve the old replay/advisor contract without
+            # changing normal live semantics.
+            self._first_action_gate_reason = "historical_baseline"
+            self._request_advice_if_needed(bypass_response_preflight=True)
+            return self._update(event=event, events=(event, turn_started))
+
+        assert normalized_opening_action is not None
+        action = normalized_opening_action
+        before = self.reducer.snapshot()
+        action_event = self._record_action(
+            action["actor"],
+            action["cards"],
+            False,
+            confidence=action["confidence"],
+            source=action["source"],
+            suit_options=action["suit_options"],
+            monotonic_ms=monotonic_ms,
+        )
+        action_event, outcomes = self._publish_action_with_outcomes(
+            action_event, before
+        )
+        self._first_action_pending = False
+        self._first_action_gate_reason = "opening_action_confirmed"
+        self._clear_first_action_candidates()
+        self._activate_zone(int(monotonic_ms))
+        next_turn_started = self._append_current_turn_started()
+        self._request_advice_if_needed(bypass_response_preflight=True)
+        events = (
+            event,
+            turn_started,
+            action_event,
+            *outcomes,
+            *((next_turn_started,) if next_turn_started else ()),
+        )
+        return self._update(event=action_event, events=events)
+
+    @staticmethod
+    def _normalize_start_opening_action(
+        opening_action: object,
+        *,
+        lead_player: Seat,
+    ) -> dict[str, object]:
+        """Validate the optional trusted opening action supplied at startup.
+
+        Vision-originated actions still go through the normal burst consensus
+        path.  This boundary is only for callers that already possess a
+        trusted opening seed (for example replay/bootstrap), so it validates
+        the seat, successor and confidence before the reducer is advanced.
+        """
+
+        actor = getattr(opening_action, "actor", None)
+        cards = tuple(str(card) for card in getattr(opening_action, "cards", ()))
+        next_player = getattr(opening_action, "next_player", None)
+        source = str(getattr(opening_action, "source", "trusted_opening_action"))
+        suit_options = tuple(
+            tuple(str(option) for option in options)
+            for options in getattr(opening_action, "suit_options", ())
+        )
+        try:
+            confidence = float(getattr(opening_action, "confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if actor != lead_player:
+            raise ValueError("首出动作的座位必须与首出座位一致")
+        if next_player != next_active_seat(lead_player, frozenset()):
+            raise ValueError("首出动作的下一行动座位不一致")
+        if not cards:
+            raise ValueError("首出动作必须包含至少一张牌")
+        if (
+            not isfinite(confidence)
+            or not MIN_OPENING_ACTION_CONFIDENCE <= confidence <= 1.0
+        ):
+            raise ValueError("首出动作置信度不足或无效")
+        return {
+            "actor": actor,
+            "cards": cards,
+            "next_player": next_player,
+            "confidence": confidence,
+            "source": source,
+            "suit_options": suit_options,
+        }
 
     def ingest_frame(
         self,
@@ -1096,6 +1225,11 @@ class LiveOrchestrator:
                     current_metrics,
                     fast,
                 )
+                if (
+                    timeout_consensus is not None
+                    and not self._first_action_consensus_acceptable(timeout_consensus)
+                ):
+                    timeout_consensus = None
                 if timeout_consensus is not None:
                     event, events = self._commit_consensus(
                         timeout_consensus,
@@ -1249,6 +1383,11 @@ class LiveOrchestrator:
                     strategy_result=consensus,
                 )
             if consensus is not None:
+                if (
+                    consensus.status == "confirmed"
+                    and not self._first_action_consensus_acceptable(consensus)
+                ):
+                    return self._update(fast_signals=fast)
                 if consensus.status == "confirmed":
                     if (
                         handoff_window is not None
@@ -1461,6 +1600,7 @@ class LiveOrchestrator:
         self._clear_burst()
         self._clear_first_action_candidates()
         self._first_action_pending = True
+        self._first_action_gate_reason = "awaiting_first_action"
         self._self_lead_controls_seen = False
         self._self_lead_controls_cleared = lead != "self"
         self._activate_zone(int(monotonic_ms))
@@ -1638,7 +1778,10 @@ class LiveOrchestrator:
             evidence_refs=review.evidence_refs,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
+        was_first_action = self._first_action_pending
         self._first_action_pending = False
+        if was_first_action:
+            self._first_action_gate_reason = "first_action_confirmed"
         self._clear_first_action_candidates()
         self._append_lifecycle_event(
             "review_resolved",
@@ -1698,7 +1841,10 @@ class LiveOrchestrator:
             action_metadata=action_metadata,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
+        was_first_action = self._first_action_pending
         self._first_action_pending = False
+        if was_first_action:
+            self._first_action_gate_reason = "first_action_confirmed"
         self._clear_first_action_candidates()
         self._activate_zone(int(monotonic_ms))
         turn_started = self._append_current_turn_started()
@@ -1772,7 +1918,10 @@ class LiveOrchestrator:
             source="manual_minimal_editor",
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
+        was_first_action = self._first_action_pending
         self._first_action_pending = False
+        if was_first_action:
+            self._first_action_gate_reason = "first_action_confirmed"
         self._clear_first_action_candidates()
         self._append_lifecycle_event(
             "review_resolved",
@@ -2332,6 +2481,8 @@ class LiveOrchestrator:
                 include_media=bool(
                     getattr(self.store, "automatic_log_include_media", False)
                 ),
+                profiles_root=getattr(self.store, "profiles_root", None),
+                profile_name=getattr(self.store, "profile_name", None),
             )
             document = result.to_dict()
         except Exception as exc:
@@ -6899,6 +7050,14 @@ class LiveOrchestrator:
             if self.status != "running":
                 self._invalidate_button_advice()
             return None
+        # A confirmed initial hand/level/lead is a coherent session, but it
+        # is not yet a complete actionable trick.  Keep the first-action gate
+        # fail-closed: no model request, no placeholder PASS, and no partial
+        # recommendation until a real opening action is committed.
+        if self._first_action_pending and snapshot.current_player == snapshot.lead_player:
+            self._first_action_gate_reason = "awaiting_first_action"
+            self._invalidate_button_advice()
+            return None
         if (
             snapshot.current_player != "self"
             or "self" in snapshot.finished_seats
@@ -8900,6 +9059,28 @@ class LiveOrchestrator:
             int(monotonic_ms) - self._last_sample_ms >= self.burst_sample_interval_ms
         )
 
+    def _first_action_consensus_acceptable(
+        self,
+        result: ConsensusResult | None,
+    ) -> bool:
+        """Keep weak opening reads out of formal history.
+
+        The normal recognizer/consensus remains unchanged.  Only the special
+        first-action gate applies the existing opening confidence floor, so a
+        low-confidence opening candidate remains diagnostic evidence and does
+        not become a fake first play.
+        """
+
+        if result is None or not self._is_first_action_turn():
+            return True
+        if result.is_pass:
+            self._first_action_gate_reason = "opening_pass_not_allowed"
+            return False
+        if result.confidence < MIN_OPENING_ACTION_CONFIDENCE:
+            self._first_action_gate_reason = "opening_action_low_confidence"
+            return False
+        return True
+
     def _decide_if_ready(
         self,
         metrics: ZoneFrameMetrics,
@@ -9245,7 +9426,10 @@ class LiveOrchestrator:
             monotonic_ms=monotonic_ms,
         )
         event, outcomes = self._publish_action_with_outcomes(event, before)
+        was_first_action = self._first_action_pending
         self._first_action_pending = False
+        if was_first_action:
+            self._first_action_gate_reason = "first_action_confirmed"
         self._clear_first_action_candidates()
         after = self.reducer.snapshot()
         self._activate_zone(

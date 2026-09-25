@@ -70,7 +70,7 @@ def test_float_window_distinguishes_fast_recovery_from_confirmed_history_gap():
     )
     app.processEvents()
     assert window.suggestion_label.text() == "确认中…"
-    assert window.detail_label.text() == ""
+    assert window.detail_label.text() == "正在确认上一手"
 
     runtime.update_ready.emit(
         SimpleNamespace(
@@ -88,7 +88,7 @@ def test_float_window_distinguishes_fast_recovery_from_confirmed_history_gap():
         )
     )
     app.processEvents()
-    assert window.suggestion_label.text() == "暂无法推荐"
+    assert window.suggestion_label.text() == "暂不推荐"
     assert "记录未完整跟上" in window.detail_label.text()
 
 
@@ -317,6 +317,54 @@ def test_opening_status_replaces_reconnected_but_cannot_overwrite_new_session():
     window.hide()
 
 
+def test_structured_opening_readiness_shows_reason_and_suggested_action():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+
+    window.apply_listening_status({
+        "state": "opening",
+        "generation": 4,
+        "status": "WAIT",
+        "primary_reason": "HAND_UNSTABLE",
+        "message": "起手牌识别仍在变化",
+        "recoverable": True,
+        "suggested_action": "保持牌桌清晰，等待连续一致的起手牌识别",
+        "compact_allowed": False,
+        "diagnostic_compact_allowed": True,
+        "session_allowed": False,
+    })
+
+    assert window.suggestion_label.text() == "起手牌识别不稳定"
+    assert "起手牌识别仍在变化" in window.detail_label.text()
+    assert "建议：保持牌桌清晰" in window.detail_label.text()
+    assert "确认开局中" not in window.suggestion_label.text()
+    window.hide()
+
+
+def test_structured_opening_hard_error_clears_compact_cards():
+    app = _app()
+    runtime = FakeRuntime()
+    window = RecommendationFloatWindow(runtime)
+    window._render_cards(("3S",))
+
+    window.apply_listening_status({
+        "state": "failed",
+        "generation": 5,
+        "status": "FAIL",
+        "primary_reason": "ROI_FATAL",
+        "message": "识别区域配置存在致命错误",
+        "recoverable": False,
+        "suggested_action": "打开完整助手修复 ROI 配置后重新连接",
+        "compact_allowed": False,
+    })
+
+    assert window.suggestion_label.text() == "识别区域配置错误"
+    assert "修复 ROI 配置" in window.detail_label.text()
+    assert window._card_badges == []
+    window.hide()
+
+
 def test_recording_capacity_warning_preserves_active_recommendation():
     app = _app()
     runtime = FakeRuntime()
@@ -459,7 +507,7 @@ def test_float_window_clears_recommendation_when_history_is_withheld():
     )
     app.processEvents()
 
-    assert window.suggestion_label.text() == "暂无法推荐"
+    assert window.suggestion_label.text() == "暂不推荐"
     assert window._card_badges == []
     window.hide()
 
@@ -706,12 +754,13 @@ def test_float_window_independent_hint_expires_without_resurrecting_model_cards(
         local_rule_hint=LocalRuleHint("session", 1, 1, now_ms, now_ms, now_ms + 80, .99, (400, 600, 80, 30)),
     )
     window.apply_update(current)
-    assert window.suggestion_label.text() == "不出"
-    assert window.detail_label.text() == "牌局记录待同步"
+    assert window.suggestion_label.text() == "确认中…"
+    assert window.detail_label.text() == "正在确认上一手"
     assert not window._card_badges
     QTest.qWait(120)
     app.processEvents()
-    assert window.suggestion_label.text() == "等待建议"
+    assert window.suggestion_label.text() == "确认中…"
+    assert window.detail_label.text() == "正在确认上一手"
     assert not window._card_badges
     window.hide()
 
@@ -869,3 +918,41 @@ def test_main_window_no_safe_slot_keeps_full_assistant_visible(monkeypatch):
     assert fake.recommendation_window.show_calls == 0
     assert fake.recommendation_window.raise_calls == 0
     assert calls == {"full": 1, "minimized": 0, "message": 1}
+
+
+def test_compact_action_bar_uses_icon_buttons_with_chinese_tooltips():
+    app = _app()
+    window = RecommendationFloatWindow(FakeRuntime())
+    buttons = [
+        window.capture_button, window.debug_button, window.copy_issue_button,
+        window.copy_summary_button, window.open_button, window.stop_button,
+    ]
+    assert all(button.toolTip() for button in buttons)
+    assert all(button.accessibleName() for button in buttons)
+    assert all(not button.text() for button in buttons)
+    assert "截取当前画面" in window.capture_button.toolTip()
+    assert "打开窗口与牌局诊断" in window.debug_button.toolTip()
+    window.close()
+
+
+def test_float_window_renders_ready_waiting_first_action_for_structured_and_legacy_payloads():
+    app = _app()
+    window = RecommendationFloatWindow(FakeRuntime())
+
+    window.apply_listening_status({
+        "state": "opening",
+        "generation": 8,
+        "status": "PASS",
+        "primary_reason": "READY_WAITING_FIRST_ACTION",
+        "message": "已进入牌桌，等待自己首出",
+        "suggested_action": "等待自己首出；首出后继续识别出牌",
+    })
+    assert window.suggestion_label.text() == "已进入牌桌，等待自己首出"
+
+    window.apply_listening_status({
+        "state": "opening",
+        "phase": "ready_waiting_first_action",
+        "generation": 9,
+    })
+    assert window.suggestion_label.text() == "已进入牌桌，等待自己首出"
+    window.hide()

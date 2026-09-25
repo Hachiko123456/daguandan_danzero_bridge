@@ -379,6 +379,17 @@ class OfflineDiagnosticPanel(CardWidget):
             # Never combine advice counts across modes or turn process completion
             # into a PASS claim. Failure of either mode stays visible.
             lines.append(line)
+        configuration = data.get("configuration")
+        if isinstance(configuration, dict):
+            status = str(configuration.get("status") or "unavailable")
+            labels = {
+                "embedded_match": "回放使用压缩包内的原始识别配置",
+                "embedded_snapshot": "回放使用压缩包内的识别配置快照",
+                "match": "回放配置与原始会话一致",
+                "mismatch": "警告：回放配置与原始会话不一致",
+                "unavailable": "警告：未能确认原始回放配置",
+            }
+            lines.append(labels.get(status, f"回放配置：{status}"))
         return "\n".join(lines) or "服务未提供分轮结果，请查看报告。"
 
     def request_cancel(self) -> None:

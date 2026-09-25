@@ -12,12 +12,15 @@ RUNTIME_LAYOUT = resolve_runtime_layout()
 PROJECT_ROOT: Path = RUNTIME_LAYOUT.bundle_root
 RESOURCE_DATA_DIR: Path = RUNTIME_LAYOUT.resource_data_dir
 RUNTIME_ROOT: Path = RUNTIME_LAYOUT.runtime_root
+APP_DATA_ROOT: Path = RUNTIME_LAYOUT.app_data_root
 DATA_DIR: Path = RUNTIME_LAYOUT.data_dir
 PROFILES_ROOT: Path = RUNTIME_LAYOUT.profiles_root
 LOGS_ROOT: Path = RUNTIME_LAYOUT.logs_root
 DIAGNOSTICS_ROOT: Path = RUNTIME_LAYOUT.diagnostics_root
 PREFERENCES_ROOT: Path = RUNTIME_LAYOUT.preferences_root
 CACHE_ROOT: Path = RUNTIME_LAYOUT.cache_root
+CALIBRATION_ROOT: Path = RUNTIME_LAYOUT.calibration_root
+WINDOW_BINDINGS_ROOT: Path = RUNTIME_LAYOUT.window_bindings_root
 
 DEFAULT_BASE_SIZE: tuple[int, int] = (1280, 720)
 DEFAULT_AUTO_CAPTURE_INTERVAL_SEC: float = 1.0

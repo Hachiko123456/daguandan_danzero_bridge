@@ -12,6 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from .card_uncertainty import is_unknown_suit_card, normalized_suit_options
+from .occlusion_evidence import OcclusionEvidence
 
 
 def _rank_counts(cards: tuple[str, ...]) -> Counter[str]:
@@ -47,6 +48,7 @@ def validate_suit_correction(
         or any(is_unknown_suit_card(card) for card in corrected)
         or len(corrected) != len(target)
         or _rank_counts(corrected) != _rank_counts(target)
+        or any(count > 2 for count in Counter(corrected).values())
     ):
         return None
     return corrected
@@ -87,6 +89,8 @@ def validate_visual_action_correction(
     if len(observed) < len(target):
         return None
     if any(observed_ranks[rank] < count for rank, count in target_ranks.items()):
+        return None
+    if any(count > 2 for count in Counter(observed).values()):
         return None
     return observed
 
@@ -171,7 +175,7 @@ def validate_visual_action_compatibility(
 
 @dataclass(frozen=True)
 class SuitCorrectionObservation:
-    """One observation result, including whether two matching reads exist."""
+    """One observation result, including a conservative evidence status."""
 
     cards: tuple[str, ...] = ()
     confirmations: int = 0
@@ -180,6 +184,37 @@ class SuitCorrectionObservation:
     @property
     def confirmed(self) -> bool:
         return bool(self.cards) and self.confirmations >= 2
+
+    @property
+    def status(self) -> str:
+        """Expose the common evidence vocabulary without breaking old callers."""
+
+        if not self.cards:
+            return "rejected"
+        if self.confirmed:
+            return "confirmed"
+        if self.evidence_kind == "exact":
+            return "known"
+        return "occluded"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "cards": list(self.cards),
+            "confirmations": self.confirmations,
+            "evidence_kind": self.evidence_kind,
+            "status": self.status,
+            "confirmed": self.confirmed,
+        }
+
+    as_dict = to_dict
+
+    def to_evidence(self, *, action_id: str = "") -> OcclusionEvidence:
+        return OcclusionEvidence(
+            state=self.status, action_id=action_id, cards=self.cards,
+            candidates=(self.cards,) if self.cards else (),
+            confirmations=self.confirmations,
+            required_confirmations=2, reason=self.evidence_kind,
+        )
 
 
 class SuitCorrectionTracker:

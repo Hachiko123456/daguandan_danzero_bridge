@@ -63,6 +63,66 @@ def _blocked_detail(reason: str, missing_player: str = "", missing_action_kind: 
     return "牌局记录未完整跟上，请先手动出牌"
 
 
+def _recovery_context(reason: str) -> str:
+    if reason == "wind_catch_pass_recovery_pending":
+        return "正在确认接风前动作"
+    if reason in {"previous_action_reread_pending", "turn_recovery_pending"}:
+        return "正在确认上一手"
+    return ""
+
+
+_FORMAL_RECOVERY_REASONS = {
+    "previous_action_reread_pending",
+    "turn_recovery_pending",
+    "turn_recovery_expired",
+    "turn_recovery_budget_exceeded",
+    "turn_desynchronized",
+    "wind_catch_pass_recovery_pending",
+    "visual_finish_without_complete_history",
+    "runtime_review_required",
+}
+
+
+def _withhold_reason(update: object, raw: object) -> str:
+    block_reason = str(getattr(update, "block_reason", "") or "")
+    if block_reason in _FORMAL_RECOVERY_REASONS:
+        return block_reason
+    return str(
+        getattr(raw, "withhold_reason", "")
+        or getattr(update, "withhold_reason", "")
+        or block_reason
+        or ""
+    )
+
+
+def _is_formal_withheld(update: object, raw: object, *, matches: bool) -> bool:
+    status = getattr(update, "status", "")
+    raw_status = getattr(raw, "status", None)
+    reason = _withhold_reason(update, raw)
+    return bool(
+        status == "review_required"
+        or (matches and raw_status == "withheld")
+        or bool(getattr(raw, "withhold_reason", "") or getattr(update, "withhold_reason", ""))
+        or reason in _FORMAL_RECOVERY_REASONS
+    )
+
+
+def _project_formal_withheld(update: object, raw: object, *, player: object) -> CompactViewState:
+    reason = _withhold_reason(update, raw)
+    if reason == "not_local_turn" and player != "self":
+        return CompactViewState("waiting", "等待自己回合")
+    context = _recovery_context(reason)
+    if context:
+        return CompactViewState("confirming", "确认中…", context)
+    return CompactViewState(
+        "blocked", "暂不推荐",
+        _blocked_detail(
+            reason, str(getattr(update, "missing_player", "") or ""),
+            str(getattr(update, "missing_action_kind", "") or ""),
+        ),
+    )
+
+
 def project_compact_view(update: object, *, now_ms: int) -> CompactViewState:
     snapshot = getattr(update, "snapshot", None)
     status = getattr(update, "status", "")
@@ -72,8 +132,23 @@ def project_compact_view(update: object, *, now_ms: int) -> CompactViewState:
         return CompactViewState("terminal", "本局已结束")
     if status == "paused":
         return CompactViewState("paused", "识别已暂停", "请排除遮挡后点击继续")
+
+    matches = raw is not None and advice_matches_snapshot(raw, snapshot)
+    raw_status = getattr(raw, "status", None)
+
+    # Formal recovery/withheld state outranks local visual hints.  This keeps a
+    # stale/partial canonical history from being masked by an independently
+    # detected “cannot beat” button.
+    if _is_formal_withheld(update, raw, matches=matches):
+        return _project_formal_withheld(update, raw, player=player)
+
+    # Older producers used ``unknown`` for an update that had not yet
+    # reached a canonical advice state. Treat it as waiting, while still
+    # allowing a confirmed local pass to win by the priority above.
+    if status == "unknown":
+        status = "running"
     if status not in {"running", "initializing", "waiting_lead"}:
-        return CompactViewState("blocked", "暂无法推荐", "请打开完整助手处理识别问题")
+        return CompactViewState("blocked", "暂不推荐", "请打开完整助手处理识别问题")
 
     hint = getattr(update, "local_rule_hint", None)
     hint_pending = bool(getattr(update, "local_rule_hint_pending", False))
@@ -84,48 +159,25 @@ def project_compact_view(update: object, *, now_ms: int) -> CompactViewState:
     if isinstance(hint, LocalRuleHint) and status == "running" and hint.is_current(
         session_id=session_id, capture_generation=generation, now_ms=now_ms,
     ):
-        detail = "牌局记录待同步" if getattr(raw, "status", None) == "withheld" or player != "self" else ""
-        return CompactViewState("local_rule_hint", "不出", detail)
+        return CompactViewState("local_rule_hint", "不出")
 
-    matches = raw is not None and advice_matches_snapshot(raw, snapshot)
     fast = getattr(update, "fast_signals", None)
     visual_self = bool(
         getattr(fast, "active_player", None) == "self"
         and getattr(fast, "self_action_buttons_visible", False)
     )
-    # The canonical actor may be behind the visual actor; never call that a
-    # harmless foreign turn. A stale withheld object cannot outrank new state.
-    withheld_reason = str(
-        getattr(update, "block_reason", "")
-        or getattr(raw, "withhold_reason", "")
-        or ""
-    )
-    # NOT_LOCAL_TURN is a normal waiting state, not a recognition failure.
-    # Actual recovery gaps retain priority even when the missing actor is a
-    # foreign seat; otherwise a real desynchronization would look harmless.
-    if matches and getattr(raw, "status", None) == "withheld":
-        if withheld_reason == "not_local_turn" and player != "self":
-            return CompactViewState("waiting", "等待自己回合")
-        if withheld_reason in {"previous_action_reread_pending", "turn_recovery_pending", "wind_catch_pass_recovery_pending"}:
-            return CompactViewState("confirming", "确认中…")
-        return CompactViewState(
-            "blocked", "暂无法推荐",
-            _blocked_detail(
-                withheld_reason, str(getattr(update, "missing_player", "") or ""),
-                str(getattr(update, "missing_action_kind", "") or ""),
-            ),
-        )
     if status == "running" and player != "self":
         if visual_self:
-            return CompactViewState("blocked", "暂无法推荐", "回合信息未对齐，请先手动出牌")
+            return CompactViewState("blocked", "暂不推荐", "回合信息未对齐，请先手动出牌")
         return CompactViewState("waiting", "等待自己回合")
     if not matches:
         return CompactViewState("waiting", "等待建议")
-    raw_status = getattr(raw, "status", None)
     if raw_status == "failed":
-        return CompactViewState("failed", "暂无法推荐", "建议计算失败，请先手动出牌")
+        return CompactViewState("failed", "暂不推荐", "建议计算失败，请先手动出牌")
     if raw_status == "requested":
         return CompactViewState("calculating", "计算中…")
+    if raw_status in {"unknown", "stale", None}:
+        return CompactViewState("waiting", "等待建议")
     advice = getattr(raw, "advice", None)
     if raw_status != "ready" or advice is None:
         return CompactViewState("waiting", "等待建议")

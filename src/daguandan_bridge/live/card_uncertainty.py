@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Iterable
 
 from ..danzero.state import GuanDanState, PlayEvent
+from .occlusion_evidence import OcclusionEvidence, utc_now_iso
 
 
 SUITS: tuple[str, ...] = ("S", "H", "C", "D")
@@ -395,3 +396,115 @@ def state_variants_for_unknown_suits_detailed(
         limit=max_variants,
         used_relaxed_suits=True,
     )
+
+# --- Explicit, delayed occlusion decisions ---------------------------------
+
+
+def assess_occluded_action(
+    *,
+    cards: Iterable[str],
+    suit_options: Iterable[Iterable[str]] = (),
+    known_cards: Iterable[str] = (),
+    known_suit_options: Iterable[Iterable[str]] = (),
+    candidate_already_known: bool = False,
+    limit: int = 64,
+    strategy_sensitive: bool | None = None,
+    action_id: str = "",
+    observed_at: str | None = None,
+) -> OcclusionEvidence:
+    """Assess an action without guessing an unknown suit.
+
+    A five-card (or larger) action is strategy-sensitive by default because a
+    wrong interpretation can change the legal response class.  If more than
+    one concrete branch survives the double-deck constraints, no branch is
+    selected; callers receive ``occluded`` and ``strategy_blocked`` instead.
+    """
+
+    observed = tuple(str(card) for card in cards)
+    supplied_options = tuple(tuple(str(suit) for suit in choices) for choices in suit_options)
+    if not observed:
+        return OcclusionEvidence(
+            state="rejected", action_id=action_id, suit_options=supplied_options,
+            strategy_blocked=True, reason="empty recognition", observed_at=observed_at,
+        )
+
+    if not any(is_unknown_suit_card(card) for card in observed):
+        return OcclusionEvidence(
+            state="known", action_id=action_id, cards=observed,
+            suit_options=supplied_options, candidates=(tuple(sorted(observed)),),
+            confirmations=1, required_confirmations=1, observed_at=observed_at,
+        )
+
+    variants = feasible_action_variants(
+        cards=observed,
+        suit_options=supplied_options,
+        known_cards=known_cards,
+        known_suit_options=known_suit_options,
+        candidate_already_known=candidate_already_known,
+        limit=limit,
+    )
+    if not variants:
+        return OcclusionEvidence(
+            state="rejected", action_id=action_id, cards=observed,
+            suit_options=supplied_options, strategy_blocked=True,
+            reason="no double-deck-consistent candidate", observed_at=observed_at,
+        )
+
+    candidates = tuple(dict.fromkeys(tuple(sorted(variant)) for variant in variants))
+    if len(candidates) == 1:
+        return OcclusionEvidence(
+            state="confirmed", action_id=action_id, cards=observed,
+            suit_options=supplied_options, candidates=candidates,
+            confirmations=1, required_confirmations=2,
+            reason="unique physical candidate; delayed confirmation still required",
+            observed_at=observed_at,
+        )
+
+    sensitive = len(observed) >= 5 if strategy_sensitive is None else strategy_sensitive
+    return OcclusionEvidence(
+        state="occluded" if supplied_options else "unknown",
+        action_id=action_id, cards=observed, suit_options=supplied_options,
+        candidates=candidates, strategy_blocked=bool(sensitive),
+        reason=("candidate disagreement blocks strategy" if sensitive
+                else "multiple physical candidates remain"),
+        observed_at=observed_at,
+    )
+
+
+def confirm_occluded_action(
+    previous: OcclusionEvidence,
+    *,
+    cards: Iterable[str],
+    suit_options: Iterable[Iterable[str]] = (),
+    known_cards: Iterable[str] = (),
+    known_suit_options: Iterable[Iterable[str]] = (),
+    candidate_already_known: bool = False,
+    strategy_sensitive: bool | None = None,
+    now: str | None = None,
+) -> OcclusionEvidence:
+    """Perform one delayed reread and require two matching safe observations."""
+
+    current = assess_occluded_action(
+        cards=cards, suit_options=suit_options, known_cards=known_cards,
+        known_suit_options=known_suit_options,
+        candidate_already_known=candidate_already_known,
+        strategy_sensitive=strategy_sensitive, action_id=previous.action_id,
+        observed_at=now or utc_now_iso(),
+    )
+    if current.state in {"rejected", "unknown", "occluded"}:
+        return current
+    if previous.candidates != current.candidates or previous.cards != current.cards:
+        return current
+    confirmations = previous.confirmations + 1
+    if current.state == "known":
+        return current
+    return OcclusionEvidence(
+        **{**current.__dict__, "confirmations": confirmations,
+           "state": "confirmed" if confirmations >= current.required_confirmations else current.state,
+           "reason": "matching delayed confirmation" if confirmations >= current.required_confirmations
+                     else "awaiting matching delayed confirmation"}
+    )
+
+# Friendly names for callers that prefer decision/evaluation terminology.
+evaluate_occlusion = assess_occluded_action
+confirm_occlusion = confirm_occluded_action

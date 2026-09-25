@@ -12,6 +12,7 @@ from ..application.recording_process_protocol import (
 )
 from ..domain.recording import RecorderWarning, RecordingResult
 from ..live.pipeline_timing import PipelineTiming
+from ..live.recorder import audit_recording_integrity
 from .recording_process_forensics import indexed_frame_count, stable_recording_files
 from .recording_process import recording_process_bootstrap
 
@@ -35,7 +36,7 @@ class ProcessSessionRecorder:
         max_video_bytes: int | None = None,
         startup_timeout: float = 10.0,
         write_timeout: float = 1.5,
-        close_timeout: float = 30.0,
+        close_timeout: float = 60.0,
         worker_module: str = "daguandan_bridge.infrastructure.recording_process_worker",
         worker_name: str = "run_session_recorder_worker",
         worker_args: tuple[object, ...] = (),
@@ -226,16 +227,53 @@ class ProcessSessionRecorder:
             indexed = 0
         code, message = self._failure or ("recording_worker_aborted", "recorder child aborted")
         dropped = max(0, self._submitted - indexed)
-        return RecordingResult(
-            self.video_path, self.index_path, indexed, dropped,
-            integrity={
-                "schema": "guandan.recording-integrity/1", "status": "FAIL",
-                "recording_state": "aborted", "writer_frame_count": indexed,
-                "indexed_frame_count": indexed, "decodable_frame_count": 0,
-                "issues": [code], "worker_failure": {"code": code, "message": message},
-                "worker_pid": self._worker_pid, "worker_confirmed_dead": not self.worker_alive,
-                "final_files": files, "omitted_capture_frames": dropped,
+        try:
+            integrity = audit_recording_integrity(
+                self.video_path, self.index_path, writer_frame_count=indexed,
+                _include_last_decodable_frame=True,
+            )
+        except TypeError:
+            integrity = audit_recording_integrity(
+                self.video_path, self.index_path, writer_frame_count=indexed,
+            )
+        except Exception as exc:
+            integrity = {
+                "schema": "guandan.recording-integrity/1",
+                "status": "FAIL",
+                "recording_state": "aborted",
+                "writer_frame_count": indexed,
+                "indexed_frame_count": indexed,
+                "decodable_frame_count": None,
+                "last_decodable_frame_index": None,
+                "issues": ["integrity_audit_failed"],
+                "integrity_error": f"{type(exc).__name__}: {exc}",
+            }
+        # The worker failure remains the authoritative session issue.  Keep
+        # decoder findings as forensic fields rather than replacing the stable
+        # failure code used by health consumers.
+        decoder_issues = list(integrity.get("issues") or [])
+        integrity.update({
+            "schema": "guandan.recording-integrity/1",
+            "status": "FAIL",
+            "recording_state": "aborted",
+            "writer_frame_count": indexed,
+            "indexed_frame_count": indexed,
+            "issues": [code],
+            "post_abort_media_audit": {
+                "status": integrity.get("status"),
+                "issues": decoder_issues,
+                "decodable_frame_count": integrity.get("decodable_frame_count"),
+                "last_decodable_frame_index": integrity.get("last_decodable_frame_index"),
             },
+            "worker_failure": {"code": code, "message": message},
+            "worker_pid": self._worker_pid,
+            "worker_confirmed_dead": not self.worker_alive,
+            "final_files": files,
+            "omitted_capture_frames": dropped,
+        })
+        integrity.pop("_last_decodable_frame", None)
+        return RecordingResult(
+            self.video_path, self.index_path, indexed, dropped, integrity=integrity,
         )
 
     def _ensure_active(self) -> None:

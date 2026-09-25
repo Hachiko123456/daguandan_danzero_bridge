@@ -18,6 +18,7 @@ from .domain.recognition import (
     PLAY_REGION_TO_SEAT,
     SEATS_IN_ORDER,
     FastSignalResult,
+    LeadEvidence,
     OpeningSignal,
     PlacementSignal,
     PlayRegionResult,
@@ -26,7 +27,14 @@ from .domain.recognition import (
     RecognizedEvent,
 )
 from .image_io import read_image_unicode
+from .live.lead_evidence import rank_lead_evidence
 from .models import Box
+from .profiles import (
+    ProfileConfigError,
+    ProfileValidationIssue,
+    validate_profile_directory,
+)
+from .resource_fingerprint import recognition_resource_identity
 from .opening_gate import ListeningPageSignal
 from .template_service import TemplateService
 
@@ -164,6 +172,95 @@ class ScreenshotRecognitionService:
         self._black_suit_hog_cache: tuple[tuple[str, np.ndarray], ...] | None = None
         self._diagnostic_tracing = bool(diagnostic_tracing)
         self._diagnostic_local = local()
+
+    def validate_configuration(
+        self,
+        image: np.ndarray | None = None,
+        *,
+        raise_on_fatal: bool = False,
+    ) -> dict[str, object]:
+        """Validate profile geometry before capture/replay starts.
+
+        The validation is read-only and does not participate in recognition
+        decisions.  ``image`` is optional; when supplied, ratio-based boxes
+        are also checked against that concrete frame size.
+        """
+
+        report = validate_profile_directory(self.annotation_service.profile_root)
+        issues = list(report.get("issues", ()))
+        if image is not None:
+            issues.extend(self._runtime_roi_issues(image))
+        report["issues"] = issues
+        report["status"] = "fail" if any(
+            isinstance(item, dict) and item.get("severity") == "fatal"
+            for item in issues
+        ) else "pass"
+        report["resource_identity"] = recognition_resource_identity(
+            self.annotation_service.profiles_root,
+            self.annotation_service.profile_name,
+        )
+        if raise_on_fatal and report["status"] == "fail":
+            messages = [
+                str(item.get("message", "未知配置错误"))
+                for item in issues
+                if isinstance(item, dict)
+            ]
+            raise ProfileConfigError("识别资源验证失败：" + "；".join(messages))
+        return report
+
+    @property
+    def configuration_validation(self) -> dict[str, object]:
+        """当前 profile 的只读验证报告，供启动/诊断层展示。"""
+
+        return self.validate_configuration()
+
+    def recognition_resource_identity(self) -> dict[str, object]:
+        """Return the canonical identity used by capture and replay."""
+
+        return recognition_resource_identity(
+            self.annotation_service.profiles_root,
+            self.annotation_service.profile_name,
+        )
+
+    def _runtime_roi_issues(self, image: np.ndarray) -> list[dict[str, object]]:
+        if not isinstance(image, np.ndarray) or image.ndim not in {2, 3}:
+            return [
+                ProfileValidationIssue(
+                    code="roi.invalid_image",
+                    severity="fatal",
+                    message="ROI 验证输入不是有效图片",
+                ).to_dict()
+            ]
+        height, width = image.shape[:2]
+        issues: list[dict[str, object]] = []
+        try:
+            regions = self.annotation_service.list_regions()
+        except Exception as exc:
+            return [
+                ProfileValidationIssue(
+                    code="roi.unreadable_config",
+                    severity="fatal",
+                    message=f"无法读取 ROI 配置：{exc}",
+                ).to_dict()
+            ]
+        for region in regions:
+            box = AnnotationService._box_for_image(region, image)
+            if not box.fits_within((width, height)):
+                issues.append(
+                    ProfileValidationIssue(
+                        code="roi.runtime_out_of_bounds",
+                        severity="fatal",
+                        message=(
+                            f"ROI 在当前 {width}×{height} 图片上越界：{region.name}"
+                        ),
+                        region=region.name,
+                        details={
+                            "box": box.to_list(),
+                            "image_size": [width, height],
+                        },
+                    ).to_dict()
+                )
+        return issues
 
     def set_diagnostic_tracing_enabled(self, enabled: bool) -> None:
         """Toggle read-only traces without changing recognition decisions."""
@@ -565,6 +662,10 @@ class ScreenshotRecognitionService:
             annotations=tuple(annotations),
             buttons=buttons,
             elapsed_ms=(perf_counter() - started) * 1000,
+            lead_evidence=self._build_lead_evidence(
+                source_image, regions, templates, lead_player, lead_score,
+                current_player, current_score, events,
+            ),
         )
 
     def recognize_play_region(
@@ -721,51 +822,38 @@ class ScreenshotRecognitionService:
         )
 
     def recognize_opening_signal(self, image: np.ndarray | Path) -> OpeningSignal:
-        """Collect the opening-only signals without deciding who leads.
+        """Collect opening evidence without deciding who leads.
 
-        The pre-game doubling controls can share screen space with seat
-        markers.  Returning raw evidence here lets the orchestrator suppress
-        that transient UI and require consistent seat evidence before it
-        enters the first turn.
+        The legacy four fields remain unchanged.  The appended evidence keeps
+        per-seat scores so a caller can audit weak templates, stable card
+        actions, timer support, and conflicts before formal confirmation.
         """
 
         source_image = self._source_image(image)
         regions = {region.name: region for region in self.annotation_service.list_regions()}
         templates = self._templates()
-        marker_player, _, _, _ = self._recognize_seat_status(
-            source_image,
-            regions,
-            templates,
-            prefix="first_play",
-            kind="status",
-            label="first_play",
+        marker_player, marker_score, _, _ = self._recognize_seat_status(
+            source_image, regions, templates, prefix="first_play",
+            kind="status", label="first_play",
         )
-        active_player, _, _, _ = self._recognize_seat_status(
-            source_image,
-            regions,
-            templates,
-            prefix="timer",
-            kind="timer",
-            label="active",
+        active_player, timer_score, _, _ = self._recognize_seat_status(
+            source_image, regions, templates, prefix="timer",
+            kind="timer", label="active",
         )
         buttons, _, _, _ = self._recognize_buttons_in_regions(
-            source_image,
-            (regions.get("button_actions"), regions.get("game_end_controls")),
+            source_image, (regions.get("button_actions"), regions.get("game_end_controls")),
             templates,
         )
         button_set = set(buttons)
         game_end_control = next(
-            (
-                label
-                for label in ("continue_game", "change_table")
-                if label in button_set
-            ),
+            (label for label in ("continue_game", "change_table") if label in button_set),
             None,
         )
+        evidence = self._build_lead_evidence(
+            source_image, regions, templates, marker_player, marker_score,
+            active_player, timer_score, (),
+        )
         return OpeningSignal(
-            # Either doubling control means the opening screen is still
-            # transient.  Keep the historical field name for callers, but
-            # normal \"加倍×2\" blocks lead commitment just like 超级加倍.
             super_double_visible=bool(button_set & {"super_double", "double"}),
             marker_player=marker_player,
             active_player=active_player,
@@ -773,6 +861,7 @@ class ScreenshotRecognitionService:
                 button_set & {"play_cards", "hint", "pass", "cannot_beat"}
             ),
             game_end_control=game_end_control,
+            lead_evidence=evidence,
         )
 
     def recognize_super_double_visible(self, image: np.ndarray | Path) -> bool:
@@ -1104,6 +1193,66 @@ class ScreenshotRecognitionService:
             return None, 0.0, "", None
         match = matches[0]
         return match.label, match.score, match.source, match
+
+    def _opening_seat_scores(
+        self, image: np.ndarray, regions: dict[str, RegionRecord],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...],
+        *, prefix: str, kind: str, label: str,
+    ) -> dict[Seat, float]:
+        scores: dict[Seat, float] = {}
+        for seat in SEATS_IN_ORDER:
+            matched, score, _source, _match = self._recognize_status(
+                image, regions.get(f"{prefix}_{seat}"), templates,
+                kind=kind, label=label,
+                # Raw scores are retained for audit even when a legacy
+                # recognizer threshold would reject the visible template.
+                threshold=0.35,
+                search_margin=(
+                    (round(image.shape[1] / 1280 * self._FIRST_PLAY_SEARCH_MARGIN),
+                     round(image.shape[0] / 720 * self._FIRST_PLAY_SEARCH_MARGIN))
+                    if prefix == "first_play" else (0, 0)
+                ),
+                foreground_shape=prefix == "first_play",
+            )
+            scores[seat] = float(score) if matched else 0.0
+        return scores
+
+    def _build_lead_evidence(
+        self, image: np.ndarray, regions: dict[str, RegionRecord],
+        templates: tuple[tuple[dict[str, object], np.ndarray], ...],
+        marker_player: Seat | None, marker_score: float,
+        active_player: Seat | None, timer_score: float,
+        events: Iterable[RecognizedEvent],
+    ) -> tuple[LeadEvidence, ...]:
+        marker_scores = self._opening_seat_scores(
+            image, regions, templates, prefix="first_play", kind="status", label="first_play"
+        )
+        timer_scores = self._opening_seat_scores(
+            image, regions, templates, prefix="timer", kind="timer", label="active"
+        )
+        action_scores = {seat: 0.0 for seat in SEATS_IN_ORDER}
+        for event in events:
+            if not event.is_pass and event.cards and event.player in action_scores:
+                action_scores[event.player] = max(action_scores[event.player], float(event.confidence))
+        if not any(action_scores.values()):
+            for region_name, seat in PLAY_REGION_TO_SEAT.items():
+                cards, score, _source, _diagnostics, _annotations, _suits = self._recognize_cards(
+                    image, regions.get(region_name), templates, source_roles={"play"},
+                    wild_rank=None, rank_threshold=self._PLAY_RANK_THRESHOLD,
+                    suit_threshold=self._PLAY_SUIT_THRESHOLD, allow_unknown_suit=True,
+                )
+                if cards:
+                    action_scores[seat] = float(score)
+        raw = tuple(
+            LeadEvidence(
+                candidate_seat=seat,
+                first_play_score=(marker_scores[seat] or (marker_score if seat == marker_player else 0.0)),
+                card_action_score=action_scores[seat],
+                timer_score=(timer_scores[seat] or (timer_score if seat == active_player else 0.0)),
+            )
+            for seat in SEATS_IN_ORDER
+        )
+        return rank_lead_evidence(raw)
 
     def _recognize_seat_status(
         self,

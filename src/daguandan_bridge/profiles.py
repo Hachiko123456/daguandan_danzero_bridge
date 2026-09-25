@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from .config import (
     DEFAULT_AUTO_CAPTURE_INTERVAL_SEC,
@@ -25,6 +25,282 @@ class ProfileNameError(ValueError):
 
 class ProfileConfigError(RuntimeError):
     """profile.json 结构无效时抛出的错误。"""
+
+
+@dataclass(frozen=True)
+class ProfileValidationIssue:
+    """一个可序列化、可展示的 profile/ROI 验证问题。"""
+
+    code: str
+    severity: str
+    message: str
+    region: str | None = None
+    related_region: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "severity": self.severity,
+            "message": self.message,
+            "region": self.region,
+            "related_region": self.related_region,
+            "details": dict(self.details),
+        }
+
+
+# These are the only regions whose overlap can misattribute one player's
+# action to another player.  Other ROI overlaps are allowed because status,
+# animation and decorative regions often intentionally touch play areas.
+KEY_PLAY_REGION_NAMES = ("left_play", "opposite_play", "right_play", "my_play")
+CRITICAL_PLAY_OVERLAP_RATIO = 0.15
+
+
+def _region_value(region: object, name: str, default: object = None) -> object:
+    if isinstance(region, Mapping):
+        return region.get(name, default)
+    return getattr(region, name, default)
+
+
+def _box_value(region: object) -> tuple[int, int, int, int] | None:
+    value = _region_value(region, "abs_box")
+    if value is None:
+        return None
+    if hasattr(value, "x") and hasattr(value, "y"):
+        try:
+            return (int(value.x), int(value.y), int(value.w), int(value.h))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (list, tuple)) and len(value) == 4:
+        try:
+            return tuple(int(item) for item in value)  # type: ignore[return-value]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _ratio_box_value(region: object) -> tuple[float, float, float, float] | None:
+    value = _region_value(region, "ratio_box")
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return tuple(float(item) for item in value)  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _intersection_area(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> int:
+    first_x, first_y, first_w, first_h = first
+    second_x, second_y, second_w, second_h = second
+    width = max(
+        0,
+        min(first_x + first_w, second_x + second_w) - max(first_x, second_x),
+    )
+    height = max(
+        0,
+        min(first_y + first_h, second_y + second_h) - max(first_y, second_y),
+    )
+    return width * height
+
+
+def validate_profile_regions(
+    regions: Iterable[object],
+    *,
+    base_size: tuple[int, int] = DEFAULT_BASE_SIZE,
+    critical_overlap_ratio: float = CRITICAL_PLAY_OVERLAP_RATIO,
+) -> tuple[ProfileValidationIssue, ...]:
+    """Validate configured ROI geometry without changing recognition behavior.
+
+    ``regions`` may contain ``RegionRecord`` instances or JSON-like mappings.
+    The function is intentionally pure so startup, diagnostics and tooling can
+    use the same checks.  Large overlaps between the four player play
+    regions are warnings that block action use, while malformed or incomplete
+    ROI geometry remains fatal.
+    """
+
+    width, height = (int(base_size[0]), int(base_size[1]))
+    issues: list[ProfileValidationIssue] = []
+    by_name: dict[str, object] = {}
+    if width <= 0 or height <= 0:
+        return (
+            ProfileValidationIssue(
+                code="profile.invalid_base_size",
+                severity="fatal",
+                message="profile 基准画面尺寸必须为正数",
+                details={"base_size": [width, height]},
+            ),
+        )
+
+    for region in regions:
+        name = str(_region_value(region, "name", "")).strip()
+        if not name:
+            issues.append(
+                ProfileValidationIssue(
+                    code="roi.missing_name",
+                    severity="fatal",
+                    message="ROI 缺少名称",
+                )
+            )
+            continue
+        if name in by_name:
+            issues.append(
+                ProfileValidationIssue(
+                    code="roi.duplicate_name",
+                    severity="fatal",
+                    message=f"ROI 名称重复：{name}",
+                    region=name,
+                )
+            )
+            continue
+        by_name[name] = region
+        box = _box_value(region)
+        if box is None:
+            issues.append(
+                ProfileValidationIssue(
+                    code="roi.invalid_box",
+                    severity="fatal",
+                    message=f"ROI 坐标无效：{name}",
+                    region=name,
+                )
+            )
+        else:
+            x, y, box_width, box_height = box
+            if box_width <= 0 or box_height <= 0:
+                issues.append(
+                    ProfileValidationIssue(
+                        code="roi.non_positive_size",
+                        severity="fatal",
+                        message=f"ROI 宽高必须大于 0：{name}",
+                        region=name,
+                        details={"abs_box": list(box)},
+                    )
+                )
+            elif x < 0 or y < 0 or x + box_width > width or y + box_height > height:
+                issues.append(
+                    ProfileValidationIssue(
+                        code="roi.out_of_bounds",
+                        severity="fatal",
+                        message=f"ROI 超出 {width}×{height} 基准画面：{name}",
+                        region=name,
+                        details={"abs_box": list(box), "base_size": [width, height]},
+                    )
+                )
+
+        ratio = _ratio_box_value(region)
+        if ratio is None:
+            issues.append(
+                ProfileValidationIssue(
+                    code="roi.invalid_ratio_box",
+                    severity="fatal",
+                    message=f"ROI ratio_box 无效：{name}",
+                    region=name,
+                )
+            )
+        else:
+            rx, ry, rw, rh = ratio
+            if (
+                any(not math.isfinite(value) for value in ratio)
+                or rw <= 0
+                or rh <= 0
+                or rx < 0
+                or ry < 0
+                or rx + rw > 1
+                or ry + rh > 1
+            ):
+                issues.append(
+                    ProfileValidationIssue(
+                        code="roi.ratio_out_of_bounds",
+                        severity="fatal",
+                        message=f"ROI ratio_box 超出 0 到 1 范围：{name}",
+                        region=name,
+                        details={"ratio_box": list(ratio)},
+                    )
+                )
+
+    missing = [name for name in KEY_PLAY_REGION_NAMES if name not in by_name]
+    if missing:
+        issues.append(
+            ProfileValidationIssue(
+                code="roi.missing_key_play_regions",
+                severity="fatal",
+                message="缺少关键出牌 ROI",
+                details={"regions": missing},
+            )
+        )
+
+    try:
+        threshold = float(critical_overlap_ratio)
+    except (TypeError, ValueError):
+        threshold = CRITICAL_PLAY_OVERLAP_RATIO
+    if not math.isfinite(threshold) or threshold <= 0 or threshold > 1:
+        threshold = CRITICAL_PLAY_OVERLAP_RATIO
+
+    for index, first_name in enumerate(KEY_PLAY_REGION_NAMES):
+        first = _box_value(by_name[first_name]) if first_name in by_name else None
+        if first is None or first[2] <= 0 or first[3] <= 0:
+            continue
+        for second_name in KEY_PLAY_REGION_NAMES[index + 1 :]:
+            second = _box_value(by_name[second_name]) if second_name in by_name else None
+            if second is None or second[2] <= 0 or second[3] <= 0:
+                continue
+            overlap = _intersection_area(first, second)
+            smaller_area = min(first[2] * first[3], second[2] * second[3])
+            ratio = overlap / smaller_area if smaller_area else 0.0
+            if ratio >= threshold:
+                issues.append(
+                    ProfileValidationIssue(
+                        code="roi.critical_play_overlap",
+                        severity="warning",
+                        message=(
+                            f"关键出牌 ROI 重叠过大，可能导致动作归属错误："
+                            f"{first_name} 与 {second_name}"
+                        ),
+                        region=first_name,
+                        related_region=second_name,
+                        details={
+                            "overlap_area": overlap,
+                            "overlap_ratio_of_smaller": round(ratio, 6),
+                            "threshold": threshold,
+                            "first_box": list(first),
+                            "second_box": list(second),
+                        },
+                    )
+                )
+    return tuple(issues)
+
+
+def profile_validation_report(
+    regions: Iterable[object],
+    *,
+    base_size: tuple[int, int] = DEFAULT_BASE_SIZE,
+    critical_overlap_ratio: float = CRITICAL_PLAY_OVERLAP_RATIO,
+) -> dict[str, Any]:
+    """Return a stable report suitable for startup and diagnostic manifests."""
+
+    issues = validate_profile_regions(
+        regions,
+        base_size=base_size,
+        critical_overlap_ratio=critical_overlap_ratio,
+    )
+    has_fatal_issue = any(item.severity == "fatal" for item in issues)
+    has_action_boundary_warning = any(
+        item.code == "roi.critical_play_overlap" for item in issues
+    )
+    return {
+        "status": "fail" if has_fatal_issue else "pass",
+        # Opening is blocked only by structural/configuration errors.  A play
+        # ROI overlap remains visible as a warning and blocks action use,
+        # because it can misattribute a player's move, without making the
+        # profile itself fail validation.
+        "opening_blocking": has_fatal_issue,
+        "action_blocking": has_fatal_issue or has_action_boundary_warning,
+        "base_size": [int(base_size[0]), int(base_size[1])],
+        "critical_overlap_ratio": float(critical_overlap_ratio),
+        "issues": [item.to_dict() for item in issues],
+    }
 
 
 KNOWN_CHINESE_PROFILE_NAMES: dict[str, str] = {
@@ -157,6 +433,7 @@ class ProfileConfig:
     match_settings: MatchSettings = field(default_factory=MatchSettings)
     counter_settings: CounterSettings = field(default_factory=CounterSettings)
     advisor_strategy: str = "fabledan"
+    allow_resize: bool = True
 
     def normalized(self) -> "ProfileConfig":
         base_size = (int(self.base_size[0]), int(self.base_size[1]))
@@ -214,6 +491,7 @@ class ProfileConfig:
             aspect_ratio_tolerance=tolerance,
             capture_backend=backend,
             allow_screen_fallback=bool(self.allow_screen_fallback),
+            allow_resize=bool(self.allow_resize),
             detect_black_bars=bool(self.detect_black_bars),
             viewport_mode=viewport_mode,
             viewport_aspect_ratio=viewport_aspect_ratio,
@@ -235,6 +513,7 @@ class ProfileConfig:
             "aspect_ratio_tolerance": normalized.aspect_ratio_tolerance,
             "capture_backend": normalized.capture_backend,
             "allow_screen_fallback": normalized.allow_screen_fallback,
+            "allow_resize": normalized.allow_resize,
             "detect_black_bars": normalized.detect_black_bars,
             "viewport_mode": normalized.viewport_mode,
             "viewport_aspect_ratio": normalized.viewport_aspect_ratio,
@@ -354,6 +633,7 @@ def load_profile_config(paths: ProfilePaths) -> ProfileConfig:
             aspect_ratio_tolerance=float(data.get("aspect_ratio_tolerance", 0.03)),
             capture_backend=str(data.get("capture_backend", "auto")),
             allow_screen_fallback=bool(data.get("allow_screen_fallback", True)),
+            allow_resize=bool(data.get("allow_resize", True)),
             detect_black_bars=bool(data.get("detect_black_bars", True)),
             viewport_mode=str(data.get("viewport_mode", "full")),
             viewport_aspect_ratio=float(
@@ -390,6 +670,117 @@ def load_profile_config(paths: ProfilePaths) -> ProfileConfig:
         ).normalized()
     except (KeyError, TypeError, ValueError, IndexError) as exc:
         raise ProfileConfigError("profile.json 字段无效") from exc
+
+
+def validate_profile_directory(
+    profile_root: Path | ProfilePaths,
+    *,
+    base_size: tuple[int, int] | None = None,
+    critical_overlap_ratio: float = CRITICAL_PLAY_OVERLAP_RATIO,
+) -> dict[str, Any]:
+    """Validate a profile directory before capture or replay starts.
+
+    This is deliberately non-mutating and never changes recognition results.
+    Callers can fail fast with the returned, human-readable issue list instead
+    of letting an invalid ROI silently produce empty recognition results.
+    """
+
+    root = Path(profile_root.root if isinstance(profile_root, ProfilePaths) else profile_root)
+    issues: list[ProfileValidationIssue] = []
+    selected_size = tuple(base_size or DEFAULT_BASE_SIZE)
+    profile_path = root / PROFILE_CONFIG_FILE_NAME
+    regions_path = root / REGIONS_CONFIG_FILE_NAME
+    if base_size is None and profile_path.is_file():
+        try:
+            raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            raw_size = raw_profile.get("base_size") if isinstance(raw_profile, dict) else None
+            if isinstance(raw_size, (list, tuple)) and len(raw_size) == 2:
+                selected_size = (int(raw_size[0]), int(raw_size[1]))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            issues.append(
+                ProfileValidationIssue(
+                    code="profile.invalid_json",
+                    severity="fatal",
+                    message=f"无法读取 profile.json：{profile_path}",
+                    details={"path": str(profile_path)},
+                )
+            )
+    if not regions_path.is_file():
+        issues.append(
+            ProfileValidationIssue(
+                code="profile.missing_regions_config",
+                severity="fatal",
+                message=f"缺少 regions_config.json：{regions_path}",
+                details={"path": str(regions_path)},
+            )
+        )
+        report = profile_validation_report((), base_size=selected_size, critical_overlap_ratio=critical_overlap_ratio)
+        report["issues"] = [item.to_dict() for item in issues] + list(report["issues"])
+        report["status"] = "fail"
+        report["opening_blocking"] = True
+        report["action_blocking"] = True
+        return report
+    try:
+        document = json.loads(regions_path.read_text(encoding="utf-8"))
+        raw_regions = document.get("regions") if isinstance(document, dict) else None
+        if not isinstance(raw_regions, list):
+            raise ValueError("regions 必须是数组")
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
+        issues.append(
+            ProfileValidationIssue(
+                code="profile.invalid_regions_config",
+                severity="fatal",
+                message=f"无法读取 regions_config.json：{exc}",
+                details={"path": str(regions_path)},
+            )
+        )
+        report = profile_validation_report((), base_size=selected_size, critical_overlap_ratio=critical_overlap_ratio)
+        report["issues"] = [item.to_dict() for item in issues] + list(report["issues"])
+        report["status"] = "fail"
+        report["opening_blocking"] = True
+        report["action_blocking"] = True
+        return report
+
+    report = profile_validation_report(
+        raw_regions,
+        base_size=selected_size,
+        critical_overlap_ratio=critical_overlap_ratio,
+    )
+    if issues:
+        report["issues"] = [item.to_dict() for item in issues] + list(report["issues"])
+        has_fatal_issue = any(
+            isinstance(item, dict) and item.get("severity") == "fatal"
+            for item in report["issues"]
+        )
+        has_action_boundary_warning = any(
+            isinstance(item, dict) and item.get("code") == "roi.critical_play_overlap"
+            for item in report["issues"]
+        )
+        report["status"] = "fail" if has_fatal_issue else "pass"
+        report["opening_blocking"] = has_fatal_issue
+        report["action_blocking"] = has_fatal_issue or has_action_boundary_warning
+    report["profile_root"] = str(root)
+    report["profile_name"] = root.name
+    return report
+
+
+def require_valid_profile_directory(
+    profile_root: Path | ProfilePaths,
+    *,
+    base_size: tuple[int, int] | None = None,
+    critical_overlap_ratio: float = CRITICAL_PLAY_OVERLAP_RATIO,
+) -> dict[str, Any]:
+    """Raise a concise, explainable error for a profile that cannot start."""
+
+    report = validate_profile_directory(
+        profile_root,
+        base_size=base_size,
+        critical_overlap_ratio=critical_overlap_ratio,
+    )
+    if report["status"] == "fail":
+        messages = [str(item.get("message", "未知配置错误")) for item in report["issues"]]
+        raise ProfileConfigError("profile 配置验证失败：" + "；".join(messages))
+    return report
 
 
 def list_profiles(data_root: Path) -> list[str]:

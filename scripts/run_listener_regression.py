@@ -142,6 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--include-ineligible",
+        action="store_true",
+        help=(
+            "仅用于诊断：允许选择 source/resource/metadata 不满足严格资格的 session；"
+            "这些结果不会阻断严格回归。"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         "--max-workers",
         dest="workers",
@@ -185,12 +193,101 @@ def _validate_worker_count(value: object) -> int:
     return workers
 
 
+def _read_manifest_for_descriptor(descriptor: SessionDescriptor) -> dict[str, object]:
+    try:
+        raw = json.loads(descriptor.manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _normalized_status(value: object) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        return normalized or None
+    return None
+
+
+def qualify_descriptor(descriptor: SessionDescriptor) -> dict[str, object]:
+    """Return a conservative, pre-replay qualification for one session.
+
+    Missing newer provenance fields are intentionally unknown.  We never turn
+    an old/manual descriptor into a strict candidate merely because it has a
+    video and a verified TruthLog.
+    """
+    manifest = _read_manifest_for_descriptor(descriptor)
+    reasons: list[str] = []
+    source_value = manifest.get("source_observability")
+    if source_value is None:
+        source_value = manifest.get("initial_state_observability")
+    if isinstance(source_value, dict):
+        source_value = source_value.get("status") or source_value.get("classification")
+    source_status = _normalized_status(source_value)
+    if source_status is None:
+        # Existing live manifests have an explicit, auditable pair of fields.
+        # Do not apply this compatibility inference to manual recordings.
+        if (
+            manifest.get("recording_phase") == "live"
+            and manifest.get("initial_state_status") == "confirmed"
+            and manifest.get("session_kind") != "manual_recording"
+        ):
+            source_status = "strict"
+        elif str(manifest.get("session_kind", "")).lower() == "manual_recording" or descriptor.session_id.startswith("manual_"):
+            source_status = "unknown"
+        else:
+            source_status = "unknown"
+    if source_status in {"observable", "confirmed", "strict_replay", "strict"}:
+        source_status = "strict"
+    elif source_status in {"not_observable", "unobservable", "missing_initial_state", "diagnostic_only"}:
+        source_status = "not_observable"
+    else:
+        source_status = "unknown"
+
+    resource_value = manifest.get("resource_identity_match")
+    if resource_value is None:
+        resource_value = manifest.get("profile_resource_match")
+    if isinstance(resource_value, dict):
+        resource_value = resource_value.get("status")
+    if isinstance(resource_value, bool):
+        resource_status = "match" if resource_value else "mismatch"
+    else:
+        resource_status = _normalized_status(resource_value)
+        if resource_status in {"matched", "match", "same", "strict"}:
+            resource_status = "match"
+        elif resource_status in {"mismatch", "different", "failed"}:
+            resource_status = "mismatch"
+        else:
+            resource_status = "unknown"
+
+    if descriptor.truth_status != "verified":
+        reasons.append(f"truth_status_{descriptor.truth_status}")
+    if not descriptor.has_video:
+        reasons.append("missing_video")
+    if not descriptor.manifest_readable:
+        reasons.append("manifest_unknown")
+    if source_status != "strict":
+        reasons.append(f"source_observability_{source_status}")
+    if resource_status != "match":
+        reasons.append(f"resource_identity_{resource_status}")
+    strict_eligible = not reasons
+    return {
+        "session_id": descriptor.session_id,
+        "source": str(descriptor.root),
+        "strict_eligible": strict_eligible,
+        "source_observability": source_status,
+        "resource_identity": resource_status,
+        "reasons": reasons,
+    }
+
+
 def select_descriptors(
     descriptors: Iterable[SessionDescriptor],
     *,
     session_filters: Iterable[str] = (),
     include_draft: bool = False,
     include_no_truth: bool = False,
+    include_ineligible: bool = False,
+    strict_only: bool = True,
     random_count: int | None = None,
     seed: int | None = None,
 ) -> tuple[SessionDescriptor, ...]:
@@ -219,19 +316,17 @@ def select_descriptors(
         statuses.add("draft")
     if include_no_truth:
         statuses.update({"missing", "invalid"})
-    selected = [
-        item
-        for item in available
-        if item.truth_status in statuses and item.has_video
-    ]
+    selected = [item for item in available if item.truth_status in statuses and item.has_video]
     if seed is not None and random_count is None:
         raise ValueError("--seed 必须与 --random-count 一起使用")
     if random_count is not None:
         if random_count <= 0:
             raise ValueError("--random-count 必须大于 0")
+        if strict_only and not include_ineligible:
+            selected = [item for item in selected if qualify_descriptor(item)["strict_eligible"]]
         if random_count > len(selected):
             raise ValueError(
-                f"--random-count={random_count} 超过候选 session 数量 {len(selected)}"
+                f"--random-count={random_count} 超过可选 strict session 数量 {len(selected)}"
             )
         rng = random.Random(seed)
         selected = rng.sample(selected, random_count)
@@ -239,75 +334,124 @@ def select_descriptors(
     return tuple(selected)
 
 
-def evaluate_run(summary: dict[str, object]) -> dict[str, object]:
-    rows = summary.get("sessions", ())
-    rows = tuple(row for row in rows if isinstance(row, dict))
+def _row_source_observability(row: dict[str, object]) -> str:
+    value = row.get("source_observability") or row.get("initial_state_observability")
+    if isinstance(value, dict):
+        value = value.get("status") or value.get("classification")
+    status = _normalized_status(value)
+    if status in {"strict", "observable", "confirmed", "strict_replay"}:
+        return "strict"
+    if status in {"not_observable", "unobservable", "missing_initial_state", "diagnostic_only"}:
+        return "not_observable"
+    session_id = str(row.get("session_id") or "")
+    if session_id.startswith("manual_") or row.get("opening_status") == "opening_not_observable":
+        return "not_observable"
+    return "unknown"
+
+
+def _row_resource_identity(row: dict[str, object]) -> str:
+    value = row.get("resource_identity_match")
+    if value is None:
+        value = row.get("profile_resource_match")
+    if isinstance(value, dict):
+        value = value.get("status")
+    if isinstance(value, bool):
+        return "match" if value else "mismatch"
+    status = _normalized_status(value)
+    if status in {"match", "matched", "same", "strict"}:
+        return "match"
+    if status in {"mismatch", "different", "failed"}:
+        return "mismatch"
+    return "unknown"
+
+
+def evaluate_run(
+    summary: dict[str, object],
+    *,
+    include_ineligible: bool = False,
+) -> dict[str, object]:
+    rows = tuple(row for row in summary.get("sessions", ()) if isinstance(row, dict))
     blocking: list[dict[str, object]] = []
     strict_passes: list[dict[str, object]] = []
     advisory: list[dict[str, object]] = []
+    classified: list[dict[str, object]] = []
+    required = {
+        "execution_status": "completed",
+        "frame_replay_status": "complete",
+        "listener_status": "complete",
+        "opening_status": "recognized",
+        "truth_quality": "passed",
+        "visual_quality": "passed",
+        "comparison_status": "passed",
+    }
     for row in rows:
-        truth_kind = (
-            str((row.get("truth_log") or {}).get("kind", "none"))
-            if isinstance(row.get("truth_log"), dict)
-            else "none"
-        )
-        quality = {
-            "execution_status": row.get("execution_status"),
-            "listener_status": row.get("listener_status"),
-            "truth_quality": row.get("truth_quality"),
-            "visual_quality": row.get("visual_quality"),
-            "fabledan_quality": row.get("fabledan_quality"),
-        }
-        failure_reasons: list[str] = []
-        expected_status = {
-            "execution_status": "completed",
-            "frame_replay_status": "complete",
-            "listener_status": "complete",
-            "opening_status": "recognized",
-            "truth_quality": "passed",
-            "visual_quality": "passed",
-            "comparison_status": "passed",
-        }
-        for key, expected in expected_status.items():
-            if key in row and row.get(key) != expected:
-                failure_reasons.append(f"{key}_{row.get(key)}")
-        # Canonical TruthLog with a verified label is a strict regression
-        # baseline. Keep the older aliases for compatibility with existing
-        # reports, but never demote verified_label to advisory.
-        strict = bool(
-            truth_kind in {"canonical", "verified"}
-            and row.get("truth_qualification")
-            in {"verified_label", "verified", "trusted_for_run"}
-        )
-        failure_reasons.extend(
-            _fabledan_blocking_reasons(row, strict=strict)
-        )
-        failed = bool(failure_reasons)
+        truth_kind = str((row.get("truth_log") or {}).get("kind", "none")) if isinstance(row.get("truth_log"), dict) else "none"
+        truth_qualification = row.get("truth_qualification")
+        truth_strict = truth_kind in {"canonical", "verified"} and truth_qualification in {"verified_label", "verified", "trusted_for_run"}
+        source_status = _row_source_observability(row)
+        resource_status = _row_resource_identity(row)
+        failure_reasons = [f"{key}_{row.get(key)}" for key, expected in required.items() if row.get(key) != expected]
+        # Keep the existing trusted FableDan channel checks for strict truth
+        # sessions.  Advisory FableDan output remains explicitly non-blocking;
+        # actual failed/timeout trusted-channel evidence remains a quality
+        # failure and therefore cannot earn strict_pass.
+        failure_reasons.extend(_fabledan_blocking_reasons(row, strict=truth_strict))
+        first_divergence = row.get("first_divergence")
+        if source_status == "not_observable":
+            classification = "source_not_observable"
+        elif resource_status == "mismatch":
+            classification = "resource_mismatch"
+        elif not truth_strict or source_status == "unknown" or resource_status == "unknown":
+            classification = "invalid"
+            if not truth_strict:
+                failure_reasons.append("truth_qualification_unknown_or_unverified")
+            if source_status == "unknown":
+                failure_reasons.append("source_observability_unknown")
+            if resource_status == "unknown":
+                failure_reasons.append("resource_identity_unknown")
+        elif failure_reasons or first_divergence:
+            classification = "listener_divergence"
+        else:
+            classification = "strict_pass"
         item = {
             "session_id": row.get("session_id"),
             "source": row.get("source"),
-            "quality": quality,
+            "classification": classification,
+            # --include-ineligible is an explicit diagnostic mode: provenance
+            # failures are retained in the report but do not block the run.
+            # Without it, a selected ineligible session is a failed gate.
+            "blocking": classification == "listener_divergence" or (
+                classification in {"resource_mismatch", "source_not_observable", "invalid"}
+                and not include_ineligible
+            ),
+            "strict_eligible": classification == "strict_pass",
+            "source_observability": source_status,
+            "resource_identity": resource_status,
+            "quality": {key: row.get(key) for key in required},
             "failure_reasons": failure_reasons,
-            "first_divergence": row.get("first_divergence"),
+            "first_divergence": first_divergence,
             "error": row.get("error"),
         }
-        if strict:
-            if failed:
-                blocking.append(item)
-            else:
-                strict_passes.append(item)
+        classified.append(item)
+        if classification == "strict_pass":
+            strict_passes.append(item)
+        elif item["blocking"]:
+            blocking.append(item)
         else:
-            item["failed"] = failed
+            item["failed"] = True
             advisory.append(item)
-    passed = not blocking and bool(rows)
+    counts = {name: sum(item["classification"] == name for item in classified) for name in (
+        "strict_pass", "source_not_observable", "resource_mismatch", "listener_divergence", "invalid"
+    )}
     return {
-        "status": "PASS" if passed else "FAIL",
+        "status": "PASS" if not blocking and bool(rows) else "FAIL",
         "session_count": len(rows),
-        "blocking_failures": blocking,
+        "classification_counts": counts,
         "strict_passes": strict_passes,
+        "blocking_failures": blocking,
         "advisory_results": advisory,
+        "results": classified,
     }
-
 
 def _write_markdown_report(
     path: Path,
@@ -730,7 +874,9 @@ def main(argv: list[str] | None = None) -> int:
             session_filters=args.session,
             include_draft=args.include_draft,
             include_no_truth=args.include_no_truth,
+            include_ineligible=args.include_ineligible,
             random_count=args.random_count,
+            strict_only=args.random_count is not None,
             seed=effective_seed,
         )
         if not selected:
@@ -760,7 +906,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         progress.finish()
         raw_summary = json.loads(run.summary_path.read_text(encoding="utf-8"))
-        quality = evaluate_run(raw_summary)
+        quality = evaluate_run(raw_summary, include_ineligible=args.include_ineligible)
         wrapper = {
             "schema": "guandan.listener-core-regression/1",
             "status": quality["status"],
@@ -774,6 +920,8 @@ def main(argv: list[str] | None = None) -> int:
                 "missing_or_invalid": sum(item.truth_status in {"missing", "invalid"} for item in selected),
                 "random_count": args.random_count,
                 "random_seed": effective_seed,
+                "include_ineligible": args.include_ineligible,
+                "qualifications": [qualify_descriptor(item) for item in selected],
                 "session_ids": [item.session_id for item in selected],
                 "workers": min(workers, len(selected)),
             },

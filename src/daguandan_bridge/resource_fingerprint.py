@@ -10,6 +10,8 @@ from pathlib import Path
 _CONFIG_FILES = frozenset(
     {"profile.json", "regions_config.json", "templates_config.json"}
 )
+_RESOURCE_DIRS = frozenset({"templates", "models"})
+_FINGERPRINT_ALGORITHM = "recognition-resources-v2"
 
 
 def recognition_resource_identity(
@@ -27,7 +29,7 @@ def recognition_resource_identity(
                 if path.is_file()
                 and (
                     path.name in _CONFIG_FILES
-                    or "templates" in path.relative_to(root).parts
+                    or bool(_RESOURCE_DIRS.intersection(path.relative_to(root).parts))
                 )
             ),
             key=lambda path: path.relative_to(root).as_posix(),
@@ -41,7 +43,12 @@ def recognition_resource_identity(
             for path in files
         ]
         if not records:
-            return {"status": "unavailable", "files": []}
+            return {
+                "status": "unavailable",
+                "algorithm": _FINGERPRINT_ALGORITHM,
+                "profile_name": str(profile_name),
+                "files": [],
+            }
         payload = json.dumps(
             records,
             ensure_ascii=False,
@@ -51,15 +58,75 @@ def recognition_resource_identity(
         ).encode("utf-8")
         return {
             "status": "identified",
+            "algorithm": _FINGERPRINT_ALGORITHM,
+            "profile_name": str(profile_name),
             "sha256": hashlib.sha256(payload).hexdigest(),
             "files": records,
         }
     except (OSError, RuntimeError, ValueError) as exc:
         return {
             "status": "unavailable",
+            "algorithm": _FINGERPRINT_ALGORITHM,
+            "profile_name": str(profile_name),
             "error_type": type(exc).__name__,
             "files": [],
         }
+
+
+def compare_resource_identities(
+    expected: object,
+    actual: object,
+) -> dict[str, object]:
+    """Compare capture/replay resource identities with explainable details."""
+
+    expected_map = expected if isinstance(expected, dict) else {}
+    actual_map = actual if isinstance(actual, dict) else {}
+    expected_sha = expected_map.get("sha256")
+    actual_sha = actual_map.get("sha256")
+    if isinstance(expected_sha, str) and isinstance(actual_sha, str):
+        matched = expected_sha == actual_sha
+        status = "match" if matched else "mismatch"
+    else:
+        matched = None
+        status = "unavailable"
+
+    def file_map(value: dict[str, object]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        files = value.get("files")
+        if isinstance(files, list):
+            for item in files:
+                if isinstance(item, dict):
+                    path = item.get("path")
+                    sha = item.get("sha256")
+                    if isinstance(path, str) and isinstance(sha, str):
+                        result[path] = sha
+        return result
+
+    expected_files = file_map(expected_map)
+    actual_files = file_map(actual_map)
+    return {
+        "status": status,
+        "matched": matched,
+        "expected_sha256": expected_sha,
+        "actual_sha256": actual_sha,
+        "missing_files": sorted(set(expected_files) - set(actual_files)),
+        "unexpected_files": sorted(set(actual_files) - set(expected_files)),
+        "changed_files": sorted(
+            path
+            for path in set(expected_files).intersection(actual_files)
+            if expected_files[path] != actual_files[path]
+        ),
+        "expected_algorithm": expected_map.get("algorithm"),
+        "actual_algorithm": actual_map.get("algorithm"),
+    }
+
+
+def resource_identities_match(expected: object, actual: object) -> bool | None:
+    """Return True/False when comparable, otherwise None for legacy data."""
+
+    result = compare_resource_identities(expected, actual)
+    value = result["matched"]
+    return value if isinstance(value, bool) else None
 
 
 def _sha256_file(path: Path) -> str:
@@ -70,4 +137,8 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["recognition_resource_identity"]
+__all__ = [
+    "compare_resource_identities",
+    "recognition_resource_identity",
+    "resource_identities_match",
+]

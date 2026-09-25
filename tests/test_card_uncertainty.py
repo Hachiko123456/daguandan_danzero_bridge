@@ -143,3 +143,74 @@ def test_state_history_keeps_suit_options_attached_after_card_normalization():
 
     assert event.cards == ("8?", "8H")
     assert event.suit_options == (("S", "C"), ("H",))
+from datetime import datetime, timedelta, timezone
+
+from daguandan_bridge.live.card_uncertainty import (
+    assess_occluded_action,
+    confirm_occluded_action,
+)
+from daguandan_bridge.live.occlusion_evidence import OcclusionEvidence, mark_stale
+
+
+def test_five_card_occlusion_blocks_strategy_when_candidates_disagree():
+    evidence = assess_occluded_action(
+        cards=("8?", "8?", "9?", "10?", "J?"),
+        suit_options=(
+            ("S", "H"), ("S", "H"), ("S", "H"), ("S", "H"), ("S", "H"),
+        ),
+        action_id="left-5",
+    )
+
+    assert evidence.state == "occluded"
+    assert evidence.strategy_blocked is True
+    assert evidence.is_actionable is False
+    assert len(evidence.candidates) > 1
+
+
+def test_double_deck_limits_reject_impossible_five_card_candidate():
+    evidence = assess_occluded_action(
+        cards=("8?", "8?", "8?", "8?", "8?"),
+        suit_options=(("S", "H", "C", "D"),) * 5,
+        known_cards=("8S", "8S", "8H", "8H", "8C", "8C", "8D", "8D"),
+        action_id="left-impossible",
+    )
+
+    assert evidence.state == "rejected"
+    assert evidence.strategy_blocked is True
+    assert "double-deck" in evidence.reason
+
+
+def test_occlusion_evidence_is_serializable_and_delayed_confirmation_is_explicit():
+    first = assess_occluded_action(
+        cards=("7?", "7C", "7D", "7D"),
+        suit_options=(("H", "D"), ("C",), ("D",), ("D",)),
+        action_id="left-bomb",
+    )
+    assert first.state == "confirmed"
+    assert first.confirmations == 1
+    assert first.delayed is True
+
+    second = confirm_occluded_action(
+        first,
+        cards=("7?", "7C", "7D", "7D"),
+        suit_options=(("H", "D"), ("C",), ("D",), ("D",)),
+    )
+    assert second.state == "confirmed"
+    assert second.confirmations == 2
+    assert second.is_actionable is True
+    assert OcclusionEvidence.from_dict(second.to_dict()) == second
+
+
+def test_empty_recognition_is_rejected_and_expired_evidence_is_stale():
+    empty = assess_occluded_action(cards=(), action_id="left-empty")
+    assert empty.state == "rejected"
+    assert empty.strategy_blocked is True
+    assert empty.is_actionable is False
+
+    expires = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    evidence = OcclusionEvidence(
+        state="occluded", cards=("8?",), expires_at=expires,
+    )
+    stale = mark_stale(evidence)
+    assert stale.state == "stale"
+    assert stale.strategy_blocked is True

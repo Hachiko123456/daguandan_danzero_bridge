@@ -155,10 +155,11 @@ def test_full_recording_mode_persists_listener_frames_without_an_initial_hand(tm
     recording.close(reason="listener_stopped")
 
     assert recording.store.directory.parent.name == ".preopening"
-    assert recording.store.directory.name.startswith("opening_")
+    assert recording.store.directory.name.startswith("episode_")
     assert not tuple((profile / "sessions").glob("game_*"))
     manifest = json.loads((recording.store.directory / "manifest.json").read_text("utf-8"))
-    assert manifest["status"] == "sealed"
+    assert manifest["status"] == "finished"
+    assert manifest["lifecycle"] == "finished"
     assert manifest["recording_mode"] == "all"
     assert manifest["recording_phase"] == "ended_without_initial_state"
     assert manifest["initial_state_status"] == "unconfirmed"
@@ -205,33 +206,26 @@ def test_confirmed_opening_is_archived_under_the_only_formal_game_directory(tmp_
         recognition_strategy="two_valid_streak",
     )
     formal = constructed.orchestrator.store.directory
-    opening_archive = formal / "opening"
-
     assert len(tuple(sessions_root.glob("game_*"))) == 1
     assert formal.name.startswith("game_")
-    assert opening_archive.is_dir()
-    assert not preopening.exists()
-    assert not (sessions_root / ".preopening").exists()
-    opening_manifest = json.loads(
-        (opening_archive / "manifest.json").read_text(encoding="utf-8")
-    )
-    assert opening_manifest["status"] == "sealed"
-    assert opening_manifest["recording_phase"] == "opening_confirmed"
-    assert opening_manifest["initial_state_status"] == "confirmed"
-    assert opening_manifest["frame_count"] == 1
-    assert len(
-        read_json_lines(opening_archive / "video" / "frame_index.jsonl")
-    ) == 1
+    assert (formal / "diagnostic_frames").is_dir()
+    assert (formal / "opening").exists() is False
+    # Promotion may retain a read-only source when cleanup is deferred; the
+    # formal session is authoritative and contains the diagnostic payload.
+    assert preopening.is_dir() or not preopening.exists()
     receipt = json.loads(
-        (opening_archive / "archive_receipt.json").read_text(encoding="utf-8")
+        (formal / "episode_promotion.json").read_text(encoding="utf-8")
     )
     formal_manifest = json.loads(
         (formal / "manifest.json").read_text(encoding="utf-8")
     )
     assert receipt["formal_session_id"] == formal.name
-    assert receipt["relative_path"] == "opening"
-    assert receipt["recording_integrity"]["writer_frame_count"] == 1
-    assert formal_manifest["opening_evidence"] == receipt
+    assert receipt["episode_id"] == opening.store.session_id
+    assert receipt["relative_diagnostic_frames"] == "diagnostic_frames"
+    assert formal_manifest["episode_promotion"] == receipt
+    assert formal_manifest["lifecycle"] == "running"
+    migrated_indexes = tuple((formal / "video").glob("*frame_index.jsonl"))
+    assert any(len(read_json_lines(path)) == 1 for path in migrated_indexes)
 
     constructed.orchestrator.finish()
 
@@ -267,7 +261,7 @@ def test_opening_archive_move_does_not_double_count_recording_capacity(tmp_path)
 
 
 
-def test_completed_opening_move_survives_formal_manifest_annotation_failure(
+def test_episode_promotion_manifest_failure_keeps_source_and_target_clean(
     tmp_path, monkeypatch
 ):
     profile = _profile(tmp_path, save_session_data=True, recording_mode="all")
@@ -292,20 +286,25 @@ def test_completed_opening_move_survives_formal_manifest_annotation_failure(
     formal = LiveSessionStore(tmp_path, profile.name)
     formal.start({"runtime": "archive-metadata-failure-test"})
 
-    def fail_metadata(_metadata):
+    before_trace = (formal.directory / "recognition_trace.jsonl").read_bytes()
+    before_manifest = (formal.directory / "manifest.json").read_bytes()
+    original_update = formal._update_manifest
+
+    def fail_manifest(changes):
+        original_update(changes)
         raise OSError("synthetic manifest update failure")
 
-    monkeypatch.setattr(formal, "update_session_metadata", fail_metadata)
-    destination = opening.archive_into(formal)
+    monkeypatch.setattr(formal, "_update_manifest", fail_manifest)
+    with pytest.raises(OSError, match="synthetic manifest update failure"):
+        opening.archive_into(formal)
 
-    assert destination == formal.directory / "opening"
-    assert destination.is_dir()
-    assert not source.exists()
-    error = json.loads(
-        (destination / "archive_metadata_error.json").read_text(encoding="utf-8")
-    )
-    assert error["status"] == "archived_manifest_update_failed"
-    assert error["error_type"] == "OSError"
+    assert source.is_dir()
+    assert (source / "manifest.json").is_file()
+    assert (formal.directory / "recognition_trace.jsonl").read_bytes() == before_trace
+    assert (formal.directory / "manifest.json").read_bytes() == before_manifest
+    assert not (formal.directory / "episode_promotion.json").exists()
+    assert not tuple((formal.directory / "diagnostic_frames").glob("*.png"))
+    formal._update_manifest = LiveSessionStore._update_manifest.__get__(formal, LiveSessionStore)
     formal.seal(frame_count=0, dropped_frames=0)
 
 
@@ -350,7 +349,8 @@ def test_live_start_failure_keeps_confirmed_opening_evidence_for_diagnosis(
     manifest = json.loads(
         (opening_directory / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["status"] == "sealed"
+    assert manifest["status"] == "waiting_first_action"
+    assert manifest["lifecycle"] == "waiting_first_action"
     assert manifest["opening_archive_status"] == "not_archived"
     assert manifest["opening_archive_reason"] == "live_recording_create_failed"
     assert not tuple((profile / "sessions").glob("game_*"))

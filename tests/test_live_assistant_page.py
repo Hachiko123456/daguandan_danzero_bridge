@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QSize, Qt, Signal
 from PySide6.QtWidgets import QApplication
 
 from daguandan_bridge.gui.live_assistant_page import LiveAssistantPage
@@ -1245,6 +1245,27 @@ def test_review_bar_disables_candidate_that_failed_rule_validation():
 
     assert not page.review_candidate_buttons[0].isEnabled()
     page.close()
+
+
+def test_main_window_replay_fits_1080p_after_switching_from_tall_annotation_page():
+    app = _app()
+    window = DaguandanBridgeWindow(live_runtime=FakeRuntime())
+    window.show()
+    window.switchTo(window.replay_page)
+    app.processEvents()
+
+    # The annotation page is much taller than a 1080p work area.  It must not
+    # impose that hidden page's size hint on the active replay page.
+    window.resize(1914, 1073)
+    app.processEvents()
+
+    assert window.size() == QSize(1914, 1073)
+    assert window.replay_page.geometry().top() == 0
+    assert window.replay_page.geometry().bottom() <= window.stackedWidget.height()
+    assert window.replay_page.content_scroll.isVisible()
+
+    window.close()
+    app.processEvents()
 
 
 def test_main_window_registers_live_page_in_fluent_navigation(monkeypatch):

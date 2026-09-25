@@ -32,8 +32,26 @@ def _assert_safe_path(path: Path) -> Path:
     return value.resolve(strict=False)
 
 
+def profile_root(profiles_root: Path | str, profile_name: str) -> Path:
+    """Return one profile below the application data profiles root."""
+
+    return Path(profiles_root).expanduser().resolve() / str(profile_name)
+
+
+def profile_templates_root(profiles_root: Path | str, profile_name: str) -> Path:
+    """Return the profile-owned templates directory."""
+
+    return profile_root(profiles_root, profile_name) / "templates"
+
+
+def profile_sessions_root(profiles_root: Path | str, profile_name: str) -> Path:
+    """Return the compatibility-default sessions directory for a profile."""
+
+    return profile_root(profiles_root, profile_name) / "sessions"
+
+
 def default_sessions_root(profiles_root: Path | str, profile_name: str) -> Path:
-    return Path(profiles_root).expanduser().resolve() / str(profile_name) / "sessions"
+    return profile_sessions_root(profiles_root, profile_name)
 
 
 def sessions_root_override_path(profiles_root: Path | str, profile_name: str) -> Path:
@@ -122,6 +140,9 @@ __all__ = [
     "SESSIONS_ROOT_SCHEMA",
     "clear_sessions_root_override",
     "default_sessions_root",
+    "profile_root",
+    "profile_sessions_root",
+    "profile_templates_root",
     "resolve_sessions_root",
     "sessions_root_info",
     "sessions_root_override_path",

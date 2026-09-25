@@ -28,6 +28,7 @@ from ..advisor_strategy import (
 from ..live.recorder import InMemorySessionRecorder
 from ..live.session_store import LiveSessionStore
 from ..runtime_identity import get_runtime_identity
+from ..resource_fingerprint import recognition_resource_identity
 from ..session_paths import resolve_sessions_root
 from ..storage import atomic_write_json
 from .live_v2_composition import build_production_live_v2_runtime
@@ -156,6 +157,21 @@ class ListenerRecording:
                         "confirmed" if confirmed else "unconfirmed"
                     ),
                     "termination_reason": str(reason),
+                    "lifecycle": (
+                        "waiting_first_action"
+                        if confirmed
+                        else "finished"
+                        if str(reason) in {"listener_stopped", "page_unknown"}
+                        else "aborted"
+                    ),
+                    "lifecycle_status": (
+                        "waiting_first_action"
+                        if confirmed
+                        else "finished"
+                        if str(reason) in {"listener_stopped", "page_unknown"}
+                        else "aborted"
+                    ),
+                    "lifecycle_reason": str(reason),
                     "recording_integrity": recording.integrity,
                 }
             )
@@ -195,6 +211,18 @@ class ListenerRecording:
             raise RuntimeError("开局证据不在受管预开局目录")
         if not source.is_dir() or not live_directory.is_dir():
             raise RuntimeError("开局证据或正式对局目录不存在")
+        # New episode stores are promoted into the formal session root so
+        # diagnostic_frames, recognition_trace and optional video share one
+        # lifecycle. Legacy opening stores retain the old nested archive path
+        # for read compatibility only.
+        if str(getattr(self.store, "session_id", "")).startswith("episode_"):
+            destination = live_directory
+            promoted = getattr(self.store, "promote_episode_into", None)
+            if not callable(promoted):
+                raise RuntimeError("当前 episode store 不支持晋升")
+            result = promoted(live_store)
+            self._archived_directory = result
+            return result
         destination = live_directory / "opening"
         if destination.exists():
             raise FileExistsError(f"正式对局已包含开局证据：{destination}")
@@ -348,7 +376,7 @@ class DefaultLiveSessionFactory:
         ):
             return None
         loaded = self.capture.load_profile(self.profile_name)
-        store = LiveSessionStore.for_opening_evidence(
+        store = LiveSessionStore.for_episode(
             self.capture.profiles_root,
             self.profile_name,
             sessions_root=self.sessions_root,
@@ -373,7 +401,10 @@ class DefaultLiveSessionFactory:
                 "advisor": self._advisor_manifest(),
             }
         )
-        store.start(manifest)
+        manifest.setdefault("lifecycle", "listening")
+        manifest.setdefault("lifecycle_status", "listening")
+        manifest.setdefault("lifecycle_reason", "listener_started")
+        store.start_episode(manifest)
         try:
             recorder = ProcessSessionRecorder(
                 store.directory,
@@ -473,6 +504,11 @@ class DefaultLiveSessionFactory:
                 round_level=round_level,
                 hand=hand,
                 lead_player=lead_player,
+                # Initial metadata establishes the session; the first visual
+                # play is bootstrapped later by the controller.  Pass this
+                # explicitly so the orchestrator enters WAITING_FIRST_ACTION
+                # instead of relying on a legacy/default call shape.
+                opening_action=None,
                 monotonic_ms=monotonic_ns() // 1_000_000,
             )
             recording.mark_initial_state_confirmed(
@@ -587,6 +623,9 @@ def build_session_manifest(config_path: Path, templates_path: Path) -> dict[str,
         "owner_pid": os.getpid(),
         "configuration_hash": _file_hash(config_path),
         "template_manifest_hash": _file_hash(templates_path),
+        "recognition_resource_identity": recognition_resource_identity(
+            config_path.parent.parent, config_path.parent.name
+        ),
         "runtime_identity": get_runtime_identity(),
         "target_fps": 10,
         "codec": "MJPG",

@@ -1,0 +1,847 @@
+{
+  "schema_version": 1,
+  "description": "人工构造的开局视觉状态转移帧；只表达识别结果和期望，不包含截图或真实会话文件。",
+  "hand": [
+    "2S",
+    "3S",
+    "4S",
+    "5S",
+    "6S",
+    "7S",
+    "8S",
+    "9S",
+    "10S",
+    "JS",
+    "QS",
+    "KS",
+    "AS",
+    "2H",
+    "3H",
+    "4H",
+    "5H",
+    "6H",
+    "7H",
+    "8H",
+    "9H",
+    "10H",
+    "JH",
+    "QH",
+    "KH",
+    "AH",
+    "2C"
+  ],
+  "scenarios": [
+    {
+      "name": "stable_27_waiting_first_action",
+      "description": "两张稳定的 27 张开局帧只建立上下文，不能合成首动。",
+      "frames": [
+        {
+          "frame_id": "stable-001",
+          "monotonic_ms": 100,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "stable-002",
+          "monotonic_ms": 200,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "confirming_hand",
+          "READY_WAITING_FIRST_ACTION"
+        ],
+        "reasons": [
+          "confirming_hand",
+          "ready_waiting_first_action"
+        ],
+        "events": [],
+        "session_ready": true,
+        "action_confirmed": false,
+        "opening_action_present": false,
+        "tracker_statuses": [
+          "NOT_READY",
+          "READY_WAITING_FIRST_ACTION"
+        ]
+      }
+    },
+    {
+      "name": "real_first_action_confirmed",
+      "description": "稳定开局之后出现真实、可校验的首出；首出使用减少后的手牌但保留 27 张种子。",
+      "frames": [
+        {
+          "frame_id": "action-001",
+          "monotonic_ms": 100,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "action-002",
+          "monotonic_ms": 200,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "action-003",
+          "monotonic_ms": 300,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": [
+              "3S",
+              "4S",
+              "5S",
+              "6S",
+              "7S",
+              "8S",
+              "9S",
+              "10S",
+              "JS",
+              "QS",
+              "KS",
+              "AS",
+              "2H",
+              "3H",
+              "4H",
+              "5H",
+              "6H",
+              "7H",
+              "8H",
+              "9H",
+              "10H",
+              "JH",
+              "QH",
+              "KH",
+              "AH",
+              "2C"
+            ],
+            "lead_player": "self",
+            "current_player": "right",
+            "events": [
+              {
+                "player": "self",
+                "cards": [
+                  "2S"
+                ],
+                "is_pass": false,
+                "confidence": 0.97,
+                "source": "visual_opening_anchor",
+                "suit_options": []
+              }
+            ],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "action-004",
+          "monotonic_ms": 400,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": [
+              "3S",
+              "4S",
+              "5S",
+              "6S",
+              "7S",
+              "8S",
+              "9S",
+              "10S",
+              "JS",
+              "QS",
+              "KS",
+              "AS",
+              "2H",
+              "3H",
+              "4H",
+              "5H",
+              "6H",
+              "7H",
+              "8H",
+              "9H",
+              "10H",
+              "JH",
+              "QH",
+              "KH",
+              "AH",
+              "2C"
+            ],
+            "lead_player": "self",
+            "current_player": "right",
+            "events": [
+              {
+                "player": "self",
+                "cards": [
+                  "2S"
+                ],
+                "is_pass": false,
+                "confidence": 0.97,
+                "source": "visual_opening_anchor",
+                "suit_options": []
+              }
+            ],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "confirming_hand",
+          "READY_WAITING_FIRST_ACTION",
+          "confirming_opening",
+          "READY_ACTION_CONFIRMED"
+        ],
+        "reasons": [
+          "confirming_hand",
+          "ready_waiting_first_action",
+          "confirming_opening",
+          "ready"
+        ],
+        "events": [
+          {
+            "player": "self",
+            "kind": "play",
+            "cards": [
+              "2S"
+            ]
+          }
+        ],
+        "session_ready": true,
+        "action_confirmed": true,
+        "opening_action_present": true,
+        "tracker_statuses": [
+          "NOT_READY",
+          "READY_WAITING_FIRST_ACTION",
+          "NOT_READY",
+          "READY_ACTION_CONFIRMED"
+        ]
+      }
+    },
+    {
+      "name": "transient_unknown_recovers",
+      "description": "一张短暂 unknown 页不应终止已经建立的开局上下文；清晰帧回来后恢复等待首动。",
+      "frames": [
+        {
+          "frame_id": "unknown-short-001",
+          "monotonic_ms": 100,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-short-002",
+          "monotonic_ms": 200,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-short-003",
+          "monotonic_ms": 300,
+          "generation": 1,
+          "anchor_score": 0.0,
+          "page": {
+            "stage": "unknown",
+            "anchor_score": 0.0
+          },
+          "result": {
+            "round_level": null,
+            "my_hand": [],
+            "lead_player": null,
+            "current_player": null,
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-short-004",
+          "monotonic_ms": 400,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-short-005",
+          "monotonic_ms": 500,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "confirming_hand",
+          "READY_WAITING_FIRST_ACTION",
+          "UNKNOWN",
+          "READY_WAITING_FIRST_ACTION",
+          "READY_WAITING_FIRST_ACTION"
+        ],
+        "reasons": [
+          "confirming_hand",
+          "ready_waiting_first_action",
+          "unknown_page",
+          "ready_waiting_first_action",
+          "ready_waiting_first_action"
+        ],
+        "events": [],
+        "unknown_policy": "recover",
+        "session_ready": true,
+        "action_confirmed": false,
+        "opening_action_present": false,
+        "tracker_statuses": [
+          "NOT_READY",
+          "READY_WAITING_FIRST_ACTION",
+          "READY_WAITING_FIRST_ACTION",
+          "READY_WAITING_FIRST_ACTION",
+          "READY_WAITING_FIRST_ACTION"
+        ],
+        "tracker_reasons_before_layer_termination": [],
+        "page_states": [
+          "table",
+          "table",
+          "recovering",
+          "table",
+          "table"
+        ],
+        "page_close_reasons": []
+      }
+    },
+    {
+      "name": "persistent_unknown_terminates",
+      "description": "连续 unknown 超过允许窗口，状态显式终止而不是无限保留旧开局。",
+      "frames": [
+        {
+          "frame_id": "unknown-long-001",
+          "monotonic_ms": 100,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-long-002",
+          "monotonic_ms": 200,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-long-003",
+          "monotonic_ms": 300,
+          "generation": 1,
+          "anchor_score": 0.0,
+          "page": {
+            "stage": "unknown",
+            "anchor_score": 0.0
+          },
+          "result": {
+            "round_level": null,
+            "my_hand": [],
+            "lead_player": null,
+            "current_player": null,
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-long-004",
+          "monotonic_ms": 400,
+          "generation": 1,
+          "anchor_score": 0.0,
+          "page": {
+            "stage": "unknown",
+            "anchor_score": 0.0
+          },
+          "result": {
+            "round_level": null,
+            "my_hand": [],
+            "lead_player": null,
+            "current_player": null,
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "unknown-long-005",
+          "monotonic_ms": 500,
+          "generation": 1,
+          "anchor_score": 0.0,
+          "page": {
+            "stage": "unknown",
+            "anchor_score": 0.0
+          },
+          "result": {
+            "round_level": null,
+            "my_hand": [],
+            "lead_player": null,
+            "current_player": null,
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "confirming_hand",
+          "READY_WAITING_FIRST_ACTION",
+          "UNKNOWN",
+          "UNKNOWN",
+          "TERMINATED"
+        ],
+        "reasons": [
+          "confirming_hand",
+          "ready_waiting_first_action",
+          "unknown_page",
+          "unknown_page",
+          "unknown_timeout"
+        ],
+        "events": [
+          {
+            "kind": "terminated",
+            "reason": "unknown_timeout"
+          }
+        ],
+        "unknown_policy": "terminate_after_timeout",
+        "session_ready": false,
+        "action_confirmed": false,
+        "opening_action_present": false,
+        "tracker_statuses": [
+          "NOT_READY",
+          "READY_WAITING_FIRST_ACTION",
+          "NOT_READY",
+          "NOT_READY",
+          "NOT_READY"
+        ],
+        "tracker_reasons_before_layer_termination": [
+          "confirming_hand",
+          "ready_waiting_first_action",
+          "table_anchor_unresolved",
+          "table_anchor_unresolved",
+          "table_anchor_unresolved"
+        ],
+        "page_states": [
+          "table",
+          "table",
+          "recovering",
+          "recovering",
+          "terminated"
+        ],
+        "page_close_reasons": [
+          "transient_page_unknown_budget_exhausted"
+        ]
+      }
+    },
+    {
+      "name": "hand_change_resets_opening",
+      "description": "开局手牌改变时不能把旧的稳定票与新手牌拼接；新稳定手牌必须重新确认。",
+      "frames": [
+        {
+          "frame_id": "hand-change-001",
+          "monotonic_ms": 100,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "hand-change-002",
+          "monotonic_ms": 200,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": [
+              "2S",
+              "3S",
+              "4S",
+              "5S",
+              "6S",
+              "7S",
+              "8S",
+              "9S",
+              "10S",
+              "JS",
+              "QS",
+              "KS",
+              "AS",
+              "2H",
+              "3H",
+              "4H",
+              "5H",
+              "6H",
+              "7H",
+              "8H",
+              "9H",
+              "10H",
+              "JH",
+              "QH",
+              "KH",
+              "2C"
+            ],
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "hand-change-003",
+          "monotonic_ms": 300,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "confirming_hand",
+          "BLOCKED",
+          "confirming_hand"
+        ],
+        "reasons": [
+          "confirming_hand",
+          "missed_opening",
+          "confirming_hand"
+        ],
+        "events": [
+          {
+            "kind": "opening_reset",
+            "reason": "hand_changed"
+          }
+        ],
+        "session_ready": false,
+        "action_confirmed": false,
+        "opening_action_present": false,
+        "tracker_statuses": [
+          "NOT_READY",
+          "BLOCKED",
+          "NOT_READY"
+        ]
+      }
+    },
+    {
+      "name": "candidate_conflict_blocks_opening",
+      "description": "互斥的 lead 候选必须留在冲突态，不得挑一个候选生成 session seed。",
+      "frames": [
+        {
+          "frame_id": "conflict-001",
+          "monotonic_ms": 100,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": null,
+            "current_player": null,
+            "events": [],
+            "buttons": [],
+            "lead_evidence": [
+              {
+                "candidate_seat": "self",
+                "status": "conflict",
+                "confidence": 0.91
+              },
+              {
+                "candidate_seat": "right",
+                "status": "conflict",
+                "confidence": 0.89
+              }
+            ]
+          }
+        },
+        {
+          "frame_id": "conflict-002",
+          "monotonic_ms": 200,
+          "generation": 1,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": null,
+            "current_player": null,
+            "events": [],
+            "buttons": [],
+            "lead_evidence": [
+              {
+                "candidate_seat": "self",
+                "status": "conflict",
+                "confidence": 0.91
+              },
+              {
+                "candidate_seat": "right",
+                "status": "conflict",
+                "confidence": 0.89
+              }
+            ]
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "CONFLICT",
+          "CONFLICT"
+        ],
+        "reasons": [
+          "candidate_conflict",
+          "candidate_conflict"
+        ],
+        "events": [
+          {
+            "kind": "candidate_conflict",
+            "candidates": [
+              "self",
+              "right"
+            ]
+          }
+        ],
+        "session_ready": false,
+        "action_confirmed": false,
+        "opening_action_present": false,
+        "tracker_statuses": [
+          "CONFLICT",
+          "CONFLICT"
+        ]
+      }
+    },
+    {
+      "name": "no_synthetic_action",
+      "description": "没有 events 的稳定帧必须保持空事件序列和空 opening_action。",
+      "frames": [
+        {
+          "frame_id": "no-fake-001",
+          "monotonic_ms": 100,
+          "generation": 7,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        },
+        {
+          "frame_id": "no-fake-002",
+          "monotonic_ms": 200,
+          "generation": 7,
+          "anchor_score": 0.95,
+          "page": {
+            "stage": "table",
+            "anchor_score": 0.95
+          },
+          "result": {
+            "round_level": "2",
+            "my_hand": "$HAND",
+            "lead_player": "self",
+            "current_player": "self",
+            "events": [],
+            "buttons": [],
+            "lead_evidence": []
+          }
+        }
+      ],
+      "expected": {
+        "states": [
+          "confirming_hand",
+          "READY_WAITING_FIRST_ACTION"
+        ],
+        "reasons": [
+          "confirming_hand",
+          "ready_waiting_first_action"
+        ],
+        "events": [],
+        "session_ready": true,
+        "action_confirmed": false,
+        "opening_action_present": false,
+        "synthetic_action_count": 0,
+        "tracker_statuses": [
+          "NOT_READY",
+          "READY_WAITING_FIRST_ACTION"
+        ]
+      }
+    }
+  ]
+}

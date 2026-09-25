@@ -8,6 +8,29 @@ from daguandan_bridge.domain.frame import FrameEnvelope
 from daguandan_bridge.opening_gate import serialized_result
 
 
+def test_recorded_replay_pacing_uses_capture_clock_and_can_cancel(monkeypatch):
+    now = iter((0.0, 0.5))
+    sleeps = []
+    monkeypatch.setattr(replay_module.time, "monotonic", lambda: next(now))
+    monkeypatch.setattr(replay_module.time, "sleep", sleeps.append)
+
+    assert replay_module._wait_for_recorded_deadline(
+        captured_monotonic_ms=500,
+        source_started_ms=0,
+        playback_started_at=0.0,
+        stop_requested=None,
+    )
+    assert sleeps == [0.05]
+
+    monkeypatch.setattr(replay_module.time, "monotonic", lambda: 0.0)
+    assert not replay_module._wait_for_recorded_deadline(
+        captured_monotonic_ms=500,
+        source_started_ms=0,
+        playback_started_at=0.0,
+        stop_requested=lambda: True,
+    )
+
+
 def test_recorded_replay_records_before_using_canonical_frame_entry(monkeypatch):
     calls = []
 

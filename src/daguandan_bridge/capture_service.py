@@ -256,5 +256,7 @@ class CaptureService:
 
         loaded = self.load_profile(profile_name)
         target = find_target_window(loaded.config.window_title_keywords)
+        if not loaded.config.allow_resize:
+            return get_client_rect_on_screen(target)
         target_size = loaded.config.target_client_size or loaded.config.base_size
         return resize_target_client(target, target_size)

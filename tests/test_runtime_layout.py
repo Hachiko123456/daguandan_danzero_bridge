@@ -13,9 +13,16 @@ from daguandan_bridge.runtime_layout import (
     ACTIVE_GENERATION_SCHEMA,
     GENERATION_MARKER,
     RuntimeLayoutError,
+    calibration_path,
     ensure_runtime_layout,
+    load_calibration,
+    load_window_binding,
     prepare_runtime_layout,
     resolve_runtime_layout,
+    save_calibration,
+    save_window_binding,
+    stable_window_binding_id,
+    window_binding_path,
 )
 
 
@@ -270,3 +277,69 @@ def test_corrupted_active_pointer_fails_closed(tmp_path):
 
     with pytest.raises(RuntimeLayoutError, match="active data pointer"):
         _layout(bundle, tmp_path / "runtime")
+
+
+def test_application_data_root_contains_all_writable_domains_and_persists_portable_binding(tmp_path):
+    bundle = _bundle(tmp_path)
+    user_root = tmp_path / "portable data"
+    layout = ensure_runtime_layout(_layout(bundle, user_root))
+
+    domains = (
+        layout.profiles_root,
+        layout.logs_root,
+        layout.diagnostics_root,
+        layout.cache_root,
+        layout.preferences_root,
+        layout.calibration_root,
+        layout.window_bindings_root,
+    )
+    assert all(layout.app_data_root in path.parents for path in domains)
+    assert layout.calibration_root.is_dir()
+    assert layout.window_bindings_root.is_dir()
+
+    binding_id = stable_window_binding_id(
+        application_id="wechat",
+        window_class="WeChatAppEx",
+        title_role="game",
+        client_size=(1280, 764),
+    )
+    assert binding_id == stable_window_binding_id(
+        application_id="wechat",
+        window_class="WeChatAppEx",
+        title_role="game",
+        client_size=(1280, 764),
+    )
+    calibration = {"scale": 1.0, "offset": [0, 0], "source": "semantic-window"}
+    calibration_file = save_calibration(
+        layout, "tencent_daguandan", calibration, binding_id=binding_id
+    )
+    binding_file = save_window_binding(
+        layout,
+        "tencent_daguandan",
+        {"application_id": "wechat", "window_class": "WeChatAppEx"},
+        binding_id=binding_id,
+    )
+    assert calibration_file == calibration_path(layout, "tencent_daguandan", binding_id=binding_id)
+    assert binding_file == window_binding_path(layout, "tencent_daguandan", binding_id=binding_id)
+    assert calibration_file.is_relative_to(layout.app_data_root)
+    assert binding_file.is_relative_to(layout.app_data_root)
+    assert load_calibration(layout, "tencent_daguandan", binding_id=binding_id)["scale"] == 1.0
+    assert load_window_binding(layout, "tencent_daguandan", binding_id=binding_id)["application_id"] == "wechat"
+    assert str(bundle) not in calibration_file.read_text(encoding="utf-8")
+
+
+def test_source_layout_exposes_compatibility_app_data_root(tmp_path):
+    checkout = tmp_path / "checkout"
+    layout = resolve_runtime_layout(frozen=False, bundle_root=checkout)
+
+    assert layout.app_data_root == checkout
+    for path in (
+        layout.profiles_root,
+        layout.logs_root,
+        layout.diagnostics_root,
+        layout.cache_root,
+        layout.preferences_root,
+        layout.calibration_root,
+        layout.window_bindings_root,
+    ):
+        assert layout.app_data_root in path.parents

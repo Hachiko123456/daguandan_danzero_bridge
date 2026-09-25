@@ -26,11 +26,17 @@ from .live_v2_runtime_journal import LiveV2LifecycleMixin, LiveV2RuntimeJournal
 from .live_v2_session_runtime_commands import LiveV2RuleCommandsMixin
 from .live_v2_session_runtime_controls import LiveV2ControlMixin
 from .live_v2_runtime_updates import (
-    VisionRuntimeLike, consume_vision, correction_event, live_update,
-    project_engine_result, runtime_result_to_advice, trusted_candidate,
+    AdviceState, RecoveryState, SessionState, VisionRuntimeLike,
+    advice_matches_snapshot,
+    consume_vision, correction_event, live_update, project_engine_result,
+    recovery_state_for_gap, runtime_result_to_advice, session_state_for,
+    trusted_candidate,
     trusted_to_live_snapshot,
 )
 from .ports import RecognitionPort, RecordingPort, SessionPersistencePort
+
+
+_OPENING_ACTION_UNSET = object()
 
 
 class _Clock:
@@ -155,7 +161,11 @@ class LiveV2SessionRuntime(
         self.rule_session, self.store, self.recorder = rule_session, store, recorder
         self.recognition_service = recognition_service
         self.status: LiveStatus = "initializing"
-        self.latest_advice: LiveAdvice | None = None
+        self._advice_state = AdviceState()
+        # The engine remains the source of formal game facts.  Advice lifecycle
+        # is owned by this single immutable record and exposed through the
+        # legacy ``latest_advice`` property for compatibility.
+        self._recovery_state: RecoveryState = "RUNNING"
         self.automatic_log_delivery_result: dict[str, object] | None = None
         self._vision_factory, self._advice_factory = vision_factory, advice_runtime_factory
         self._on_update = on_update
@@ -177,6 +187,12 @@ class LiveV2SessionRuntime(
         self._last_local_hint: Any | None = None
         self._status_before_pause: LiveStatus | None = None
         self._opening_required = False
+        # A confirmed hand/level/lead is a usable session context, but it is
+        # not yet an actionable trick.  Keep this gate in the application
+        # runtime so live-v2 does not publish advice from an unobserved
+        # opening state.
+        self._first_action_pending = False
+        self._advice_enabled = True
         self._visual_corrections: dict[str, _VisualCorrection] = {}
         self._last_visual_repair_seat: Seat | None = None
         self._suppressed_correction_surfaces: dict[Seat, tuple[str, ...]] = {}
@@ -188,19 +204,70 @@ class LiveV2SessionRuntime(
         self._aux_event_sequence = 0
 
     @property
+    def latest_advice(self) -> LiveAdvice | None:
+        return self._advice_state.advice
+
+    @latest_advice.setter
+    def latest_advice(self, advice: LiveAdvice | None) -> None:
+        if advice is None:
+            phase = "invalidated"
+        elif advice.status in {"requested", "ready", "withheld"}:
+            phase = advice.status
+        else:
+            phase = "invalidated"
+        self._advice_state = AdviceState(advice=advice, phase=phase)
+
+    @property
     def snapshot(self) -> LiveSnapshot:
         return trusted_to_live_snapshot(self._trusted_snapshot())
 
     @property
+    def recovery_state(self) -> RecoveryState:
+        """Compatibility view of the recovery sub-state."""
+
+        return self._recovery_state
+
+    @property
+    def session_state(self) -> SessionState:
+        """The single coarse lifecycle used by business-facing decisions."""
+
+        if self._first_action_pending and self.status == "running":
+            # Keep LiveStatus compatibility (``running``) while exposing the
+            # more precise business state required by the opening contract.
+            return "WAITING_FIRST_ACTION"  # type: ignore[return-value]
+        return session_state_for(
+            status=self.status,
+            recovery=self._recovery_state,
+            terminal=self._terminal_detected,
+        )
+
+    @property
+    def authoritative_state(self) -> SessionState:
+        """Alias for callers migrating from the legacy status vocabulary."""
+
+        return self.session_state
+
+    @property
+    def advice_state(self) -> AdviceState:
+        """Current logical advice lifecycle, kept beside the compatibility field."""
+
+        return self._advice_state
+
+    @property
     def needs_first_action_frames(self) -> bool:
-        return self.status == "waiting_lead"
+        return bool(self.status == "waiting_lead" or self._first_action_pending)
 
     def start(
         self, *, round_level: str, hand: tuple[str, ...], lead_player: str | None,
         monotonic_ms: int, wall_time: str | None = None,
         historical_scan: bool = False,
+        opening_action: object = _OPENING_ACTION_UNSET,
     ) -> LiveUpdate:
         del historical_scan
+        opening_action_supplied = opening_action is not _OPENING_ACTION_UNSET
+        opening_action_value = (
+            None if not opening_action_supplied else opening_action
+        )
         with self._lock:
             if self._initialized:
                 raise RuntimeError("live-v2 session already started")
@@ -214,10 +281,79 @@ class LiveV2SessionRuntime(
             )
             self._initialized = True
             self._opening_required = lead_player is None
+            self._first_action_pending = bool(
+                lead_player is not None
+                and opening_action_supplied
+                and opening_action_value is None
+            )
+            self._advice_enabled = not self._first_action_pending
             self.status = "waiting_lead" if self._opening_required else "running"
             self.store.update_runtime_identity(self._identity())
-            self._journal.lifecycle("session_started", lead_player=lead_player)
-            return self._plain_update()
+            self._journal.lifecycle(
+                "session_started",
+                lead_player=lead_player,
+                first_action_pending=self._first_action_pending,
+            )
+            update = self._plain_update()
+            if not opening_action_supplied or opening_action_value is None:
+                return update
+
+            # A non-null opening action is trusted input, not a vision result.
+            # Reuse the normal trusted commit path so reducer validation and
+            # durable event publication remain identical to later actions.
+            action = self._opening_action_fields(
+                opening_action_value, lead_player=lead_player
+            )
+            self._ensure_workers_for_trusted_commit()
+            self._first_action_pending = True
+            self._advice_enabled = False
+            committed = self._commit_trusted(
+                Seat(action["actor"]), action["cards"], False,
+                monotonic_ms, float(action["confidence"]), EvidenceOrigin.OPENING,
+                CandidateReason.OPENING_ACTION_CONFIRMED,
+                (f"opening-{action['source']}-{action['actor']}-{monotonic_ms}",),
+                action["suit_options"],
+            )
+            return committed
+
+    @staticmethod
+    def _opening_action_fields(
+        opening_action: object, *, lead_player: str | None
+    ) -> dict[str, object]:
+        actor = getattr(opening_action, "actor", None)
+        cards = tuple(str(card) for card in getattr(opening_action, "cards", ()) or ())
+        next_player = getattr(opening_action, "next_player", None)
+        source = str(getattr(opening_action, "source", "trusted_opening_action"))
+        try:
+            confidence = float(getattr(opening_action, "confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = -1.0
+        options = tuple(
+            tuple(str(item) for item in choices)
+            for choices in getattr(opening_action, "suit_options", ()) or ()
+        )
+        if lead_player is None or actor != lead_player:
+            raise ValueError("opening_action actor must match lead_player")
+        order = tuple(Seat)
+        actor_seat = Seat(actor)
+        expected_next = order[(order.index(actor_seat) + 1) % len(order)]
+        if next_player != expected_next.value:
+            raise ValueError("opening_action next_player does not match turn order")
+        if not cards:
+            raise ValueError("opening_action must contain cards")
+        if not 0.80 <= confidence <= 1.0:
+            raise ValueError("opening_action confidence must be between 0.80 and 1.0")
+        return {
+            "actor": actor, "cards": cards, "next_player": next_player,
+            "confidence": confidence, "source": source,
+            "suit_options": options,
+        }
+
+    def _ensure_workers_for_trusted_commit(self) -> None:
+        if self._engine is not None:
+            return
+        binding = self.rule_session.bind_generation(self._generation)
+        self._install_workers(binding)
 
     def bind_capture_generation(self, generation: int) -> LiveUpdate:
         with self._lock:
@@ -241,9 +377,12 @@ class LiveV2SessionRuntime(
             self._visual_corrections.clear()
             self._last_visual_repair_seat = None
             self._suppressed_correction_surfaces.clear()
+            self._advice_enabled = not self._first_action_pending
             self._install_workers(binding)
             self.store.update_runtime_identity(self._identity())
             self._journal.lifecycle("capture_generation_bound", generation=generation)
+            if self._first_action_pending:
+                return self._plain_update()
             return self._process(EngineInput(captured_watermark_ms=self._last_ms))
 
     def analyze_frame(
@@ -262,13 +401,22 @@ class LiveV2SessionRuntime(
             if self.status in {"finalizing", "sealed"}:
                 self._visual_corrections.clear()
                 return self._plain_update(block_reason=self.status)
+            if self._recovery_state == "BLOCKED":
+                return self._plain_update(block_reason="recovery_blocked")
             self._ensure_engine_current()
             identity = self._capture_identity(trace_context, monotonic_ms)
             if identity is None:
                 return self._plain_update(block_reason="stale_capture_identity")
             snapshot = self._engine.state.snapshot
             version = self._engine.state.version
-            expected = snapshot.current_seat
+            # During resync the old current seat is evidence, not a filter.
+            # Let vision inspect the whole table once; the engine remains the
+            # only component allowed to commit the recovered action.
+            expected = (
+                snapshot.current_seat
+                if self._recovery_state == "RUNNING"
+                else None
+            )
             self._expire_visual_corrections(expected)
             formal_action_boundary = (
                 snapshot.play_history[-1].last_frame
@@ -411,10 +559,12 @@ class LiveV2SessionRuntime(
                 frame_sequence=frame.frame_sequence,
             )
             self.status = "running"
+            self._recovery_state = "BLOCKED"
+            self._invalidate_advice("terminal_suspected")
             self._sequence += 1
             return live_update(
                 status=self.status, snapshot=snapshot, sequence=self._sequence,
-                advice=self.latest_advice, events=(), fast_signals=fast,
+                advice=None, events=(), fast_signals=fast,
                 block_reason="terminal_suspected_inconsistent_rule_state",
             )
         self._aux_event_sequence += 1
@@ -459,7 +609,8 @@ class LiveV2SessionRuntime(
         self._terminal_detected = True
         self._terminal_event = event
         self._visual_corrections.clear()
-        self.latest_advice = None
+        self._invalidate_advice("terminal")
+        self._recovery_state = "BLOCKED"
         self.status = "finalizing"
         self._sequence += 1
         return live_update(
@@ -717,7 +868,8 @@ class LiveV2SessionRuntime(
         )
 
     def _install_workers(self, binding: RuleBinding) -> None:
-        self.latest_advice = None
+        self._invalidate_advice("capture_generation_changed")
+        self._recovery_state = "RUNNING"
         self._pending.clear()
         vision = self._vision_factory(binding.version)
         runtime = self._advice_factory(binding.version)
@@ -743,14 +895,15 @@ class LiveV2SessionRuntime(
         return LiveEngine(
             initial_version=binding.version, projector=binding.adapter,
             committer=binding.adapter, state_provider=binding.adapter,
-            clock=self._clock, journal=self._journal, advice_consumer=pump,
+            clock=self._clock, journal=self._journal,
+            advice_consumer=pump if self._advice_enabled else None,
             initial_captured_ms=self._last_ms,
         )
 
     def _reset_engine(self, binding: RuleBinding) -> None:
         if self._advice_pump is None:
             raise RuntimeError("advice runtime is not active")
-        self.latest_advice = None
+        self._invalidate_advice("state_rebound")
         self._pending.clear()
         self._engine = self._new_engine(binding, self._advice_pump)
 
@@ -767,16 +920,45 @@ class LiveV2SessionRuntime(
     def _from_engine(self, result: EngineResult, *, fast: Any = None) -> LiveUpdate:
         confirmed = result.update.confirmed_actions if result.update else ()
         events = self.rule_session.events_for_actions(confirmed) if confirmed else ()
+        first_action_committed = bool(self._first_action_pending and confirmed)
         for action in confirmed:
             self._pending.pop(action.source_candidate.candidate_id, None)
+        update = result.update
+        if first_action_committed:
+            self._first_action_pending = False
+            self._advice_enabled = True
+            # The first-action engine was deliberately created without an
+            # advice consumer. Rebind once after the action is durable so the
+            # next self opportunity can be published normally.
+            binding = self.rule_session.bind_generation(self._generation)
+            self._reset_engine(binding)
+            follow_up = self._engine.process(
+                EngineInput(captured_watermark_ms=self._last_ms)
+            )
+            follow_update = self._from_engine(follow_up, fast=fast)
+            return replace(
+                follow_update,
+                event=events[-1] if events else follow_update.event,
+                events=events + follow_update.events,
+            )
         local_hint, local_hint_pending = self._local_hint_projection()
-        projected, self.status, self.latest_advice, self._sequence = project_engine_result(
+        next_recovery = self._recovery_state
+        if update is not None:
+            next_recovery = recovery_state_for_gap(
+                update.gap,
+                terminal=bool(self._engine.state.snapshot.terminal),
+            )
+        self._transition_recovery(next_recovery)
+        projected, next_status, next_advice, self._sequence = project_engine_result(
             result=result, snapshot=self._engine.state.snapshot, action_events=events,
             status=self.status, latest_advice=self.latest_advice,
             sequence=self._sequence, fast_signals=fast,
             local_rule_hint=local_hint,
             local_rule_hint_pending=local_hint_pending,
         )
+        self.status = next_status
+        self._recovery_state = next_recovery
+        self._set_advice(next_advice)
         if self._engine.state.snapshot.current_seat is None:
             self._visual_corrections.clear()
             self._last_visual_repair_seat = None
@@ -792,6 +974,8 @@ class LiveV2SessionRuntime(
         requested_semantics: ActionSemantics | None = None,
     ) -> LiveUpdate:
         with self._lock:
+            if self._engine is None:
+                self._ensure_workers_for_trusted_commit()
             self._require_engine()
             self._ensure_engine_current()
             self._clock.advance(captured_ms)
@@ -810,8 +994,10 @@ class LiveV2SessionRuntime(
 
     def _accept_advice(self, result: AdviceRuntimeResult) -> bool | str:
         with self._lock:
-            if self.status in {"finalizing", "sealed"}:
-                return "session_terminal"
+            if self.status in {"finalizing", "sealed"} or self._recovery_state == "BLOCKED":
+                return "session_terminal" if self.status in {"finalizing", "sealed"} else "recovery_blocked"
+            if self._recovery_state != "RUNNING":
+                return "recovery_in_progress"
             if self._engine is None:
                 return "advice_runtime_unavailable"
             opportunity = self._engine.state.opportunity.current
@@ -829,9 +1015,9 @@ class LiveV2SessionRuntime(
                 if current.capture_generation != result.identity.version.capture_generation:
                     return "capture_generation_changed"
                 return "opportunity_closed"
-            self.latest_advice = runtime_result_to_advice(
+            self._set_advice(runtime_result_to_advice(
                 result, self._engine.state.snapshot
-            )
+            ))
             update = self._plain_update()
         if self._on_update:
             self._on_update(update)
@@ -843,21 +1029,66 @@ class LiveV2SessionRuntime(
         local_rule_hint_pending: bool | None = None,
     ) -> LiveUpdate:
         self._require_initialized()
+        snapshot = self._trusted_snapshot()
+        if self.status in {"finalizing", "sealed"} or self._recovery_state != "RUNNING":
+            if self.latest_advice is not None:
+                self._invalidate_advice("lifecycle_transition")
+        elif self.latest_advice is not None and not advice_matches_snapshot(
+            self.latest_advice, snapshot
+        ):
+            self._invalidate_advice("state_revision_changed")
         self._sequence += 1
         if local_rule_hint is None and local_rule_hint_pending is None:
             local_rule_hint, local_rule_hint_pending = self._local_hint_projection()
         elif local_rule_hint_pending is None:
             local_rule_hint_pending = self._hint.pending
         return live_update(
-            status=self.status, snapshot=self._trusted_snapshot(),
+            status=self.status, snapshot=snapshot,
             sequence=self._sequence, advice=self.latest_advice,
             fast_signals=fast, local_rule_hint=local_rule_hint,
             local_rule_hint_pending=bool(local_rule_hint_pending),
             block_reason=block_reason,
         )
 
+    def _transition_recovery(self, state: RecoveryState) -> None:
+        """Apply the one recovery transition owned by this coordinator."""
+
+        if state == self._recovery_state:
+            return
+        if state != "RUNNING":
+            # Local PASS is valid only inside the same trusted, running
+            # opportunity.  Drop visual evidence at the recovery boundary so
+            # it cannot survive a gap or be shown over formal withheld advice.
+            self._hint.reset()
+            self._last_local_hint = None
+            if self._advice_pump is not None:
+                # Stop an in-flight result from becoming business state while
+                # the engine is resynchronizing.  The worker itself stays warm.
+                self._advice_pump.cancel_pending(
+                    reason=f"recovery_{state.lower()}", preserve_worker=True
+                )
+        self._recovery_state = state
+
+    def _set_advice(self, advice: LiveAdvice | None) -> None:
+        """Update the compatibility field and the authoritative advice phase."""
+
+        self.latest_advice = advice
+
+    def _invalidate_advice(self, reason: str) -> None:
+        """Invalidate visible advice without changing the public API."""
+
+        if self._advice_pump is not None and reason in {
+            "terminal", "capture_generation_changed", "state_rebound",
+        }:
+            self._advice_pump.cancel_pending(reason=reason, preserve_worker=False)
+        self._set_advice(None)
+
     def _rule_failure(self, operation: str, exc: Exception) -> LiveUpdate:
         self.status = "review_required"
+        # A command/persistence failure is not a vision gap.  Keep the
+        # recovery lifecycle unchanged so the operator can retry the same
+        # opening/correction command without being trapped in BLOCKED.
+        self._invalidate_advice("rule_failure")
         if operation == "opening_action" and not self._trusted_snapshot().play_history:
             self._opening_required = True
         self._safe_fault("rule_session", str(exc), operation=operation)
@@ -871,7 +1102,13 @@ class LiveV2SessionRuntime(
         the canonical turn and capture generation remain unchanged.
         """
 
-        if self._engine is None:
+        if (
+            self._engine is None
+            or self.status != "running"
+            or self._recovery_state != "RUNNING"
+        ):
+            self._hint.reset()
+            self._last_local_hint = None
             return None, False
         snapshot = self._engine.state.snapshot
         now_ms = self._clock.processing_ms()
@@ -905,7 +1142,7 @@ class LiveV2SessionRuntime(
     def _detach_workers(self) -> tuple[LiveV2AdvicePump | None, VisionRuntimeLike | None]:
         detached = self._advice_pump, self._vision
         self._advice_pump = self._vision = self._engine = None
-        self.latest_advice = None
+        self._invalidate_advice("workers_detached")
         return detached
 
     @staticmethod

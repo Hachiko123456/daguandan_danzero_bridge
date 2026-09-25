@@ -18,6 +18,7 @@ from ..config import DIAGNOSTICS_ROOT, PROFILES_ROOT
 from ..recognition_service import ScreenshotRecognitionService
 from ..template_service import TemplateService
 from .live_v2_recorded_replay import replay_video_through_production_live_v2
+from .session_replay_audit import prepared_replay_input
 
 
 @dataclass(frozen=True)
@@ -101,33 +102,49 @@ class OfflineDiagnosticReplayService:
                 })
 
         with tempfile.TemporaryDirectory(prefix="guandan-offline-replay-") as temporary:
-            session = self._prepare_session(source, Path(temporary))
-            recognition = ScreenshotRecognitionService(
-                AnnotationService(self.profiles_root, self.profile_name),
-                TemplateService(self.profiles_root, self.profile_name),
-            )
-            mode_results: dict[str, object] = {}
-            cancelled = False
-            for mode in ("latest", "synchronous"):
-                if stop_requested is not None and stop_requested():
-                    cancelled = True
-                    break
-                current_mode = mode
-                emit_progress(0, 0, -1)
-                result = replay_video_through_production_live_v2(
-                    session,
-                    recognition,
-                    profile_root=self.profiles_root / self.profile_name,
-                    output_root=output / mode,
-                    on_progress=emit_progress,
-                    stop_requested=stop_requested,
-                    vision_delivery=mode,
+            with prepared_replay_input(
+                source,
+                fallback_profile=self.profiles_root / self.profile_name,
+                temporary_root=Path(temporary),
+            ) as replay_input:
+                session = replay_input.session
+                profile_root = replay_input.profile_path
+                configuration = {
+                    "source_health": replay_input.source_health,
+                    "profile_resource_match": replay_input.profile_resource_match,
+                    "input_kind": replay_input.input_kind,
+                    "embedded_snapshot": replay_input.embedded_snapshot,
+                }
+                recognition = ScreenshotRecognitionService(
+                    AnnotationService(profile_root.parent, profile_root.name),
+                    TemplateService(profile_root.parent, profile_root.name),
                 )
-                mode_results[mode] = result
-                if str(getattr(result, "status", "")) == "incomplete" and str(getattr(result, "status_reason", "")) == "replay_cancelled":
-                    cancelled = True
-                    break
-        summary = self._build_summary(source, mode_results, environment=environment or {}, cancelled=cancelled)
+                mode_results: dict[str, object] = {}
+                cancelled = False
+                for mode in ("latest", "synchronous"):
+                    if stop_requested is not None and stop_requested():
+                        cancelled = True
+                        break
+                    current_mode = mode
+                    emit_progress(0, 0, -1)
+                    result = replay_video_through_production_live_v2(
+                        session,
+                        recognition,
+                        profile_root=profile_root,
+                        output_root=output / mode,
+                        on_progress=emit_progress,
+                        stop_requested=stop_requested,
+                        vision_delivery=mode,
+                        pace_to_recording_timestamps=mode == "latest",
+                    )
+                    mode_results[mode] = result
+                    if str(getattr(result, "status", "")) == "incomplete" and str(getattr(result, "status_reason", "")) == "replay_cancelled":
+                        cancelled = True
+                        break
+        summary = self._build_summary(
+            source, mode_results, environment=environment or {},
+            cancelled=cancelled, configuration=configuration,
+        )
         json_path = output / "offline_diagnostic_summary.json"
         json_path.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -160,37 +177,74 @@ class OfflineDiagnosticReplayService:
         )
 
     @staticmethod
-    def _prepare_session(source: Path, temporary: Path) -> Path:
-        if source.is_dir():
-            if (source / "video" / "game.avi").is_file():
-                return source
-            archives = sorted(source.glob("*.zip"))
-            if archives:
-                source = archives[0]
-            else:
-                raise ValueError("目录中没有可回放的 game.avi 或诊断 ZIP")
-        if source.suffix.casefold() != ".zip" or not source.is_file():
-            raise ValueError("请选择完整诊断 ZIP 或包含完整诊断 ZIP 的目录")
-        session = temporary / "session"
-        session.mkdir(parents=True, exist_ok=True)
-        root = session.resolve()
-        with zipfile.ZipFile(source) as archive:
-            for info in archive.infolist():
-                name = info.filename.replace("\\", "/")
-                if not name.startswith("session/") or name.endswith("/"):
-                    continue
-                relative = Path(name).relative_to("session")
-                target = (session / relative).resolve()
-                if target != root and root not in target.parents:
-                    raise ValueError("诊断 ZIP 含有越界路径")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(info) as source_stream, target.open("wb") as target_stream:
-                    shutil.copyfileobj(source_stream, target_stream)
-        if not (session / "video" / "game.avi").is_file():
-            raise ValueError("诊断 ZIP 缺少 session/video/game.avi")
-        if not (session / "video" / "frame_index.jsonl").is_file():
-            raise ValueError("诊断 ZIP 缺少 session/video/frame_index.jsonl")
-        return session
+    def _prepare_session(
+        source: Path, temporary: Path,
+    ) -> tuple[Path, Path, str, dict[str, object]]:
+        """Compatibility adapter for callers of the old private helper.
+
+        New execution goes through ``prepared_replay_input`` directly; this
+        adapter keeps older integrations working without maintaining a second
+        ZIP/profile extraction implementation.
+        """
+        with prepared_replay_input(
+            source,
+            fallback_profile=PROFILES_ROOT / "tencent_daguandan",
+            temporary_root=temporary,
+        ) as replay_input:
+            profile = replay_input.profile_path
+            return (
+                replay_input.session,
+                profile.parent,
+                profile.name,
+                {
+                    "source_health": replay_input.source_health,
+                    "profile_resource_match": replay_input.profile_resource_match,
+                    "input_kind": replay_input.input_kind,
+                    "embedded_snapshot": replay_input.embedded_snapshot,
+                },
+            )
+
+    @staticmethod
+    def _configuration_status(
+        session: Path, profiles_root: Path, profile_name: str,
+        *, embedded: bool = False,
+    ) -> dict[str, object]:
+        """Legacy compatibility helper; execution uses the shared input policy."""
+        manifest_path = session / "manifest.json"
+        source_manifest: dict[str, object] = {}
+        if manifest_path.is_file():
+            try:
+                value = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    source_manifest = value
+            except (OSError, json.JSONDecodeError):
+                pass
+        current = recognition_resource_identity(profiles_root, profile_name)
+        source_identity = source_manifest.get("recognition_resource_identity")
+        source_config = source_manifest.get("configuration_hash")
+        current_config = None
+        profile_path = Path(profiles_root) / profile_name / "profile.json"
+        if profile_path.is_file():
+            import hashlib
+            current_config = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+        if isinstance(source_identity, dict) and isinstance(current, dict):
+            match = source_identity.get("sha256") == current.get("sha256")
+        elif source_config and current_config:
+            match = str(source_config) == str(current_config)
+        else:
+            match = None
+        return {
+            "status": "embedded_match" if embedded and match is True else
+                "embedded_snapshot" if embedded else
+                "match" if match is True else
+                "mismatch" if match is False else "unavailable",
+            "embedded_snapshot": bool(embedded),
+            "source_configuration_hash": source_config,
+            "current_configuration_hash": current_config,
+            "source_resource_identity": source_identity,
+            "current_resource_identity": current,
+            "profile_name": profile_name,
+        }
 
     @classmethod
     def _result_dict(cls, result: object) -> dict[str, object]:
@@ -252,7 +306,7 @@ class OfflineDiagnosticReplayService:
             )
             initial_payload = initial.get("payload") if isinstance(initial, dict) else {}
             if isinstance(initial_payload, dict):
-                lead_player = initial_payload.get("lead_player") or initial.get("actor")
+                lead_player = initial_payload.get("lead_player") or (initial or {}).get("actor")
 
         first_action = next(
             (
@@ -275,7 +329,11 @@ class OfflineDiagnosticReplayService:
         return _json_safe(payload)
 
     @classmethod
-    def _build_summary(cls, source: Path, results: dict[str, object], *, environment: dict[str, object], cancelled: bool) -> dict[str, object]:
+    def _build_summary(
+        cls, source: Path, results: dict[str, object], *,
+        environment: dict[str, object], cancelled: bool,
+        configuration: dict[str, object],
+    ) -> dict[str, object]:
         modes = {mode: cls._result_dict(result) for mode, result in results.items()}
         return _json_safe({
             "schema": "guandan.offline-diagnostic-replay/1",
@@ -284,6 +342,18 @@ class OfflineDiagnosticReplayService:
             "legacy_orchestrator_used": False,
             "cancelled": bool(cancelled),
             "environment": environment,
+            "configuration": _json_safe(configuration),
+            "source_health": _json_safe(configuration.get("source_health", {})),
+            "profile_resource_match": _json_safe(configuration.get("profile_resource_match", {})),
+            "visual_replay": {
+                "status": "completed" if len(results) == 2 and not cancelled else "incomplete",
+                "modes": {mode: item.get("status", "unknown") for mode, item in modes.items()},
+            },
+            "truth_comparison": {
+                "status": "not_available",
+                "strict_regression": False,
+                "reason": "diagnostic ZIP replay has no TruthLog comparison input",
+            },
             "modes": modes,
             "comparison": {
                 "synchronous_status": str(getattr(results.get("synchronous"), "status", "missing")),
@@ -296,12 +366,32 @@ class OfflineDiagnosticReplayService:
 
     @staticmethod
     def _markdown_report(summary: dict[str, object]) -> str:
+        raw_configuration = summary.get("configuration")
+        configuration = raw_configuration if isinstance(raw_configuration, dict) else {}
+        source_identity = configuration.get("source_resource_identity")
+        current_identity = configuration.get("current_resource_identity")
+        compact_configuration = {
+            key: configuration.get(key)
+            for key in (
+                "status", "embedded_snapshot", "profile_name",
+                "source_configuration_hash", "current_configuration_hash",
+            )
+        }
+        if isinstance(source_identity, dict):
+            compact_configuration["source_resource_sha256"] = source_identity.get("sha256")
+        if isinstance(current_identity, dict):
+            compact_configuration["current_resource_sha256"] = current_identity.get("sha256")
         lines = [
             "# 离线对局诊断报告",
             "",
             f"- 输入：`{summary.get('input_path')}`",
             f"- 运行时：`{summary.get('runtime')}`",
             f"- 是否取消：`{summary.get('cancelled')}`",
+            f"- 源数据健康：`{_markdown_value(summary.get('source_health', {}))}`",
+            f"- 配置/资源匹配：`{_markdown_value(summary.get('profile_resource_match', compact_configuration))}`",
+            f"- 视觉回放：`{_markdown_value(summary.get('visual_replay', {}))}`",
+            f"- TruthLog 严格对比：`{_markdown_value(summary.get('truth_comparison', {}))}`",
+            f"- 回放配置：`{_markdown_value(compact_configuration)}`",
             "",
             "## 两种回放模式",
             "",
@@ -327,8 +417,8 @@ class OfflineDiagnosticReplayService:
         lines.extend((
             "## 解释",
             "",
-            "- `latest`：模拟生产环境的异步 latest-only 识别链路。",
-            "- `synchronous`：同一录像的同步识别对照链路。",
+            "- `latest`：按录像原始时间戳模拟生产环境的异步 latest-only 识别链路。",
+            "- `synchronous`：同一录像的同步逐帧识别对照链路（不等待原始帧间隔）。",
             "- 两者差异可用于区分识别问题与异步调度/丢帧问题。",
             f"- advice divergence：`{_markdown_value((summary.get('comparison') or {}).get('advice_divergence', {}))}`",
         ))

@@ -10,6 +10,10 @@ from qfluentwidgets import (
     CaptionLabel,
     CardWidget,
     PushButton,
+    ToolButton,
+    ToolTipFilter,
+    ToolTipPosition,
+    FluentIcon,
     StrongBodyLabel,
     TitleLabel,
     isDarkTheme,
@@ -19,6 +23,11 @@ from qfluentwidgets import (
 from ..advisor_strategy import ADVISOR_OPTIONS
 from ..live.display_text import compact_cards_text, live_status_text, seat_text
 from ..domain.live_runtime import LiveAdvice, LiveUpdate
+from ..application.opening_readiness import (
+    OpeningReadinessCode,
+    OpeningReadinessStatus,
+    coerce_report,
+)
 from .single_image_danzero_page import CardBadge
 from .compact_view_state import (
     CompactUpdateGate, CompactViewState, advice_matches_snapshot,
@@ -161,6 +170,11 @@ class RecommendationFloatWindow(QWidget):
     """A read-only companion view over the shared live controller."""
 
     open_full_assistant_requested = Signal()
+    open_diagnostic_requested = Signal()
+    capture_diagnostic_requested = Signal()
+    copy_issue_requested = Signal()
+    copy_summary_requested = Signal()
+    stop_listening_requested = Signal()
 
     def __init__(self, runtime: Any, parent=None) -> None:
         super().__init__(parent)
@@ -179,7 +193,9 @@ class RecommendationFloatWindow(QWidget):
         self._update_gate = CompactUpdateGate()
         self._view_state: CompactViewState | None = None
         self._latest_update: object | None = None
+        self._opening_readiness = None
         self._fault_identity: tuple[str, int] | None = None
+        self._diagnostic_frame_saving = False
         self._hint_expiry_timer = QTimer(self)
         self._hint_expiry_timer.setSingleShot(True)
         self._hint_expiry_timer.timeout.connect(self._expire_local_hint)
@@ -235,10 +251,63 @@ class RecommendationFloatWindow(QWidget):
         actions = QHBoxLayout()
         self.capture_label = CaptionLabel("")
         actions.addWidget(self.capture_label, 1)
-        self.open_button = PushButton("打开完整助手")
-        self.open_button.clicked.connect(self.open_full_assistant_requested.emit)
+
+        self.capture_button = self._make_action_button(
+            FluentIcon.CAMERA,
+            "截取当前画面：保存最近一帧实时监听截图，稍后到窗口与牌局诊断中识别",
+            self.capture_diagnostic_requested.emit,
+        )
+        actions.addWidget(self.capture_button)
+        self.debug_button = self._make_action_button(
+            FluentIcon.SEARCH,
+            "打开窗口与牌局诊断：打开完整助手中的窗口与牌局诊断页",
+            self.open_diagnostic_requested.emit,
+        )
+        actions.addWidget(self.debug_button)
+        self.copy_issue_button = self._make_action_button(
+            FluentIcon.INFO,
+            "复制当前问题说明到剪贴板",
+            self.copy_issue_requested.emit,
+        )
+        actions.addWidget(self.copy_issue_button)
+        self.copy_summary_button = self._make_action_button(
+            FluentIcon.COPY,
+            "复制完整诊断摘要到剪贴板",
+            self.copy_summary_requested.emit,
+        )
+        actions.addWidget(self.copy_summary_button)
+        self.open_button = self._make_action_button(
+            FluentIcon.SETTING,
+            "打开完整助手",
+            self.open_full_assistant_requested.emit,
+        )
         actions.addWidget(self.open_button)
+        self.stop_button = self._make_action_button(
+            FluentIcon.CLOSE,
+            "停止实时监听",
+            self.stop_listening_requested.emit,
+        )
+        actions.addWidget(self.stop_button)
         root.addLayout(actions)
+
+    @staticmethod
+    def _make_action_button(icon: object, tooltip: str, callback: object) -> ToolButton:
+        button = ToolButton()
+        button.setIcon(icon)
+        button.setFixedSize(32, 32)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        # QFluentWidgets ToolButton does not consistently show the native Qt
+        # tooltip on every platform/theme. Install its own filter while
+        # retaining the native tooltip and accessibility name as fallbacks.
+        tooltip_filter = ToolTipFilter(
+            button, showDelay=250, position=ToolTipPosition.TOP
+        )
+        button.installEventFilter(tooltip_filter)
+        button._compact_tooltip_filter = tooltip_filter
+        if callable(callback):
+            button.clicked.connect(callback)
+        return button
 
     def _connect_runtime(self) -> None:
         update_signal = getattr(self.runtime, "update_ready", None)
@@ -268,6 +337,9 @@ class RecommendationFloatWindow(QWidget):
         recording_status = getattr(self.runtime, "recording_status", None)
         if recording_status is not None:
             recording_status.connect(self.apply_recording_status)
+        diagnostic_frame_status = getattr(self.runtime, "diagnostic_frame_status", None)
+        if diagnostic_frame_status is not None and hasattr(diagnostic_frame_status, "connect"):
+            diagnostic_frame_status.connect(self.apply_diagnostic_frame_status)
 
     def _apply_theme(self, *_args) -> None:
         if isDarkTheme():
@@ -413,6 +485,15 @@ class RecommendationFloatWindow(QWidget):
             self._listening_generation = generation
         if self._has_live_view():
             return
+
+        report = coerce_report(status)
+        if report is not None:
+            self._opening_readiness = report
+            self._render_opening_readiness(report)
+            return
+
+        # Compatibility for older controller payloads and third-party runtimes.
+        # New controller emissions always take the structured path above.
         state = str(status.get("state", "") or "")
         if state == "listening":
             self._update_gate.begin_listening()
@@ -420,7 +501,10 @@ class RecommendationFloatWindow(QWidget):
             self._render_view(CompactViewState("listening", "等待开局"))
         elif state == "opening":
             phase = str(status.get("phase", "") or "")
-            title = "等待开局" if phase in {"unknown", "lobby", "settlement", "waiting_table"} else "确认开局中…"
+            if phase in {"ready_waiting_first_action", "ready_waiting_lead"}:
+                title = "已进入牌桌，等待自己首出"
+            else:
+                title = "等待开局" if phase in {"unknown", "lobby", "settlement", "waiting_table"} else "确认开局中…"
             self._render_view(CompactViewState("opening", title))
         elif state == "recovering":
             self._render_view(CompactViewState("recovering", "重新连接中…"))
@@ -429,6 +513,86 @@ class RecommendationFloatWindow(QWidget):
         elif state == "failed":
             self._render_view(CompactViewState("failed", "监听已停止", "请打开完整助手重新连接牌桌"))
 
+    def _render_opening_readiness(self, report: object) -> None:
+        """Render the shared report without collapsing every WAIT into one label."""
+
+        reason = getattr(report, "primary_reason", None)
+        reason_value = getattr(reason, "value", reason)
+        reason_value = str(reason_value or "OPENING_UNRESOLVED")
+        status = getattr(report, "status", None)
+        status_value = getattr(status, "value", status)
+        status_value = str(status_value or "WAIT")
+        titles = {
+            OpeningReadinessCode.READY.value: "开局已就绪",
+            OpeningReadinessCode.READY_WAITING_FIRST_ACTION.value: "已进入牌桌，等待自己首出",
+            OpeningReadinessCode.LISTENING.value: "等待开局",
+            OpeningReadinessCode.LOBBY.value: "等待进入牌桌",
+            OpeningReadinessCode.DEAL_IN_PROGRESS.value: "对局已进行",
+            OpeningReadinessCode.MID_GAME_HAND_COUNT.value: "起手牌数量未稳定",
+            OpeningReadinessCode.HAND_UNSTABLE.value: "起手牌识别不稳定",
+            OpeningReadinessCode.OPENING_UNRESOLVED.value: "开局证据未确认",
+            OpeningReadinessCode.WINDOW_NOT_FOUND.value: "未找到牌桌窗口",
+            OpeningReadinessCode.MULTIPLE_WINDOWS.value: "检测到多个牌桌窗口",
+            OpeningReadinessCode.WINDOW_MINIMIZED.value: "牌桌窗口已最小化",
+            OpeningReadinessCode.CAPTURE_FAILED.value: "画面捕获失败",
+            OpeningReadinessCode.ROI_FATAL.value: "识别区域配置错误",
+            OpeningReadinessCode.WORKER_FAULT.value: "后台识别失败",
+        }
+        title = titles.get(reason_value, "开局状态不可用")
+        message = str(getattr(report, "message", "") or "")
+        suggested_action = str(getattr(report, "suggested_action", "") or "")
+        detail_parts = [part for part in (message, f"建议：{suggested_action}" if suggested_action else "") if part]
+        detail = "\n".join(detail_parts)
+
+        if status_value == OpeningReadinessStatus.PASS.value:
+            kind = "opening"
+        elif status_value == OpeningReadinessStatus.FAIL.value:
+            kind = "failed"
+        else:
+            kind = "opening"
+        if reason_value == OpeningReadinessCode.LISTENING.value:
+            kind = "listening"
+        self._render_view(CompactViewState(kind, title, detail))
+
+    def apply_diagnostic_frame_status(self, value: object) -> None:
+        """Render the save-only compact screenshot status."""
+        if not isinstance(value, dict):
+            return
+        status = str(value.get("status") or value.get("state") or "").upper()
+        if status in {"RUNNING", "SAVING", "PENDING", "STARTED", "LOADING"}:
+            self._diagnostic_frame_saving = True
+            self.capture_button.setEnabled(False)
+            self.capture_label.setText("正在保存实时监听截图…")
+            return
+
+        self._diagnostic_frame_saving = False
+        self.capture_button.setEnabled(True)
+        if status in {"PASS", "SUCCESS", "SAVED", "COMPLETED", "DONE"}:
+            message = str(value.get("message") or "")
+            if "复制" in message and not any(
+                value.get(key) for key in ("session_directory", "session_dir", "directory", "count", "frame_count", "saved_count")
+            ):
+                self.capture_label.setText(message)
+                return
+            directory = str(
+                value.get("session_directory")
+                or value.get("session_dir")
+                or value.get("directory")
+                or ""
+            )
+            count = value.get("count", value.get("frame_count", value.get("saved_count")))
+            detail = "截图已保存"
+            if count is not None:
+                detail += f"，当前对局共 {count} 张"
+            if directory:
+                detail += f" · 对局目录：{directory}"
+            detail += "；请到窗口与牌局诊断中识别"
+            self.capture_label.setText(detail)
+        elif status in {"FAIL", "FAILURE", "ERROR", "FAILED"}:
+            message = str(value.get("message") or value.get("error") or "保存实时监听截图失败")
+            self.capture_label.setText(f"截图保存失败：{message}")
+        elif status:
+            self.capture_label.setText(str(value.get("message") or status))
     def apply_recording_status(self, value: object) -> None:
         if isinstance(value, dict) and value.get("reason") == "recording_capacity_reached":
             self._recording_capacity_notice = str(value.get("message", ""))

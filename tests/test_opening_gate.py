@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from daguandan_bridge.domain.recognition import LeadEvidence
 from daguandan_bridge.opening_gate import (
     OpeningActionSeed, OpeningSessionSeed, OpeningTracker,
     evaluate_opening_gate, opening_semantic_key, serialized_result,
@@ -11,10 +12,10 @@ from daguandan_bridge.opening_gate import (
 HAND = tuple(f"{r}{s}" for r in ("3", "4", "5", "6", "7", "8", "9") for s in "SHCD")[:27]
 
 
-def result(*, hand=HAND, lead="left", current="self", cards=("2C",), confidence=.92, source="a", level="5"):
+def result(*, hand=HAND, lead="left", current="self", cards=("2C",), confidence=.92, source="a", level="5", player="left"):
     return serialized_result(
         round_level=level, hand=hand, lead_player=lead, current_player=current,
-        events=(() if cards is None else ({"player": "left", "cards": cards,
+        events=(() if cards is None else ({"player": player, "cards": cards,
                   "is_pass": False, "confidence": confidence, "source": source},)),
     )
 
@@ -120,17 +121,23 @@ def test_visible_action_cannot_disappear_from_seed_history():
     observe(tracker, result(), 100)
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 200).ready
-    assert not observe(tracker, empty, 300).ready
+    waiting = observe(tracker, empty, 300)
+    assert waiting.ready
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
+    assert waiting.seed is not None
+    assert waiting.seed.opening_action is None
 
 
-def test_expiry_does_not_forget_an_already_observed_first_action():
+def test_expiry_does_not_promote_a_stale_first_action():
     tracker = OpeningTracker()
     observe(tracker, result(), 100)
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 10000).ready
-    assert not observe(tracker, empty, 10100).ready
-    assert tracker.saw_action
-    assert tracker.candidate is None
+    waiting = observe(tracker, empty, 10100)
+    assert waiting.ready
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
+    assert waiting.seed is not None
+    assert waiting.seed.opening_action is None
 
 
 def test_completed_table_phase_never_starts_twice_after_expiry_or_clock_reversal():
@@ -151,25 +158,33 @@ def test_fresh_complete_first_action_can_reconfirm_after_observation_expiry():
     assert accepted.seed.opening_action.cards == ("2C",)
 
 
-def test_ordinary_clock_reversal_and_unknown_anchor_do_not_erase_history_fact():
+def test_ordinary_clock_reversal_and_unknown_anchor_require_fresh_confirmation():
     tracker = OpeningTracker()
     observe(tracker, result(), 1000)
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 100).ready
     assert not tracker.observe(empty, anchor_score=.1, generation=0, monotonic_ms=200).ready
     assert not observe(tracker, empty, 300).ready
-    assert not observe(tracker, empty, 400).ready
+    waiting = observe(tracker, empty, 400)
+    assert waiting.ready
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
+    assert waiting.seed is not None and waiting.seed.opening_action is None
 
 
 @pytest.mark.parametrize("weak", [result(cards=("?",)), result(confidence=.1), result(current="right")])
-def test_single_weak_or_contradictory_event_does_not_start_without_opening_action(weak):
+def test_single_weak_or_contradictory_event_does_not_start_as_action(weak):
     tracker = OpeningTracker()
     observe(tracker, weak, 100)
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 10000).ready
-    assert not observe(tracker, empty, 10100).ready
+    waiting = observe(tracker, empty, 10100)
+    assert waiting.ready
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
+    assert waiting.seed is not None and waiting.seed.opening_action is None
     assert not observe(tracker, result(), 10200).ready
-    assert observe(tracker, result(confidence=.95), 10300).ready
+    confirmed = observe(tracker, result(confidence=.95), 10300)
+    assert confirmed.ready
+    assert confirmed.status == "READY_ACTION_CONFIRMED"
 
 
 def test_explicit_generation_or_settlement_boundary_may_start_a_new_phase():
@@ -178,9 +193,13 @@ def test_explicit_generation_or_settlement_boundary_may_start_a_new_phase():
     assert observe(tracker, result(), 200).ready
     empty = result(lead=None, current=None, cards=None)
     assert not observe(tracker, empty, 300, generation=1).ready
-    assert not observe(tracker, empty, 400, generation=1).ready
+    waiting = observe(tracker, empty, 400, generation=1)
+    assert waiting.ready
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
     assert not observe(tracker, result(), 500, generation=1).ready
-    assert observe(tracker, result(), 600, generation=1).ready
+    confirmed = observe(tracker, result(), 600, generation=1)
+    assert confirmed.ready
+    assert confirmed.status == "READY_ACTION_CONFIRMED"
     terminal = serialized_result(round_level="5", hand=(), buttons=("continue_game", "change_table"))
     assert observe(tracker, terminal, 650, generation=1).reason == "settlement_screen"
     assert not observe(tracker, empty, 700, generation=1).ready
@@ -209,6 +228,126 @@ def test_visible_wrong_successor_is_not_repaired_by_marker_cache():
     observe(tracker, result(hand=(), current="left", cards=None), 200)
     assert not observe(tracker, result(lead=None, current="right"), 300).ready
     assert not observe(tracker, result(lead=None, current="right"), 400).ready
+
+
+def test_two_stable_complete_frames_establish_waiting_first_action_without_events():
+    tracker = OpeningTracker()
+    first = observe(tracker, result(lead="self", current="self", cards=None), 100)
+    second = observe(tracker, result(lead="self", current="self", cards=None), 200)
+
+    assert first.status == "NOT_READY"
+    assert second.ready is True
+    assert second.status == "READY_WAITING_FIRST_ACTION"
+    assert second.seed is not None
+    assert second.seed.opening_action is None
+
+
+def test_real_first_play_confirms_action_after_waiting_seed():
+    tracker = OpeningTracker()
+    observe(tracker, result(lead="self", current="self", cards=None), 100)
+    waiting = observe(tracker, result(lead="self", current="self", cards=None), 200)
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
+
+    first_action = observe(
+        tracker,
+        result(hand=HAND[:-1], lead="self", current="right", cards=("2C",), player="self"),
+        300,
+    )
+    assert first_action.status == "NOT_READY"
+    confirmed = observe(
+        tracker,
+        result(hand=HAND[:-1], lead="self", current="right", cards=("2C",), player="self"),
+        400,
+    )
+    assert confirmed.ready is True
+    assert confirmed.status == "READY_ACTION_CONFIRMED"
+    assert confirmed.seed is not None
+    assert confirmed.seed.opening_action is not None
+    assert confirmed.seed.opening_action.actor == "self"
+    assert confirmed.seed.opening_action.next_player == "right"
+
+
+def test_conflict_short_hand_unknown_suit_and_anchor_are_not_ready():
+    tracker = OpeningTracker()
+    conflict = serialized_result(
+        round_level="5", hand=HAND, lead_player="self", current_player="self",
+        events=(),
+        lead_evidence=(
+            LeadEvidence("self", first_play_score=.90, status="conflict", rejection_reason="candidate_conflict"),
+            LeadEvidence("right", first_play_score=.89, status="conflict", rejection_reason="candidate_conflict"),
+        ),
+    )
+    conflict_result = tracker.observe(
+        conflict, anchor_score=.95, generation=0, monotonic_ms=100, observation_id=1
+    )
+    assert conflict_result.status == "CONFLICT"
+    assert not conflict_result.ready
+
+    tracker = OpeningTracker()
+    anchored = serialized_result(
+        round_level="5", hand=HAND, lead_player="self", current_player="self", events=()
+    )
+    first = tracker.observe(
+        anchored, anchor_score=.95, generation=0, monotonic_ms=200, observation_id=2
+    )
+    assert first.status == "NOT_READY"
+    assert tracker.observe(
+        anchored, anchor_score=.80, generation=0, monotonic_ms=300, observation_id=3
+    ).status == "NOT_READY"
+
+    uncertain = list(HAND)
+    uncertain[0] = uncertain[0][:-1] + "?"
+    blocked = tracker.observe(
+        serialized_result(round_level="5", hand=tuple(uncertain), lead_player="self", current_player="self", events=()),
+        anchor_score=.95, generation=1, monotonic_ms=300, observation_id=3,
+    )
+    assert blocked.status == "BLOCKED"
+    assert not blocked.ready
+
+    short = tracker.observe(
+        serialized_result(round_level="5", hand=HAND[:-1], lead_player="self", current_player="self", events=()),
+        anchor_score=.95, generation=2, monotonic_ms=400, observation_id=4,
+    )
+    assert short.status in {"NOT_READY", "BLOCKED"}
+    assert not short.ready
+
+
+def test_single_frame_gate_exposes_waiting_and_action_statuses():
+    waiting = evaluate_opening_gate(
+        result(lead="self", current="self", cards=None), anchor_score=.95
+    )
+    assert waiting.ready is True
+    assert waiting.status == "READY_WAITING_FIRST_ACTION"
+    assert waiting.session_ready is True
+    assert waiting.action_confirmed is False
+
+    action = evaluate_opening_gate(
+        result(lead="self", current="right", cards=("2C",), player="self"),
+        anchor_score=.95,
+    )
+    assert action.ready is True
+    assert action.status == "READY_ACTION_CONFIRMED"
+    assert action.action_confirmed is True
+
+
+def test_invalid_action_cannot_be_promoted_to_opening_action():
+    invalid = evaluate_opening_gate(
+        result(lead="self", current="right", cards=("ZZ",), player="self"),
+        anchor_score=.95,
+    )
+    assert invalid.ready is False
+    assert invalid.status in {"BLOCKED", "CONFLICT", "NOT_READY"}
+
+
+def test_legacy_reason_mapping_is_explicit_and_stable():
+    from daguandan_bridge.opening_gate import (
+        legacy_reason_for_status, opening_status_for_reason,
+    )
+
+    assert opening_status_for_reason("ready") == "READY_ACTION_CONFIRMED"
+    assert opening_status_for_reason("confirming_opening") == "NOT_READY"
+    assert opening_status_for_reason("candidate_conflict") == "CONFLICT"
+    assert legacy_reason_for_status("READY_WAITING_FIRST_ACTION") == "ready_waiting_first_action"
 
 
 def test_raw_opening_gate_still_rejects_unanchored_or_late_state():

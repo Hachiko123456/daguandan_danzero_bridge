@@ -17,6 +17,7 @@ from uuid import uuid4
 from .storage import atomic_write_json
 from .support_bundle import sanitize_support_text
 from .diagnostic_test_evidence import build_test_evidence
+from .resource_fingerprint import recognition_resource_identity
 
 
 AUTO_LOG_SCHEMA = "guandan.auto-log-delivery/1"
@@ -89,6 +90,8 @@ class AutomaticLogDeliveryService:
         *,
         include_media: bool = False,
         destination_name: str | None = None,
+        profiles_root: Path | None = None,
+        profile_name: str | None = None,
     ) -> AutomaticLogDeliveryResult:
         session = Path(session_directory).resolve(strict=True)
         session_id = session.name
@@ -157,6 +160,11 @@ class AutomaticLogDeliveryService:
             zip_path,
             include_media=include_media,
             extra_files={} if test_evidence is None else test_evidence.files,
+            profile_snapshot_root=(
+                Path(profiles_root).expanduser().resolve() / str(profile_name)
+                if profiles_root is not None and profile_name
+                else None
+            ),
         )
         summary["diagnostic_zip_path"] = str(zip_path)
         summary["diagnostic_zip_sha256"] = zip_sha256
@@ -208,6 +216,8 @@ def export_automatic_session_log(
     documents_root: Path | None = None,
     fallback_root: Path | None = None,
     destination_name: str | None = None,
+    profiles_root: Path | None = None,
+    profile_name: str | None = None,
 ) -> AutomaticLogDeliveryResult:
     return AutomaticLogDeliveryService(
         documents_root=documents_root,
@@ -216,6 +226,8 @@ def export_automatic_session_log(
         session_directory,
         include_media=include_media,
         destination_name=destination_name,
+        profiles_root=profiles_root,
+        profile_name=profile_name,
     )
 
 
@@ -591,22 +603,80 @@ def _archive_payload(session: Path, source: Path) -> _ArchivePayload:
     )
 
 
+def _profile_snapshot_payloads(profile_root: Path) -> tuple[_ArchivePayload, ...]:
+    """Include the exact recognition inputs used by the sealed session.
+
+    Full diagnostic ZIPs are intentionally self-describing: replay on another
+    machine must not silently fall back to that machine's profile geometry or
+    templates. Models are represented by hashes in the identity manifest; the
+    small config/template tree is copied so the visual replay can use it.
+    """
+    root = Path(profile_root).resolve(strict=True)
+    if not root.is_dir():
+        return ()
+    identity = recognition_resource_identity(root.parent, root.name)
+    payloads: list[_ArchivePayload] = []
+    for name in ("profile.json", "regions_config.json", "templates_config.json"):
+        source = root / name
+        if source.is_file():
+            payloads.append(
+                _ArchivePayload(
+                    f"profile_snapshot/{root.name}/{name}",
+                    "recognition-config",
+                    content=source.read_bytes(),
+                )
+            )
+    for source in sorted((root / "templates").rglob("*")) if (root / "templates").is_dir() else ():
+        if source.is_file():
+            relative = source.relative_to(root).as_posix()
+            payloads.append(
+                _ArchivePayload(
+                    f"profile_snapshot/{root.name}/{relative}",
+                    "recognition-template",
+                    content=source.read_bytes(),
+                )
+            )
+    models = root / "models"
+    if models.is_dir():
+        for source in sorted(models.rglob("*")):
+            if source.is_file():
+                relative = source.relative_to(root).as_posix()
+                payloads.append(
+                    _ArchivePayload(
+                        f"profile_snapshot/{root.name}/{relative}",
+                        "recognition-model",
+                        content=source.read_bytes(),
+                    )
+                )
+    payloads.append(
+        _ArchivePayload(
+            f"profile_snapshot/{root.name}/resource_identity.json",
+            "recognition-config",
+            content=(json.dumps(identity, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+    )
+    return tuple(payloads)
+
+
 def _write_zip_atomic(
     session: Path,
     destination: Path,
     *,
     include_media: bool,
     extra_files: dict[str, bytes] | None = None,
+    profile_snapshot_root: Path | None = None,
 ) -> tuple[Path, str, int]:
     temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
     try:
         sources = _zip_sources(session, include_media=include_media)
         payloads = tuple(_archive_payload(session, source) for source in sources)
+        if include_media and profile_snapshot_root is not None:
+            payloads += _profile_snapshot_payloads(profile_snapshot_root)
         for path in (extra_files or {}):
             relative = PurePosixPath(str(path))
             if (
                 relative.is_absolute()
-                or relative.parts[:1] != ("test_evidence",)
+                or relative.parts[:1] not in (("test_evidence",), ("profile_snapshot",))
                 or ".." in relative.parts
             ):
                 raise ValueError("unsafe generated test evidence archive path")

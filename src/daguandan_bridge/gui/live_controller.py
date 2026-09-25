@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
+import shutil
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic_ns, perf_counter
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
 
@@ -40,9 +42,16 @@ from ..domain.live_runtime import AdviceRequestKey, LiveAdvice, LiveUpdate
 from ..live.frame_pipeline import analyze_frame_envelope
 from ..live.latest_worker import LatestOnlyWorker
 from ..live.pipeline_timing import PipelineTiming
+from ..session_paths import resolve_sessions_root
 from ..opening_evidence import (
     NonBlockingOpeningEvidenceSink,
     build_opening_evidence_monitor,
+)
+from ..application.opening_readiness import (
+    OpeningReadinessReport,
+    listening_report,
+    report_for_error,
+    report_for_phase,
 )
 from ..opening_gate import (
     OpeningActionSeed as _OpeningActionSeed,
@@ -95,6 +104,14 @@ class _AnalysisFrameTask:
 
 
 @dataclass(frozen=True)
+class _LiveFrameDelivery:
+    """Internal capture-worker result carrying the sequence beside the frame."""
+
+    snapshot: FrameSnapshot
+    capture_seq: int
+
+
+@dataclass(frozen=True)
 class _AnalysisDelivery:
     token: _LiveRunToken
     update: LiveUpdate | None
@@ -114,6 +131,37 @@ class _WaitingAnalysisTask:
     snapshot: FrameSnapshot
     generation: int
     page: ListeningPageSignal | None = None
+
+
+@dataclass(frozen=True)
+class _WaitingFrameDelivery:
+    snapshot: FrameSnapshot
+    generation: int
+    capture_seq: int
+
+
+@dataclass(frozen=True)
+class _DiagnosticFrameSaveContext:
+    session_directory: Path
+    session_id: str
+    snapshot: FrameSnapshot
+    capture_generation: int
+    capture_seq: int
+    source_phase: str
+    source: str = "live_listener_frame"
+
+
+class _DiagnosticFrameCaptureFailure(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "CAPTURE-BACKEND-FAILED",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.details = dict(details or {})
 
 
 @dataclass(frozen=True)
@@ -165,6 +213,7 @@ class LiveAssistantController(QObject):
     log_delivery_status = Signal(object)
     recording_status = Signal(object)
     live_fault = Signal(object)
+    diagnostic_frame_status = Signal(object)
     _waiting_recognized = Signal(object, object)
     _waiting_capture_stopped = Signal(object)
     _analysis_delivered = Signal()
@@ -178,6 +227,11 @@ class LiveAssistantController(QObject):
     _GEOMETRY_ANALYSIS_DRAIN_TIMEOUT_SEC = 5.0
     _GEOMETRY_RECOVERY_MAX_CYCLES = 3
     _GEOMETRY_RECOVERY_RESET_AFTER_FRAMES = 5
+    # A cheap page probe may be uncertain briefly.  This is a bounded
+    # observation-quality recovery window, not a recognition threshold and it
+    # must never manufacture an action event.
+    _PAGE_UNKNOWN_MAX_RETRIES = 5
+    _PAGE_UNKNOWN_RECOVERY_WINDOW_MS = 5_000
 
     def __init__(
         self,
@@ -264,6 +318,11 @@ class LiveAssistantController(QObject):
         self._finish_thread: OneShotThread | None = None
         self._log_export_thread: OneShotThread | None = None
         self._log_open_thread: OneShotThread | None = None
+        self._diagnostic_frame_thread: OneShotThread | None = None
+        self._manual_diagnostic_directory: Path | None = None
+        self._manual_diagnostic_session_id = ""
+        self._manual_capture_seq = 0
+        self._manual_diagnostic_lock = Lock()
         self._last_log_delivery_result: dict[str, object] | None = None
         self._deferred_source_close = None
         self._capture_generation = 0
@@ -273,6 +332,11 @@ class LiveAssistantController(QObject):
         self._pending_gui_delivery: _AnalysisDelivery | None = None
         self._gui_delivery_scheduled = False
         self._gui_accepted_version: tuple[_LiveRunToken, int, int, int] | None = None
+        # The controller is the GUI-facing authority for recommendation
+        # lifetime.  Preselection may prepare input, but it never owns the
+        # recommendation currently visible to either UI.
+        self._authoritative_advice_key: AdviceRequestKey | None = None
+        self._authoritative_advice_generation = 0
         self._queued_fault_identity: tuple[str, int] | None = None
         self._fatal_capture_session_id: str | None = None
         self._resume_requested = False
@@ -282,9 +346,22 @@ class LiveAssistantController(QObject):
         self._waiting_analysis_worker: LatestOnlyWorker | None = None
         self._draining_waiting_analysis_worker: LatestOnlyWorker | None = None
         self._waiting_generation = 0
+        self._latest_waiting_frame: FrameSnapshot | None = None
+        self._latest_waiting_frame_generation = -1
+        self._latest_waiting_frame_capture_seq = -1
+        self._waiting_capture_seq_counter = 0
+        self._latest_waiting_frame_lock = Lock()
+        self._preopening_diagnostic_directory: Path | None = None
+        self._preopening_diagnostic_session_id = ""
         self._waiting_candidate: _AutoSessionSeed | None = None
         self._opening_tracker = OpeningTracker()
         self._listening_page = ListeningPageSignal("unknown", 0.0)
+        self._last_stable_page_stage = "unknown"
+        self._page_unknown_retry_count = 0
+        self._page_unknown_started_ms: int | None = None
+        self._page_unknown_last_reason = ""
+        self._page_recovery_terminated = False
+        self._last_opening_readiness: OpeningReadinessReport = listening_report()
         self._pending_auto_session: _AutoSessionSeed | None = None
         self._listener_recording: object | None = None
         self._listener_recording_stop_reason: str | None = None
@@ -311,12 +388,13 @@ class LiveAssistantController(QObject):
         # the most recent immutable capture frame.
         self._latest_live_frame: FrameSnapshot | None = None
         self._latest_live_frame_generation = 0
+        self._latest_live_frame_capture_seq = -1
+        self._latest_live_frame_lock = Lock()
         self._preselection_thread: OneShotThread | None = None
         self._active_preselection_task: _PreselectionTask | None = None
         self._pending_preselection_task: _PreselectionTask | None = None
         self._handled_preselection_request_ids: set[str] = set()
         self._hand_preselector: object | None = None
-        self.latest_preselection_result: PreselectionResult | None = None
         self._waiting_recognized.connect(self._consume_waiting_recognition)
         self._waiting_capture_stopped.connect(self._waiting_capture_finished)
         self.update_ready.connect(self._auto_finish_on_game_end)
@@ -332,7 +410,360 @@ class LiveAssistantController(QObject):
     def is_running(self) -> bool:
         return bool(self._capture_worker and self._capture_worker.is_running)
 
+    def save_latest_live_frame_to_session(self) -> dict[str, object]:
+        """Save the exact listener frame, or capture one through the same live source."""
+
+        context = self._prepare_cached_live_frame_save()
+        if context is None:
+            if not callable(getattr(self.capture_service, "open_live_source", None)):
+                raise self._cached_frame_unavailable_error()
+            context = self._capture_manual_frame_context()
+        return self._persist_prepared_live_frame(context)
+
+    def save_latest_live_frame_to_session_background(self) -> bool:
+        """Save without blocking Qt; manual fallback captures in the worker thread."""
+
+        current = self._diagnostic_frame_thread
+        if current is not None and current.isRunning():
+            return False
+
+        try:
+            context = self._prepare_cached_live_frame_save()
+        except Exception as exc:
+            self.diagnostic_frame_status.emit(self._diagnostic_failure_payload(exc))
+            return False
+
+        if context is None and not callable(
+            getattr(self.capture_service, "open_live_source", None)
+        ):
+            self.diagnostic_frame_status.emit(
+                self._diagnostic_failure_payload(self._cached_frame_unavailable_error())
+            )
+            return False
+
+        if context is not None:
+            self.diagnostic_frame_status.emit({
+                "status": "SAVING",
+                "source": context.source,
+                "source_phase": context.source_phase,
+                "session_directory": str(context.session_directory),
+            })
+            operation = lambda: self._persist_prepared_live_frame(context)
+        else:
+            self.diagnostic_frame_status.emit({
+                "status": "SAVING",
+                "source": "manual_window_capture",
+                "source_phase": "manual_window_capture",
+            })
+
+            def operation():
+                try:
+                    return self._persist_prepared_live_frame(
+                        self._capture_manual_frame_context()
+                    )
+                except _DiagnosticFrameCaptureFailure as exc:
+                    return self._diagnostic_failure_payload(exc)
+
+        thread = OneShotThread(operation, self)
+        thread.result.connect(self._diagnostic_frame_saved)
+        thread.error.connect(self._diagnostic_frame_save_failed)
+        thread.finished.connect(
+            lambda current=thread: self._diagnostic_frame_thread_finished(current)
+        )
+        self._diagnostic_frame_thread = thread
+        thread.start()
+        return True
+
+    def _diagnostic_frame_saved(self, value: object) -> None:
+        payload = dict(value) if isinstance(value, dict) else {}
+        payload.setdefault("status", "SUCCESS")
+        self.diagnostic_frame_status.emit(payload)
+
+    def _diagnostic_frame_save_failed(self, message: str) -> None:
+        self.diagnostic_frame_status.emit({
+            "status": "FAILURE",
+            "source": "manual_window_capture",
+            "source_phase": "manual_window_capture",
+            "error_code": "DIAGNOSTIC-SAVE-FAILED",
+            "message": message or "保存诊断截图失败",
+        })
+
+    def _diagnostic_frame_thread_finished(self, thread: OneShotThread) -> None:
+        if self._diagnostic_frame_thread is thread:
+            self._diagnostic_frame_thread = None
+
+    def _prepare_cached_live_frame_save(self) -> _DiagnosticFrameSaveContext | None:
+        """Return a frozen exact listener frame, preferring formal then waiting."""
+
+        token = self._active_live_token
+        orchestrator = self.orchestrator
+        if token is not None and orchestrator is not None and self._live_token_is_current(token):
+            store = getattr(orchestrator, "store", None)
+            session_directory = getattr(store, "directory", None) if store is not None else None
+            session_id = str(getattr(store, "session_id", "") or "").strip() if store is not None else ""
+            with self._latest_live_frame_lock:
+                snapshot = self._latest_live_frame
+                frame_generation = self._latest_live_frame_generation
+                capture_seq = self._latest_live_frame_capture_seq
+            if (
+                session_directory is not None
+                and session_id
+                and session_id == token.session_id
+                and snapshot is not None
+                and frame_generation == token.generation
+                and frame_generation == self._capture_generation
+                and int(capture_seq) >= 0
+            ):
+                return _DiagnosticFrameSaveContext(
+                    Path(session_directory),
+                    session_id,
+                    self._copy_live_snapshot(snapshot),
+                    token.generation,
+                    int(capture_seq),
+                    "live_session",
+                    "live_listener_frame",
+                )
+
+        if self._listening_enabled:
+            with self._latest_waiting_frame_lock:
+                snapshot = self._latest_waiting_frame
+                frame_generation = self._latest_waiting_frame_generation
+                capture_seq = self._latest_waiting_frame_capture_seq
+            directory = self._preopening_diagnostic_directory
+            session_id = self._preopening_diagnostic_session_id
+            if (
+                snapshot is not None
+                and frame_generation == self._waiting_generation
+                and int(capture_seq) >= 0
+            ):
+                # The recording may start only after the first table page is
+                # recognized.  Before that point, save the exact cached
+                # listener frame into an on-demand fallback directory; this
+                # directory is later merged into the managed episode.
+                if directory is None or not session_id:
+                    directory, session_id = self._ensure_manual_diagnostic_directory()
+                return _DiagnosticFrameSaveContext(
+                    Path(directory),
+                    session_id,
+                    self._copy_live_snapshot(snapshot),
+                    frame_generation,
+                    int(capture_seq),
+                    "preopening_listener",
+                    "live_listener_frame",
+                )
+        return None
+
+    def _cached_frame_unavailable_error(self) -> RuntimeError:
+        """Return the precise legacy error when no manual capture API exists."""
+
+        token = self._active_live_token
+        orchestrator = self.orchestrator
+        if token is not None and orchestrator is not None:
+            store = getattr(orchestrator, "store", None)
+            if store is None:
+                return RuntimeError("当前实时对局没有会话存储，无法保存监听截图")
+            with self._latest_live_frame_lock:
+                snapshot = self._latest_live_frame
+                frame_generation = self._latest_live_frame_generation
+            if snapshot is None:
+                return RuntimeError("当前还没有可保存的实时监听帧")
+            if frame_generation != token.generation or frame_generation != self._capture_generation:
+                return RuntimeError("最新监听帧的采集代次已失效，无法保存监听截图")
+        if self._listening_enabled:
+            with self._latest_waiting_frame_lock:
+                snapshot = self._latest_waiting_frame
+                frame_generation = self._latest_waiting_frame_generation
+            if snapshot is None:
+                return RuntimeError("当前还没有可保存的等待开局监听帧")
+            if frame_generation != self._waiting_generation:
+                return RuntimeError("最新等待开局监听帧的采集代次已失效，无法保存监听截图")
+        return RuntimeError("当前没有活动实时对局，无法保存监听截图")
+
+    def _ensure_manual_diagnostic_directory(self) -> tuple[Path, str]:
+        """Allocate a manual fallback directory only when a frame is saved."""
+
+        with self._manual_diagnostic_lock:
+            if self._manual_diagnostic_directory is None:
+                sessions_root = resolve_sessions_root(
+                    self.capture_service.profiles_root,
+                    self.profile_name,
+                )
+                stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                diagnostic_id = f"diagnostic_{stamp}_{uuid4().hex[:8]}"
+                self._manual_diagnostic_directory = (
+                    Path(sessions_root) / "manual_diagnostic" / diagnostic_id
+                )
+                self._manual_diagnostic_session_id = diagnostic_id
+                self._manual_capture_seq = 0
+            return (
+                Path(self._manual_diagnostic_directory),
+                self._manual_diagnostic_session_id,
+            )
+
+    def _capture_manual_frame_context(self) -> _DiagnosticFrameSaveContext:
+        """Capture one manual frame through CaptureService.open_live_source().capture()."""
+
+        source = None
+        try:
+            source = self.capture_service.open_live_source(self.profile_name)
+            snapshot = source.capture()
+        except Exception as exc:
+            raise self._manual_capture_failure(exc) from exc
+        finally:
+            if source is not None:
+                try:
+                    source.close()
+                except Exception:
+                    pass
+
+        if not isinstance(snapshot, FrameSnapshot) or getattr(snapshot, "image", None) is None:
+            raise _DiagnosticFrameCaptureFailure(
+                "截图失败：捕获源没有返回有效图片",
+                code="CAPTURE-EMPTY",
+            )
+        image = snapshot.image
+        if getattr(image, "size", 0) <= 0:
+            raise _DiagnosticFrameCaptureFailure(
+                "截图失败：捕获结果为空",
+                code="CAPTURE-EMPTY",
+            )
+
+        directory, session_id = self._ensure_manual_diagnostic_directory()
+        with self._manual_diagnostic_lock:
+            self._manual_capture_seq += 1
+            capture_seq = self._manual_capture_seq
+
+        return _DiagnosticFrameSaveContext(
+            Path(directory),
+            session_id,
+            self._copy_live_snapshot(snapshot),
+            int(self._capture_generation),
+            capture_seq,
+            "manual_window_capture",
+            "manual_window_capture",
+        )
+
+    @staticmethod
+    def _manual_capture_failure(exc: Exception) -> _DiagnosticFrameCaptureFailure:
+        code = str(getattr(exc, "code", "CAPTURE-BACKEND-FAILED") or "CAPTURE-BACKEND-FAILED")
+        details = getattr(exc, "details", {})
+        if not isinstance(details, dict):
+            details = {}
+        messages = {
+            "WINDOW-NOT-FOUND": "截图失败：没有找到可捕获的大掼蛋窗口，请先打开程序并确保窗口可见",
+            "WINDOW-MINIMIZED": "截图失败：大掼蛋窗口处于最小化状态，无法可靠截图",
+            "WINDOW-AMBIGUOUS": "截图失败：找到多个可能的大掼蛋窗口，请收窄窗口匹配配置",
+            "CAPTURE-OCCLUDED": "截图失败：大掼蛋窗口被其他窗口遮挡，请移开遮挡后重试",
+            "GEOMETRY-CHANGED": "截图失败：大掼蛋窗口位置、大小或 DPI 发生变化，请保持窗口尺寸稳定后重试",
+            "CAPTURE-UNSUPPORTED": "截图失败：当前环境不支持大掼蛋窗口捕获",
+        }
+        message = messages.get(code) or str(exc) or "截图失败：窗口捕获失败"
+        return _DiagnosticFrameCaptureFailure(message, code=code, details=details)
+
+    @classmethod
+    def _diagnostic_failure_payload(cls, exc: Exception) -> dict[str, object]:
+        failure = exc if isinstance(exc, _DiagnosticFrameCaptureFailure) else cls._manual_capture_failure(exc)
+        return {
+            "status": "FAILURE",
+            "source": "manual_window_capture",
+            "source_phase": "manual_window_capture",
+            "error_code": failure.code,
+            "details": dict(failure.details),
+            "message": str(failure),
+        }
+
+    def _persist_prepared_live_frame(
+        self,
+        context: _DiagnosticFrameSaveContext,
+    ) -> dict[str, object]:
+        from ..application.session_diagnostic_frames import SessionDiagnosticFrameStore
+
+        persisted = SessionDiagnosticFrameStore().save_snapshot(
+            context.session_directory,
+            context.snapshot,
+            session_id=context.session_id,
+            capture_generation=context.capture_generation,
+            capture_seq=context.capture_seq,
+            source=context.source,
+            source_phase=context.source_phase,
+        )
+        result = self._diagnostic_frame_store_result(persisted)
+        store = SessionDiagnosticFrameStore()
+        if "count" not in result:
+            try:
+                result["count"] = len(store.list_frames(context.session_directory))
+            except Exception:
+                result["count"] = result.get("sequence", 0)
+        required = ("sequence", "image_path", "metadata_path", "count")
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise RuntimeError(
+                "诊断截图存储服务返回字段不完整：" + ", ".join(missing)
+            )
+        result.setdefault("session_id", context.session_id)
+        result.setdefault("session_directory", str(context.session_directory))
+        result.setdefault("source", context.source)
+        result.setdefault("source_phase", context.source_phase)
+        result.setdefault("evidence_frame_id", context.snapshot.evidence_frame_id)
+        result.setdefault("capture_seq", context.capture_seq)
+        result.setdefault("capture_generation", context.capture_generation)
+        result.setdefault(
+            "raw_sha256",
+            hashlib.sha256(context.snapshot.image.tobytes(order="C")).hexdigest(),
+        )
+        result.setdefault(
+            "message",
+            "手动窗口截图已保存"
+            if context.source == "manual_window_capture"
+            else "实时监听截图已保存到当前对局"
+            if context.source_phase == "live_session"
+            else "实时监听截图已保存到本轮预开局诊断目录",
+        )
+        return result
+
+    @staticmethod
+    def _copy_live_snapshot(snapshot: FrameSnapshot) -> FrameSnapshot:
+        """Copy mutable image buffers while retaining frame identity metadata."""
+
+        image = snapshot.image.copy()
+        raw_image = getattr(snapshot.frame, "raw_image", None)
+        raw_image_copy = raw_image.copy() if hasattr(raw_image, "copy") else raw_image
+        standardization = replace(snapshot.frame.standardization, image=image)
+        frame = replace(
+            snapshot.frame,
+            standardization=standardization,
+            raw_image=raw_image_copy,
+        )
+        return replace(snapshot, frame=frame)
+
+    @staticmethod
+    def _diagnostic_frame_store_result(value: object) -> dict[str, object]:
+        if isinstance(value, dict):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            if isinstance(payload, dict):
+                return dict(payload)
+        fields = ("sequence", "image_path", "metadata_path", "count")
+        payload = {field: getattr(value, field) for field in fields if hasattr(value, field)}
+        if payload:
+            return payload
+        raise RuntimeError("诊断截图存储服务返回了无效结果")
+
     def target_client_rect(self):
+        # Formal recommendation compact remains strict: only a confirmed
+        # opening may request the recommendation surface.
+        if not self.compact_request_allowed():
+            return None
+        return self.capture_service.target_client_rect(self.profile_name)
+
+    def diagnostic_target_client_rect(self):
+        # WAIT states (lobby/settlement/hand confirmation) may still show the
+        # diagnostic waiting surface. This method exposes geometry only and
+        # never authorizes recommendations or a live session.
+        if not self.diagnostic_compact_request_allowed():
+            return None
         return self.capture_service.target_client_rect(self.profile_name)
 
     def recognize_initial(self) -> None:
@@ -440,6 +871,216 @@ class LiveAssistantController(QObject):
             self.capture_service.profiles_root, self.profile_name
         )
 
+    @property
+    def opening_readiness(self) -> OpeningReadinessReport:
+        """Latest unified report for the opening/listening boundary."""
+
+        return self._last_opening_readiness
+
+    def compact_request_report(self) -> OpeningReadinessReport:
+        """Return the report a compact-window caller must inspect."""
+
+        return self._last_opening_readiness
+
+    def compact_request_allowed(self) -> bool:
+        """Guard explicit compact requests without changing ``main_window``.
+
+        Only PASS is allowed for recommendation compact mode.  WAIT is
+        exposed separately through ``can_show_waiting_compact`` for a future
+        diagnostic surface, and FAIL is denied so window/ROI/worker errors
+        cannot be bypassed by asking for recommendations directly.
+        """
+
+        return self._last_opening_readiness.can_request_compact
+
+    def can_show_compact_recommendation(self) -> bool:
+        """Readable alias for UI callers checking recommendation compact mode."""
+
+        return self.compact_request_allowed()
+
+    def diagnostic_compact_request_allowed(self) -> bool:
+        """Allow a future waiting-state diagnostic compact surface only."""
+
+        return self._last_opening_readiness.can_show_waiting_compact
+
+    def can_show_waiting_compact(self) -> bool:
+        """Readable alias for the independent WAIT diagnostic contract."""
+
+        return self.diagnostic_compact_request_allowed()
+
+    def _emit_listening_status(
+        self,
+        state: str,
+        report: OpeningReadinessReport,
+        **payload: object,
+    ) -> None:
+        """Publish one structured report while retaining legacy top-level keys."""
+
+        self._last_opening_readiness = report
+        report_payload = report.to_dict()
+        message = payload.pop("message", report.message)
+        status_payload: dict[str, object] = {
+            "state": state,
+            "message": str(message),
+            "report": report,
+            "readiness": report_payload,
+            **report_payload,
+            **payload,
+        }
+        # ``message`` is the only legacy field that can intentionally override
+        # the report's presentation text; the stable code fields never do.
+        status_payload["message"] = str(message)
+        self.listening_status.emit(status_payload)
+
+    def _reset_page_recovery(self) -> None:
+        self._page_unknown_retry_count = 0
+        self._page_unknown_started_ms = None
+        self._page_unknown_last_reason = ""
+
+    def _page_recovery_payload(self) -> dict[str, object]:
+        started = self._page_unknown_started_ms
+        now = monotonic_ns() // 1_000_000
+        elapsed = max(0, now - started) if started is not None else 0
+        return {
+            "stage": "page",
+            "page_stage": self._listening_page.stage,
+            "last_stable_page_stage": self._last_stable_page_stage,
+            "reason": self._page_unknown_last_reason or "page_stable",
+            "retry_count": int(self._page_unknown_retry_count),
+            "retry_budget": int(self._PAGE_UNKNOWN_MAX_RETRIES),
+            "recovery_window_ms": int(self._PAGE_UNKNOWN_RECOVERY_WINDOW_MS),
+            "recovery_elapsed_ms": int(elapsed),
+            "recovery_active": bool(self._page_unknown_retry_count),
+        }
+
+    def _update_listener_diagnostic_state(self, **changes: object) -> None:
+        """Best-effort observability for the active opening recording."""
+
+        recording = self._listener_recording
+        store = getattr(recording, "store", None)
+        update_metadata = getattr(store, "update_session_metadata", None)
+        if not callable(update_metadata):
+            return
+        stage = str(changes.get("stage", "page"))
+        page_stage = str(changes.get("page_stage", self._listening_page.stage))
+        reason = str(changes.get("reason", ""))
+        payload = {
+            "listening_stage": stage,
+            "listening_reason": reason,
+            "listening_retry_count": int(changes.get("retry_count", 0) or 0),
+            "listening_page_stage": page_stage,
+            "listening_last_stable_page": str(
+                changes.get("last_stable_page_stage", self._last_stable_page_stage)
+            ),
+            "page_recovery": dict(changes),
+        }
+        if stage == "page":
+            payload.update({
+                "lifecycle": "paused" if page_stage == "unknown" else "listening",
+                "lifecycle_status": "paused" if page_stage == "unknown" else "listening",
+                "lifecycle_reason": reason,
+            })
+        try:
+            update_metadata(payload)
+            append_trace = getattr(store, "append_recognition_trace", None)
+            if callable(append_trace):
+                append_trace({
+                    "phase": "page_recovery",
+                    "stage": stage,
+                    "page_stage": page_stage,
+                    "reason": reason,
+                    "retry_count": payload["listening_retry_count"],
+                    "recovery": dict(changes),
+                })
+        except Exception:
+            # Observability must not change capture or recognition decisions.
+            return
+
+    def _handle_transient_unknown_page(
+        self, page: ListeningPageSignal, snapshot: object
+    ) -> bool:
+        now = monotonic_ns() // 1_000_000
+        if self._page_unknown_started_ms is None:
+            self._page_unknown_started_ms = now
+        self._page_unknown_retry_count += 1
+        self._page_unknown_last_reason = "transient_page_unknown"
+        elapsed = now - self._page_unknown_started_ms
+        payload = self._page_recovery_payload()
+        payload.update({
+            "page_stage": page.stage,
+            "anchor_score": float(page.anchor_score),
+            "reason": self._page_unknown_last_reason,
+        })
+        self._update_listener_diagnostic_state(**payload)
+        if (
+            self._page_unknown_retry_count <= self._PAGE_UNKNOWN_MAX_RETRIES
+            and elapsed <= self._PAGE_UNKNOWN_RECOVERY_WINDOW_MS
+        ):
+            # Keep the last stable table/episode context.  Unknown is not a
+            # lobby, settlement, action, or new-game boundary.
+            worker = getattr(self._waiting_capture_worker, "worker", None)
+            if worker is not None:
+                worker.interval_sec = 0.2
+            return True
+
+        self._page_unknown_last_reason = "transient_page_unknown_budget_exhausted"
+        payload = self._page_recovery_payload()
+        payload.update({
+            "page_stage": page.stage,
+            "reason": self._page_unknown_last_reason,
+            "failure_class": "transient_page_recovery_exhausted",
+        })
+        self._update_listener_diagnostic_state(**payload)
+        try:
+            self.opening_evidence.observe_failure(
+                RuntimeError("page probe remained unknown beyond recovery budget"),
+                stage="page",
+                snapshot=snapshot,
+            )
+        except Exception:
+            pass
+        self._page_recovery_terminated = True
+        self._listening_enabled = False
+        self._listener_recording_stop_reason = self._page_unknown_last_reason
+        stopped = self._stop_waiting_workers()
+        if stopped:
+            self._close_listener_recording()
+        self.live_fault.emit({
+            "session_id": self._preopening_diagnostic_session_id,
+            "capture_generation": self._waiting_generation,
+            "kind": "page_recovery",
+            **payload,
+        })
+        report = report_for_phase(
+            "unknown",
+            message="页面识别暂时失败，已超过恢复预算，监听已停止",
+        )
+        self._emit_listening_status(
+            "failed",
+            report,
+            **payload,
+            message="页面识别暂时失败，已超过恢复预算，监听已停止",
+        )
+        return False
+
+    def _begin_preopening_diagnostic_round(self) -> None:
+        """Reset listener-round state without creating an empty parallel directory."""
+
+        with self._latest_waiting_frame_lock:
+            self._latest_waiting_frame = None
+            self._latest_waiting_frame_generation = -1
+            self._latest_waiting_frame_capture_seq = -1
+            self._waiting_capture_seq_counter = 0
+        # The managed episode is allocated by start_listener_recording().
+        # Until then these remain unset; a manual fallback is allocated only
+        # when the user actually saves a frame.
+        self._preopening_diagnostic_directory = None
+        self._preopening_diagnostic_session_id = ""
+        with self._manual_diagnostic_lock:
+            self._manual_diagnostic_directory = None
+            self._manual_diagnostic_session_id = ""
+            self._manual_capture_seq = 0
+
     def start_listening(self) -> bool:
         """Continuously inspect the current page and start only on a stable deal."""
 
@@ -451,6 +1092,8 @@ class LiveAssistantController(QObject):
         try:
             preload_live_worker_dependencies()
         except Exception as exc:
+            report = report_for_error(exc, stage="worker")
+            self._emit_listening_status("failed", report)
             self.error.emit(f"实时依赖预加载失败：{exc}")
             return False
         self.opening_evidence.begin(monotonic_ms=monotonic_ns() // 1_000_000)
@@ -460,8 +1103,11 @@ class LiveAssistantController(QObject):
                 lock_client(self.profile_name)
             except Exception as exc:
                 self.opening_evidence.observe_failure(exc, stage="window")
+                report = report_for_error(exc, stage="window")
+                self._emit_listening_status("failed", report)
                 self.error.emit(f"无法锁定牌桌客户区尺寸：{exc}")
                 return False
+        self._begin_preopening_diagnostic_round()
         self._listening_enabled = True
         self._geometry_recovery_cycle_count = 0
         self._geometry_post_recovery_frames_remaining = 0
@@ -469,9 +1115,10 @@ class LiveAssistantController(QObject):
         self._listener_recording_stop_reason = None
         self._opening_tracker.reset()
         self._listening_page = ListeningPageSignal("unknown", 0.0)
-        self.listening_status.emit(
-            {"state": "listening", "message": "持续监听页面中"}
-        )
+        self._last_stable_page_stage = "unknown"
+        self._reset_page_recovery()
+        self._page_recovery_terminated = False
+        self._emit_listening_status("listening", listening_report())
         self._start_danzero_warmup()
         if self.orchestrator is None and self._finish_thread is None:
             self._start_waiting_workers()
@@ -484,6 +1131,8 @@ class LiveAssistantController(QObject):
         self._opening_tracker.reset()
         self._pending_auto_session = None
         self._table_anchor_observed = False
+        self._reset_page_recovery()
+        self._page_recovery_terminated = False
         self._listener_recording_stop_reason = "listener_stopped"
         if self._stop_waiting_workers():
             self._close_listener_recording()
@@ -510,6 +1159,8 @@ class LiveAssistantController(QObject):
                 source = self.capture_service.open_live_source(self.profile_name)
             except Exception as exc:
                 self.opening_evidence.observe_failure(exc, stage="window")
+                report = report_for_error(exc, stage="window")
+                self._emit_listening_status("failed", report)
                 self.error.emit(str(exc))
                 self._listening_enabled = False
                 return
@@ -524,6 +1175,11 @@ class LiveAssistantController(QObject):
             except Exception:
                 pass
             self._listening_enabled = False
+            report = report_for_error(
+                RuntimeError("旧开局识别线程尚未退出，拒绝启动新的识别线程"),
+                stage="worker",
+            )
+            self._emit_listening_status("failed", report)
             self.error.emit("旧开局识别线程尚未退出，拒绝启动新的识别线程")
             return
         self._waiting_source = source
@@ -537,14 +1193,18 @@ class LiveAssistantController(QObject):
         self._waiting_analysis_worker = analysis
         analysis.start()
 
-        def operation() -> FrameSnapshot:
+        def operation() -> _WaitingFrameDelivery:
             snapshot: FrameSnapshot = source.capture()
+            with self._latest_waiting_frame_lock:
+                self._waiting_capture_seq_counter += 1
+                capture_seq = self._waiting_capture_seq_counter
+            delivery = _WaitingFrameDelivery(snapshot, generation, capture_seq)
             if generation != self._waiting_generation:
-                return snapshot
+                return delivery
             page_probe = getattr(self.recognition_service, "recognize_listening_page", None)
             page = page_probe(snapshot.image) if callable(page_probe) else None
             if generation != self._waiting_generation:
-                return snapshot
+                return delivery
             if page is not None:
                 # Gate every persisted frame using its own cheap page probe,
                 # not a slow full-hand recognition from an earlier screen.
@@ -572,7 +1232,7 @@ class LiveAssistantController(QObject):
                         reason="submit_failed",
                     )
                     raise
-            return snapshot
+            return delivery
 
         worker = WorkerHandle(operation, 1.0)
         worker.frame_ready.connect(
@@ -606,7 +1266,11 @@ class LiveAssistantController(QObject):
                 page = page_probe(snapshot.image)
             if page is not None:
                 observe_page = getattr(self.opening_evidence, "observe_page", None)
-                if callable(observe_page) and (generation is None or generation == self._waiting_generation):
+                if (
+                    callable(observe_page)
+                    and page.stage != "unknown"
+                    and (generation is None or generation == self._waiting_generation)
+                ):
                     observe_page(page.stage, monotonic_ms=getattr(
                         snapshot, "captured_monotonic_ms", monotonic_ns() // 1_000_000))
             if page is not None and not page.allows_media:
@@ -686,11 +1350,33 @@ class LiveAssistantController(QObject):
 
     def _accept_waiting_frame(
         self,
-        snapshot: object,
+        value: object,
         generation: int | None = None,
+        capture_seq: int | None = None,
     ) -> None:
-        if generation is None or generation == self._waiting_generation:
-            self.frame_ready.emit(snapshot)
+        if isinstance(value, _WaitingFrameDelivery):
+            snapshot = value.snapshot
+            delivery_generation = value.generation
+            delivery_seq = value.capture_seq
+        elif isinstance(value, FrameSnapshot):
+            snapshot = value
+            delivery_generation = generation
+            delivery_seq = capture_seq if capture_seq is not None else -1
+        else:
+            return
+        current_generation = self._waiting_generation
+        if (
+            delivery_generation is None
+            or delivery_generation != current_generation
+            or (generation is not None and generation != current_generation)
+            or not self._listening_enabled
+        ):
+            return
+        with self._latest_waiting_frame_lock:
+            self._latest_waiting_frame = snapshot
+            self._latest_waiting_frame_generation = current_generation
+            self._latest_waiting_frame_capture_seq = int(delivery_seq)
+        self.frame_ready.emit(snapshot)
 
     def _accept_waiting_error(
         self,
@@ -708,11 +1394,27 @@ class LiveAssistantController(QObject):
         ):
             self._begin_geometry_recovery(error)
             return
-        self.error.emit(str(error))
+        report = report_for_error(error, stage="capture")
+        hard_failure = {
+            "stage": "capture",
+            "reason": "window_or_capture_hard_failure",
+            "failure_class": "window_capture_hard_failure",
+            "retry_count": 0,
+            "page_stage": self._listening_page.stage,
+        }
+        self._update_listener_diagnostic_state(**hard_failure)
+        self._emit_listening_status("failed", report, **hard_failure)
         if self.orchestrator is None:
             self._listening_enabled = False
             self._waiting_candidate = None
             self._listener_recording_stop_reason = "waiting_capture_failed"
+            self.live_fault.emit({
+                "session_id": self._preopening_diagnostic_session_id,
+                "capture_generation": self._waiting_generation,
+                "kind": "capture",
+                **hard_failure,
+            })
+        self.error.emit(str(error))
 
     def _accept_waiting_recognition_error(self, error: Exception) -> None:
         """Preserve the typed failure and the already-buffered capture evidence."""
@@ -734,6 +1436,8 @@ class LiveAssistantController(QObject):
             stage="recognition",
             snapshot=snapshot,
         )
+        report = report_for_error(original, stage="recognition")
+        self._emit_listening_status("failed", report)
         self.error.emit(str(original))
 
     def _consume_waiting_recognition(self, result: object, snapshot: object) -> None:
@@ -766,7 +1470,21 @@ class LiveAssistantController(QObject):
             self._apply_listening_page(envelope.page, snapshot)
             if not envelope.page.allows_media:
                 self.initial_recognized.emit(result, snapshot)
-                self._publish_opening_status(envelope.page.stage, result)
+                if envelope.page.stage == "unknown":
+                    if not self._page_recovery_terminated:
+                        recovery = self._page_recovery_payload()
+                        recovery.update({
+                            "page_stage": "unknown",
+                            "reason": "transient_page_unknown",
+                            "retry_count": self._page_unknown_retry_count,
+                        })
+                        self._emit_listening_status(
+                            "recovering",
+                            listening_report(message="页面暂时无法确认，正在恢复"),
+                            **recovery,
+                        )
+                else:
+                    self._publish_opening_status(envelope.page.stage, result)
                 return
         if envelope is not None:
             self.opening_evidence.observe_recognition(
@@ -854,45 +1572,104 @@ class LiveAssistantController(QObject):
         previous = self._listening_page.stage
         self._listening_page = page
         worker = getattr(self._waiting_capture_worker, "worker", None)
+
+        if page.stage == "unknown":
+            # ``unknown`` is a transient page-probe miss.  Do not clear the
+            # OpeningTracker candidate, table anchor, episode recording, or
+            # any stable hand/lead evidence.  No action is produced from this
+            # page because the recognizer returns an empty result for it.
+            self._handle_transient_unknown_page(page, snapshot)
+            return
+
+        # A real page classification ends the unknown recovery window.
+        recovered_unknown = self._page_unknown_retry_count > 0
+        if page.stage in {"table", "lobby", "settlement"}:
+            self._last_stable_page_stage = page.stage
+        self._reset_page_recovery()
         if worker is not None:
             worker.interval_sec = 0.2 if page.allows_media else 1.0
+
         if not page.allows_media:
             if page.stage in {"lobby", "settlement"}:
+                # These are explicit page boundaries, unlike transient
+                # unknown.  Preserve the existing reset semantics.
                 self._opening_tracker.reset()
                 self._waiting_candidate = None
             self._table_anchor_observed = False
             self._listener_recording_stop_reason = "page_" + page.stage
+            self._update_listener_diagnostic_state(
+                stage="page",
+                page_stage=page.stage,
+                reason="page_" + page.stage,
+                retry_count=0,
+                recovered_unknown=recovered_unknown,
+            )
             self._close_listener_recording()
             return
+
         if previous in {"lobby", "settlement"}:
             self._opening_tracker.reset()
         self._table_anchor_observed = page.anchor_score >= self._TABLE_ANCHOR_READY_SCORE
+        self._update_listener_diagnostic_state(
+            stage="page",
+            page_stage=page.stage,
+            reason=("page_recovered" if recovered_unknown else "page_table"),
+            retry_count=0,
+            recovered_unknown=recovered_unknown,
+            anchor_score=float(page.anchor_score),
+        )
+        if recovered_unknown:
+            recovery = self._page_recovery_payload()
+            recovery.update({
+                "page_stage": page.stage,
+                "reason": "page_recovered",
+                "retry_count": 0,
+            })
+            self._emit_listening_status(
+                "recovered",
+                listening_report(message="页面已恢复，继续监听"),
+                **recovery,
+            )
         if self._start_listener_recording() and snapshot is not None:
             self._record_listener_frame(snapshot)
 
     def _publish_opening_status(self, phase: str, result: object) -> None:
         count = len(tuple(getattr(result, "my_hand", ()) or ()))
         messages = {
-            "unknown": "已连接，等待进入牌桌", "lobby": "已连接，等待进入牌桌",
+            "unknown": "已连接，等待进入牌桌",
+            "lobby": "已连接，等待进入牌桌",
             "waiting_table": "已连接，等待进入牌桌",
             "settlement": "本局已结束，等待下一局（未录像）",
-            "round_level_unresolved": "正在确认当前级牌",
-            "hand_count_mismatch": f"正在确认起手牌，已识别{count}张",
-            "hand_invalid": "起手牌识别有冲突，正在重新确认",
-            "hand_unresolved": "起手牌存在未确认花色，正在等待清晰画面",
-            "missed_opening": f"错过完整开局，当前{count}张，本局暂无法推荐",
-            "opening_seed_invalid": f"已识别{count}张，等待首出确认",
-            "confirming_hand": f"已识别{count}张，正在确认起手牌",
-            "confirming_opening": f"已识别{count}张，等待首出确认",
+            "round_level_unresolved": "当前级牌尚未确认",
+            "hand_count_mismatch": f"起手牌数量尚未稳定，当前识别到{count}张",
+            "hand_invalid": "起手牌识别仍在变化或存在冲突",
+            "hand_unresolved": "起手牌存在未确认花色",
+            "missed_opening": f"当前对局已进行，当前识别到{count}张手牌",
+            "opening_seed_invalid": f"已识别{count}张，首出证据尚未确认",
+            "confirming_hand": f"已识别{count}张，正在等待稳定起手牌",
+            "confirming_opening": f"已识别{count}张，正在等待稳定首出",
+            "ready_waiting_first_action": "已进入牌桌，等待自己首出",
+            "ready_waiting_lead": "已进入牌桌，等待自己首出",
             "ready": "完整开局已确认，正在建立对局",
         }
         if phase in {"already_started", "duplicate_frame"}:
             return
-        self.listening_status.emit({
-            "state": "opening", "phase": phase, "reason": phase,
-            "hand_count": count, "generation": self._waiting_generation,
-            "message": messages.get(phase, "正在确认完整开局"),
-        })
+        report = report_for_phase(
+            phase,
+            hand_count=count,
+            message=messages.get(phase),
+        )
+        self._emit_listening_status(
+            "opening",
+            report,
+            phase=phase,
+            reason=phase,
+            hand_count=count,
+            generation=self._waiting_generation,
+            page_stage=self._listening_page.stage,
+            page_reason=(self._page_unknown_last_reason or phase),
+            retry_count=self._page_unknown_retry_count,
+        )
 
     def _start_detected_session(self, result: object) -> None:
         if isinstance(result, _AutoSessionSeed):
@@ -1056,14 +1833,12 @@ class LiveAssistantController(QObject):
             details=self._geometry_recovery_error_details,
             reason=str(error),
         )
-        message = "牌桌窗口发生变化，正在重新连接"
-        self.listening_status.emit(
-            {
-                "state": "recovering",
-                "message": message,
-                "generation": self._waiting_generation,
-                "attempt_count": 0,
-            }
+        report = report_for_error(error, stage="capture", recovering=True)
+        self._emit_listening_status(
+            "recovering",
+            report,
+            generation=self._waiting_generation,
+            attempt_count=0,
         )
 
     def _schedule_geometry_recovery_attempt(self) -> None:
@@ -1272,13 +2047,11 @@ class LiveAssistantController(QObject):
             details=result.details,
             reason="target window stable across consecutive samples",
         )
-        self.listening_status.emit(
-            {
-                "state": "recovered",
-                "message": "牌桌窗口已重新连接，继续监听",
-                "generation": result.generation,
-                "attempt_count": result.attempt_count,
-            }
+        self._emit_listening_status(
+            "recovered",
+            listening_report(message="牌桌窗口已重新连接，继续监听"),
+            generation=result.generation,
+            attempt_count=result.attempt_count,
         )
         self._start_waiting_workers()
 
@@ -1300,14 +2073,20 @@ class LiveAssistantController(QObject):
         self._listener_recording_stop_reason = "geometry_recovery_failed"
         self._close_listener_recording()
         message = "监听已停止，请打开完整助手"
-        self.listening_status.emit(
-            {
-                "state": "failed",
-                "message": message,
-                "reason": reason,
-                "generation": self._waiting_generation,
-                "attempt_count": self._geometry_recovery_attempt_count,
-            }
+        source_code = str(
+            self._geometry_recovery_error_details.get("source_error_code", "")
+            or "CAPTURE-BACKEND-FAILED"
+        )
+        source_error = RuntimeError(reason)
+        source_error.code = source_code  # type: ignore[attr-defined]
+        report = report_for_error(source_error, stage="capture")
+        self._emit_listening_status(
+            "failed",
+            report,
+            message=message,
+            reason=reason,
+            generation=self._waiting_generation,
+            attempt_count=self._geometry_recovery_attempt_count,
         )
         self.error.emit(f"{message}：{reason}")
 
@@ -1333,6 +2112,9 @@ class LiveAssistantController(QObject):
     def _stop_waiting_workers(self) -> bool:
         worker = self._waiting_capture_worker
         self._waiting_generation += 1
+        with self._latest_waiting_frame_lock:
+            self._latest_waiting_frame_generation = -1
+            self._latest_waiting_frame_capture_seq = -1
         self._opening_tracker.reset()
         self._listening_page = ListeningPageSignal("unknown", 0.0)
         self._stop_waiting_analysis_worker()
@@ -1406,7 +2188,88 @@ class LiveAssistantController(QObject):
             self.error.emit("全程录制未启动，请检查保存方式配置")
             return False
         self._listener_recording = recording
+        self._bind_preopening_diagnostic_to_recording(recording)
         return True
+
+    def _bind_preopening_diagnostic_to_recording(self, recording: object) -> None:
+        """Bind diagnostic frames to the same managed episode as the recorder."""
+
+        store = getattr(recording, "store", None)
+        directory = getattr(store, "directory", None)
+        session_id = str(getattr(store, "session_id", "") or "").strip()
+        if directory is None or not session_id:
+            return
+        self._migrate_manual_diagnostic_frames_to_recording(store)
+        self._preopening_diagnostic_directory = Path(directory)
+        self._preopening_diagnostic_session_id = session_id
+
+    def _migrate_manual_diagnostic_frames_to_recording(self, target_store: object) -> None:
+        """Move on-demand fallback frames into the active episode, best effort."""
+
+        source_directory = self._manual_diagnostic_directory
+        source_session_id = self._manual_diagnostic_session_id
+        target_directory = getattr(target_store, "directory", None)
+        target_session_id = str(getattr(target_store, "session_id", "") or "").strip()
+        if source_directory is None or not source_session_id or target_directory is None or not target_session_id:
+            return
+        try:
+            source_root = Path(resolve_sessions_root(
+                self.capture_service.profiles_root, self.profile_name,
+            )).resolve()
+            source = Path(source_directory).resolve()
+            source.relative_to(source_root / "manual_diagnostic")
+            target = Path(target_directory).resolve()
+            target.relative_to(source_root / ".preopening")
+            from ..application.session_diagnostic_frames import SessionDiagnosticFrameStore
+
+            frame_store = SessionDiagnosticFrameStore()
+            records = tuple(frame_store.list_frames(source)) if source.exists() else ()
+            target_frames = target / "diagnostic_frames"
+            target_frames.mkdir(parents=True, exist_ok=True)
+            used = {int(record.sequence) for record in frame_store.list_frames(target)}
+            next_sequence = max(used, default=0) + 1
+            for record in records:
+                while next_sequence in used:
+                    next_sequence += 1
+                stem = f"{next_sequence:06d}"
+                image_path = target_frames / f"{stem}.png"
+                metadata_path = target_frames / f"{stem}.json"
+                shutil.copyfile(record.image_path, image_path)
+                metadata = dict(record.metadata)
+                metadata.update({
+                    "session_id": target_session_id,
+                    "sequence": next_sequence,
+                    "original_manual_fallback_session_id": source_session_id,
+                })
+                temporary = metadata_path.with_name(f".{stem}.{uuid4().hex}.tmp")
+                try:
+                    temporary.write_text(
+                        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(temporary, metadata_path)
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    image_path.unlink(missing_ok=True)
+                    raise
+                record.image_path.unlink(missing_ok=True)
+                record.metadata_path.unlink(missing_ok=True)
+                used.add(next_sequence)
+                next_sequence += 1
+            if source.exists():
+                remaining = tuple(source.rglob("*"))
+                if not any(path.is_file() for path in remaining):
+                    shutil.rmtree(source, ignore_errors=True)
+            self._manual_diagnostic_directory = None
+            self._manual_diagnostic_session_id = ""
+            self._manual_capture_seq = 0
+        except Exception as exc:
+            self.diagnostic_frame_status.emit({
+                "status": "MIGRATION_SKIPPED",
+                "source_phase": "preopening_listener",
+                "session_directory": str(source_directory),
+                "message": f"预开局截图保留在手动回退目录，迁移未完成：{exc}",
+            })
 
     def _record_listener_frame(self, snapshot: FrameSnapshot) -> None:
         if not self._listening_page.allows_media:
@@ -1524,6 +2387,89 @@ class LiveAssistantController(QObject):
         self._danzero_warmup_running = False
         self._danzero_warmup_thread = None
 
+    def _migrate_preopening_diagnostic_frames(self, target_store: object | None) -> None:
+        """Move completed pre-opening frame pairs into the formal session.
+
+        This is best-effort by design: if a listener save is in flight or a
+        filesystem safety check fails, the original pre-opening directory is
+        left untouched and remains selectable for diagnosis.
+        """
+
+        source_directory = self._preopening_diagnostic_directory
+        source_session_id = self._preopening_diagnostic_session_id
+        target_directory = getattr(target_store, "directory", None)
+        target_session_id = str(getattr(target_store, "session_id", "") or "").strip()
+        if (
+            source_directory is None
+            or not source_session_id
+            or target_directory is None
+            or not target_session_id
+        ):
+            return
+        diagnostic_thread = self._diagnostic_frame_thread
+        if diagnostic_thread is not None and diagnostic_thread.isRunning():
+            return
+        try:
+            source_root = Path(resolve_sessions_root(
+                self.capture_service.profiles_root,
+                self.profile_name,
+            )).resolve()
+            source = source_directory.resolve()
+            source.relative_to(source_root / ".preopening")
+            target_session_directory = Path(target_directory).resolve()
+            target_session_directory.relative_to(source_root)
+            from ..application.session_diagnostic_frames import SessionDiagnosticFrameStore
+
+            frame_store = SessionDiagnosticFrameStore()
+            if not source.exists():
+                return
+            records = tuple(frame_store.list_frames(source))
+            if not records:
+                return
+            target_frames = target_session_directory / "diagnostic_frames"
+            target_frames.mkdir(parents=True, exist_ok=True)
+            used: set[int] = set()
+            for record in frame_store.list_frames(target_session_directory):
+                used.add(int(record.sequence))
+            next_sequence = max(used, default=0) + 1
+            for record in records:
+                while next_sequence in used:
+                    next_sequence += 1
+                stem = f"{next_sequence:06d}"
+                image_path = target_frames / f"{stem}.png"
+                metadata_path = target_frames / f"{stem}.json"
+                shutil.copyfile(record.image_path, image_path)
+                metadata = dict(record.metadata)
+                metadata.update({
+                    "session_id": target_session_id,
+                    "sequence": next_sequence,
+                    "original_preopening_session_id": source_session_id,
+                })
+                temporary = metadata_path.with_name(
+                    f".{stem}.{uuid4().hex}.tmp"
+                )
+                try:
+                    temporary.write_text(
+                        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(temporary, metadata_path)
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    image_path.unlink(missing_ok=True)
+                    raise
+                record.image_path.unlink(missing_ok=True)
+                record.metadata_path.unlink(missing_ok=True)
+                used.add(next_sequence)
+                next_sequence += 1
+        except Exception as exc:
+            self.diagnostic_frame_status.emit({
+                "status": "MIGRATION_SKIPPED",
+                "source_phase": "preopening_listener",
+                "session_directory": str(source_directory),
+                "message": f"预开局截图保留在原目录，迁移未完成：{exc}",
+            })
+
     def start_session(
         self,
         *,
@@ -1556,6 +2502,9 @@ class LiveAssistantController(QObject):
         self.orchestrator = constructed.orchestrator
         self._live_source = constructed.source
         token = self._activate_live_token(constructed.orchestrator)
+        self._migrate_preopening_diagnostic_frames(
+            getattr(constructed.orchestrator, "store", None)
+        )
         try:
             # Binding must precede bootstrap/model notifications and capture,
             # including waiting-lead sessions which have not analyzed a frame.
@@ -1581,12 +2530,15 @@ class LiveAssistantController(QObject):
                 return False
         self.opening_evidence.mark_session_started()
         self._auto_finish_requested = False
-        self._latest_live_frame = None
-        self._latest_live_frame_generation = 0
+        with self._latest_live_frame_lock:
+            self._latest_live_frame = None
+            self._latest_live_frame_generation = 0
+            self._latest_live_frame_capture_seq = -1
         self._pending_preselection_task = None
         self._handled_preselection_request_ids.clear()
-        self.latest_preselection_result = None
-        self.update_ready.emit(initial_update)
+        self._authoritative_advice_key = None
+        self._authoritative_advice_generation = self._capture_generation
+        self._emit_authoritative_update(initial_update)
         self._start_analysis_worker()
         self._start_capture_worker()
         return True
@@ -1651,6 +2603,9 @@ class LiveAssistantController(QObject):
         self._capture_generation += 1
         self._live_session_nonce += 1
         self._active_live_token = None
+        self._authoritative_advice_key = None
+        self._authoritative_advice_generation = self._capture_generation
+        self._pending_preselection_task = None
 
     def _live_token_is_current(self, token: _LiveRunToken) -> bool:
         return bool(
@@ -1860,7 +2815,114 @@ class LiveAssistantController(QObject):
                 "capture_to_gui_receive", (received_ns - delivery.capture_started_ns) / 1_000_000
             )
         timing.increment("gui_update_received")
-        self.update_ready.emit(delivery.update)
+        self._emit_authoritative_update(delivery.update)
+
+    @staticmethod
+    def _advice_key_for_update(update: LiveUpdate) -> AdviceRequestKey:
+        snapshot = update.snapshot
+        return AdviceRequestKey(
+            str(getattr(snapshot, "session_id", "") or ""),
+            int(getattr(snapshot, "turn_id", 0) or 0),
+            int(getattr(snapshot, "revision", 0) or 0),
+        )
+
+    @classmethod
+    def _has_current_visible_advice(cls, update: LiveUpdate) -> bool:
+        raw = update.advice
+        if (
+            update.status != "running"
+            or getattr(update.snapshot, "current_player", None) != "self"
+            or not isinstance(raw, LiveAdvice)
+            or raw.status != "ready"
+            or not raw.visible
+            or raw.advice is None
+        ):
+            return False
+        return raw.key == cls._advice_key_for_update(update)
+
+    @staticmethod
+    def _update_has_committed_action(update: LiveUpdate) -> bool:
+        events = tuple(getattr(update, "events", ()) or ())
+        event = getattr(update, "event", None)
+        if event is not None:
+            events = (event, *events)
+        return any(
+            str(getattr(item, "event_type", "") or "")
+            in {"player_played", "player_passed", "action_committed"}
+            for item in events
+        )
+
+    @classmethod
+    def _advice_invalidation_reason(cls, update: LiveUpdate) -> str:
+        status = str(getattr(update, "status", "") or "")
+        if status in {"finalizing", "sealed"}:
+            return "terminal"
+        event = getattr(update, "event", None)
+        events = tuple(getattr(update, "events", ()) or ())
+        if event is not None:
+            events = (event, *events)
+        if any(
+            str(getattr(item, "event_type", "") or "")
+            in {"game_end_detected", "terminal_detected", "session_finished"}
+            for item in events
+        ):
+            return "terminal"
+        block_reason = str(getattr(update, "block_reason", "") or "")
+        raw = update.advice
+        withhold_reason = str(getattr(raw, "withhold_reason", "") or "")
+        if block_reason or withhold_reason or getattr(update, "missing_player", None) is not None:
+            return withhold_reason or block_reason or "recovery"
+        if cls._update_has_committed_action(update):
+            return "action_committed"
+        if getattr(update.snapshot, "current_player", None) != "self":
+            return "not_local_turn"
+        return ""
+
+    def _authoritative_update_for_ui(self, update: LiveUpdate) -> LiveUpdate:
+        """Make the public update the only source of visible advice.
+
+        A late/empty update must actively invalidate the previous visible
+        recommendation.  The runtime remains untouched: this is only a GUI
+        projection, and the synthetic withheld advice makes both the full and
+        compact views clear their existing card in the same update turn.
+        """
+        key = self._advice_key_for_update(update)
+        generation = int(getattr(update, "capture_generation", 0) or 0)
+        reason = self._advice_invalidation_reason(update)
+        current_visible = self._has_current_visible_advice(update) and not reason
+        identity_changed = (
+            self._authoritative_advice_key != key
+            or self._authoritative_advice_generation != generation
+        )
+        had_visible = self._authoritative_advice_key is not None
+        if current_visible:
+            if identity_changed:
+                self._pending_preselection_task = None
+            self._authoritative_advice_key = key
+            self._authoritative_advice_generation = generation
+            return update
+
+        if had_visible or identity_changed or reason:
+            self._authoritative_advice_key = None
+            self._authoritative_advice_generation = generation
+            self._pending_preselection_task = None
+            raw = update.advice
+            if not isinstance(raw, LiveAdvice) or raw.status != "withheld" or raw.visible:
+                withheld = LiveAdvice(
+                    key=key,
+                    status="withheld",
+                    advice=None,
+                    visible=False,
+                    withhold_reason=reason or "advice_invalidated",
+                    error="当前状态已变化，旧推荐已清除",
+                )
+                return replace(update, advice=withheld)
+        return update
+
+    def _emit_authoritative_update(self, update: object) -> None:
+        if isinstance(update, LiveUpdate):
+            update = self._authoritative_update_for_ui(update)
+        self.update_ready.emit(update)
 
     @staticmethod
     def _update_has_capture_identity(update: LiveUpdate, token: _LiveRunToken) -> bool:
@@ -1956,7 +3018,7 @@ class LiveAssistantController(QObject):
             captured_ms = snapshot.captured_monotonic_ms
             if not self._live_token_is_current(token):
                 timing.increment("capture_stale")
-                return snapshot
+                return _LiveFrameDelivery(snapshot, capture_seq)
             timing.increment("capture_completed")
             submit_for_analysis = True
             if self.deduplicate_analysis_frames:
@@ -1988,7 +3050,7 @@ class LiveAssistantController(QObject):
             self._submit_recording_frame(
                 token, snapshot, capture_sequence=capture_seq,
             )
-            return snapshot
+            return _LiveFrameDelivery(snapshot, capture_seq)
 
         worker = WorkerHandle(operation, self.capture_interval_sec)
         worker.frame_ready.connect(
@@ -2181,10 +3243,24 @@ class LiveAssistantController(QObject):
         return True
 
     def _accept_live_frame(self, token: _LiveRunToken, value: object) -> None:
-        if self._live_token_is_current(token) and isinstance(value, FrameSnapshot):
-            self._latest_live_frame = value
-            self._latest_live_frame_generation = self._capture_generation
-            self.frame_ready.emit(value)
+        if isinstance(value, _LiveFrameDelivery):
+            snapshot = value.snapshot
+            capture_seq = value.capture_seq
+        elif isinstance(value, FrameSnapshot):
+            # Keep compatibility with tests/plugins that still deliver only a
+            # FrameSnapshot.  Do not invent a sequence for that path.
+            snapshot = value
+            capture_seq = -1
+        else:
+            return
+        if self._live_token_is_current(token):
+            with self._latest_live_frame_lock:
+                self._latest_live_frame = snapshot
+                self._latest_live_frame_generation = self._capture_generation
+                self._latest_live_frame_capture_seq = int(capture_seq)
+            # The public signal remains FrameSnapshot-only for existing UI
+            # consumers; the sequence is kept in controller sidecar state.
+            self.frame_ready.emit(snapshot)
 
     def _schedule_hand_preselection(self, update: object) -> None:
         """Sidecar entry point: queue one all-or-nothing hand selection.
@@ -2394,14 +3470,13 @@ class LiveAssistantController(QObject):
             != task.key
         ):
             return False
-        current = orchestrator.latest_advice
+        # Only the controller's last authoritative update can keep a
+        # preselection task alive.  The orchestrator's mutable sidecar advice
+        # is deliberately not a GUI authority.
         return bool(
-            isinstance(current, LiveAdvice)
-            and current.key == task.key
-            and current.status == "ready"
-            and current.visible
-            and current.advice is not None
-            and not current.advice.is_pass
+            self._authoritative_advice_key is not None
+            and self._authoritative_advice_generation == task.capture_generation
+            and self._authoritative_advice_key == task.key
         )
 
     def _get_hand_preselector(self):
@@ -2416,7 +3491,8 @@ class LiveAssistantController(QObject):
         return self._hand_preselector
 
     def _publish_preselection_result(self, result: PreselectionResult) -> None:
-        self.latest_preselection_result = result
+        # Preselection is an execution/diagnostic signal only.  It is never
+        # retained as a second recommendation cache.
         self.preselection_result.emit(result)
 
     def _accept_live_error(self, token: _LiveRunToken, error: object) -> None:
@@ -2486,7 +3562,7 @@ class LiveAssistantController(QObject):
         except Exception as exc:
             self.error.emit(str(exc))
             return
-        self.update_ready.emit(update)
+        self._emit_authoritative_update(update)
 
     def pause(self) -> None:
         self._resume_requested = False
@@ -2570,7 +3646,7 @@ class LiveAssistantController(QObject):
         self._live_source = source
         self._resume_requested = False
         if update is not None:
-            self.update_ready.emit(update)
+            self._emit_authoritative_update(update)
         self._start_analysis_worker()
         self._start_capture_worker()
 
@@ -2617,7 +3693,7 @@ class LiveAssistantController(QObject):
         if isinstance(delivery, dict):
             self._last_log_delivery_result = dict(delivery)
             self.log_delivery_status.emit(dict(delivery))
-        self.update_ready.emit(update)
+        self._emit_authoritative_update(update)
         self.session_finished.emit(update)
 
     def automatic_log_directory(self) -> Path:
@@ -2726,6 +3802,8 @@ class LiveAssistantController(QObject):
         return export_automatic_session_log(
             session,
             include_media=True,
+            profiles_root=getattr(self.capture_service, "profiles_root", None),
+            profile_name=self.profile_name,
         ).to_dict()
 
     def _full_diagnostic_exported(self, result: object) -> None:
@@ -2792,6 +3870,10 @@ class LiveAssistantController(QObject):
 
     def shutdown(self) -> None:
         self.stop_listening()
+        diagnostic_thread = self._diagnostic_frame_thread
+        if diagnostic_thread is not None and diagnostic_thread.isRunning():
+            diagnostic_thread.wait(10_000)
+        self._diagnostic_frame_thread = None
         recovery_thread = self._geometry_recovery_thread
         if recovery_thread is not None and recovery_thread.isRunning():
             recovery_thread.wait(10_000)

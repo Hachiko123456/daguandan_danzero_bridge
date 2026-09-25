@@ -528,6 +528,27 @@ def test_opening_signal_collects_marker_timer_and_super_double_without_committin
     assert service.recognize_super_double_visible(normal_double_image) is True
 
 
+def test_opening_signal_exposes_auditable_lead_candidate_scores(monkeypatch):
+    service = ScreenshotRecognitionService(
+        AnnotationService(PROFILES_ROOT),
+        TemplateService(PROFILES_ROOT),
+    )
+
+    def fake_cards(_image, region, _templates, **_kwargs):
+        if region is not None and region.name == "my_play":
+            return (("2C",), 0.94, "template:cards", (), (), ())
+        return ((), 0.0, "", (), (), ())
+
+    monkeypatch.setattr(service, "_recognize_cards", fake_cards)
+    signal = service.recognize_opening_signal(np.full((720, 1280, 3), 255, dtype=np.uint8))
+
+    candidate = next(item for item in signal.lead_evidence if item.candidate_seat == "self")
+    assert candidate.card_action_score == 0.94
+    assert candidate.status == "pending_confirmation"
+    assert signal.candidate_scores["self"] == 0.94
+    assert signal.candidates == signal.lead_evidence
+
+
 def test_fast_signals_recognize_continue_game_as_an_end_control():
     image = np.full((720, 1280, 3), 255, dtype=np.uint8)
     _paste_template(image, "templates/button/continue_game.png", 520, 250)

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from ..domain.live import LiveEvent, LiveSnapshot
 from ..domain.live_runtime import AdviceRequestKey, LiveAdvice, LiveStatus, LiveUpdate
@@ -27,6 +28,78 @@ class VisionRuntimeLike(Protocol):
 
     def start(self, *, timeout: float = 10.0) -> None: ...
     def close(self, *, timeout: float = 5.0) -> None: ...
+
+
+SessionState = Literal["RUNNING", "RESYNCING", "BLOCKED", "TERMINAL", "SEALED"]
+RecoveryState = Literal["RUNNING", "RESYNCING", "BLOCKED"]
+
+
+@dataclass(frozen=True, slots=True)
+class AdviceState:
+    """The runtime's single logical owner for the currently published advice.
+
+    ``LiveAdvice`` remains the public compatibility value exposed through
+    ``LiveV2SessionRuntime.latest_advice``.  This small record makes its
+    lifecycle explicit: an advice value is only meaningful for its versioned
+    request key, and it is never allowed to survive a recovery or terminal
+    transition as a visible recommendation.
+    """
+
+    advice: LiveAdvice | None = None
+    phase: Literal["idle", "requested", "ready", "withheld", "invalidated"] = "idle"
+
+
+
+def recovery_state_for_gap(gap: Any, *, terminal: bool = False) -> RecoveryState:
+    """Map the engine's detailed gap phases to one lifecycle state.
+
+    The engine can keep its detailed evidence/recovery phases.  The
+    application boundary intentionally exposes only three states so callers
+    do not have to reconstruct a state machine from several flags.
+    """
+
+    if terminal:
+        return "BLOCKED"
+    phase = getattr(gap, "phase", GapPhase.CLEAR)
+    if phase is GapPhase.CLEAR:
+        return "RUNNING"
+    if phase in {
+        GapPhase.OBSERVING, GapPhase.RECOVERABLE, GapPhase.BLOCKING,
+    }:
+        return "RESYNCING"
+    return "BLOCKED"
+
+
+def session_state_for(
+    *, status: str, recovery: RecoveryState, terminal: bool = False
+) -> SessionState:
+    """Project the small authoritative lifecycle from legacy status fields.
+
+    ``LiveStatus`` is kept for compatibility with the existing public API.
+    Business code should use this projection instead of combining status, gap,
+    and advice flags independently.
+    """
+
+    if status == "sealed":
+        return "SEALED"
+    if terminal or status == "finalizing":
+        return "TERMINAL"
+    if recovery == "BLOCKED":
+        return "BLOCKED"
+    if recovery == "RESYNCING":
+        return "RESYNCING"
+    return "RUNNING"
+
+
+def advice_matches_snapshot(
+    advice: LiveAdvice | None, snapshot: TrustedGameSnapshot
+) -> bool:
+    """Return whether an advice value belongs to the current session revision."""
+
+    if advice is None:
+        return False
+    key = request_key(snapshot)
+    return advice.key == key
 
 
 def _observed_at(action: GameAction) -> datetime:
@@ -378,8 +451,18 @@ def project_engine_result(
     local_rule_hint: object | None = None,
     local_rule_hint_pending: bool = False,
 ) -> tuple[LiveUpdate, LiveStatus, LiveAdvice | None, int]:
+    """Project one engine result without allowing stale advice to leak.
+
+    Advice is versioned by ``turn_id`` and ``state_revision``.  This function
+    is the one presentation boundary where that invariant is enforced for
+    engine-driven transitions; the session runtime enforces the same rule for
+    asynchronous results and lifecycle calls.
+    """
+
     update = result.update
     if update is None:
+        # A rejected engine input closes the current projection; never reuse old advice.
+        latest_advice = None
         sequence += 1
         projected = live_update(
             status=status, snapshot=snapshot, sequence=sequence,
@@ -388,15 +471,34 @@ def project_engine_result(
             block_reason="engine_input_rejected",
         )
         return projected, status, latest_advice, sequence
+
     sequence = max(sequence, update.version.update_sequence)
     opportunity = update.advice_opportunity
-    if opportunity and opportunity.status is not OpportunityStatus.READY:
-        latest_advice = opportunity_advice(snapshot, opportunity)
-    elif opportunity and (
-        latest_advice is None
-        or latest_advice.key.state_revision != update.version.state_revision
-    ):
-        latest_advice = requested_advice(snapshot)
+    recovery = recovery_state_for_gap(
+        update.gap, terminal=bool(getattr(snapshot, "terminal", False))
+    )
+
+    if opportunity is not None:
+        if opportunity.status is not OpportunityStatus.READY:
+            # A blocked/stale value is a new non-visible lifecycle value, not
+            # the old recommendation.  Its key is the current engine key.
+            latest_advice = opportunity_advice(snapshot, opportunity)
+        elif (
+            latest_advice is None
+            or latest_advice.key != request_key(snapshot)
+            or recovery != "RUNNING"
+        ):
+            latest_advice = requested_advice(snapshot) if recovery == "RUNNING" else None
+    elif not advice_matches_snapshot(latest_advice, snapshot):
+        latest_advice = None
+
+    # Never carry a visible recommendation through recovery or terminal
+    # detection, even if the engine did not publish a new opportunity.
+    if recovery != "RUNNING" and latest_advice is not None and latest_advice.visible:
+        latest_advice = None
+    if getattr(snapshot, "terminal", False):
+        latest_advice = None
+
     gap = update.gap
     blocked = gap.reason.value if gap and gap.phase is not GapPhase.CLEAR else ""
     if gap and gap.phase in {GapPhase.BLOCKING, GapPhase.EXPIRED}:
@@ -449,6 +551,8 @@ def live_update(
 __all__ = [
     "VisionRuntimeLike", "consume_vision", "correction_event", "live_update",
     "manual_confirmation_candidate", "opportunity_advice",
-    "project_engine_result", "requested_advice", "runtime_result_to_advice",
-    "trusted_candidate", "trusted_to_live_snapshot",
+    "AdviceState", "SessionState", "RecoveryState",
+    "advice_matches_snapshot", "recovery_state_for_gap",
+    "session_state_for", "project_engine_result", "requested_advice",
+    "runtime_result_to_advice", "trusted_candidate", "trusted_to_live_snapshot",
 ]

@@ -46,6 +46,7 @@ class RecognitionResult:
     annotations: tuple[RecognitionAnnotation, ...] = ()
     buttons: tuple[str, ...] = ()
     elapsed_ms: float = 0.0
+    lead_evidence: tuple[LeadEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,40 @@ class FastSignalResult:
 
 
 @dataclass(frozen=True)
+class LeadEvidence:
+    """Auditable evidence for one possible opening leader.
+
+    The three component scores deliberately remain separate: a weak first-play
+    glyph must not erase a stable card action, and a timer alone must not
+    establish a session.  ``status`` and ``rejection_reason`` make the
+    candidate chain inspectable without changing the legacy signal fields.
+    """
+
+    candidate_seat: Seat
+    first_play_score: float = 0.0
+    card_action_score: float = 0.0
+    timer_score: float = 0.0
+    status: str = "pending"
+    rejection_reason: str | None = None
+
+    @property
+    def seat(self) -> Seat:
+        """Compatibility alias for callers that use the shorter seat name."""
+
+        return self.candidate_seat
+
+    @property
+    def candidate_score(self) -> float:
+        """Best independent evidence, not a hidden blended confidence."""
+
+        return max(
+            float(self.first_play_score),
+            float(self.card_action_score),
+            float(self.timer_score),
+        )
+
+
+@dataclass(frozen=True)
 class OpeningSignal:
     """Raw opening evidence, before the live state machine commits a lead."""
 
@@ -109,3 +144,18 @@ class OpeningSignal:
     active_player: Seat | None
     self_action_buttons_visible: bool
     game_end_control: str | None = None
+    # Appended defaults preserve the positional compatibility of older
+    # recognizer plug-ins and test doubles.
+    lead_evidence: tuple[LeadEvidence, ...] = ()
+
+    @property
+    def candidates(self) -> tuple[LeadEvidence, ...]:
+        """Candidate alias used by newer opening-chain consumers."""
+
+        return self.lead_evidence
+
+    @property
+    def candidate_scores(self) -> dict[Seat, float]:
+        """Expose per-seat scores without forcing callers to parse evidence."""
+
+        return {item.candidate_seat: item.candidate_score for item in self.lead_evidence}

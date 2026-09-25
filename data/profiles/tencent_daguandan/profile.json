@@ -15,8 +15,9 @@
   "recording_mode": "all",
   "fabledan_debug": true,
   "aspect_ratio_tolerance": 0.03,
-  "capture_backend": "auto",
-  "allow_screen_fallback": true,
+  "capture_backend": "printwindow",
+  "allow_screen_fallback": false,
+  "allow_resize": false,
   "detect_black_bars": false,
   "viewport_mode": "bottom_aspect",
   "viewport_aspect_ratio": 1.7777777777777777,
@@ -50,6 +51,6 @@
       "play"
     ]
   },
-  "recording_max_total_bytes": 21474836480,
-  "automatic_log_include_media": false
+  "recording_max_total_bytes": 53687091200,
+  "automatic_log_include_media": true
 }

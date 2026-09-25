@@ -856,6 +856,20 @@ def replay_video_through_live_pipeline(
     if not use_live_pipeline and lead_player not in {"self", "right", "opposite", "left"}:
         raise ValueError("复测基线中的首出座位无效")
 
+    replay_action_events = tuple(
+        event for event in expected_events
+        if event.event_type in {"player_played", "player_passed", "manual_confirmed_event"}
+    )
+    # A replay containing only the persisted initial-state event has no visual
+    # opening action to rediscover.  Treat that explicit stored baseline as a
+    # historical entry point so advisor replay remains compatible; sessions
+    # with real action events still go through the visual opening path.
+    replay_baseline_only = bool(
+        use_live_pipeline
+        and lead_player in {"self", "right", "opposite", "left"}
+        and not replay_action_events
+    )
+
     video_source = VideoReplaySource(video_path, frame_index_path)
     indexed_frame_count = video_source.indexed_frame_count
     frames = iter(video_source.envelopes())
@@ -923,13 +937,15 @@ def replay_video_through_live_pipeline(
             # phase as a new live game.  The saved timeline remains the
             # comparison baseline only; it is not permitted to pre-fill who
             # leads this replay.
-            lead_player=lead_player if use_saved_baseline else (
-                None if use_live_pipeline else lead_player
+            lead_player=(
+                lead_player
+                if (use_saved_baseline or replay_baseline_only)
+                else (None if use_live_pipeline else lead_player)
             ),
             # 必须与录像时间线对齐，保证区域生命周期从首帧开始计时。
             monotonic_ms=int(first_frame.captured_monotonic_ms),
             wall_time=first_frame.wall_time,
-            historical_scan=use_saved_baseline,
+            historical_scan=bool(use_saved_baseline or replay_baseline_only),
         )
         try:
             for envelope in chain(prefetched_frames, frames):

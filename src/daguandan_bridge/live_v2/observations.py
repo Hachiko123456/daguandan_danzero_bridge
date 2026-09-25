@@ -78,8 +78,9 @@ def require_suit_options(
 
     A rank-only observation such as ``7?`` is intentionally not a physical
     card and therefore cannot be required to occur literally in its options.
-    Its options must instead contain one or more concrete cards of rank 7.
-    Determined cards retain the stricter self-membership rule.
+    Its options may contain either concrete cards of rank 7 or legacy suit
+    labels (``S/H/C/D``) aligned to that rank. Determined cards retain the
+    stricter self-membership rule.
     """
     require_tuple(suit_options, "suit_options")
     if len(suit_options) != len(cards):
@@ -96,11 +97,17 @@ def require_suit_options(
             # that placeholder, but validate every non-marker option strictly.
             if not concrete:
                 continue
-            if any(not _is_physical_card(option) for option in concrete):
+            if any(
+                option not in _CARD_SUITS and not _is_physical_card(option)
+                for option in concrete
+            ):
                 raise ValueError(
-                    "unknown-suit card options must contain concrete physical cards"
+                    "unknown-suit card options must contain suits or concrete physical cards"
                 )
-            if any(option[:-1] != unknown_rank for option in concrete):
+            if any(
+                _is_physical_card(option) and option[:-1] != unknown_rank
+                for option in concrete
+            ):
                 raise ValueError(
                     "unknown-suit card options must preserve the observed rank"
                 )

@@ -808,6 +808,7 @@ def _orchestrator(
     round_level="2",
     settle_ms=100,
     hand=HAND,
+    opening_action=None,
     **options,
 ):
     store = LiveSessionStore(tmp_path / "profiles", "tencent_daguandan", session_id="game")
@@ -832,12 +833,15 @@ def _orchestrator(
         minimum_free_bytes=0,
         **options,
     )
-    orchestrator.start(
-        round_level=round_level,
-        hand=hand,
-        lead_player=lead_player,
-        monotonic_ms=0,
-    )
+    start_kwargs = {
+        "round_level": round_level,
+        "hand": hand,
+        "lead_player": lead_player,
+        "monotonic_ms": 0,
+    }
+    if opening_action is not None:
+        start_kwargs["opening_action"] = opening_action
+    orchestrator.start(**start_kwargs)
     return orchestrator
 
 
@@ -4037,7 +4041,7 @@ def test_self_response_preflight_is_cancelled_by_pause(tmp_path):
     orchestrator.finish()
 
 
-def test_self_lead_does_not_wait_for_response_preflight(tmp_path):
+def test_self_lead_does_not_request_advice_before_first_action(tmp_path):
     advisor = SuccessfulAdviceService()
     orchestrator = _orchestrator(
         tmp_path,
@@ -4047,6 +4051,18 @@ def test_self_lead_does_not_wait_for_response_preflight(tmp_path):
         advisor=advisor,
     )
 
+    assert not advisor.called.wait(0.40)
+    assert advisor.calls == 0
+    assert orchestrator.first_action_pending is True
+
+    # Once the opening action is real and the trick returns to self, advice is
+    # allowed through the ordinary response-turn path.
+    orchestrator.commit_trusted_action(
+        actor="self", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="right", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=30)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=40)
     assert advisor.called.wait(1.0)
     assert orchestrator.wait_for_advice_idle(timeout=1.0)
     assert advisor.calls == 1
@@ -5268,9 +5284,16 @@ def test_stopping_inflight_advice_persists_cancelled_terminal_and_signals(tmp_pa
     orchestrator = _orchestrator(
         tmp_path,
         [],
-        lead_player="self",
+        lead_player="right",
         advisor=advisor,
     )
+    # Advice is intentionally deferred until the first action is confirmed.
+    orchestrator.commit_trusted_action(
+        actor="right", cards=("3S",), is_pass=False, monotonic_ms=10
+    )
+    orchestrator.commit_trusted_action(actor="opposite", is_pass=True, monotonic_ms=20)
+    orchestrator.commit_trusted_action(actor="left", is_pass=True, monotonic_ms=30)
+    orchestrator.commit_trusted_action(actor="self", is_pass=True, monotonic_ms=40)
     assert advisor.started.wait(2)
 
     finished = threading.Event()

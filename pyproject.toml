@@ -27,7 +27,57 @@ include = ["daguandan_bridge*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
+norecursedirs = ["codex_project_analysis"]
 tmp_path_retention_policy = "failed"
 markers = [
+  "unit: fast isolated unit tests",
+  "contract: validates stable external and internal contracts",
+  "visual_fixture: uses visual fixtures or image-based test assets",
+  "integration: exercises multiple components together",
+  "replay: validates deterministic replay workflows",
   "windows_integration: requires a visible real Win32 desktop and HWND",
+  "slow: tests that may take longer than the normal suite",
+  "benchmark: performance and benchmark tests",
+  "legacy_compat: verifies compatibility with legacy behavior or data",
+  "data_quality: validates dataset and evidence quality",
+]
+[tool.daguandan.test_layers]
+# Exact files/directories form the marker bridge; no filename globs are used.
+unit = [
+  "tests/test_action_uncertainty.py",
+  "tests/test_card_uncertainty.py",
+  "tests/test_compact_view_state.py",
+  "tests/test_display_text.py",
+  "tests/test_local_rule_hint.py",
+  "tests/test_opening_gate.py",
+  "tests/test_opening_readiness.py",
+  "tests/live_v2/test_game_state.py",
+  "tests/live_v2/test_turn_core.py",
+  "tests/test_run_test_layers.py",
+]
+contract = [
+  "tests/live_v2/test_architecture.py",
+  "tests/test_action_interpretation_cross_engine_matching_contract.py",
+  "tests/test_game_action_invariant_contract.py",
+  "tests/test_live_v2_session_production_contract.py",
+]
+visual_fixture = [
+  "tests/test_visual_fixture_layers.py",
+  "tests/test_visual_resource_boundaries.py",
+  "tests/test_failure_scope_acceptance.py",
+]
+integration = [
+  "tests/test_live_v2_session_factory.py",
+  "tests/test_live_end_to_end.py",
+  "tests/test_failure_scope_acceptance.py",
+]
+replay = [
+  "tests/test_live_v2_recorded_replay.py",
+  "tests/test_live_replay.py",
+]
+data_quality = [
+  "tests/test_session_health.py",
+  "tests/test_truth_log_semantic_validation.py",
+  "tests/test_fabledan_training_data.py",
 ]

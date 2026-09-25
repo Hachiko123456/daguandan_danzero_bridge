@@ -31,14 +31,14 @@ def test_cross_session_old_advice_cannot_show_on_same_numeric_turn():
     assert not project_compact_view(current, now_ms=100).cards
 
 
-def test_canonical_history_hold_can_show_independent_local_hint_without_mutation():
+def test_formal_recovery_withheld_outranks_local_hint_without_mutation():
     current = update(player="right")
     original = replace(current.advice, status="withheld", visible=False, withhold_reason="turn_recovery_pending")
     current.advice = original
     current.local_rule_hint = LocalRuleHint("s1", 1, 1, 100, 110, 600, .99, (400, 600, 80, 30))
     state = project_compact_view(current, now_ms=200)
-    assert state.kind == "local_rule_hint" and state.title == "不出"
-    assert state.detail == "牌局记录待同步"
+    assert state.kind == "confirming" and state.title == "确认中…"
+    assert state.detail == "正在确认上一手"
     assert current.advice is original and current.snapshot.current_player == "right"
     assert project_compact_view(current, now_ms=601).kind == "confirming"
     current.capture_generation = 2
@@ -58,7 +58,7 @@ def test_foreign_wait_and_visual_conflict_are_not_confused():
     current = update(player="left")
     assert project_compact_view(current, now_ms=100).title == "等待自己回合"
     current.fast_signals = NS(active_player="self", self_action_buttons_visible=True)
-    assert project_compact_view(current, now_ms=100).title == "暂无法推荐"
+    assert project_compact_view(current, now_ms=100).title == "暂不推荐"
     assert "未对齐" in project_compact_view(current, now_ms=100).detail
 
 
@@ -103,7 +103,7 @@ def test_recovery_budget_has_structured_cause_without_rendering_internal_text():
     current.missing_player = "right"
     current.missing_action_kind = "action"
     state = project_compact_view(current, now_ms=100)
-    assert state.title == "暂无法推荐"
+    assert state.title == "暂不推荐"
     assert state.detail == "右家上一手未确认，请先手动出牌"
     assert "INTERNAL" not in state.detail
 
@@ -128,7 +128,7 @@ def test_production_live_update_projects_structured_missing_action_kind(action_k
         missing_action_kind=action_kind,
     )
     state = project_compact_view(production_update, now_ms=100)
-    assert state.kind == "blocked" and state.title == "暂无法推荐"
+    assert state.kind == "blocked" and state.title == "暂不推荐"
     assert state.detail == expected and not state.cards
     assert "误认" not in state.detail and "左家" not in state.detail
 
@@ -144,3 +144,62 @@ def test_unknown_seat_or_terminal_history_conflict_stays_neutral():
     state = project_compact_view(production_update, now_ms=100)
     assert state.detail == "牌局记录未完整跟上，请先手动出牌"
     assert "误检" not in state.detail and "首出" not in state.detail
+
+
+def test_withheld_block_with_local_hint_displays_not_recommended():
+    current = update()
+    current.advice = replace(
+        current.advice,
+        status="withheld",
+        visible=False,
+        withhold_reason="turn_recovery_budget_exceeded",
+    )
+    current.local_rule_hint = LocalRuleHint("s1", 1, 1, 100, 110, 600, .99, (400, 600, 80, 30))
+
+    state = project_compact_view(current, now_ms=200)
+
+    assert state.kind == "blocked"
+    assert state.title == "暂不推荐"
+    assert state.detail == "回合信息未对齐，请先手动出牌"
+    assert not state.cards
+
+
+def test_local_pass_displays_pass_without_advice_cards():
+    current = update()
+    current.advice = None
+    current.local_rule_hint = LocalRuleHint("s1", 1, 1, 100, 110, 600, .99, (400, 600, 80, 30))
+
+    state = project_compact_view(current, now_ms=200)
+
+    assert state.kind == "local_rule_hint"
+    assert state.title == "不出"
+    assert not state.detail
+    assert not state.cards
+
+
+def test_fabledan_ready_displays_play_advice():
+    state = project_compact_view(update(), now_ms=100)
+
+    assert state.kind == "ready"
+    assert state.title == "出牌 · 单张"
+    assert state.cards == ("4S",)
+
+
+def test_repeated_projection_for_same_state_is_stable():
+    current = update()
+
+    first = project_compact_view(current, now_ms=100)
+    second = project_compact_view(current, now_ms=100)
+
+    assert first == second
+
+
+def test_review_required_and_unknown_status_compatibility_mapping():
+    current = update()
+    current.status = "review_required"
+    current.block_reason = "runtime_review_required"
+    assert project_compact_view(current, now_ms=100).title == "暂不推荐"
+
+    current = update()
+    current.advice = replace(current.advice, status="unknown")
+    assert project_compact_view(current, now_ms=100).kind == "waiting"

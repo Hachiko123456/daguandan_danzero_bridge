@@ -9,7 +9,12 @@ from daguandan_bridge.capture_service import (
 from daguandan_bridge.image_io import standardize_to_base
 from daguandan_bridge.models import ClientRect
 from daguandan_bridge.models import TargetWindow
-from daguandan_bridge.profiles import ProfileConfig, create_profile
+from daguandan_bridge.profiles import (
+    ProfileConfig,
+    create_profile,
+    get_profile_paths,
+    load_profile_config,
+)
 from daguandan_bridge.window_capture import (
     CapturedStandardizedFrame,
     TargetWindowError,
@@ -206,6 +211,94 @@ def test_capture_service_uses_a_profile_specific_client_size_when_configured(
 
     assert result == ClientRect(10, 20, 1280, 764)
     assert locked == [(target, (1280, 764))]
+
+
+def test_capture_service_does_not_resize_when_profile_disallows_resize(
+    tmp_path,
+    monkeypatch,
+):
+    service = CaptureService(tmp_path / "profiles")
+    create_profile(
+        service.profiles_root,
+        ProfileConfig(
+            "test_game",
+            "Test",
+            ("Test",),
+            base_size=(1280, 720),
+            target_client_size=(1280, 764),
+            allow_resize=False,
+        ),
+    )
+    target = TargetWindow(hwnd=123, title="Test Window")
+    actual_rect = ClientRect(10, 20, 1000, 600)
+    resize_calls = []
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.find_target_window",
+        lambda _keywords: target,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.get_client_rect_on_screen",
+        lambda passed_target: actual_rect if passed_target == target else None,
+    )
+    monkeypatch.setattr(
+        "daguandan_bridge.capture_service.resize_target_client",
+        lambda *_args: resize_calls.append(_args),
+    )
+
+    result = service.lock_target_client_size("test_game")
+
+    assert result == actual_rect
+    assert resize_calls == []
+
+
+def test_profile_allow_resize_is_appended_after_existing_positional_fields():
+    config = ProfileConfig(
+        "test_game",
+        "Test",
+        ("Test",),
+        (1280, 720),
+        0.5,
+        7,
+        0.04,
+        "screen",
+        False,
+        False,
+        "bottom_aspect",
+        4 / 3,
+        (1280, 764),
+        ProfileConfig.__dataclass_fields__["match_settings"].default_factory(),
+        ProfileConfig.__dataclass_fields__["counter_settings"].default_factory(),
+        "danzero",
+    )
+
+    assert config.allow_resize is True
+    assert config.advisor_strategy == "danzero"
+
+
+def test_profile_allow_resize_defaults_true_for_legacy_json(tmp_path):
+    service = CaptureService(tmp_path / "profiles")
+    paths = create_profile(
+        service.profiles_root,
+        ProfileConfig("test_game", "Test", ("Test",), allow_resize=False),
+    )
+    data = paths.profile_config_path.read_text(encoding="utf-8")
+    assert '"allow_resize"' in data
+    assert load_profile_config(paths).allow_resize is False
+
+    legacy_paths = get_profile_paths(service.profiles_root, "legacy_game")
+    legacy_paths.ensure_dirs()
+    legacy_paths.profile_config_path.write_text(
+        '''{
+  "name": "legacy_game",
+  "display_name": "Legacy",
+  "window_title_keywords": ["Legacy"],
+  "schema_version": 2
+}
+''',
+        encoding="utf-8",
+    )
+
+    assert load_profile_config(legacy_paths).allow_resize is True
 
 
 def test_live_source_reports_geometry_change_as_interruption(tmp_path, monkeypatch):

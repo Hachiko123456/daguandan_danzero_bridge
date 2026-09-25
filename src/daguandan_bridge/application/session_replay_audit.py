@@ -8,20 +8,25 @@ import hashlib
 import json
 import platform
 import re
+import shutil
 import subprocess
+import tempfile
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from contextlib import contextmanager
 from threading import Lock
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Iterator, Literal
 from uuid import uuid4
 
 import cv2
 
 from ..advisor_strategy import build_advisor
+from ..config import PROFILES_ROOT
 from ..annotation_service import AnnotationService
 from ..application.live_v2_recorded_replay import replay_video_through_production_live_v2
 from ..live.replay import (
@@ -68,6 +73,246 @@ class SessionReplayAuditRun:
     inventory_path: Path | None = None
     verification_path: Path | None = None
     execution_ok: bool = False
+
+
+@dataclass(frozen=True)
+class ReplayInput:
+    """Canonical input contract shared by diagnostic ZIP and session replay."""
+
+    source: Path
+    session: Path
+    profile_path: Path
+    source_health: dict[str, object]
+    profile_resource_match: dict[str, object]
+    input_kind: Literal["session", "diagnostic_zip"]
+    embedded_snapshot: bool
+
+
+@contextmanager
+def prepared_replay_input(
+    source: Path | str,
+    *,
+    fallback_profile: Path | str | None = None,
+    temporary_root: Path | str | None = None,
+    allow_missing_video: bool = False,
+) -> Iterator[ReplayInput]:
+    """Open a session or diagnostic ZIP using one deterministic input policy.
+
+    The policy is intentionally shared by the GUI diagnostic importer and the
+    listener regression service: an embedded profile snapshot wins, otherwise
+    the supplied profile is used.  The function never injects TruthLog into
+    visual replay; TruthLog remains post-replay comparison input.
+
+    ``allow_missing_video`` is a narrow compatibility escape hatch for legacy
+    test doubles that provide a frame index but intentionally do not create an
+    AVI.  Production ZIP/session imports keep the default strict requirement
+    that ``video/game.avi`` exists.
+    """
+
+    original = Path(source).expanduser().resolve()
+    archive = original
+    sibling_snapshot: Path | None = None
+    if original.is_dir() and not (original / "video" / "game.avi").is_file():
+        candidates = sorted(original.glob("*.zip"))
+        if candidates:
+            archive = candidates[0].resolve()
+        elif (original / "session" / "video" / "game.avi").is_file():
+            # Accept a directory wrapper containing the canonical ``session/``
+            # tree and an optional sibling ``profile_snapshot/`` tree.  This is
+            # the directory form of the same contract used by diagnostic ZIPs.
+            archive = (original / "session").resolve()
+            sibling_snapshot = original / "profile_snapshot"
+        elif allow_missing_video and (original / "video" / "frame_index.jsonl").is_file():
+            # Legacy injected replay tests use a synthetic session directory
+            # with frame metadata only; the injected visual runner does not
+            # open the AVI.  Keep this path explicit and never apply it to
+            # normal production input.
+            archive = original
+        else:
+            raise ValueError("输入目录中没有可回放 session 或诊断 ZIP")
+
+    created_temp: tempfile.TemporaryDirectory[str] | None = None
+    root: Path
+    input_kind: Literal["session", "diagnostic_zip"]
+    snapshot_root: Path | None = None
+    try:
+        if archive.is_file() and archive.suffix.casefold() == ".zip":
+            input_kind = "diagnostic_zip"
+            if temporary_root is None:
+                created_temp = tempfile.TemporaryDirectory(prefix="guandan-replay-input-")
+                root = Path(created_temp.name)
+            else:
+                root = Path(temporary_root).expanduser().resolve()
+                root.mkdir(parents=True, exist_ok=True)
+            session = root / "session"
+            snapshot_root = root / "profile_snapshot"
+            _extract_replay_zip(archive, session, snapshot_root)
+        elif archive.is_dir() and (
+            (archive / "video" / "game.avi").is_file()
+            or (
+                allow_missing_video
+                and (archive / "video" / "frame_index.jsonl").is_file()
+            )
+        ):
+            input_kind = "session"
+            session = archive
+            snapshot_root = archive / "profile_snapshot"
+            if not snapshot_root.is_dir() and sibling_snapshot is not None:
+                snapshot_root = sibling_snapshot
+            elif not snapshot_root.is_dir() and (archive.parent / "profile_snapshot").is_dir():
+                snapshot_root = archive.parent / "profile_snapshot"
+        else:
+            raise ValueError("请选择完整诊断 ZIP 或包含 game.avi 的 session 目录")
+
+        if not (session / "video" / "game.avi").is_file() and not allow_missing_video:
+            raise ValueError("回放输入缺少 video/game.avi")
+        if not (session / "video" / "frame_index.jsonl").is_file():
+            raise ValueError("回放输入缺少 video/frame_index.jsonl")
+
+        profile_path, embedded = _select_replay_profile(
+            snapshot_root, fallback_profile=fallback_profile
+        )
+        yield ReplayInput(
+            source=original,
+            session=session.resolve(),
+            profile_path=profile_path,
+            source_health=_source_health(session),
+            profile_resource_match=_profile_resource_match(
+                session, profile_path, embedded=embedded
+            ),
+            input_kind=input_kind,
+            embedded_snapshot=embedded,
+        )
+    finally:
+        if created_temp is not None:
+            created_temp.cleanup()
+
+
+def _extract_replay_zip(archive_path: Path, session: Path, snapshot: Path) -> None:
+    session_root = session.resolve()
+    snapshot_root = snapshot.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            name = info.filename.replace("\\", "/")
+            if not name or name.endswith("/"):
+                continue
+            if not (name.startswith("session/") or name.startswith("profile_snapshot/")):
+                continue
+            base = session if name.startswith("session/") else snapshot
+            base_root = session_root if base is session else snapshot_root
+            relative = Path(name.split("/", 1)[1])
+            target = (base / relative).resolve()
+            if target != base_root and base_root not in target.parents:
+                raise ValueError("诊断 ZIP 含有越界路径")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source_stream, target.open("wb") as target_stream:
+                shutil.copyfileobj(source_stream, target_stream)
+
+
+def _select_replay_profile(
+    snapshot_root: Path | None, *, fallback_profile: Path | str | None
+) -> tuple[Path, bool]:
+    if snapshot_root is not None and snapshot_root.is_dir():
+        candidates: list[Path] = []
+        if (snapshot_root / "profile.json").is_file():
+            candidates.append(snapshot_root)
+        candidates.extend(
+            sorted(
+                path for path in snapshot_root.iterdir()
+                if path.is_dir() and (path / "profile.json").is_file()
+            )
+        )
+        if candidates:
+            return candidates[0].resolve(), True
+    if fallback_profile is None:
+        fallback = (PROFILES_ROOT / "tencent_daguandan").resolve()
+    else:
+        fallback = Path(fallback_profile).expanduser().resolve()
+    return fallback, False
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _source_health(session: Path) -> dict[str, object]:
+    manifest = _read_json_object(session / "manifest.json")
+    health = _read_json_object(session / "health_audit.json")
+    recording = manifest.get("recording_integrity")
+    if not isinstance(recording, dict):
+        recording = health.get("recording_integrity")
+    recording = recording if isinstance(recording, dict) else {}
+    required = {
+        "video": (session / "video" / "game.avi").is_file(),
+        "frame_index": (session / "video" / "frame_index.jsonl").is_file(),
+    }
+    health_status = str(health.get("status", "")).upper() or None
+    recording_status = str(recording.get("status", "")).upper() or None
+    if not all(required.values()) or health_status == "FAIL" or recording_status in {"FAIL", "PARTIAL"}:
+        status = "FAIL"
+    elif health_status == "PASS" or recording_status == "PASS":
+        status = "PASS"
+    else:
+        status = "UNKNOWN"
+    return {
+        "status": status,
+        "health_audit_status": health_status,
+        "recording_integrity_status": recording_status,
+        "required_files": required,
+        "issues": list(health.get("issues", ()) or ()),
+        "recording_integrity": recording,
+    }
+
+
+def _profile_resource_match(
+    session: Path, profile_path: Path, *, embedded: bool
+) -> dict[str, object]:
+    manifest = _read_json_object(session / "manifest.json")
+    source_identity = manifest.get("recognition_resource_identity")
+    source_identity = source_identity if isinstance(source_identity, dict) else None
+    source_config = manifest.get("configuration_hash")
+    current_identity = None
+    if (profile_path / "profile.json").is_file():
+        try:
+            from ..resource_fingerprint import recognition_resource_identity
+            current_identity = recognition_resource_identity(
+                profile_path.parent, profile_path.name
+            )
+        except (OSError, RuntimeError, ValueError):
+            current_identity = None
+    current_config = None
+    profile_file = profile_path / "profile.json"
+    if profile_file.is_file():
+        current_config = _sha_file(profile_file)
+    source_sha = source_identity.get("sha256") if source_identity else None
+    current_sha = current_identity.get("sha256") if isinstance(current_identity, dict) else None
+    if isinstance(source_sha, str) and isinstance(current_sha, str):
+        matched: bool | None = source_sha == current_sha
+    elif source_config and current_config:
+        matched = str(source_config) == str(current_config)
+    else:
+        matched = None
+    if matched is True:
+        status = "embedded_match" if embedded else "match"
+    elif matched is False:
+        status = "embedded_mismatch" if embedded else "mismatch"
+    else:
+        status = "embedded_snapshot" if embedded else "unavailable"
+    return {
+        "status": status,
+        "source": "embedded_snapshot" if embedded else "fallback_profile",
+        "embedded_snapshot": embedded,
+        "profile_path": str(profile_path),
+        "profile_name": profile_path.name,
+        "source_configuration_hash": source_config,
+        "current_configuration_hash": current_config,
+        "source_resource_identity": source_identity,
+        "current_resource_identity": current_identity,
+    }
 
 
 def resolve_truth_audit_reference(
@@ -162,6 +407,7 @@ class SessionReplayAuditService:
         trusted_session_ids: Iterable[str] = (),
     ) -> None:
         self._profile_root = Path(profile_root).resolve() if profile_root is not None else None
+        self._uses_default_recognition = recognition_factory is None
         self._recognition_factory = recognition_factory or (
             _recognition_for_profile(self._profile_root)
             if self._profile_root is not None
@@ -338,6 +584,35 @@ class SessionReplayAuditService:
         *,
         on_progress: ProgressCallback | None = None,
     ) -> dict[str, object]:
+        # Use the same session/profile input contract as diagnostic ZIP replay.
+        # For ordinary session directories this is zero-copy; for a portable
+        # input it also honors an embedded profile snapshot.
+        with prepared_replay_input(
+            item.source,
+            fallback_profile=self._profile_root or item.source.parent.parent,
+            # Preserve the historical injected-test contract: those tests
+            # provide frame metadata and a fake visual runner, but no AVI.
+            # Real audit/replay inputs remain strict.
+            allow_missing_video=(
+                self._opening_probe is not None
+                or self._visual_replay is not replay_video_through_production_live_v2
+            ),
+        ) as replay_input:
+            return self._audit_session_impl(
+                item, output, scan_run_id, inventory, replay_input=replay_input,
+                on_progress=on_progress,
+            )
+
+    def _audit_session_impl(
+        self,
+        item: _Session,
+        output: Path,
+        scan_run_id: str | Iterable[str] | None,
+        inventory: dict[str, object],
+        *,
+        replay_input: ReplayInput,
+        on_progress: ProgressCallback | None = None,
+    ) -> dict[str, object]:
         """Run the visual audit first; load TruthLog only as post-run evidence.
 
         The default visual path intentionally starts with no TruthLog object and
@@ -362,6 +637,14 @@ class SessionReplayAuditService:
             "session_id": item.session_id,
             "status": "error",
             "execution_status": "error",
+            "source_health": replay_input.source_health,
+            "profile_resource_match": replay_input.profile_resource_match,
+            "visual_replay": {"status": "not_evaluated"},
+            "truth_comparison": {
+                "status": "not_available",
+                "strict_regression": False,
+                "reason": "TruthLog is optional and is loaded only after visual replay",
+            },
             "truth_quality": "not_available",
             "visual_quality": "not_evaluated",
             "fabledan_quality": "not_evaluated",
@@ -378,7 +661,14 @@ class SessionReplayAuditService:
         truth: TruthLog | None = None
         opening: dict[str, object] = {}
         try:
-            recognition = self._recognition_factory(item.source)
+            recognition = (
+                ScreenshotRecognitionService(
+                    AnnotationService(replay_input.profile_path.parent, replay_input.profile_path.name),
+                    TemplateService(replay_input.profile_path.parent, replay_input.profile_path.name),
+                )
+                if self._uses_default_recognition
+                else self._recognition_factory(item.source)
+            )
             legacy_probe = self._opening_probe
             if legacy_probe is not None:
                 # Compatibility path for injected test doubles.  The default
@@ -391,7 +681,7 @@ class SessionReplayAuditService:
             else:
                 report("opening", 0, 0, "生产开局链路：页面/牌桌/级牌/手牌/首出")
 
-            visual_advisor = self._advisor(item.source)
+            visual_advisor = self._advisor_for_profile(replay_input.profile_path)
             report("visual", 0, int(initial_frame_inventory.get("row_count", 0) or 0), "开始 LiveV2 视觉监听回放")
             visual_kwargs: dict[str, object] = {}
             if on_progress is not None:
@@ -401,7 +691,7 @@ class SessionReplayAuditService:
                     )
                 )
             if legacy_probe is None and self._visual_replay is replay_video_through_production_live_v2:
-                visual_kwargs["profile_root"] = self._profile_root or item.source.parent.parent
+                visual_kwargs["profile_root"] = replay_input.profile_path
                 visual_kwargs["advisor"] = visual_advisor
             else:
                 # Existing injected doubles use the historical signature, but
@@ -411,7 +701,7 @@ class SessionReplayAuditService:
                 visual_kwargs["recognition_strategy"] = "two_valid_streak"
                 visual_kwargs["advisor"] = visual_advisor
             result = self._visual_replay(
-                item.source,
+                replay_input.session,
                 recognition,
                 output_root=output / "visual_driven",
                 **visual_kwargs,
@@ -455,6 +745,7 @@ class SessionReplayAuditService:
             listener_status, listener_status_reason = _listener_completion(
                 result, visual, complete, legacy_compat=legacy_probe is not None
             )
+            visual_replay_status = "passed" if listener_status == "complete" else "incomplete"
             metrics = _field_metrics(truth, opening, visual) if truth else _na_metrics()
             divergence = _first_divergence(truth, opening, visual)
             runtime_listener_status = listener_status
@@ -521,6 +812,22 @@ class SessionReplayAuditService:
                 {
                     "status": "completed" if execution_complete else "error",
                     "execution_status": "completed" if execution_complete else "incomplete",
+                    "source_health": replay_input.source_health,
+                    "profile_resource_match": replay_input.profile_resource_match,
+                    "visual_replay": {
+                        "status": visual_replay_status,
+                        "listener_status": listener_status,
+                        "reason": listener_status_reason,
+                    },
+                    "truth_comparison": {
+                        "status": strict if strict != "diagnostic" else "not_available",
+                        "strict_regression": strict != "diagnostic",
+                        "truth_log_present": truth is not None,
+                        "reason": (
+                            "verified TruthLog comparison" if strict != "diagnostic"
+                            else "no verified TruthLog; visual result is diagnostic only"
+                        ),
+                    },
                     "frame_replay_status": "complete" if complete else "incomplete",
                     "opening_status": str(opening.get("status", "recognized" if opening else "not_observable")),
                     "listener_status": listener_status,
@@ -579,6 +886,10 @@ class SessionReplayAuditService:
 
     def _advisor(self, session: Path) -> Any:
         profile = self._profile_root or session.parent.parent
+        return self._advisor_for_profile(profile)
+
+    def _advisor_for_profile(self, profile: Path) -> Any:
+        profile = Path(profile).resolve()
         advisor = self._advisor_factory(profile.parent, profile.name)
         if hasattr(advisor, "write_decision_log"):
             advisor.write_decision_log = False
@@ -1578,8 +1889,23 @@ def _make_summary(*, run_id: str, rows: list[dict[str, object]], inventory: dict
         "environment": inventory.get("environment", {}), "session_count": len(rows), "completed": completed, "errors": len(rows) - completed,
         "frames_processed": sum(int(row.get("frames_processed", 0) or 0) for row in rows), "indexed_frames": sum(int(row.get("indexed_frames", 0) or 0) for row in rows),
         "source_integrity": {"unchanged": not source_changes, "changes": source_changes, "before_snapshot": str(source_snapshot_paths[0]), "after_snapshot": str(source_snapshot_paths[1])},
+        "source_health": _aggregate_layer(rows, "source_health", "status"),
+        "profile_resource_match": _aggregate_layer(rows, "profile_resource_match", "status"),
+        "visual_replay": _aggregate_layer(rows, "visual_replay", "status"),
+        "truth_comparison": _aggregate_layer(rows, "truth_comparison", "status"),
         "truth_levels": dict(Counter(str(row.get("truth_log", {}).get("kind", "none")) for row in rows)), "fabledan": _aggregate_advice(rows), "sessions": rows,
     }
+
+
+def _aggregate_layer(
+    rows: Iterable[dict[str, object]], field: str, key: str
+) -> dict[str, object]:
+    counts: Counter[str] = Counter()
+    for row in rows:
+        value = row.get(field, {})
+        value = value if isinstance(value, dict) else {}
+        counts[str(value.get(key, "unknown"))] += 1
+    return {"status_counts": dict(sorted(counts.items()))}
 
 
 def _aggregate_advice(rows: Iterable[dict[str, object]]) -> dict[str, object]:
@@ -1645,7 +1971,7 @@ def _write_failures_csv(path: Path, rows: Iterable[dict[str, object]]) -> None:
 
 def _write_markdown(path: Path, summary: dict[str, object]) -> None:
     integrity = summary.get("source_integrity", {})
-    lines = ["# 第一阶段：离线全量审计报告", "", f"- 对局：{summary.get('completed', 0)}/{summary.get('session_count', 0)} 完整执行", f"- 帧：{summary.get('frames_processed', 0)}/{summary.get('indexed_frames', 0)}", f"- 工具错误：{summary.get('errors', 0)}", f"- 源数据未变化：{'是' if integrity.get('unchanged') else '否'}", f"- 真值等级：{json.dumps(summary.get('truth_levels', {}), ensure_ascii=False)}", "", "## FableDan", ""]
+    lines = ["# 第一阶段：离线全量审计报告", "", f"- 对局：{summary.get('completed', 0)}/{summary.get('session_count', 0)} 完整执行", f"- 帧：{summary.get('frames_processed', 0)}/{summary.get('indexed_frames', 0)}", f"- 工具错误：{summary.get('errors', 0)}", f"- 源数据未变化：{'是' if integrity.get('unchanged') else '否'}", f"- 源数据健康：{json.dumps(summary.get('source_health', {}), ensure_ascii=False)}", f"- 配置/资源匹配：{json.dumps(summary.get('profile_resource_match', {}), ensure_ascii=False)}", f"- 视觉回放：{json.dumps(summary.get('visual_replay', {}), ensure_ascii=False)}", f"- TruthLog 对比：{json.dumps(summary.get('truth_comparison', {}), ensure_ascii=False)}", f"- 真值等级：{json.dumps(summary.get('truth_levels', {}), ensure_ascii=False)}", "", "## FableDan", ""]
     for channel, data in summary.get("fabledan", {}).items():
         lines.append(f"- {channel}：{json.dumps(data, ensure_ascii=False)}")
     lines.extend(["", "## 会话", ""])

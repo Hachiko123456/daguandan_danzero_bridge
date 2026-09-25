@@ -209,6 +209,8 @@ class LiveV2LifecycleMixin:
                 include_media=bool(
                     getattr(self.store, "automatic_log_include_media", False)
                 ),
+                profiles_root=getattr(self.store, "profiles_root", None),
+                profile_name=getattr(self.store, "profile_name", None),
             ).to_dict()
         except Exception as exc:
             document = {"status": "FAIL", "error": f"{type(exc).__name__}: {exc}"}
