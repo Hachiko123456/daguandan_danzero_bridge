@@ -9,12 +9,14 @@ if /I "%~1"=="-h" goto :usage
 set "ReleaseRoot=%~1"
 set "WheelhouseRoot=%~2"
 set "OverwriteFlag="
+set "AllowDirtyFlag="
 set "DefaultWheelhouse=0"
 set "NeedPrepareWheelhouse=0"
 
 if "%~1"=="" (
   set "ReleaseRoot=%~dp0release\current"
   set "OverwriteFlag=-OverwriteExisting"
+  set "AllowDirtyFlag=-AllowDirtyDevelopmentBuild"
 )
 
 if "%~2"=="" (
@@ -64,7 +66,7 @@ echo.
 echo [3/3] 构建发布包
 echo Release output directory: "%ReleaseOutputDirectory%"
 if defined OverwriteFlag (
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%" -OverwriteExisting
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%" -OverwriteExisting %AllowDirtyFlag%
 ) else (
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%"
 )
@@ -91,7 +93,9 @@ echo   RELEASE_ROOT   %~dp0release\current
 echo   WHEELHOUSE_ROOT %%LOCALAPPDATA%%\Daguandan\wheelhouse
 echo.
 echo When RELEASE_ROOT is omitted, the default current release directory is rebuilt
-echo automatically by passing -OverwriteExisting to scripts\package_release.ps1.
+echo automatically by passing -OverwriteExisting and -AllowDirtyDevelopmentBuild to
+echo scripts\package_release.ps1. This default development build tolerates untracked
+echo diagnostic materials in the working tree; explicit ReleaseRoot builds remain strict.
 echo When WHEELHOUSE_ROOT is omitted, this launcher checks the default wheelhouse
 echo and runs scripts\prepare_release_wheelhouse.ps1 before packaging if the
 echo ownership marker or completion lock file is missing.

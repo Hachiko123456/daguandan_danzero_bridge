@@ -84,6 +84,33 @@ finally {
     Remove-Item -LiteralPath $runtimeRequirements -Force -ErrorAction SilentlyContinue
 }
 
+function Get-ReleaseFileHash {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $LiteralPath
+    )
+
+    # Keep the native cmdlet path when available, while supporting legacy
+    # Windows PowerShell installations that predate Get-FileHash.
+    $getFileHash = Get-Command -Name Get-FileHash -CommandType Cmdlet -ErrorAction SilentlyContinue
+    if ($null -ne $getFileHash) {
+        return (Get-FileHash -LiteralPath $LiteralPath -Algorithm SHA256).Hash
+    }
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($LiteralPath)
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        $sha256.Dispose()
+    }
+}
 $candidateRequirements = Join-Path $wheelhouse "requirements-release.candidate.lock"
 $candidateWheelhouse = Join-Path $wheelhouse "wheelhouse.candidate.lock.json"
 & $Python (Join-Path $projectRoot "scripts\generate_release_lock.py") `
@@ -94,12 +121,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Candidate wheelhouse lock generation failed."
 }
 
-if ((Get-FileHash -LiteralPath $candidateRequirements -Algorithm SHA256).Hash -ne `
-    (Get-FileHash -LiteralPath (Join-Path $projectRoot "requirements-release.lock") -Algorithm SHA256).Hash) {
+if ((Get-ReleaseFileHash -LiteralPath $candidateRequirements) -ne `
+    (Get-ReleaseFileHash -LiteralPath (Join-Path $projectRoot "requirements-release.lock"))) {
     throw "Downloaded wheels do not match the committed requirements lock. Review candidate lock files."
 }
-if ((Get-FileHash -LiteralPath $candidateWheelhouse -Algorithm SHA256).Hash -ne `
-    (Get-FileHash -LiteralPath (Join-Path $projectRoot "wheelhouse.lock.json") -Algorithm SHA256).Hash) {
+if ((Get-ReleaseFileHash -LiteralPath $candidateWheelhouse) -ne `
+    (Get-ReleaseFileHash -LiteralPath (Join-Path $projectRoot "wheelhouse.lock.json"))) {
     throw "Downloaded wheels do not match the committed wheelhouse lock. Review candidate lock files."
 }
 

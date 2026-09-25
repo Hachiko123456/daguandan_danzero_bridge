@@ -103,7 +103,9 @@ CPython 工具链哈希完全一致：
 随后可直接运行批处理入口完成常规本机构建；不传参数时默认输出到仓库内的
 `release\current`，并从 `%LOCALAPPDATA%\Daguandan\wheelhouse` 读取 wheelhouse。
 如果默认 wheelhouse 不存在或缺少完成锁文件，批处理入口会先自动运行
-`scripts\prepare_release_wheelhouse.ps1` 准备依赖。默认 `release\current` 会自动以受管方式覆盖重建，因此日常打包无需每次输入路径：
+`scripts\prepare_release_wheelhouse.ps1` 准备依赖。默认 `release\current` 会自动以受管方式覆盖重建，并传入
+`-AllowDirtyDevelopmentBuild`，因此工作区存在未跟踪诊断资料时仍可直接完成日常开发打包，
+无需每次输入路径。显式指定 `ReleaseRoot` 的候选构建仍保持严格源码脏检查，不会自动放宽：
 
 ```bat
 .\package_release.bat

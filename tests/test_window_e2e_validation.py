@@ -848,6 +848,10 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
     assert 'set "ReleaseRoot=%~dp0release\\current"' in launcher
     assert 'set "WheelhouseRoot=%LOCALAPPDATA%\\Daguandan\\wheelhouse"' in launcher
     assert 'set "OverwriteFlag=-OverwriteExisting"' in launcher
+    assert 'set "AllowDirtyFlag=-AllowDirtyDevelopmentBuild"' in launcher
+    assert '-OverwriteExisting %AllowDirtyFlag%' in launcher
+    assert '-ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%"' in launcher
+    assert 'if defined OverwriteFlag (' in launcher
     assert 'set "DefaultWheelhouse=0"' in launcher
     assert 'set "NeedPrepareWheelhouse=0"' in launcher
     assert '[1/3] 检查 wheelhouse' in launcher
@@ -874,6 +878,8 @@ def test_package_script_requires_unique_external_offline_roots_and_clean_build_e
     assert help_completed.returncode == 0
     assert "Usage: package_release.bat [RELEASE_ROOT [WHEELHOUSE_ROOT]]" in help_completed.stdout
     assert r"%LOCALAPPDATA%\Daguandan\wheelhouse" in help_completed.stdout
+    assert "-AllowDirtyDevelopmentBuild" in help_completed.stdout
+    assert "explicit ReleaseRoot builds remain strict" in help_completed.stdout
     assert "-OverwriteExisting" in help_completed.stdout
 
     gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
