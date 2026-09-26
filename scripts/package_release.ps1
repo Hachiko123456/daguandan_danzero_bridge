@@ -110,17 +110,14 @@ function Assert-DisjointRoots {
     }
 }
 
-function Clear-ManagedReleaseRoot {
+function Assert-ManagedReleaseRoot {
     param(
-        [Parameter(Mandatory = $true)][string] $Root,
-        [Parameter(Mandatory = $true)][bool] $Overwrite
+        [Parameter(Mandatory = $true)][string] $Root
     )
     $fullRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     if (-not [System.IO.Directory]::Exists($fullRoot)) {
+        if (Test-Path -LiteralPath $fullRoot) { throw "Managed release root is not a directory: $fullRoot" }
         return
-    }
-    if (-not $Overwrite) {
-        throw "ReleaseRoot already exists. Use -OverwriteExisting only for a managed current release root: $fullRoot"
     }
     Assert-NoReparseTree -LiteralPath $fullRoot
     $markerPath = Join-Path $fullRoot ".daguandan-release-root"
@@ -133,7 +130,7 @@ function Clear-ManagedReleaseRoot {
     $managed = @(
         "build", "build-env", "dist", "payload", "spec", "temp", "pyinstaller-config",
         "DaguandanAssistant.zip", "DaguandanAssistant.zip.sha256", "DaguandanAssistant.release.json",
-        "source_identity.json", "release_input_audit.json", "bootstrap_python_audit.json"
+        "source_identity.json", "release_input_audit.json", "bootstrap_python_audit.json", "build_metrics.json"
     )
     foreach ($entry in Get-ChildItem -LiteralPath $fullRoot -Force) {
         if ($entry.Name -eq ".daguandan-release-root") { continue }
@@ -141,12 +138,114 @@ function Clear-ManagedReleaseRoot {
             throw "Existing ReleaseRoot contains unmanaged content; refusing to delete: $($entry.FullName)"
         }
     }
-    foreach ($name in $managed) {
-        $candidate = Join-Path $fullRoot $name
-        if (Test-Path -LiteralPath $candidate) {
-            Remove-Item -LiteralPath $candidate -Recurse -Force
+}
+
+function Clear-ManagedReleaseRoot {
+    param([Parameter(Mandatory=$true)][string] $Root, [Parameter(Mandatory=$true)][bool] $Overwrite)
+    if (-not $Overwrite) { throw "Explicit overwrite permission is required." }
+    Assert-ManagedReleaseRoot -Root $Root
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if ($fullRoot -eq [IO.Path]::GetPathRoot($fullRoot).TrimEnd('\')) { throw "Refuse root deletion." }
+    foreach ($entry in Get-ChildItem -LiteralPath $fullRoot -Force) {
+        if ($entry.Name -eq '.daguandan-release-root') { continue }
+        $candidate = [IO.Path]::GetFullPath($entry.FullName)
+        if ([IO.Path]::GetDirectoryName($candidate) -ne $fullRoot) { throw "Cleanup escaped managed root." }
+        Remove-Item -LiteralPath $candidate -Recurse -Force
+    }
+}
+
+function Ensure-OwnedBuildDirectory {
+    param([string] $Root, [string] $Marker, [string] $Identity)
+    Assert-NoReparsePathChain -LiteralPath $Root
+    $markerPath = Join-Path $Root $Marker
+    if (Test-Path -LiteralPath $Root) {
+        if (-not [IO.Directory]::Exists($Root)) { throw "Build root is not a directory: $Root" }
+        Assert-NoReparsePathChain -LiteralPath $markerPath
+        if (Test-Path -LiteralPath $markerPath) {
+            if ([IO.File]::ReadAllText($markerPath).Trim() -ne $Identity) { throw "Build root belongs to another owner: $Root" }
+        } elseif (@(Get-ChildItem -LiteralPath $Root -Force).Count -gt 0) {
+            throw "Refusing unowned build directory: $Root"
         }
     }
+    [IO.Directory]::CreateDirectory($Root) | Out-Null
+    [IO.File]::WriteAllText($markerPath, $Identity, [Text.UTF8Encoding]::new($false))
+}
+
+function Reset-OwnedCacheDirectory {
+    param([string] $Directory, [string] $CacheRoot)
+    $directoryPath = Resolve-ManagedChildPath -Root $CacheRoot -Child $Directory
+    Assert-NoReparsePathChain -LiteralPath $directoryPath
+    if (Test-Path -LiteralPath $directoryPath) {
+        Assert-NoReparseTree -LiteralPath $directoryPath
+        Remove-Item -LiteralPath $directoryPath -Recurse -Force
+    }
+    $receipt = "$directoryPath.receipt.json"
+    Assert-NoReparsePathChain -LiteralPath $receipt
+    if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
+    [IO.Directory]::CreateDirectory($directoryPath) | Out-Null
+}
+
+function Publish-ManagedRelease {
+    param([Parameter(Mandatory=$true)][string] $Stage, [Parameter(Mandatory=$true)][string] $Destination)
+    $stagePath = [IO.Path]::GetFullPath($Stage).TrimEnd('\')
+    $finalPath = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    $previousPath = "$finalPath.previous"
+    if ($finalPath -eq [IO.Path]::GetPathRoot($finalPath).TrimEnd('\')) { throw "Refuse publishing at filesystem root." }
+    Assert-DisjointRoots -First $stagePath -Second $finalPath -Description 'Stage and destination'
+    Assert-DisjointRoots -First $stagePath -Second $previousPath -Description 'Stage and previous'
+    Assert-NoReparsePathChain -LiteralPath $finalPath
+    Assert-NoReparsePathChain -LiteralPath $previousPath
+    Assert-ManagedReleaseRoot -Root $stagePath
+    if (-not (Test-Path -LiteralPath (Join-Path $stagePath '.daguandan-release-root'))) { throw 'Stage is not owned.' }
+    if (Test-Path -LiteralPath $finalPath) { Assert-ManagedReleaseRoot -Root $finalPath }
+    if (Test-Path -LiteralPath $previousPath) {
+        Assert-ManagedReleaseRoot -Root $previousPath
+        Clear-ManagedReleaseRoot -Root $previousPath -Overwrite $true
+        Remove-Item -LiteralPath (Join-Path $previousPath '.daguandan-release-root') -Force
+        Remove-Item -LiteralPath $previousPath -Force
+    }
+    $movedOld = $false
+    try {
+        if (Test-Path -LiteralPath $finalPath) {
+            Move-Item -LiteralPath $finalPath -Destination $previousPath
+            $movedOld = $true
+        }
+        Move-Item -LiteralPath $stagePath -Destination $finalPath
+    } catch {
+        if ($movedOld -and -not (Test-Path -LiteralPath $finalPath) -and (Test-Path -LiteralPath $previousPath)) {
+            Move-Item -LiteralPath $previousPath -Destination $finalPath
+        }
+        throw
+    }
+}
+
+function Complete-BuildStage {
+    if ($null -ne $script:stageWatch) {
+        $script:stageWatch.Stop()
+        $seconds = [Math]::Round($script:stageWatch.Elapsed.TotalSeconds, 3)
+        $script:stageTimings.Add([ordered]@{name=$script:stageName; seconds=$seconds})
+        Write-Host ("[done] {0}: {1:N1}s (total {2:N1}s)" -f $script:stageName, $seconds, $script:buildWatch.Elapsed.TotalSeconds) -ForegroundColor DarkCyan
+        $script:stageWatch = $null
+    }
+}
+function Start-BuildStage {
+    param([int] $Number, [string] $Name)
+    Complete-BuildStage
+    $script:stageName = $Name
+    $script:stageWatch = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host ("[{0}/8] {1}" -f $Number, $Name) -ForegroundColor Cyan
+}
+function Write-BuildMetrics {
+    param([string] $Root, [string] $Status, [string] $Failure = '')
+    $document = [ordered]@{
+        schema='guandan.release-build-metrics/1'; status=$Status;
+        started_at_utc=$script:buildStarted; total_seconds=[Math]::Round($script:buildWatch.Elapsed.TotalSeconds,3);
+        environment_cache_hit=$script:environmentCacheHit; work_cache_hit=$script:workCacheHit;
+        cache_enabled=$script:cacheEnabled; stages=@($script:stageTimings.ToArray()); error=$Failure
+    }
+    $path = Join-Path $Root 'build_metrics.json'
+    Assert-NoReparsePathChain -LiteralPath $path
+    [IO.File]::WriteAllText($path, ($document | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
 }
 
 function Resolve-ManagedChildPath {
@@ -170,7 +269,7 @@ function Invoke-PythonCommand {
         [Parameter(Mandatory = $true)][string] $Python,
         [Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments
     )
-    & $Python -I -S @Arguments
+    & $Python -I -B -S @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Python command failed (exit code $LASTEXITCODE): $($Arguments -join ' ')"
     }
@@ -245,10 +344,10 @@ function Invoke-CleanPython {
         [System.Environment]::SetEnvironmentVariable("TMP", $script:tempPath, "Process")
         [System.Environment]::SetEnvironmentVariable("TEMP", $script:tempPath, "Process")
         if ($NoSite) {
-            & $Python -I -S @Arguments
+            & $Python -I -B -S @Arguments
         }
         else {
-            & $Python -I @Arguments
+            & $Python -I -B @Arguments
         }
         if ($LASTEXITCODE -ne 0) {
             throw "Clean Python command failed (exit code $LASTEXITCODE): $($Arguments -join ' ')"
@@ -261,46 +360,58 @@ function Invoke-CleanPython {
     }
 }
 
-$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$appName = "DaguandanAssistant"
-$releaseRoot = [System.IO.Path]::GetFullPath($ReleaseRoot)
-$wheelhouseRoot = [System.IO.Path]::GetFullPath($WheelhouseRoot)
-$filesystemRoot = [System.IO.Path]::GetPathRoot($releaseRoot)
-$projectCurrentReleaseRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "release\current"))
-$isProjectCurrentRelease = $releaseRoot.TrimEnd('\').Equals($projectCurrentReleaseRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
-if (
-    [string]::IsNullOrWhiteSpace($filesystemRoot) -or
-$releaseRoot.TrimEnd('\') -eq $filesystemRoot.TrimEnd('\')
-) {
-    throw "ReleaseRoot must not be a filesystem root."
+$script:buildWatch = [Diagnostics.Stopwatch]::StartNew()
+$script:buildStarted = [DateTime]::UtcNow.ToString('o')
+$script:stageTimings = New-Object 'System.Collections.Generic.List[object]'
+$script:stageWatch = $null
+$script:environmentCacheHit = $false
+$script:workCacheHit = $false
+$script:cacheEnabled = [bool]$AllowDirtyDevelopmentBuild
+$cacheLock = $null
+$requestedReleaseRoot = $ReleaseRoot
+$stagingReleaseRoot = $null
+try {
+Start-BuildStage 1 'Validate inputs and preserve the previous release'
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$appName = 'DaguandanAssistant'
+$finalReleaseRoot = [IO.Path]::GetFullPath($requestedReleaseRoot).TrimEnd('\')
+$wheelhouseRoot = [IO.Path]::GetFullPath($WheelhouseRoot)
+if ([string]::IsNullOrWhiteSpace([IO.Path]::GetPathRoot($finalReleaseRoot)) -or
+    $finalReleaseRoot -eq [IO.Path]::GetPathRoot($finalReleaseRoot).TrimEnd('\')) {
+    throw 'ReleaseRoot must not be a filesystem root.'
 }
-if ($isProjectCurrentRelease) {
-    if (-not $OverwriteExisting -and (Test-Path -LiteralPath $releaseRoot)) {
-        throw "In-project ReleaseRoot already exists. Use -OverwriteExisting: $releaseRoot"
-    }
-    if (Test-Path -LiteralPath $releaseRoot) {
-        Clear-ManagedReleaseRoot -Root $releaseRoot -Overwrite $OverwriteExisting
-    }
-    else {
-        [System.IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
-    }
-    Assert-NoReparsePathChain -LiteralPath $releaseRoot
+$projectCurrentReleaseRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot 'release\current'))
+$isProjectCurrentRelease = $finalReleaseRoot.Equals($projectCurrentReleaseRoot, [StringComparison]::OrdinalIgnoreCase)
+Assert-NoReparsePathChain -LiteralPath $finalReleaseRoot
+$cacheRoot = Join-Path $projectRoot '.cache\release'
+Ensure-OwnedBuildDirectory -Root $cacheRoot -Marker '.daguandan-release-cache' -Identity 'guandan.release-build-cache/1'
+$cacheLockPath = Join-Path $cacheRoot '.build.lock'
+Assert-NoReparsePathChain -LiteralPath $cacheLockPath
+try { $cacheLock = [IO.File]::Open($cacheLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+catch { throw "Another release build is active or the build lock is unavailable: $cacheLockPath" }
+$previousRoot = "$finalReleaseRoot.previous"
+if (-not (Test-Path -LiteralPath $finalReleaseRoot) -and (Test-Path -LiteralPath $previousRoot)) {
+    Assert-ManagedReleaseRoot -Root $previousRoot
+    Move-Item -LiteralPath $previousRoot -Destination $finalReleaseRoot
+    Write-Host 'Restored the previous release after an interrupted publication.'
 }
-else {
-    if (Test-Path -LiteralPath $releaseRoot) {
-        if (-not $OverwriteExisting) {
-            throw "ReleaseRoot already exists. Use -OverwriteExisting: $releaseRoot"
-        }
-        Clear-ManagedReleaseRoot -Root $releaseRoot -Overwrite $true
-    }
-    Assert-NoReparsePathChain -LiteralPath $releaseRoot
+if (Test-Path -LiteralPath $finalReleaseRoot) {
+    if (-not $OverwriteExisting) { throw "ReleaseRoot exists; explicit overwrite permission is required: $finalReleaseRoot" }
+    Assert-ManagedReleaseRoot -Root $finalReleaseRoot
 }
+$stagingBase = Join-Path (Split-Path -Parent $finalReleaseRoot) '.staging'
+Ensure-OwnedBuildDirectory -Root $stagingBase -Marker '.daguandan-release-staging' -Identity 'guandan.release-staging/1'
+$stagingName = [IO.Path]::GetFileName($finalReleaseRoot) + '-' + [DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)
+$stagingReleaseRoot = Resolve-ManagedChildPath -Root $stagingBase -Child (Join-Path $stagingBase $stagingName)
+[IO.Directory]::CreateDirectory($stagingReleaseRoot) | Out-Null
+[IO.File]::WriteAllText((Join-Path $stagingReleaseRoot '.daguandan-release-root'), 'guandan.package-release-root/2', [Text.UTF8Encoding]::new($false))
 Assert-NoReparseTree -LiteralPath $wheelhouseRoot
 if (-not $isProjectCurrentRelease) {
-    Assert-DisjointRoots -First $releaseRoot -Second $projectRoot -Description "ReleaseRoot and project root"
+    Assert-DisjointRoots -First $finalReleaseRoot -Second $projectRoot -Description "ReleaseRoot and project root"
 }
 Assert-DisjointRoots -First $wheelhouseRoot -Second $projectRoot -Description "WheelhouseRoot and project root"
-Assert-DisjointRoots -First $releaseRoot -Second $wheelhouseRoot -Description "ReleaseRoot and WheelhouseRoot"
+Assert-DisjointRoots -First $finalReleaseRoot -Second $wheelhouseRoot -Description "ReleaseRoot and WheelhouseRoot"
+Assert-DisjointRoots -First $stagingReleaseRoot -Second $wheelhouseRoot -Description "Staging and WheelhouseRoot"
 
 if ([string]::IsNullOrWhiteSpace($BootstrapPython)) {
     $BootstrapPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
@@ -341,6 +452,7 @@ $requiredFiles = @(
     (Join-Path $projectRoot "python_runtime.lock.json"),
     (Join-Path $projectRoot "wheelhouse.lock.json"),
     (Join-Path $projectRoot "scripts\verify_release_inputs.py"),
+    (Join-Path $projectRoot "scripts\release_build_cache.py"),
     (Join-Path $projectRoot "scripts\audit_bootstrap_python.py"),
     (Join-Path $projectRoot "scripts\audit_frozen_bundle.py"),
     (Join-Path $projectRoot "scripts\generate_build_manifest.py"),
@@ -370,36 +482,36 @@ foreach ($requiredFile in $requiredFiles) {
     }
 }
 
-Write-Host "[1/7] Verifying committed locks and the external wheelhouse..." -ForegroundColor Cyan
+Write-Host "Verifying committed locks and the external wheelhouse..."
 Invoke-PythonCommand $bootstrapPython `
     (Join-Path $projectRoot "scripts\verify_release_inputs.py") `
     --project-root $projectRoot `
     --wheelhouse $wheelhouseRoot `
     --python $bootstrapPython
 
-[System.IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
-Assert-NoReparsePathChain -LiteralPath $releaseRoot
-$ownershipMarkerPath = Join-Path $releaseRoot ".daguandan-release-root"
+[System.IO.Directory]::CreateDirectory($stagingReleaseRoot) | Out-Null
+Assert-NoReparsePathChain -LiteralPath $stagingReleaseRoot
+$ownershipMarkerPath = Join-Path $stagingReleaseRoot ".daguandan-release-root"
 [System.IO.File]::WriteAllText(
     $ownershipMarkerPath,
     "guandan.package-release-root/2`r`n",
     [System.Text.UTF8Encoding]::new($false)
 )
 
-$distPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "dist")
-$workPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "build")
-$specPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "spec")
-$payloadPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "payload")
-$buildEnvPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "build-env")
-$script:tempPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "temp")
-$script:pyinstallerConfigPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "pyinstaller-config")
-$bundlePath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $distPath $appName)
-$archivePath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "DaguandanAssistant.zip")
-$archiveChecksumPath = Resolve-ManagedChildPath -Root $releaseRoot -Child "$archivePath.sha256"
-$releaseRecordPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "DaguandanAssistant.release.json")
-$sourceIdentityPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "source_identity.json")
-$releaseInputAuditPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "release_input_audit.json")
-$bootstrapAuditPath = Resolve-ManagedChildPath -Root $releaseRoot -Child (Join-Path $releaseRoot "bootstrap_python_audit.json")
+$distPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "dist")
+$workPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "build")
+$specPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "spec")
+$payloadPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "payload")
+$buildEnvPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "build-env")
+$script:tempPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "temp")
+$script:pyinstallerConfigPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "pyinstaller-config")
+$bundlePath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $distPath $appName)
+$archivePath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "DaguandanAssistant.zip")
+$archiveChecksumPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child "$archivePath.sha256"
+$releaseRecordPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "DaguandanAssistant.release.json")
+$sourceIdentityPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "source_identity.json")
+$releaseInputAuditPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "release_input_audit.json")
+$bootstrapAuditPath = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child (Join-Path $stagingReleaseRoot "bootstrap_python_audit.json")
 $buildManifestPath = Join-Path $bundlePath "build_manifest.json"
 $nativeAuditPath = Join-Path $bundlePath "native_dependency_audit.json"
 $bundledInputAuditPath = Join-Path $bundlePath "release_input_audit.json"
@@ -426,7 +538,7 @@ if ($AllowDirtyDevelopmentBuild) {
 }
 Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
-Write-Host "[2/7] Creating a fresh isolated build environment..." -ForegroundColor Cyan
+Start-BuildStage 2 "Validate or create isolated build environment"
 $bootstrapAuditArguments = @(
     (Join-Path $projectRoot "scripts\audit_bootstrap_python.py"),
     "--python-root", $script:pythonBaseRoot,
@@ -438,26 +550,42 @@ Invoke-CleanPython `
     -ScriptsPath (Split-Path -Parent $bootstrapPython) `
     -NoSite `
     -Arguments $bootstrapAuditArguments
-Invoke-CleanPython `
-    -Python $bootstrapPython `
-    -ScriptsPath (Split-Path -Parent $bootstrapPython) `
-    -NoSite `
-    -Arguments @("-m", "venv", $buildEnvPath)
-$buildPython = Join-Path $buildEnvPath "Scripts\python.exe"
-if (-not [System.IO.File]::Exists($buildPython)) {
-    throw "Fresh build environment did not create python.exe."
+$cacheHelper = Join-Path $projectRoot 'scripts\release_build_cache.py'
+if ($script:cacheEnabled) {
+    $keyPath = Join-Path $script:tempPath 'cache_keys.json'
+    Invoke-PythonCommand $bootstrapPython $cacheHelper key --project-root $projectRoot --python-root $script:pythonBaseRoot --output $keyPath | Out-Null
+    $keys = Get-Content -LiteralPath $keyPath -Raw | ConvertFrom-Json
+    if ($keys.environment_key -notmatch '^[0-9a-f]{64}$' -or $keys.work_key -notmatch '^[0-9a-f]{64}$') { throw 'Invalid cache keys.' }
+    $buildEnvPath = Join-Path $cacheRoot ("envs\" + $keys.environment_key.Substring(0,20) + '\env')
+    $cachedWorkRoot = Join-Path $cacheRoot ("work\" + $keys.work_key.Substring(0,20) + '\work')
+    $envDecisionPath = Join-Path $script:tempPath 'environment_cache.json'
+    Invoke-PythonCommand $bootstrapPython $cacheHelper inspect --directory $buildEnvPath --kind environment --key $keys.environment_key --output $envDecisionPath | Out-Null
+    $decision = Get-Content -LiteralPath $envDecisionPath -Raw | ConvertFrom-Json
+    $script:environmentCacheHit = [bool]$decision.hit
+    Write-Host ("Environment cache: {0} ({1})" -f $(if ($decision.hit) {'HIT'} else {'MISS'}), $decision.reason)
+    if (-not $script:environmentCacheHit) { Reset-OwnedCacheDirectory -Directory $buildEnvPath -CacheRoot $cacheRoot }
+    $workDecisionPath = Join-Path $script:tempPath 'work_cache.json'
+    Invoke-PythonCommand $bootstrapPython $cacheHelper inspect --directory $cachedWorkRoot --kind work --key $keys.work_key --output $workDecisionPath | Out-Null
+    $workDecision = Get-Content -LiteralPath $workDecisionPath -Raw | ConvertFrom-Json
+    $script:workCacheHit = [bool]$workDecision.hit -and $script:environmentCacheHit
+    Write-Host ("PyInstaller work cache: {0} ({1})" -f $(if ($script:workCacheHit) {'HIT'} else {'MISS'}), $workDecision.reason)
+    if (-not $script:workCacheHit) { Reset-OwnedCacheDirectory -Directory $cachedWorkRoot -CacheRoot $cacheRoot }
+    $workPath = Join-Path $cachedWorkRoot 'build'
+    $specPath = Join-Path $cachedWorkRoot 'spec'
+    $script:pyinstallerConfigPath = Join-Path $cachedWorkRoot 'pyinstaller-config'
+    foreach ($directory in @($workPath, $specPath, $script:pyinstallerConfigPath)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
 }
-Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
-    -m pip install `
-    --isolated `
-    --no-index `
-    --no-cache-dir `
-    --disable-pip-version-check `
-    --require-hashes `
-    --ignore-requires-python `
-    --no-deps `
-    --find-links $wheelhouseRoot `
-    -r (Join-Path $projectRoot "requirements-release.lock")
+if (-not $script:environmentCacheHit) {
+    Invoke-CleanPython -Python $bootstrapPython -ScriptsPath (Split-Path -Parent $bootstrapPython) -NoSite -Arguments @('-m','venv',$buildEnvPath)
+    $buildPython = Join-Path $buildEnvPath 'Scripts\python.exe'
+    if (-not [IO.File]::Exists($buildPython)) { throw 'Build environment did not create python.exe.' }
+    Invoke-CleanPython $buildPython (Join-Path $buildEnvPath 'Scripts') `
+        -m pip install --isolated --no-index --no-cache-dir --no-compile --disable-pip-version-check --require-hashes `
+        --ignore-requires-python --no-deps --find-links $wheelhouseRoot -r (Join-Path $projectRoot 'requirements-release.lock')
+} else {
+    $buildPython = Join-Path $buildEnvPath 'Scripts\python.exe'
+    Write-Host 'Validated environment reused; skipping virtualenv creation and dependency installation.' -ForegroundColor Green
+}
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     (Join-Path $projectRoot "scripts\verify_release_inputs.py") `
     --project-root $projectRoot `
@@ -466,7 +594,13 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     --verify-installed `
     --output $releaseInputAuditPath
 
-Write-Host "[3/7] Preparing immutable seed resources..." -ForegroundColor Cyan
+# RLCard expands packaged jsondata.zip on its first import. Materialize that
+# deterministic data BEFORE collect-data runs, not halfway through Analysis.
+# Otherwise the next identical build sees a changed _input_datas and rebuilds.
+Write-Host "Preparing deterministic RLCard data before module collection..."
+Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") -c "import rlcard.envs"
+
+Start-BuildStage 3 "Copy fresh immutable seed resources"
 $payloadProfile = Join-Path $payloadPath "data\profiles\tencent_daguandan"
 [System.IO.Directory]::CreateDirectory((Join-Path $payloadProfile "models\danzero")) | Out-Null
 Copy-Item -LiteralPath (Join-Path $profileSource "profile.json") -Destination $payloadProfile
@@ -476,7 +610,7 @@ Copy-Item -LiteralPath (Join-Path $profileSource "templates") -Destination $payl
 Copy-Item -LiteralPath $modelSource -Destination (Join-Path $payloadProfile "models\best.npz")
 Copy-Item -LiteralPath $danzeroWeightsSource -Destination (Join-Path $payloadProfile "models\danzero\q_network.ckpt")
 
-Write-Host "[4/7] Building the frozen application from the clean environment..." -ForegroundColor Cyan
+Start-BuildStage 4 "Build frozen application into fresh staging directory"
 $liveV2CollectionPath = Join-Path $projectRoot "scripts\pyinstaller_live_v2_collection.json"
 $liveV2Collection = Get-Content -LiteralPath $liveV2CollectionPath -Raw | ConvertFrom-Json
 if ($liveV2Collection.schema -ne "guandan.pyinstaller-live-v2-collection/1") {
@@ -501,7 +635,6 @@ foreach ($module in $liveV2HiddenImports) {
 $pyinstallerArguments = @(
     "-m", "PyInstaller",
     "--noconfirm",
-    "--clean",
     "--onedir",
     "--noconsole",
     "--noupx",
@@ -524,6 +657,7 @@ $pyinstallerArguments = @(
     "--hidden-import", "pythoncom",
     "--hidden-import", "pywintypes"
 )
+if (-not $script:workCacheHit) { $pyinstallerArguments += '--clean' }
 foreach ($module in $liveV2HiddenImports) {
     $pyinstallerArguments += @("--hidden-import", $module)
 }
@@ -534,7 +668,7 @@ if (-not [System.IO.File]::Exists($executablePath)) {
     throw "PyInstaller did not produce $appName.exe."
 }
 
-Write-Host "[5/7] Adding resources and running the fail-closed native audit..." -ForegroundColor Cyan
+Start-BuildStage 5 "Add resources and audit native dependencies"
 Copy-Item -LiteralPath (Join-Path $payloadPath "data") -Destination $bundlePath -Recurse
 Copy-Item -LiteralPath (Join-Path $projectRoot "app.ico") -Destination $bundlePath
 Copy-Item -LiteralPath (Join-Path $projectRoot "release_assets\MODEL_REPLACEMENT.txt") -Destination $bundlePath
@@ -567,7 +701,7 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
 # tracked commit/tree/status before signing those bytes into the manifest.
 Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
-Write-Host "[6/7] Creating and verifying the build manifest..." -ForegroundColor Cyan
+Start-BuildStage 6 "Create and verify build manifest"
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
     (Join-Path $projectRoot "scripts\generate_build_manifest.py") `
     create `
@@ -590,7 +724,7 @@ if (-not $AllowDirtyDevelopmentBuild) {
 }
 Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") @manifestVerifyArguments
 
-Write-Host "[7/7] Creating the archive, checksum, and release record..." -ForegroundColor Cyan
+Start-BuildStage 7 "Create archive, checksum, and release record"
 $archiveCreated = $false
 for ($attempt = 1; $attempt -le 3; $attempt++) {
     try {
@@ -625,16 +759,32 @@ Invoke-CleanPython $buildPython (Join-Path $buildEnvPath "Scripts") `
 Invoke-PythonCommand $bootstrapPython @sourceIdentityVerifyArguments
 
 $size = (Get-ChildItem -LiteralPath $bundlePath -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
-if ($Compact) {
-    foreach ($managedDirectory in @($distPath, $workPath, $buildEnvPath, $payloadPath, $specPath, $script:tempPath, $script:pyinstallerConfigPath)) {
-        if (Test-Path -LiteralPath $managedDirectory) {
-            Remove-Item -LiteralPath $managedDirectory -Recurse -Force
-        }
-    }
-    Write-Host "Compact mode removed build intermediates; archive and release records remain." -ForegroundColor Green
+if ($script:cacheEnabled) {
+    Invoke-PythonCommand $bootstrapPython $cacheHelper seal --directory $buildEnvPath --kind environment --key $keys.environment_key --output (Join-Path $script:tempPath 'environment_seal.json') | Out-Null
+    Invoke-PythonCommand $bootstrapPython $cacheHelper seal --directory $cachedWorkRoot --kind work --key $keys.work_key --output (Join-Path $script:tempPath 'work_seal.json') | Out-Null
 }
-Write-Host ("Complete bundle: {0}" -f $bundlePath) -ForegroundColor Green
-Write-Host ("Archive: {0}" -f $archivePath) -ForegroundColor Green
-Write-Host ("Archive SHA256: {0}" -f $archiveChecksumPath) -ForegroundColor Green
-Write-Host ("Release record: {0}" -f $releaseRecordPath) -ForegroundColor Green
-Write-Host ("Uncompressed size: {0:N1} MB" -f $size) -ForegroundColor Green
+if ($Compact) {
+    foreach ($managedDirectory in @($distPath, $payloadPath, $script:tempPath)) {
+        $safe = Resolve-ManagedChildPath -Root $stagingReleaseRoot -Child $managedDirectory
+        if (Test-Path -LiteralPath $safe) { Assert-NoReparseTree -LiteralPath $safe; Remove-Item -LiteralPath $safe -Recurse -Force }
+    }
+}
+Start-BuildStage 8 'Publish validated release (previous release retained)'
+Write-BuildMetrics -Root $stagingReleaseRoot -Status 'validated'
+Publish-ManagedRelease -Stage $stagingReleaseRoot -Destination $finalReleaseRoot
+$stagingReleaseRoot = $finalReleaseRoot
+Complete-BuildStage
+Write-BuildMetrics -Root $stagingReleaseRoot -Status 'passed'
+Write-Host ("Complete bundle: {0}" -f (Join-Path $stagingReleaseRoot "dist\$appName")) -ForegroundColor Green
+Write-Host ("Archive: {0}" -f (Join-Path $stagingReleaseRoot 'DaguandanAssistant.zip')) -ForegroundColor Green
+Write-Host ("Build timings: {0}" -f (Join-Path $stagingReleaseRoot 'build_metrics.json')) -ForegroundColor Green
+Write-Host ("Total: {0:N1}s; uncompressed size: {1:N1} MB" -f $script:buildWatch.Elapsed.TotalSeconds, $size) -ForegroundColor Green
+} catch {
+    Complete-BuildStage
+    if ($stagingReleaseRoot -and (Test-Path -LiteralPath $stagingReleaseRoot)) {
+        try { Write-BuildMetrics -Root $stagingReleaseRoot -Status 'failed' -Failure $_.Exception.Message } catch { Write-Warning 'Could not write failure timing report.' }
+    }
+    throw
+} finally {
+    if ($null -ne $cacheLock) { $cacheLock.Dispose() }
+}

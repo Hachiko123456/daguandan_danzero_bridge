@@ -65,6 +65,7 @@ if "%NeedPrepareWheelhouse%"=="1" (
 echo.
 echo [3/3] 构建发布包
 echo Release output directory: "%ReleaseOutputDirectory%"
+echo Verified build caches are reused automatically; the previous release is kept until success.
 if defined OverwriteFlag (
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -ReleaseRoot "%ReleaseRoot%" -WheelhouseRoot "%WheelhouseRoot%" -OverwriteExisting %AllowDirtyFlag%
 ) else (

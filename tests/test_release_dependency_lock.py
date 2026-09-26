@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -12,9 +13,10 @@ from daguandan_bridge.release_lock import verify_release_inputs
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WHEELHOUSE = Path(
-    r"C:\Users\yhx\AppData\Local\DaguandanAssistant\release-inputs\wheelhouse-cp312-win_amd64"
-)
+WHEELHOUSE = Path(os.environ.get(
+    "DAGUANDAN_TEST_WHEELHOUSE",
+    str(Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "Daguandan" / "wheelhouse"),
+))
 
 
 def test_runtime_requirements_are_exactly_pinned():
