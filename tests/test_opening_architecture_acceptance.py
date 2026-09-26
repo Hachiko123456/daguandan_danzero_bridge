@@ -295,7 +295,7 @@ def _app():
     return QApplication.instance() or QApplication([])
 
 
-def test_transient_page_unknown_is_recoverable_and_only_budget_exhaustion_stops_recording(tmp_path):
+def test_transient_and_persistent_page_unknown_keep_bounded_recovery_without_stopping_recording(tmp_path):
     _app()
     controller = LiveAssistantController(_CaptureStub(tmp_path))
     controller._listening_enabled = True
@@ -313,14 +313,17 @@ def test_transient_page_unknown_is_recoverable_and_only_budget_exhaustion_stops_
     controller._apply_listening_page(ListeningPageSignal("table", 0.95), snapshot)
     assert not recording.closed_with, "短暂 unknown 后回到 table 应保持同一监听回合"
 
-    # The exact product budget is intentionally implementation-owned.  The
-    # acceptance contract only requires it to be finite: recovery is allowed
-    # for a transient unknown, while an actually stuck page eventually stops.
+    # A finite fast budget transitions to low-frequency recovery. The
+    # listener remains enabled without fabricating actions from unknown frames.
     for _ in range(32):
         controller._apply_listening_page(ListeningPageSignal("unknown", 0.0), snapshot)
         if recording.closed_with:
             break
-    assert recording.closed_with, "连续 page_unknown 超预算后必须终止，不能无限占用监听资源"
+    assert not recording.closed_with, (
+        "page_unknown 超过快速预算后进入低频恢复，不应永久封存监听；"
+        "只有硬故障或用户停止才能关闭 recording"
+    )
+    assert controller._page_recovery_slow is True
 
 
 # ---------------------------------------------------------------------------
@@ -488,3 +491,8 @@ def test_manual_fallback_uses_the_same_live_capture_service_chain(tmp_path, monk
     assert result["raw_sha256"] == hashlib.sha256(snapshot.image.tobytes(order="C")).hexdigest()
 
 
+
+
+@pytest.fixture(autouse=True)
+def _isolate_case_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAGUANDAN_DIAGNOSTICS_ROOT", str(tmp_path / "diagnostics"))

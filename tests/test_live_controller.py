@@ -2283,3 +2283,8 @@ def test_publish_ready_waiting_first_action_keeps_legacy_message_field(tmp_path)
     assert statuses[-1]["phase"] == "ready_waiting_first_action"
     assert statuses[-1]["message"] == "已进入牌桌，等待自己首出"
     assert statuses[-1]["primary_reason"] == "READY_WAITING_FIRST_ACTION"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_case_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAGUANDAN_DIAGNOSTICS_ROOT", str(tmp_path / "diagnostics"))

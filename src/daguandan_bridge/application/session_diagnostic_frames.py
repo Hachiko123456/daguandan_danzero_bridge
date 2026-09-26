@@ -29,6 +29,8 @@ SOURCE_KIND = "live_listener_frame"
 MANUAL_SOURCE_KIND = "manual_window_capture"
 _ALLOWED_SOURCES = frozenset({SOURCE_KIND, MANUAL_SOURCE_KIND})
 _DIAGNOSTIC_DIRECTORY = "diagnostic_frames"
+_CASE_FRAMES_DIRECTORY = "frames"
+_FRAME_DIRECTORIES = frozenset({_DIAGNOSTIC_DIRECTORY, _CASE_FRAMES_DIRECTORY})
 _FRAME_NAME = re.compile(r"^(?P<sequence>[0-9]{6,})\.(?P<suffix>png|json)$", re.IGNORECASE)
 _REPARSE_POINT = 0x0400
 
@@ -268,18 +270,36 @@ class SessionDiagnosticFrameStore:
 
     @staticmethod
     def _diagnostic_directory(session_directory: Path | str, *, create: bool) -> tuple[Path, Path]:
-        session = _assert_no_reparse_components(Path(session_directory).expanduser())
+        requested = _assert_no_reparse_components(Path(session_directory).expanduser())
+        if requested.name.casefold() in _FRAME_DIRECTORIES:
+            if not requested.is_dir():
+                raise SessionDiagnosticFrameError(f"对局诊断截图目录不存在：{requested}")
+            return requested.parent, requested
+        session = requested
         if _lexists(session) and not session.is_dir():
             raise SessionDiagnosticFrameError(f"对局目录不是目录：{session}")
         if create:
             session = _ensure_directory(session, field="对局目录")
         elif not session.is_dir():
             raise SessionDiagnosticFrameError(f"对局目录不存在：{session}")
-        diagnostic = session / _DIAGNOSTIC_DIRECTORY
-        if create:
-            diagnostic = _ensure_directory(diagnostic, field="对局诊断截图目录")
-        elif not diagnostic.is_dir():
-            raise SessionDiagnosticFrameError(f"对局诊断截图目录不存在：{diagnostic}")
+        # New cases use frames/. Existing sessions keep diagnostic_frames/ so
+        # old data remains readable and is never silently moved.
+        frames = session / _CASE_FRAMES_DIRECTORY
+        legacy = session / _DIAGNOSTIC_DIRECTORY
+        if (session / "case.json").is_file():
+            # A case always has exactly one authoritative frames directory,
+            # even if somebody copied a legacy directory alongside it.
+            diagnostic = _ensure_directory(frames, field="对局诊断截图目录") if create else frames
+            if not diagnostic.is_dir():
+                raise SessionDiagnosticFrameError(f"对局诊断截图目录不存在：{diagnostic}")
+        elif legacy.is_dir():
+            diagnostic = legacy
+        elif frames.is_dir():
+            diagnostic = frames
+        elif create:
+            diagnostic = _ensure_directory(legacy, field="对局诊断截图目录")
+        else:
+            raise SessionDiagnosticFrameError(f"对局诊断截图目录不存在：{session}")
         _assert_no_reparse_components(diagnostic)
         return session, diagnostic
 
@@ -310,8 +330,8 @@ class SessionDiagnosticFrameStore:
         metadata = _assert_regular_file(metadata, field="诊断截图 metadata")
         if image.parent != metadata.parent or image.stem != metadata.stem:
             raise SessionDiagnosticFrameError("PNG 与 metadata 必须是同编号同目录文件对")
-        if image.parent.name != _DIAGNOSTIC_DIRECTORY:
-            raise SessionDiagnosticFrameError("监听截图必须位于 session/diagnostic_frames 目录")
+        if image.parent.name.casefold() not in _FRAME_DIRECTORIES:
+            raise SessionDiagnosticFrameError("监听截图必须位于 case/frames 或 session/diagnostic_frames 目录")
         match = _FRAME_NAME.match(image.name)
         if match is None or match.group("suffix").lower() != "png":
             raise SessionDiagnosticFrameError("诊断截图 PNG 文件名必须是六位以上数字序号")
@@ -426,6 +446,8 @@ class SessionDiagnosticFrameStore:
                 "png_sha256": _sha256_bytes(png_bytes),
                 "source": source,
             }
+            if session.parent.name == "cases":
+                metadata["case_id"] = session.name
             # raw_sha256 historically names the standardized listener pixels,
             # not the unscaled native-window buffer. Keep that stable spelling
             # and add explicit geometry/provenance without altering any pixels.

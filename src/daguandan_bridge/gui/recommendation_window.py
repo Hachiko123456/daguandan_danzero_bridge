@@ -7,13 +7,15 @@ from pathlib import Path
 from typing import Any
 from time import monotonic_ns
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer, QUrl
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, Signal, Slot, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QPlainTextEdit, QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import (
     CaptionLabel,
     CardWidget,
     PushButton,
+    PrimaryPushButton,
+    LineEdit,
     ToolButton,
     ToolTipFilter,
     ToolTipPosition,
@@ -170,6 +172,310 @@ class _CurrentTrickStrip(QWidget):
             cell.apply_palette(dark=dark, accent=accent)
 
 
+def _absolute_local_path(value: object) -> Path | None:
+    """Accept filesystem paths only; never reinterpret a URL or cwd as evidence."""
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        return None
+    try:
+        path = Path(value)
+        if not path.is_absolute() or path == Path(path.anchor) or ".." in path.parts:
+            return None
+        if "\x00" in str(path):
+            return None
+        return path
+    except (OSError, ValueError):
+        return None
+
+
+def _case_frames_directory(path: Path) -> bool:
+    try:
+        return path.name.casefold() == "frames" and (path.parent / "case.json").is_file()
+    except (OSError, ValueError):
+        return False
+
+
+class _ProblemDialog(QDialog):
+    """Native dialogs need their own background when Fluent dark labels are used."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("problemExportDialog")
+        self._apply_problem_theme()
+        qconfig.themeChanged.connect(self._apply_problem_theme)
+
+    def _apply_problem_theme(self, *_args) -> None:
+        dark = isDarkTheme()
+        background, foreground = ("#202020", "#f3f3f3") if dark else ("#f7f7f7", "#202020")
+        entry, border = ("#292929", "#555555") if dark else ("#ffffff", "#cccccc")
+        self.setStyleSheet(
+            "QDialog#problemExportDialog {"
+            f"background-color:{background}; color:{foreground};"
+            "} QDialog#problemExportDialog QPlainTextEdit {"
+            f"background-color:{entry}; color:{foreground}; border:1px solid {border};"
+            "}"
+        )
+
+
+class _ProblemExportConfirmation(_ProblemDialog):
+    """A small modeless consent dialog; it never interrupts the live listener."""
+
+    def __init__(self, parent: QWidget, case_directory: Path | None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("导出问题包")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,
+                           bool(parent.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+        self.setMinimumWidth(420)
+        self.choice: bool | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.addWidget(StrongBodyLabel("导出问题包", self))
+        self.privacy_label = CaptionLabel(
+            "游戏截图可能包含昵称、头像等个人信息。\n"
+            "问题包仅保存到本机，不会自动上传；监听和推荐继续。", self
+        )
+        self.privacy_label.setWordWrap(True)
+        layout.addWidget(self.privacy_label)
+        self.target_label = CaptionLabel(
+            "范围：已选择的历史对局" if case_directory is not None else "范围：当前或最近一次对局", self
+        )
+        self.target_label.setToolTip(str(case_directory or ""))
+        layout.addWidget(self.target_label)
+        buttons = QHBoxLayout()
+        self.images_button = PrimaryPushButton("包含截图导出（推荐）", self)
+        self.images_button.setDefault(True)
+        self.images_button.clicked.connect(lambda: self._choose(True))
+        buttons.addWidget(self.images_button)
+        self.logs_button = PushButton("仅日志", self)
+        self.logs_button.clicked.connect(lambda: self._choose(False))
+        buttons.addWidget(self.logs_button)
+        self.cancel_button = PushButton("取消", self)
+        self.cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(self.cancel_button)
+        layout.addLayout(buttons)
+
+    def _choose(self, include_images: bool) -> None:
+        self.choice = include_images
+        self.accept()
+
+
+class _ProblemExportResultDialog(_ProblemDialog):
+    """Bounded result presentation with a single, explicitly local ZIP path."""
+
+    def __init__(self, payload: Mapping[str, object], parent: QWidget) -> None:
+        super().__init__(parent)
+        status = str(payload.get("status") or "FAILURE")
+        self.archive_path = _absolute_local_path(payload.get("archive_path"))
+        title = "问题包已生成" if status in {"SUCCESS", "PARTIAL"} else "问题包导出失败"
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,
+                           bool(parent.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+        self.setFixedWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.addWidget(StrongBodyLabel(title, self))
+        self.message_label = CaptionLabel(
+            "已保存可用证据，部分信息缺失；可以直接发送此 ZIP。" if status == "PARTIAL" else
+            "仅保存在本机，未自动上传。" if status == "SUCCESS" else "未生成可用的问题包，请重试。", self
+        )
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+        details = []
+        if payload.get("message"):
+            details.append(str(payload["message"]))
+        for key, label in (("missing", "缺失"), ("omitted", "未包含")):
+            value = payload.get(key)
+            if value:
+                text = "、".join(str(item) for item in value) if isinstance(value, (list, tuple)) else str(value)
+                details.append(f"{label}：{text}")
+        if payload.get("include_images") is False:
+            details.append("本次为仅日志导出，不包含游戏截图。")
+        self.details_view = QPlainTextEdit(self)
+        self.details_view.setReadOnly(True)
+        self.details_view.setPlainText("\n".join(details))
+        self.details_view.setFixedHeight(76)
+        self.details_view.hide()
+        self.details_toggle = PushButton("查看详情", self)
+        self.details_toggle.setCheckable(True)
+        self.details_toggle.setVisible(bool(details))
+        self.details_toggle.toggled.connect(self._toggle_details)
+        layout.addWidget(self.details_toggle)
+        layout.addWidget(self.details_view)
+        self.path_edit = LineEdit(self)
+        self.path_edit.setReadOnly(True)
+        self.path_edit.setAccessibleName("问题包 ZIP 文件路径")
+        self.path_edit.setText(str(self.archive_path) if self.archive_path is not None else "")
+        self.path_edit.setCursorPosition(0)
+        self.path_edit.setToolTip(self.path_edit.text())
+        layout.addWidget(self.path_edit)
+        buttons = QHBoxLayout()
+        self.open_folder_button = PushButton("打开所在文件夹", self)
+        self.open_folder_button.clicked.connect(self._open_folder)
+        buttons.addWidget(self.open_folder_button)
+        self.copy_path_button = PushButton("复制文件路径", self)
+        self.copy_path_button.clicked.connect(self._copy_path)
+        buttons.addWidget(self.copy_path_button)
+        self.close_button = PrimaryPushButton("关闭", self)
+        self.close_button.clicked.connect(self.accept)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+        usable = status in {"SUCCESS", "PARTIAL"} and self._archive_exists()
+        self.open_folder_button.setEnabled(usable)
+        self.copy_path_button.setEnabled(usable)
+        self.path_edit.setVisible(usable)
+        if not usable:
+            self.archive_path = None
+
+    def _toggle_details(self, checked: bool) -> None:
+        self.details_view.setVisible(checked)
+        self.details_toggle.setText("收起详情" if checked else "查看详情")
+        self.adjustSize()
+
+    def _archive_exists(self) -> bool:
+        try:
+            return bool(self.archive_path is not None and self.archive_path.suffix.casefold() == ".zip"
+                        and self.archive_path.is_file())
+        except (OSError, ValueError):
+            return False
+
+    def _check_archive(self) -> bool:
+        if self._archive_exists():
+            return True
+        self.message_label.setText("问题包文件已不存在，请重新导出。")
+        self.open_folder_button.setEnabled(False)
+        self.copy_path_button.setEnabled(False)
+        return False
+
+    def _open_folder(self) -> None:
+        if not self._check_archive():
+            return
+        try:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.archive_path.parent)))
+        except Exception:
+            opened = False
+        if not opened:
+            self.message_label.setText("无法打开文件夹，可复制文件路径后手动查看。")
+
+    def _copy_path(self) -> None:
+        if self._check_archive():
+            QGuiApplication.clipboard().setText(str(self.archive_path))
+            self.message_label.setText("文件路径已复制；问题包未自动上传。")
+
+
+class ProblemExportUi(QObject):
+    """Shared UI-only consent, duplicate-click guard and result presentation.
+
+    The controller owns all case selection, collection and background work.
+    The main window shares this presenter across both export entry points.
+    """
+
+    def __init__(self, runtime: object, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.runtime = runtime
+        self._buttons: list[QWidget] = []
+        self._running = False
+        self._pending = False
+        self._include_images = True
+        self._result_parent: QWidget = parent
+        self.confirmation_dialog: _ProblemExportConfirmation | None = None
+        self.result_dialog: _ProblemExportResultDialog | None = None
+        signal = getattr(runtime, "problem_export_status", None)
+        self._has_status_signal = signal is not None and callable(getattr(signal, "connect", None))
+        if self._has_status_signal:
+            signal.connect(self.apply_status)
+
+    def bind_button(self, button: QWidget) -> None:
+        self._buttons.append(button)
+        button.setEnabled(not self._running)
+        button.setToolTip("导出问题包：仅保存本机，可选择包含截图或仅日志")
+
+    def _set_busy(self, busy: bool, notice: str = "") -> None:
+        self._running = busy
+        for button in self._buttons:
+            button.setEnabled(not busy)
+            button.setToolTip(notice or "导出问题包：仅保存本机，可选择包含截图或仅日志")
+
+    def request(self, *, parent: QWidget, case_directory: Path | None = None) -> None:
+        if self._running:
+            return
+        self._result_parent = parent
+        if not callable(getattr(self.runtime, "request_problem_export", None)) or not self._has_status_signal:
+            self._show_result({"status": "FAILURE", "message": "当前运行时不支持问题包导出，请升级后重试。"})
+            return
+        if case_directory is not None and _absolute_local_path(case_directory) is None:
+            self._show_result({"status": "FAILURE", "message": "所选对局必须是本机绝对目录；未改为导出当前对局。"})
+            return
+        self._set_busy(True, "请确认问题包截图隐私选项")
+        dialog = _ProblemExportConfirmation(parent, case_directory)
+        self.confirmation_dialog = dialog
+        dialog.finished.connect(lambda _result: self._confirmed(dialog, case_directory))
+        dialog.show()
+
+    def _confirmed(self, dialog: _ProblemExportConfirmation, case_directory: Path | None) -> None:
+        self.confirmation_dialog = None
+        include_images = dialog.choice
+        dialog.deleteLater()
+        if include_images is None:
+            self._set_busy(False)
+            return
+        self._pending = True
+        self._include_images = include_images
+        self._set_busy(True, "正在后台导出问题包 · 监听和推荐继续")
+        try:
+            accepted = self.runtime.request_problem_export(
+                include_images=include_images, case_directory=case_directory,
+            )
+        except Exception as exc:
+            if self._pending:
+                self.apply_status({"status": "FAILURE", "message": str(exc) or type(exc).__name__})
+            return
+        # Some small runtimes emit the completion signal synchronously.
+        if not accepted and self._pending:
+            self.apply_status({"status": "FAILURE", "message": "未能启动导出，可能已有导出任务，请稍后重试。"})
+
+    @Slot(object)
+    def apply_status(self, value: object) -> None:
+        def field(name: str, default: object = None) -> object:
+            return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+        raw_status = field("status", "")
+        status = str(getattr(raw_status, "value", raw_status)).upper()
+        if status == "RUNNING":
+            # A task started elsewhere while consent was open owns the guard.
+            # Dismiss that stale consent rather than submit a second request.
+            if self.confirmation_dialog is not None:
+                self.confirmation_dialog.reject()
+            self._set_busy(True, "正在后台导出问题包 · 监听和推荐继续")
+            return
+        if status not in {"SUCCESS", "PARTIAL", "FAILURE"}:
+            return
+        if self.confirmation_dialog is not None and not self._pending:
+            return  # An unrelated late result must not unlock active consent.
+        self._set_busy(False, {"SUCCESS": "问题包已导出", "PARTIAL": "问题包部分导出", "FAILURE": "问题包导出失败，请重试"}[status])
+        if not self._pending:
+            return
+        self._pending = False
+        payload = {name: field(name) for name in ("archive_path", "message", "missing", "omitted")}
+        payload.update(status=status, include_images=field("include_images", self._include_images))
+        if status in {"SUCCESS", "PARTIAL"}:
+            archive = _absolute_local_path(payload["archive_path"])
+            try:
+                valid = archive is not None and archive.suffix.casefold() == ".zip" and archive.is_file()
+            except (OSError, ValueError):
+                valid = False
+            if not valid:
+                payload.update(status="FAILURE", archive_path=None,
+                               message="未找到导出的 ZIP 文件，不能确认导出成功，请重试。")
+                self._set_busy(False, "问题包导出失败：未找到 ZIP 文件")
+        self._show_result(payload)
+
+    def _show_result(self, payload: Mapping[str, object]) -> None:
+        if self.result_dialog is not None:
+            self.result_dialog.close()
+            self.result_dialog.deleteLater()
+        self.result_dialog = _ProblemExportResultDialog(payload, self._result_parent)
+        self.result_dialog.show()
+
+
 class RecommendationFloatWindow(QWidget):
     """A read-only companion view over the shared live controller."""
 
@@ -215,6 +521,8 @@ class RecommendationFloatWindow(QWidget):
         self.setMinimumSize(420, 235)
         self.resize(500, 245)
         self._build_ui()
+        self.problem_export_ui = ProblemExportUi(runtime, self)
+        self.problem_export_ui.bind_button(self.problem_export_button)
         self._connect_runtime()
         qconfig.themeChanged.connect(self._apply_theme)
         self._apply_theme()
@@ -284,12 +592,13 @@ class RecommendationFloatWindow(QWidget):
             self.copy_issue_requested.emit,
         )
         actions.addWidget(self.copy_issue_button)
-        self.copy_summary_button = self._make_action_button(
-            FluentIcon.COPY,
-            "复制完整诊断摘要到剪贴板",
-            self.copy_summary_requested.emit,
+        self.problem_export_button = self._make_action_button(
+            FluentIcon.SAVE,
+            "导出问题包：包含截图或仅日志，不自动上传",
+            lambda: self.problem_export_ui.request(parent=self),
         )
-        actions.addWidget(self.copy_summary_button)
+        self.problem_export_button.setObjectName("compactProblemExportButton")
+        actions.addWidget(self.problem_export_button)
         self.open_button = self._make_action_button(
             FluentIcon.SETTING,
             "打开完整助手",
@@ -576,23 +885,16 @@ class RecommendationFloatWindow(QWidget):
             kind = "listening"
         self._render_view(CompactViewState(kind, title, detail))
 
+    _absolute_diagnostic_path = staticmethod(_absolute_local_path)
+
     @staticmethod
-    def _absolute_diagnostic_path(value: object) -> Path | None:
-        # An empty/relative path must never become the working directory.
-        if not isinstance(value, (str, Path)) or not str(value).strip():
-            return None
-        try:
-            path = Path(value)
-            if not path.is_absolute() or path == Path(path.anchor) or ".." in path.parts:
-                return None
-            return path
-        except (OSError, ValueError):
-            return None
+    def _known_frame_directory(path: Path) -> bool:
+        return path.name.casefold() == "diagnostic_frames" or _case_frames_directory(path)
 
     def _remember_diagnostic_frame(self, value: Mapping[str, object]) -> None:
         image = self._absolute_diagnostic_path(value.get("image_path"))
         session = self._absolute_diagnostic_path(value.get("session_directory"))
-        if image is not None and image.parent.name.casefold() == "diagnostic_frames":
+        if image is not None and self._known_frame_directory(image.parent):
             # The saved PNG is stronger evidence than a stale session directory.
             self._last_diagnostic_image_path = image
             self._last_diagnostic_session_directory = image.parent.parent
@@ -609,17 +911,21 @@ class RecommendationFloatWindow(QWidget):
                 directory = self._absolute_diagnostic_path(getter())
             except Exception:
                 directory = None
-            if directory is not None and directory.name.casefold() == "diagnostic_frames":
+            if directory is not None and (
+                self._known_frame_directory(directory)
+                or (directory.name.casefold() == "cases" and directory.parent.name.casefold() == "diagnostics")
+            ):
                 candidates.append(directory)
         image = self._last_diagnostic_image_path
         session = self._last_diagnostic_session_directory
         if image is not None:
             candidates.append(image.parent)
         elif session is not None:
-            candidates.append(
-                session if session.name.casefold() == "diagnostic_frames"
-                else session / "diagnostic_frames"
-            )
+            if self._known_frame_directory(session):
+                candidates.append(session)
+            else:
+                candidates.append(session / "frames" if _case_frames_directory(session / "frames")
+                                  else session / "diagnostic_frames")
 
         def existing_directory(path: Path) -> bool:
             try:
@@ -635,7 +941,8 @@ class RecommendationFloatWindow(QWidget):
             directory = next((
                 parent
                 for path in candidates
-                for parent in (path.parent, path.parent.parent)
+                for parent in ((path.parent,) if path.name.casefold() == "cases"
+                               else (path.parent, path.parent.parent))
                 if parent != Path(parent.anchor) and existing_directory(parent)
             ), None)
         if directory is None:

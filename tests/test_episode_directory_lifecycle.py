@@ -189,7 +189,7 @@ def test_promotion_rolls_back_after_manifest_failure_and_retry_is_clean(tmp_path
 
 
 # Exercise the real controller writer and frame store; only desktop capture is fake.
-def _migration_snapshot(value=7):
+def _case_snapshot(value=7):
     from daguandan_bridge.capture_service import FrameSnapshot
     from daguandan_bridge.image_io import StandardizationResult
     from daguandan_bridge.models import Box, ClientRect
@@ -204,9 +204,9 @@ def _migration_snapshot(value=7):
                 aspect_error=0.0, aspect_compatible=True,
             ),
             rect=ClientRect(10, 20, 4, 4), backend="screen", dpi=96,
-            window_title="migration test", raw_image=image.copy(),
+            window_title="case test", raw_image=image.copy(),
         ),
-        evidence_frame_id=f"migration-frame-{value}",
+        evidence_frame_id=f"case-frame-{value}",
     )
 
 
@@ -220,7 +220,7 @@ def diagnostic_controller(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     profile = _profile(tmp_path)
     capture = SimpleNamespace(
-        profiles_root=tmp_path, open_calls=[], snapshot=_migration_snapshot(),
+        profiles_root=tmp_path, open_calls=[], snapshot=_case_snapshot(),
     )
 
     def open_source(profile_name):
@@ -232,48 +232,73 @@ def diagnostic_controller(tmp_path, monkeypatch):
         capture, profile_name=profile.name,
         recognition_service=SimpleNamespace(), advisor=object(),
         session_factory=SimpleNamespace(), opening_evidence_monitor=SimpleNamespace(),
+        diagnostics_root=tmp_path / "diagnostics",
     )
     try:
         yield controller
     finally:
+        # Formal-frame tests use only a runtime identity stub, not a running
+        # orchestrator whose finish() should start a background shutdown job.
+        controller._active_live_token = None
+        controller.orchestrator = None
         controller.shutdown()
         app.processEvents()
 
 
-def _diagnostic_target(controller, phase):
+def _case_session(controller, *, formal=False):
     root = controller.capture_service.profiles_root
-    if phase == "manual":
-        # Diagnostic-only preopening stores have no recorder manifest to retain.
-        return LiveSessionStore.for_episode(root, controller.profile_name)
-    formal = LiveSessionStore(root, controller.profile_name, session_id="game_formal")
-    formal.start({})
-    return formal
+    if formal:
+        store = LiveSessionStore(root, controller.profile_name, session_id="game_formal")
+        store.start({})
+    else:
+        store = LiveSessionStore.for_episode(root, controller.profile_name)
+        store.start_episode({})
+    return store
 
 
-def _save_controller_diagnostic(controller, phase, *, retain=False):
-    if phase == "preopening":
-        episode = _diagnostic_target(controller, "manual")
-        controller._bind_preopening_diagnostic_to_recording(SimpleNamespace(store=episode))
-    if phase == "preopening" or retain:
-        controller._listening_enabled = True
-        controller._accept_waiting_frame(
-            controller.capture_service.snapshot,
-            generation=controller._waiting_generation, capture_seq=1,
-        )
+def _save_case_frame(controller):
     result = controller.save_latest_live_frame_to_session()
     assert controller._listener_evidence.writer.wait_idle(5)
-    if retain:
-        controller.stop_listening()
-        assert controller._retained_diagnostic_frame is not None
-        assert controller._retained_diagnostic_frame.session_directory == Path(result["session_directory"])
     return result
 
 
-def _migrate_diagnostics(controller, phase, target):
-    if phase == "manual":
-        controller._bind_preopening_diagnostic_to_recording(SimpleNamespace(store=target))
-    else:
-        controller._migrate_preopening_diagnostic_frames(target)
+def _accept_waiting_case_frame(controller, *, value=7, capture_seq=1):
+    controller._listening_enabled = True
+    controller._accept_waiting_frame(
+        _case_snapshot(value), generation=controller._waiting_generation,
+        capture_seq=capture_seq,
+    )
+
+
+def _assert_case_path(result, tmp_path):
+    case = Path(result["session_directory"])
+    assert case.parent == tmp_path / "diagnostics" / "cases"
+    assert case.name.startswith("case_")
+    assert Path(result["image_path"]).parent == case / "frames"
+    assert Path(result["metadata_path"]).parent == case / "frames"
+    assert (case / "case.json").is_file()
+    assert not (case / "diagnostic_frames").exists()
+    return case
+
+
+def _assert_case_session_links(case, episode, formal):
+    manifest = json.loads((case / "case.json").read_text(encoding="utf-8"))
+    assert manifest["case_id"] == case.name
+    assert manifest["frames_directory"] == "frames"
+    assert manifest["session_id"] == formal.session_id
+    assert Path(manifest["session_directory"]) == formal.directory
+    assert {
+        (link["kind"], link["session_id"], Path(link["directory"]))
+        for link in manifest["session_links"]
+    } == {
+        ("preopening", episode.session_id, episode.directory),
+        ("session", formal.session_id, formal.directory),
+    }
+    assert list(case.parent.glob("*/case.json")) == [case / "case.json"]
+    for store in (episode, formal):
+        assert not tuple(store.directory.rglob("*.png"))
+        assert not (store.directory / "case.json").exists()
+        assert not (store.directory / "frames").exists()
 
 
 def _make_directory_link(link, destination, kind):
@@ -294,172 +319,182 @@ def _make_directory_link(link, destination, kind):
         assert link.is_symlink()
 
 
-@pytest.mark.parametrize("phase", ["manual", "preopening"])
 @pytest.mark.parametrize("link_kind", ["symlink", "junction"])
-@pytest.mark.parametrize("linked_component", ["session", "diagnostic_frames"])
-def test_diagnostic_migration_rejects_link_destination_before_external_write(
-    diagnostic_controller, tmp_path, phase, link_kind, linked_component,
+@pytest.mark.parametrize("linked_component", ["diagnostics_root", "cases_root", "case", "frames"])
+def test_case_save_rejects_link_on_actual_write_path_before_external_write(
+    diagnostic_controller, tmp_path, link_kind, linked_component,
 ):
+    from daguandan_bridge.application.session_diagnostic_frames import SessionDiagnosticFrameError
+
     controller = diagnostic_controller
-    saved = _save_controller_diagnostic(controller, phase)
-    source = Path(saved["session_directory"])
-    source_bytes = {p.name: p.read_bytes() for p in (source / "diagnostic_frames").iterdir()}
-    target = _diagnostic_target(controller, phase)
-    # Formal start makes an empty diagnostic directory; remove only that empty
-    # directory when replacing it with a link. Never traverse/delete the target.
-    if linked_component == "diagnostic_frames":
-        link = target.directory / "diagnostic_frames"
-        if link.exists():
-            link.rmdir()
-    else:
-        target = SimpleNamespace(
-            directory=target.directory.parent / "linked_session",
-            session_id="linked_session",
-        )
-        link = target.directory
-    outside = tmp_path / "outside_sessions"
+    # Allocate only the identity, then substitute a link before the real writer
+    # creates anything. This tests the write path, not an unrelated session path.
+    case = controller._diagnostic_cases.allocate()
+    assert case.parent == tmp_path / "diagnostics" / "cases"
+    link = {
+        "diagnostics_root": tmp_path / "diagnostics",
+        "cases_root": case.parent,
+        "case": case,
+        "frames": case / "frames",
+    }[linked_component]
+    assert not link.exists()
+    outside = tmp_path / "outside_diagnostics"
     outside.mkdir()
-    sentinel = outside / "keep.txt"
-    sentinel.write_bytes(b"must not change")
+    (outside / "keep.txt").write_bytes(b"must not change")
     _make_directory_link(link, outside, link_kind)
-    before = {p.relative_to(outside): p.read_bytes() for p in outside.rglob("*") if p.is_file()}
-    statuses = []
-    controller.diagnostic_frame_status.connect(statuses.append)
 
-    _migrate_diagnostics(controller, phase, target)
+    with pytest.raises((ValueError, SessionDiagnosticFrameError), match="链接|重解析点"):
+        controller.save_latest_live_frame_to_session()
+    assert controller._listener_evidence.writer.wait_idle(5)
 
-    assert statuses and statuses[-1]["status"] == "MIGRATION_SKIPPED"
-    assert {p.relative_to(outside): p.read_bytes() for p in outside.rglob("*") if p.is_file()} == before
-    assert sorted(p.name for p in outside.iterdir()) == ["keep.txt"]
-    assert {p.name: p.read_bytes() for p in (source / "diagnostic_frames").iterdir()} == source_bytes
-    assert controller.diagnostic_frame_directory() == source / "diagnostic_frames"
+    assert sorted(path.name for path in outside.iterdir()) == ["keep.txt"]
+    assert (outside / "keep.txt").read_bytes() == b"must not change"
+    assert not tuple(outside.rglob("*.png"))
+    assert not tuple(outside.rglob("*.json"))
 
 
-@pytest.mark.parametrize("phase", ["manual", "preopening"])
-def test_controller_saved_diagnostics_migrate_to_formal_session_and_update_directory(
-    diagnostic_controller, phase,
+@pytest.mark.parametrize("initial_source", ["manual", "listener"])
+def test_controller_frames_stay_in_one_case_across_preopening_and_formal_session(
+    diagnostic_controller, tmp_path, initial_source,
 ):
     controller = diagnostic_controller
-    saved = _save_controller_diagnostic(controller, phase)
-    original = Path(saved["session_directory"])
-    original_png = Path(saved["image_path"]).read_bytes()
-    store = SessionDiagnosticFrameStore()
-    if phase == "manual":
-        episode = _diagnostic_target(controller, "manual")
-        _migrate_diagnostics(controller, "manual", episode)
-        assert not original.exists()
-        assert len(store.list_frames(episode.directory)) == 1
-        assert controller.diagnostic_frame_directory() == episode.directory / "diagnostic_frames"
-        preopening = episode.directory
-    else:
-        preopening = original
-    formal = _diagnostic_target(controller, "preopening")
-    existing = store.save_snapshot(
-        formal.directory, _migration_snapshot(19), session_id=formal.session_id,
-        capture_generation=3, capture_seq=9,
+    if initial_source == "listener":
+        _accept_waiting_case_frame(controller)
+    first = _save_case_frame(controller)
+    case = _assert_case_path(first, tmp_path)
+    original = {
+        Path(first[key]): Path(first[key]).read_bytes()
+        for key in ("image_path", "metadata_path")
+    }
+    first_manifest = json.loads((case / "case.json").read_text(encoding="utf-8"))
+    assert first_manifest["session_id"] is None
+    assert first_manifest["session_links"] == []
+
+    episode = _case_session(controller)
+    controller._bind_preopening_diagnostic_to_recording(SimpleNamespace(store=episode))
+    assert controller._preopening_diagnostic_directory == case
+    assert controller.diagnostic_frame_directory() == case / "frames"
+    _accept_waiting_case_frame(controller, value=19, capture_seq=2)
+    waiting = _save_case_frame(controller)
+    assert _assert_case_path(waiting, tmp_path) == case
+    original.update({
+        Path(waiting[key]): Path(waiting[key]).read_bytes()
+        for key in ("image_path", "metadata_path")
+    })
+
+    formal = _case_session(controller, formal=True)
+    controller._migrate_preopening_diagnostic_frames(formal)
+    assert controller._preopening_diagnostic_directory == case
+    assert all(path.read_bytes() == contents for path, contents in original.items())
+    runtime = SimpleNamespace(store=formal, snapshot=SimpleNamespace(session_id=formal.session_id))
+    controller.orchestrator = runtime
+    token = controller._activate_live_token(runtime)
+    controller._retain_listener_snapshot(_case_snapshot(31), token.generation, 1, token=token)
+    live = _save_case_frame(controller)
+
+    assert _assert_case_path(live, tmp_path) == case
+    assert all(path.read_bytes() == contents for path, contents in original.items())
+    assert [first["sequence"], waiting["sequence"], live["sequence"]] == [1, 2, 3]
+    assert first["source_phase"] == (
+        "manual_window_capture" if initial_source == "manual" else "preopening_listener"
     )
-    existing_png, existing_json = existing.image_path.read_bytes(), existing.metadata_path.read_bytes()
-
-    _migrate_diagnostics(controller, "preopening", formal)
-
-    records = store.list_frames(formal.directory)
-    assert len(records) == 2, "a real controller save must not permanently pin ordinary diagnostics"
-    migrated = records[1]
-    assert existing.image_path.read_bytes() == existing_png
-    assert existing.metadata_path.read_bytes() == existing_json
-    assert migrated.sequence == 2
-    assert migrated.image_path.read_bytes() == original_png
-    assert migrated.metadata["session_id"] == formal.session_id
-    assert migrated.metadata["evidence_frame_id"] == saved["evidence_frame_id"]
-    assert migrated.metadata["capture_seq"] == saved["capture_seq"]
-    assert migrated.metadata["capture_generation"] == saved["capture_generation"]
-    np.testing.assert_array_equal(store.load_image(migrated), controller.capture_service.snapshot.image)
-    assert not preopening.exists()
-    assert controller._last_diagnostic_frame_directory == formal.directory / "diagnostic_frames"
-    assert controller.diagnostic_frame_directory() == formal.directory / "diagnostic_frames"
+    assert waiting["source_phase"] == "preopening_listener"
+    assert live["source_phase"] == "live_session"
+    assert live["session_id"] == formal.session_id
+    records = SessionDiagnosticFrameStore().list_frames(case)
+    assert len(records) == 3
+    for record, value in zip(records, (7, 19, 31), strict=True):
+        assert record.image_path.parent == case / "frames"
+        np.testing.assert_array_equal(
+            SessionDiagnosticFrameStore().load_image(record), _case_snapshot(value).image,
+        )
+    assert controller._last_diagnostic_frame_directory == case / "frames"
+    assert controller.diagnostic_frame_directory() == case / "frames"
+    assert controller.capture_service.open_calls == (
+        [controller.profile_name] if initial_source == "manual" else []
+    )
+    _assert_case_session_links(case, episode, formal)
 
 
-@pytest.mark.parametrize("phase", ["manual", "preopening"])
-def test_retained_listener_frame_rebinds_after_migration_without_recreating_source(
-    diagnostic_controller, phase,
+@pytest.mark.parametrize("initial_binding", ["unbound", "preopening"])
+def test_retained_listener_frame_keeps_case_directory_and_saves_without_recapture(
+    diagnostic_controller, tmp_path, initial_binding,
 ):
     controller = diagnostic_controller
-    saved = _save_controller_diagnostic(controller, phase, retain=True)
-    original = Path(saved["session_directory"])
+    episode = _case_session(controller)
+    if initial_binding == "preopening":
+        controller._bind_preopening_diagnostic_to_recording(SimpleNamespace(store=episode))
+    _accept_waiting_case_frame(controller)
+    first = _save_case_frame(controller)
+    case = _assert_case_path(first, tmp_path)
+    original = {
+        Path(first[key]): Path(first[key]).read_bytes()
+        for key in ("image_path", "metadata_path")
+    }
+    controller.stop_listening()
     retained = controller._retained_diagnostic_frame
-    assert retained.session_directory == original
+    assert retained is not None
+    assert retained.session_directory == case
     assert retained.source_phase == "listener_stopped"
     assert controller.capture_service.open_calls == []
-    if phase == "manual":
-        episode = _diagnostic_target(controller, "manual")
-        _migrate_diagnostics(controller, "manual", episode)
-        assert not original.exists()
-        assert controller._retained_diagnostic_frame.session_directory == episode.directory
-        preopening = episode.directory
-    else:
-        preopening = original
-    formal = _diagnostic_target(controller, "preopening")
 
-    _migrate_diagnostics(controller, "preopening", formal)
+    if initial_binding == "unbound":
+        controller._bind_preopening_diagnostic_to_recording(SimpleNamespace(store=episode))
+    formal = _case_session(controller, formal=True)
+    controller._migrate_preopening_diagnostic_frames(formal)
 
-    assert not preopening.exists()
-    rebound = controller._retained_diagnostic_frame
-    assert rebound.session_directory == formal.directory
-    assert rebound.session_id == formal.session_id
-    assert rebound.identity == retained.identity
+    assert controller._retained_diagnostic_frame.session_directory == case
+    assert controller._retained_diagnostic_frame.identity == retained.identity
     cached = controller._listener_evidence.find(
         retained.snapshot, retained.capture_generation, retained.capture_scope[0],
         scope_id=retained.capture_scope[2],
     )
     assert cached is not None
-    # Fallback captures may remain storage-unbound in the ring (None), unlike
-    # the retained save context. Neither cache may name a deleted directory.
-    if phase == "manual" and cached.session_directory is None:
-        assert cached.session_id == ""
-    else:
-        assert cached.session_directory == formal.directory
-        assert cached.session_id == formal.session_id
+    assert cached.session_directory == case
+    assert controller.diagnostic_frame_directory() == case / "frames"
+    again = _save_case_frame(controller)
 
-    again = controller.save_latest_live_frame_to_session()
-    assert controller._listener_evidence.writer.wait_idle(5)
-
-    assert not original.exists(), "manual save must not recreate the deleted source directory"
-    assert not preopening.exists()
-    assert Path(again["session_directory"]) == formal.directory
-    assert Path(again["image_path"]).parent == formal.directory / "diagnostic_frames"
-    assert again["session_id"] == formal.session_id
-    assert again["evidence_frame_id"] == saved["evidence_frame_id"]
+    assert _assert_case_path(again, tmp_path) == case
+    assert again["sequence"] == 2
+    assert again["evidence_frame_id"] == first["evidence_frame_id"]
+    assert again["capture_seq"] == first["capture_seq"]
+    assert again["capture_generation"] == first["capture_generation"]
     assert again["source_phase"] == "listener_stopped"
-    assert controller.capture_service.open_calls == [], "save must reuse retained evidence, not recapture"
-    records = SessionDiagnosticFrameStore().list_frames(formal.directory)
-    assert len(records) == 2
-    assert records[0].image_path.read_bytes() == records[1].image_path.read_bytes()
-    assert controller.diagnostic_frame_directory() == formal.directory / "diagnostic_frames"
+    assert all(path.read_bytes() == contents for path, contents in original.items())
+    assert Path(again["image_path"]).read_bytes() == Path(first["image_path"]).read_bytes()
+    assert controller.capture_service.open_calls == [], "retained save must not recapture the desktop"
+    assert len(SessionDiagnosticFrameStore().list_frames(case)) == 2
+    _assert_case_session_links(case, episode, formal)
 
 
-@pytest.mark.parametrize("phase", ["manual", "preopening"])
-def test_diagnostic_migration_preserves_orphan_json_and_does_not_reuse_its_sequence(
-    diagnostic_controller, phase,
+@pytest.mark.parametrize("source", ["manual", "listener"])
+def test_case_save_preserves_orphan_json_and_does_not_reuse_its_sequence(
+    diagnostic_controller, tmp_path, source,
 ):
     controller = diagnostic_controller
-    saved = _save_controller_diagnostic(controller, phase)
-    original_png = Path(saved["image_path"]).read_bytes()
-    target = _diagnostic_target(controller, phase)
-    directory = SessionDiagnosticFrameStore.diagnostic_directory(target.directory, create=True)
+    case = controller._diagnostic_cases.allocate()
+    assert case.parent == tmp_path / "diagnostics" / "cases"
+    directory = case / "frames"
+    directory.mkdir(parents=True)
     orphan = directory / "000001.json"
     orphan_bytes = b'{"interrupted_write": true, "preserve": "exact bytes"}\n'
     orphan.write_bytes(orphan_bytes)
     assert not orphan.with_suffix(".png").exists()
+    if source == "listener":
+        _accept_waiting_case_frame(controller)
 
-    _migrate_diagnostics(controller, phase, target)
+    saved = _save_case_frame(controller)
 
+    assert _assert_case_path(saved, tmp_path) == case
+    assert saved["sequence"] == 2
     assert orphan.read_bytes() == orphan_bytes
     assert not orphan.with_suffix(".png").exists()
-    records = SessionDiagnosticFrameStore().list_frames(target.directory)
+    records = SessionDiagnosticFrameStore().list_frames(case)
     assert len(records) == 1
     assert records[0].sequence == 2
-    assert records[0].image_path.read_bytes() == original_png
-    assert records[0].metadata["session_id"] == target.session_id
-    assert not Path(saved["image_path"]).exists()
-    assert not Path(saved["metadata_path"]).exists()
+    assert records[0].image_path == directory / "000002.png"
+    assert records[0].metadata_path == directory / "000002.json"
+    np.testing.assert_array_equal(
+        SessionDiagnosticFrameStore().load_image(records[0]), controller.capture_service.snapshot.image,
+    )
     assert controller.diagnostic_frame_directory() == directory

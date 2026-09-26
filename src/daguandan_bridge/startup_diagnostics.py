@@ -90,7 +90,7 @@ def resolve_diagnostics_root(
     bundle_root: Path | str | None = None,
     executable_path: Path | str | None = None,
 ) -> DiagnosticsRoot:
-    """Use the same explicit overrides and local-log default as runtime layout."""
+    """Use the same explicit overrides and diagnostics default as runtime layout."""
 
     app = resolve_application_root(
         frozen=frozen, bundle_root=bundle_root, executable_path=executable_path

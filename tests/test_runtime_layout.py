@@ -255,7 +255,7 @@ def test_data_override_must_be_absolute_external_and_not_reparse(tmp_path, monke
             bundle_root=bundle,
             environ={
                 "DAGUANDAN_DATA_ROOT": str(tmp_path / "valid-runtime"),
-                "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "diagnostics"),
+                "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "_internal" / "diagnostics"),
             },
         )
 

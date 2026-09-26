@@ -108,6 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--export-problem", action="store_true",
+        help="导出最近问题的离线问题包（默认含截图，不要求正式对局或封存）。",
+    )
+    parser.add_argument("--problem-case", type=Path, help="指定 diagnostics/cases 下的问题目录。")
+    parser.add_argument("--problem-no-images", action="store_true", help="问题包不包含任何媒体。")
+    parser.add_argument(
         "--export-support",
         type=Path,
         metavar="ZIP",
@@ -217,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         help="把独立真值绑定到 incident 中实际送达 opening gate 的帧序号。",
     )
     args = parser.parse_args(argv)
+    if (args.problem_case is not None or args.problem_no_images) and not args.export_problem:
+        parser.error("问题包选项只能与 --export-problem 一起使用")
     selected_modes = sum(
         (
             bool(args.fabledan_fixed_benchmark),
@@ -229,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             bool(args.rollback_sessions),
             bool(args.sessions_status),
             args._doctor_import_probe is not None,
+            bool(args.export_problem),
             args.export_support is not None,
             args.replay_diagnostic is not None,
             args.export_session_diagnostic is not None,
@@ -411,6 +420,43 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
             if not isinstance(suite_gate, dict) or suite_gate.get("status") != "PASS":
                 return 2
+        return 0
+    if args.export_problem:
+        from daguandan_bridge.problem_bundle import (
+            ProblemBundleRequest, export_problem_bundle, select_problem_bundle_sources,
+            select_problem_profile_directory,
+        )
+        from daguandan_bridge.runtime_layout import (
+            resolve_application_root, resolve_log_diagnostics_root, resolve_runtime_layout,
+        )
+
+        try:
+            diagnostics_root, _ = resolve_log_diagnostics_root()
+            latest_case, previous_run = select_problem_bundle_sources(
+                diagnostics_root, exclude_run=STARTUP_DIAGNOSTICS.run_directory,
+            )
+            selected_case = args.problem_case or latest_case
+            profile_directory = None
+            try:
+                profile_directory = select_problem_profile_directory(
+                    selected_case, resolve_runtime_layout().profiles_root,
+                )
+            except (OSError, ValueError, RuntimeError):
+                pass  # Export other evidence; the manifest reports missing profile/session.
+            result = export_problem_bundle(ProblemBundleRequest(
+                diagnostics_root=diagnostics_root,
+                case_directory=selected_case,
+                run_directory=previous_run if args.problem_case is None else None,
+                profile_directory=profile_directory,
+                bundle_root=resolve_application_root(),
+                include_images=not args.problem_no_images,
+            ))
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(json.dumps({"status": "FAILED", "archive_path": None,
+                              "message": "问题包导出失败", "error_type": type(exc).__name__},
+                             ensure_ascii=False, indent=2))
+            return 2
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.export_support is not None:
         from daguandan_bridge.support_export import (

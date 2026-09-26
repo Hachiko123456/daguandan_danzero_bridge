@@ -66,10 +66,11 @@ class DaguandanBridgeWindow(FluentWindow):
         self.annotation_page.setObjectName("annotationPage")
         self.live_assistant_page = LiveAssistantPage(self.live_runtime)
         self.replay_page = ReplayPage(dependencies.sessions_root)
+        self.recommendation_window = RecommendationFloatWindow(self.live_runtime)
         self.window_debug_page = WindowDebugPage(
             report_service=window_debug_service,
+            problem_export_ui=self.recommendation_window.problem_export_ui,
         )
-        self.recommendation_window = RecommendationFloatWindow(self.live_runtime)
         self.live_assistant_page.compact_mode_requested.connect(
             self.show_compact_recommendation
         )

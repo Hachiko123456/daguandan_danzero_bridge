@@ -55,6 +55,14 @@ WindowRecord = Mapping[str, object]
 WindowReport = Mapping[str, object]
 
 
+class ProblemExportUiPort(Protocol):
+    """UI presenter injected by the composition root, not a runtime dependency."""
+
+    def bind_button(self, button: QWidget) -> None: ...
+
+    def request(self, *, parent: QWidget, case_directory: Path | None = None) -> None: ...
+
+
 class WindowDebugReportPort(Protocol):
     """The read-only service surface needed by :class:`WindowDebugPage`."""
 
@@ -479,10 +487,12 @@ class WindowDebugPage(QWidget):
         parent: QWidget | None = None,
         *,
         service: WindowDebugReportPort | None = None,
+        problem_export_ui: ProblemExportUiPort | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("windowDebugPage")
         self.report_service = report_service or service or WindowDebugReportService()
+        self.problem_export_ui = problem_export_ui
         self._window_records: dict[int, WindowRecord] = {}
         self._last_report: WindowReport | None = None
         self._session_directory: Path | None = None
@@ -490,6 +500,8 @@ class WindowDebugPage(QWidget):
         self._current_session_frame_index = -1
         self._current_preview_pixmap = QPixmap()
         self._build_ui()
+        if problem_export_ui is not None:
+            problem_export_ui.bind_button(self.problem_export_button)
         self._set_idle_state()
 
     def _build_ui(self) -> None:
@@ -516,7 +528,14 @@ class WindowDebugPage(QWidget):
         header_layout = QVBoxLayout(header)
         header_layout.setContentsMargins(20, 16, 20, 16)
         header_layout.setSpacing(4)
-        header_layout.addWidget(SubtitleLabel("窗口与牌局诊断"))
+        title_row = QHBoxLayout()
+        title_row.addWidget(SubtitleLabel("窗口与牌局诊断"), 1)
+        self.problem_export_button = PrimaryPushButton("导出问题包", header)
+        self.problem_export_button.setObjectName("windowDebugProblemExportButton")
+        self.problem_export_button.setToolTip("导出所选对局；未选择时导出当前或最近对局，不自动上传")
+        self.problem_export_button.clicked.connect(self.request_problem_export)
+        title_row.addWidget(self.problem_export_button)
+        header_layout.addLayout(title_row)
         header_layout.addWidget(
             CaptionLabel(
                 "刷新可见窗口，选择 HWND 后执行一次只读单帧诊断。"
@@ -567,7 +586,7 @@ class WindowDebugPage(QWidget):
         policy_layout = QHBoxLayout(policy)
         policy_layout.setContentsMargins(16, 10, 16, 10)
         self.policy_label = BodyLabel(
-            "只读策略：不控制目标窗口 · 默认不保存截图 · 导出需要显式选择文件路径"
+            "只读诊断不控制目标窗口；问题包仅存本机，可选包含截图或仅日志，不自动上传。"
         )
         self.policy_label.setWordWrap(True)
         policy_layout.addWidget(self.policy_label)
@@ -646,6 +665,7 @@ class WindowDebugPage(QWidget):
         layout.addWidget(StrongBodyLabel("对局截图诊断"))
         directory_row = QHBoxLayout()
         self.choose_session_button = PushButton("选择对局目录", panel)
+        self.choose_session_button.setToolTip("可选择 case 目录、frames 目录或旧对局的 diagnostic_frames 目录")
         self.choose_session_button.setObjectName("chooseSessionDirectoryButton")
         self.choose_session_button.clicked.connect(self.choose_session_directory)
         directory_row.addWidget(self.choose_session_button)
@@ -681,7 +701,7 @@ class WindowDebugPage(QWidget):
         layout.addLayout(frame_row)
 
         preview_row = QHBoxLayout()
-        self.frame_preview = QLabel("选择对局目录后查看实时监听帧", panel)
+        self.frame_preview = QLabel("选择对局或 frames 目录后查看诊断截图", panel)
         self.frame_preview.setObjectName("sessionFramePreview")
         self.frame_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.frame_preview.setMinimumHeight(120)
@@ -840,6 +860,7 @@ class WindowDebugPage(QWidget):
         if store_cls is not None:
             stores: list[object] = []
             for args, kwargs in (
+                ((), {}),
                 ((session_directory,), {}),
                 ((), {"session_directory": session_directory}),
                 ((), {"root": session_directory}),
@@ -866,7 +887,9 @@ class WindowDebugPage(QWidget):
                     break
         if values is None:
             frames_dir = session_directory / "diagnostic_frames"
-            if session_directory.name.casefold() == "diagnostic_frames":
+            if (session_directory / "case.json").is_file():
+                frames_dir = session_directory / "frames"
+            elif session_directory.name.casefold() == "diagnostic_frames":
                 frames_dir = session_directory
             values = sorted(frames_dir.glob("*.png")) if frames_dir.is_dir() else []
 
@@ -889,14 +912,22 @@ class WindowDebugPage(QWidget):
         return result
 
     def choose_session_directory(self) -> Path | None:
-        selected = QFileDialog.getExistingDirectory(self, "选择对局目录", "")
+        selected = QFileDialog.getExistingDirectory(self, "选择对局或 frames 目录", "")
         if not selected:
             return None
-        return self.set_session_directory(Path(selected))
+        try:
+            return self.set_session_directory(Path(selected))
+        except (OSError, ValueError) as exc:
+            self.status_label.setText(f"无法选择截图目录：{exc}")
+            return None
 
     def set_session_directory(self, directory: Path | str) -> Path:
-        selected = Path(directory).expanduser()
-        if selected.name.casefold() == "diagnostic_frames":
+        selected = Path(directory)
+        if not selected.is_absolute() or selected == Path(selected.anchor) or ".." in selected.parts or "\x00" in str(selected):
+            raise ValueError("请选择本机绝对目录，不支持 URL 或相对路径")
+        if selected.name.casefold() == "frames" and not (selected.parent / "case.json").is_file():
+            raise ValueError("frames 目录缺少所属对局的 case.json 标识")
+        if selected.name.casefold() in {"diagnostic_frames", "frames"}:
             session_directory = selected.parent
         else:
             session_directory = selected
@@ -905,15 +936,30 @@ class WindowDebugPage(QWidget):
         self.refresh_session_frames()
         return session_directory
 
+    def request_problem_export(self) -> None:
+        # Pass the explicitly selected historical case even when it has no
+        # frames. Only the controller may resolve current/recent when None.
+        if self.problem_export_ui is None:
+            self.policy_label.setText("当前运行时不支持问题包导出；不影响已有诊断功能。")
+            return
+        self.problem_export_ui.request(parent=self, case_directory=self._session_directory)
+
     def refresh_session_frames(self) -> None:
+        load_error = ""
         self.frame_selector.blockSignals(True)
         try:
             self.frame_selector.clear()
-            self._session_frames = (
-                self._list_session_frames(self._session_directory)
-                if self._session_directory is not None
-                else []
-            )
+            try:
+                self._session_frames = (
+                    self._list_session_frames(self._session_directory)
+                    if self._session_directory is not None
+                    else []
+                )
+            except Exception as exc:
+                # Keep the selected historical case bound to export, but never
+                # bypass a store integrity error with the legacy file scan.
+                self._session_frames = []
+                load_error = str(exc) or type(exc).__name__
             for index, frame in enumerate(self._session_frames, 1):
                 sequence = frame.get("sequence", index)
                 captured_at = str(frame.get("captured_at") or "").replace("T", " ")
@@ -925,13 +971,13 @@ class WindowDebugPage(QWidget):
             self._current_session_frame_index = -1
             self.frame_index_label.setText("0 / 0")
             self.frame_preview.setPixmap(QPixmap())
-            self.frame_preview.setText("当前对局没有可用的实时监听帧")
+            self.frame_preview.setText("当前对局没有可用的诊断截图")
             self.frame_metadata_view.clear()
             self.previous_frame_button.setEnabled(False)
             self.next_frame_button.setEnabled(False)
             self.recognize_frame_button.setEnabled(False)
             self._clear_report_views("请选择一张实时监听帧后显式点击识别。")
-            self.status_label.setText("截图为空或没有有效的 PNG 帧")
+            self.status_label.setText("无法加载截图：" + load_error if load_error else "截图为空或没有有效的 PNG 帧")
             return
         self.frame_selector.setCurrentIndex(0)
         self._session_frame_changed(0)
@@ -962,7 +1008,7 @@ class WindowDebugPage(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             ))
         metadata = {
-            "来源": "实时监听帧",
+            "来源": "诊断截图",
             "图片": str(image_path),
             "元数据": str(frame["metadata_path"]),
             "序号": frame.get("sequence"),
@@ -974,13 +1020,20 @@ class WindowDebugPage(QWidget):
                 metadata["metadata_json"] = json.loads(metadata_path.read_text(encoding="utf-8"))
             except Exception as exc:
                 metadata["metadata_error"] = str(exc)
+        saved_metadata = _mapping(metadata.get("metadata_json"))
+        source = str(saved_metadata.get("source") or "")
+        phase = str(saved_metadata.get("source_phase") or "")
+        source_label = "手动窗口截图" if source == "manual_window_capture" else "实时监听帧"
+        if phase in {"last_listener_frame", "failed_listener_frame", "waiting_capture_failed", "geometry_recovery_failed"}:
+            source_label = "故障恢复截图"
+        metadata["来源"] = source_label
         self.frame_metadata_view.setPlainText(_pretty_json(metadata))
         self.frame_index_label.setText(f"{frame_index + 1} / {len(self._session_frames)}")
         self.previous_frame_button.setEnabled(frame_index > 0)
         self.next_frame_button.setEnabled(frame_index + 1 < len(self._session_frames))
         self.recognize_frame_button.setEnabled(not pixmap.isNull())
         self._clear_report_views("当前截图尚未识别；点击“识别当前截图”开始。")
-        self.status_label.setText(f"来源：实时监听帧 · 第 {frame_index + 1} 张")
+        self.status_label.setText(f"来源：{source_label} · 第 {frame_index + 1} 张")
 
     def previous_session_frame(self) -> None:
         if self._current_session_frame_index > 0:

@@ -168,7 +168,7 @@ def test_early_frozen_diagnostics_rejects_paths_inside_resources(tmp_path, monke
     with pytest.raises(RuntimeLayoutError, match="outside the bundle tree"):
         resolve_diagnostics_root(
             environ={
-                "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "diagnostics"),
+                "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "_internal" / "diagnostics"),
                 "DAGUANDAN_DATA_ROOT": str(bundle / "data-root"),
                 "LOCALAPPDATA": str(tmp_path / "safe-local"),
             },

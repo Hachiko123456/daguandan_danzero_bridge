@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import os
+import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
@@ -220,3 +221,8 @@ def test_unknown_recovery_resumes_without_false_opening_and_user_stop_wins(tmp_p
     controller._consume_waiting_recognition(result, envelope)
     assert observed == []
     assert controller._listening_enabled is False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_case_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAGUANDAN_DIAGNOSTICS_ROOT", str(tmp_path / "diagnostics"))

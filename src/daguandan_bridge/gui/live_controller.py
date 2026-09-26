@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
 
+from ..application.diagnostic_cases import DiagnosticCases
 from ..application.listener_evidence import (
     EvidenceWriteHandle,
     ListenerEvidence,
@@ -49,6 +50,7 @@ from ..live.frame_pipeline import analyze_frame_envelope
 from ..live.latest_worker import LatestOnlyWorker
 from ..live.pipeline_timing import PipelineTiming
 from ..session_paths import resolve_sessions_root
+from ..runtime_layout import resolve_log_diagnostics_root
 from ..opening_evidence import (
     NonBlockingOpeningEvidenceSink,
     build_opening_evidence_monitor,
@@ -211,6 +213,7 @@ class LiveAssistantController(QObject):
     listening_status = Signal(object)
     preselection_result = Signal(object)
     log_delivery_status = Signal(object)
+    problem_export_status = Signal(object)
     recording_status = Signal(object)
     live_fault = Signal(object)
     diagnostic_frame_status = Signal(object)
@@ -246,6 +249,7 @@ class LiveAssistantController(QObject):
         capture_interval_sec: float = 0.1,
         deduplicate_analysis_frames: bool = False,
         opening_evidence_monitor: object | None = None,
+        diagnostics_root: Path | None = None,
     ) -> None:
         super().__init__()
         if (
@@ -290,6 +294,7 @@ class LiveAssistantController(QObject):
         evidence_target = opening_evidence_monitor or build_opening_evidence_monitor(
             profiles_root=self.capture_service.profiles_root,
             profile_name=self.profile_name,
+            persist_images=False,
         )
         self.opening_evidence = (
             evidence_target
@@ -319,6 +324,8 @@ class LiveAssistantController(QObject):
         self._danzero_warmup_complete = False
         self._finish_thread: OneShotThread | None = None
         self._log_export_thread: OneShotThread | None = None
+        self._problem_export_thread: OneShotThread | None = None
+        self._last_problem_export: dict[str, object] | None = None
         self._log_open_thread: OneShotThread | None = None
         self._diagnostic_frame_thread: EvidenceWriteHandle | None = None
         self._diagnostics_closed = False
@@ -326,6 +333,10 @@ class LiveAssistantController(QObject):
         self._diagnostic_directory_lock = Lock()
         self._retained_diagnostic_frame: _DiagnosticFrameSaveContext | None = None
         self._diagnostic_run_id = uuid4().hex
+        self._diagnostic_cases = DiagnosticCases(
+            diagnostics_root if diagnostics_root is not None else resolve_log_diagnostics_root()[0],
+            profile_name=profile_name,
+        )
         self._diagnostic_no_frame_failure = False
         self._diagnostic_runtime_evidence = None
         self._last_no_frame_fault: tuple[object, ...] | None = None
@@ -530,16 +541,16 @@ class LiveAssistantController(QObject):
         self.diagnostic_frame_status.emit(payload)
 
     def diagnostic_frame_directory(self) -> Path | None:
-        """Resolve only known, existing directories; never allocate one here."""
+        """Open the actual case, never an unrelated profile/session directory."""
         with self._diagnostic_directory_lock:
             last = self._last_diagnostic_frame_directory
-        store = getattr(self.orchestrator, "store", None)
-        candidates = [last]
-        for directory in (getattr(store, "directory", None),
-                          self._preopening_diagnostic_directory,
-                          self._manual_diagnostic_directory):
-            if directory is not None:
-                candidates.append(Path(directory).absolute() / "diagnostic_frames")
+        case = self._diagnostic_cases.current
+        candidates = ([case / "frames", case / "diagnostic_frames"] if case is not None else [])
+        candidates.append(last)
+        legacy = getattr(getattr(self.orchestrator, "store", None), "directory", None)
+        if legacy is not None:
+            candidates.append(Path(legacy) / "diagnostic_frames")
+        candidates.append(self._diagnostic_cases.root / "cases")
         for directory in candidates:
             try:
                 if directory is not None and directory.is_dir():
@@ -563,9 +574,12 @@ class LiveAssistantController(QObject):
             "fingerprint_scope": "config_at_listener_start_not_template_integrity_check",
         }
         if state is not None:
-            context["run_id"] = state.run_id
-            context["startup_report"] = (str(state.run_directory / "startup_report.json")
-                                         if state.run_directory else None)
+            run_directory = getattr(state, "run_directory", None)
+            if run_directory is not None and Path(run_directory).parent == self._diagnostic_cases.root / "runs":
+                context["run_id"] = state.run_id
+                context["startup_report"] = str(Path(run_directory) / "startup_report.json")
+            else:
+                context["startup_report_unavailable"] = "outside_selected_diagnostics_root"
         digests = {}
         for name in ("profile.json", "regions_config.json", "templates_config.json"):
             try:
@@ -605,14 +619,18 @@ class LiveAssistantController(QObject):
                 if not self._live_token_is_current(token):
                     return None
                 store = getattr(token.orchestrator, "store", None)
-                directory = getattr(store, "directory", None)
-                session_id = str(getattr(store, "session_id", "") or "")
+                store_directory = getattr(store, "directory", None)
+                session_id = str(getattr(store, "session_id", "") or token.session_id)
+                directory = self._diagnostic_cases.bind_session(
+                    session_id, Path(store_directory) if store_directory is not None else None,
+                    formal=True,
+                )
                 prefix = "_latest_live_frame"
             else:
                 if not self._listening_enabled or generation != self._waiting_generation:
                     return None
-                directory = self._preopening_diagnostic_directory
-                session_id = self._preopening_diagnostic_session_id
+                directory = self._preopening_diagnostic_directory or self._diagnostic_cases.allocate()
+                session_id = self._preopening_diagnostic_session_id or directory.name
                 prefix = "_latest_waiting_frame"
             scope_id = self._diagnostic_scope_id(token=token)
             previous = self._listener_evidence.find(snapshot, generation, phase, scope_id=scope_id, capture_seq=capture_seq)
@@ -727,8 +745,12 @@ class LiveAssistantController(QObject):
                     "geometry": self._snapshot_geometry(snapshot), "listener_phase": phase,
                 }, scope_id=scope_id,
             )
+        # The frame keeps its capture-time case even if the live session has
+        # since acquired a formal ID. Storage binding never moves its pixels.
+        bound_directory = context.session_directory or directory
         context = self._bind_diagnostic_context(replace(
-            context, session_directory=directory, session_id=session_id,
+            context, session_directory=bound_directory,
+            session_id=session_id or context.session_id,
         ))
         retained = self._retained_diagnostic_frame
         if (retained is not None and retained.source_phase in {"failed_listener_frame", "last_listener_frame"}
@@ -751,9 +773,12 @@ class LiveAssistantController(QObject):
             if (directory is not None and session_id == token.session_id and session_id
                     and snapshot is not None and generation == token.generation
                     and generation == self._capture_generation and capture_seq >= 0):
+                case_directory = self._diagnostic_cases.bind_session(
+                    session_id, Path(directory), formal=True,
+                )
                 return self._cached_diagnostic_context(
                     snapshot, generation, capture_seq, "live_session",
-                    Path(directory), session_id, token=token,
+                    case_directory, session_id, token=token,
                 )
             # Never use a waiting/old-session frame for a formal current claim.
             return None
@@ -786,16 +811,9 @@ class LiveAssistantController(QObject):
 
         with self._manual_diagnostic_lock:
             if self._manual_diagnostic_directory is None:
-                sessions_root = resolve_sessions_root(
-                    self.capture_service.profiles_root,
-                    self.profile_name,
-                )
-                stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-                diagnostic_id = f"diagnostic_{stamp}_{uuid4().hex[:8]}"
-                self._manual_diagnostic_directory = (
-                    Path(sessions_root) / "manual_diagnostic" / diagnostic_id
-                )
-                self._manual_diagnostic_session_id = diagnostic_id
+                case_directory = self._diagnostic_cases.allocate()
+                self._manual_diagnostic_directory = case_directory
+                self._manual_diagnostic_session_id = case_directory.name
                 self._manual_capture_seq = 0
             return (
                 Path(self._manual_diagnostic_directory),
@@ -881,6 +899,12 @@ class LiveAssistantController(QObject):
     ) -> dict[str, object]:
         from ..application.session_diagnostic_frames import SessionDiagnosticFrameStore
 
+        if context.session_directory is not None and context.session_directory.parent.name == "cases":
+            self._diagnostic_cases.materialize(
+                context.session_directory,
+                runtime=context.details.get("runtime") if isinstance(context.details, dict) else None,
+                profile_directory=Path(self.capture_service.profiles_root) / self.profile_name,
+            )
         persisted = SessionDiagnosticFrameStore().save_snapshot(
             context.session_directory,
             context.snapshot,
@@ -911,10 +935,13 @@ class LiveAssistantController(QObject):
         result.setdefault("evidence_frame_id", context.snapshot.evidence_frame_id)
         result.setdefault("capture_seq", context.capture_seq)
         result.setdefault("capture_generation", context.capture_generation)
-        result.setdefault("captured_at", context.snapshot.captured_at.isoformat())
-        result.setdefault("captured_monotonic_ms", context.snapshot.captured_monotonic_ms)
-        result["frame_age_ms"] = max(
-            0, monotonic_ns() // 1_000_000 - context.snapshot.captured_monotonic_ms,
+        captured_at = getattr(context.snapshot, "captured_at", None)
+        result.setdefault("captured_at", captured_at.isoformat() if hasattr(captured_at, "isoformat") else None)
+        captured_ms = getattr(context.snapshot, "captured_monotonic_ms", None)
+        result.setdefault("captured_monotonic_ms", captured_ms)
+        result["frame_age_ms"] = (
+            max(0, monotonic_ns() // 1_000_000 - captured_ms)
+            if isinstance(captured_ms, (int, float)) else None
         )
         result.setdefault(
             "raw_sha256",
@@ -1267,6 +1294,10 @@ class LiveAssistantController(QObject):
 
         if not self._listener_evidence.begin_run():
             return False
+        if self._listener_stop_requested:
+            previous = self._diagnostic_cases.end_pending_listener()
+            if previous is not None:
+                self._listener_evidence.writer.submit(lambda: self._diagnostic_cases.materialize(previous))
         self._retained_diagnostic_frame = None
         self._diagnostic_run_id = uuid4().hex
         self._diagnostic_no_frame_failure = False
@@ -2453,8 +2484,8 @@ class LiveAssistantController(QObject):
         session_id = str(getattr(store, "session_id", "") or "").strip()
         if directory is None or not session_id:
             return
-        self._migrate_manual_diagnostic_frames_to_recording(store)
-        self._preopening_diagnostic_directory = Path(directory)
+        case = self._diagnostic_cases.bind_session(session_id, Path(directory), formal=False)
+        self._preopening_diagnostic_directory = case
         self._preopening_diagnostic_session_id = session_id
 
     def _rebind_diagnostic_directory(self, source: Path, target: Path, session_id: str) -> None:
@@ -2661,6 +2692,10 @@ class LiveAssistantController(QObject):
             return
         if self._diagnostics_closed or self._listener_evidence.directory_is_pinned(source_directory):
             return
+        if source_directory.parent.name == "cases":
+            self._diagnostic_cases.bind_session(target_session_id, Path(target_directory), formal=True)
+            self._preopening_diagnostic_session_id = target_session_id
+            return
         diagnostic_thread = self._diagnostic_frame_thread
         if not self._listener_evidence.writer.wait_idle(0) or (
             diagnostic_thread is not None and diagnostic_thread.isRunning()
@@ -2737,9 +2772,14 @@ class LiveAssistantController(QObject):
         self.orchestrator = constructed.orchestrator
         self._live_source = constructed.source
         token = self._activate_live_token(constructed.orchestrator)
-        self._migrate_preopening_diagnostic_frames(
-            getattr(constructed.orchestrator, "store", None)
-        )
+        store = getattr(constructed.orchestrator, "store", None)
+        case = self._diagnostic_cases.bind_session(token.session_id, getattr(store, "directory", None))
+        # Persist association through the same writer as frames. No capture path
+        # blocks on disk and no promotion changes screenshot locations.
+        self._listener_evidence.writer.submit(lambda: self._diagnostic_cases.materialize(
+            case, runtime=self._diagnostic_runtime_context(),
+            profile_directory=Path(self.capture_service.profiles_root) / self.profile_name,
+        ))
         try:
             # Binding must precede bootstrap/model notifications and capture,
             # including waiting-lead sessions which have not analyzed a frame.
@@ -3933,7 +3973,16 @@ class LiveAssistantController(QObject):
             if not self._close_recording_dispatcher(token):
                 raise RuntimeError("录像进程未能确认终止，本局拒绝封存")
             orchestrator.begin_finalizing()
-            return orchestrator.finish()
+            update = orchestrator.finish()
+            # Final persistence belongs to this worker, not a queued GUI slot:
+            # shutdown may be waiting here with its event loop temporarily idle.
+            case = self._diagnostic_cases.finish_session(str(getattr(getattr(orchestrator, "snapshot", None), "session_id", "")))
+            if case is not None:
+                try:
+                    self._diagnostic_cases.materialize(case)
+                except Exception as exc:
+                    self._diagnostic_write_completed(None, exc)
+            return update
 
         thread = OneShotThread(finalize_session, self)
         thread.result.connect(
@@ -3981,6 +4030,103 @@ class LiveAssistantController(QObject):
         preferred = (Path(profile) if profile else Path.home()) / "Documents" / "掼蛋助手日志"
         preferred.mkdir(parents=True, exist_ok=True)
         return preferred
+
+    def request_problem_export(self, *, include_images: bool = True,
+                               case_directory: Path | None = None) -> bool:
+        """Freeze the selected case and export in background, including live games."""
+        if self._diagnostics_closed or self._problem_export_thread is not None:
+            return False
+        try:
+            from ..application.diagnostic_cases import safe_path
+            selected = safe_path(Path(case_directory)) if case_directory is not None else self._diagnostic_cases.current
+            if selected is not None and selected.name in {"frames", "diagnostic_frames"}:
+                selected = selected.parent
+            explicit_history = case_directory is not None
+            legacy_session = None
+            if selected is not None and selected.parent != self._diagnostic_cases.root / "cases":
+                # Explicit selection is authority for this single legacy session,
+                # never for arbitrary paths embedded in its metadata.
+                if not (selected / "diagnostic_frames").is_dir():
+                    raise ValueError("请选择问题记录或历史 diagnostic_frames 所在目录")
+                safe_path(selected / "diagnostic_frames")
+                legacy_session, selected = selected, None
+            frozen_context = dict(self._diagnostic_runtime_context())
+            frozen_context["scope"] = "selected_history" if explicit_history else "current_listener"
+            report = getattr(self, "opening_readiness", None)
+            frozen_context["listener_running"] = bool(self._listening_enabled)
+            frozen_context["readiness"] = report.to_dict() if hasattr(report, "to_dict") else str(report or "")
+            description = self._diagnostic_cases.describe(selected) if legacy_session is None else {}
+            if legacy_session is not None:
+                session_directory = legacy_session
+            elif selected is None:
+                store = getattr(self.orchestrator, "store", None)
+                session_directory = getattr(store, "directory", None)
+            else:
+                session_directory = description.get("session_directory")
+            profile_directory = Path(self.capture_service.profiles_root) / self.profile_name
+            snapshot = getattr(self.orchestrator, "snapshot", None)
+            semantic = getattr(snapshot, "semantic_dict", None)
+            if callable(semantic) and not explicit_history:
+                frozen_context["game_state_at_export_request"] = {
+                    **deepcopy(semantic()), "session_id": getattr(snapshot, "session_id", None),
+                    "revision": getattr(snapshot, "revision", None),
+                }
+        except Exception as exc:
+            self.problem_export_status.emit({"status": "FAILURE", "message": str(exc)})
+            return False
+
+        def operation():
+            from ..problem_bundle import ProblemBundleRequest, export_problem_bundle, select_problem_bundle_sources
+            from ..runtime_layout import resolve_application_root
+            from ..startup_diagnostics import initialized_startup_diagnostics
+            export_case = selected
+            drained = self._listener_evidence.writer.wait_idle(3.0)
+            frozen_context["capture_writer_drained"] = drained
+            if selected is not None and description:
+                self._diagnostic_cases.materialize(selected, runtime=frozen_context,
+                                                   profile_directory=profile_directory)
+            state = initialized_startup_diagnostics()
+            run_directory = (Path(description["run_directory"]) if description.get("run_directory")
+                             else None if explicit_history else getattr(state, "run_directory", None))
+            if run_directory is not None and Path(run_directory).parent != self._diagnostic_cases.root / "runs":
+                # An injected/changed root or another application's logger is
+                # not evidence of this case. Historical roots are resolved by
+                # the exporter's explicit safe association policy instead.
+                run_directory = None
+                frozen_context["startup_report_unavailable"] = "outside_selected_diagnostics_root"
+            if export_case is None and not explicit_history and not frozen_context["listener_running"]:
+                export_case, prior_run = select_problem_bundle_sources(
+                    self._diagnostic_cases.root, exclude_run=run_directory,
+                )
+                if prior_run is not None:
+                    run_directory = prior_run
+            return export_problem_bundle(ProblemBundleRequest(
+                diagnostics_root=self._diagnostic_cases.root,
+                case_directory=export_case, run_directory=run_directory,
+                session_directory=Path(session_directory) if session_directory else None,
+                profile_directory=profile_directory, bundle_root=resolve_application_root(),
+                include_images=include_images, runtime_context=frozen_context,
+            ))
+
+        thread = OneShotThread(operation, self)
+        thread.result.connect(self._problem_export_completed)
+        thread.error.connect(lambda message: self.problem_export_status.emit({
+            "status": "FAILURE", "message": str(message), "include_images": include_images,
+        }))
+        thread.finished.connect(self._problem_export_finished)
+        self._problem_export_thread = thread
+        self.problem_export_status.emit({"status": "RUNNING", "message": "正在整理问题包…",
+                                         "include_images": include_images})
+        thread.start()
+        return True
+
+    def _problem_export_completed(self, value: object) -> None:
+        if isinstance(value, dict):
+            self._last_problem_export = dict(value)
+            self.problem_export_status.emit(dict(value))
+
+    def _problem_export_finished(self) -> None:
+        self._problem_export_thread = None
 
     def request_full_diagnostic_export(self) -> None:
         if self._log_export_thread is not None and self._log_export_thread.isRunning():
@@ -4133,7 +4279,6 @@ class LiveAssistantController(QObject):
     def shutdown(self) -> None:
         self._diagnostics_closed = True
         self.stop_listening()
-        self._listener_evidence.writer.close(timeout=2.0)
         self._diagnostic_frame_thread = None
         recovery_thread = self._geometry_recovery_thread
         if recovery_thread is not None and recovery_thread.isRunning():
@@ -4157,6 +4302,8 @@ class LiveAssistantController(QObject):
         self._close_recording_dispatcher()
         if self._log_export_thread is not None and self._log_export_thread.isRunning():
             self._log_export_thread.wait(30_000)
+        if self._problem_export_thread is not None and self._problem_export_thread.isRunning():
+            self._problem_export_thread.wait(30_000)
         if self._log_open_thread is not None and self._log_open_thread.isRunning():
             self._log_open_thread.wait(30_000)
         if self._capture_worker is not None and self._capture_worker.is_running:
@@ -4177,4 +4324,8 @@ class LiveAssistantController(QObject):
             and self._danzero_warmup_thread.isRunning()
         ):
             self._danzero_warmup_thread.wait(30_000)
+        pending_case = self._diagnostic_cases.end_pending_listener()
+        if pending_case is not None:
+            self._listener_evidence.writer.submit(lambda: self._diagnostic_cases.materialize(pending_case))
+        self._listener_evidence.writer.close(timeout=2.0)
         self.opening_evidence.close(timeout=5.0)

@@ -118,3 +118,8 @@ def test_random_snapshots_are_tables_and_exact_listener_save_roundtrips(number, 
         controller._listener_evidence.writer.close()
         controller.opening_evidence.close()
         app.processEvents()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_case_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAGUANDAN_DIAGNOSTICS_ROOT", str(tmp_path / "diagnostics"))

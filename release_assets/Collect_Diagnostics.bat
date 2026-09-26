@@ -1,80 +1,78 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-cd /d "%~dp0"
+if /i "%~1"=="--help" goto help
+if /i "%~1"=="/?" goto help
+if not "%~2"=="" goto usage_error
+set "IMAGE_OPTION="
+if /i "%~1"=="--problem-no-images" set "IMAGE_OPTION=--problem-no-images"
+if not "%~1"=="" if not defined IMAGE_OPTION goto usage_error
 
-for /f %%I in ('powershell.exe -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "DIAG_STAMP=%%I"
-rem Match Python's explicit override precedence. Defaults stay beside this EXE.
-set "DIAG_ROOT=%~dp0logs\diagnostics"
+rem Display only: the EXE validates/resolves these unchanged environment values.
+rem Never create a fresh doctor run or replace the selected diagnostics root.
+set "DIAG_ROOT=%~dp0diagnostics"
 if not "%DAGUANDAN_DATA_ROOT%"=="" set "DIAG_ROOT=%DAGUANDAN_DATA_ROOT%\diagnostics"
 if not "%DAGUANDAN_DIAGNOSTICS_DIR%"=="" set "DIAG_ROOT=%DAGUANDAN_DIAGNOSTICS_DIR%"
 if not "%DAGUANDAN_DIAGNOSTICS_ROOT%"=="" set "DIAG_ROOT=%DAGUANDAN_DIAGNOSTICS_ROOT%"
-rem Fail before mkdir if the configured root is relative, inside immutable
-rem resources, or traverses a link. No AppData/TEMP fallback is permitted.
-set "DIAG_APP_ROOT=%~dp0"
-powershell.exe -NoProfile -Command "$ErrorActionPreference='Stop'; $p=$env:DIAG_ROOT; if ([IO.Path]::GetPathRoot($p).Length -lt 3) { exit 1 }; $p=[IO.Path]::GetFullPath($p).TrimEnd('\'); if ($p -eq [IO.Path]::GetPathRoot($p).TrimEnd('\')) { exit 1 }; $app=[IO.Path]::GetFullPath($env:DIAG_APP_ROOT).TrimEnd('\'); $logs=$app+'\logs'; if (($p.Equals($app,[StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($app+'\',[StringComparison]::OrdinalIgnoreCase)) -and -not ($p.Equals($logs,[StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($logs+'\',[StringComparison]::OrdinalIgnoreCase))) { exit 1 }; for ($q=$p; $q; $q=[IO.Path]::GetDirectoryName($q)) { if (Test-Path -LiteralPath $q) { if ((Get-Item -LiteralPath $q -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } } }" >nul 2>&1
-if errorlevel 1 (
-  echo Invalid or unsafe diagnostics directory: "%DIAG_ROOT%"
-  echo Use an absolute external path or this application's logs directory. No fallback was used.
-  pause
-  exit /b 1
-)
-set "DAGUANDAN_DIAGNOSTICS_ROOT=%DIAG_ROOT%"
-set "MANUAL_ROOT=%DIAG_ROOT%\manual_%DIAG_STAMP%"
-mkdir "%MANUAL_ROOT%" >nul 2>&1
-if not exist "%MANUAL_ROOT%\" (
-  echo Unable to create diagnostics directory: "%MANUAL_ROOT%"
-  echo Check permissions or explicitly set DAGUANDAN_DIAGNOSTICS_ROOT. No fallback was used.
-  pause
-  exit /b 1
-)
+if not exist "%~dp0DaguandanAssistant.exe" goto missing_exe
 
-set "DIAG_ROOT=%MANUAL_ROOT%"
-set "DOCTOR_REPORT=%DIAG_ROOT%\doctor.json"
-set "LAUNCHER_LOG=%DIAG_ROOT%\launcher.log"
-call :run_doctor
+echo Export an existing problem case, configuration, run and session evidence.
+echo Nothing is uploaded. Screenshots can contain private game/window content.
+if defined IMAGE_OPTION goto export
+choice /C YN /N /M "Include screenshots in the local ZIP? [Y/N] "
+if errorlevel 255 goto cancelled
+if errorlevel 2 set "IMAGE_OPTION=--problem-no-images"
+if not errorlevel 1 goto cancelled
 
-set "SUPPORT_DIR=%DAGUANDAN_DIAGNOSTICS_ROOT%\support"
-mkdir "%SUPPORT_DIR%" >nul 2>&1
-set "SUPPORT_ZIP=%SUPPORT_DIR%\support_%DIAG_STAMP%.zip"
+:export
 echo.
-echo Exporting a sanitized support bundle without screenshots...
-rem The resulting support ZIP is sanitized and image-free by default.
-"%~dp0DaguandanAssistant.exe" --export-support "%SUPPORT_ZIP%"
+echo Exporting existing evidence without starting the GUI or running doctor...
+"%~dp0DaguandanAssistant.exe" --export-problem %IMAGE_OPTION%
 set "EXPORT_EXIT=%ERRORLEVEL%"
-if "%EXPORT_EXIT%"=="0" (
-  echo Support bundle: %SUPPORT_ZIP%
-) else (
-  echo Support export failed with exit code %EXPORT_EXIT%.
-)
-
+if not "%EXPORT_EXIT%"=="0" goto export_failed
 echo.
-echo Doctor finished with exit code %DOCTOR_EXIT%.
-echo Report directory:
-echo %DIAG_ROOT%
-echo.
-echo The default bundle contains no screenshots. To include sensitive images,
-echo run the executable with --include-support-images after explicit approval.
+echo Export completed. Problem ZIP folder:
+echo "%DIAG_ROOT%\exports"
+echo Filename: DaguandanAssistant_problem_*.zip
+echo Check the ZIP inventory for missing, excluded or budget-limited evidence.
+echo Review it before sharing. Nothing is uploaded.
 pause
-if not "%DOCTOR_EXIT%"=="0" exit /b %DOCTOR_EXIT%
+exit /b 0
+
+:missing_exe
+set "EXPORT_EXIT=2"
+echo DaguandanAssistant.exe is missing beside this script.
+goto recovery
+
+:export_failed
+echo Export failed or the EXE could not run. Exit code: %EXPORT_EXIT%
+
+:recovery
+echo No problem ZIP was created by this script.
+echo If the EXE is missing or cannot run, manually copy the existing diagnostics folder:
+echo "%DIAG_ROOT%"
+echo Keep any old logs folder too; do not move or delete the original evidence.
+echo If the path is invalid or unwritable, fix permissions or the explicit override.
+echo No AppData/TEMP fallback is used. Copied evidence may contain private content.
+echo Nothing is uploaded.
+pause
 exit /b %EXPORT_EXIT%
 
-:run_doctor
-set "EXE_PRESENT=false"
-set "MANIFEST_PRESENT=false"
-if exist "%~dp0DaguandanAssistant.exe" set "EXE_PRESENT=true"
-if exist "%~dp0build_manifest.json" set "MANIFEST_PRESENT=true"
->"%LAUNCHER_LOG%" echo schema=guandan.diagnostics-launcher/1
->>"%LAUNCHER_LOG%" echo executable_present=%EXE_PRESENT%
->>"%LAUNCHER_LOG%" echo build_manifest_present=%MANIFEST_PRESENT%
->>"%LAUNCHER_LOG%" echo diagnostics_root=%DAGUANDAN_DIAGNOSTICS_ROOT%
->>"%LAUNCHER_LOG%" echo default_diagnostics_subdirectory=logs\diagnostics
->>"%LAUNCHER_LOG%" echo doctor_report=doctor.json
-if not exist "%~dp0DaguandanAssistant.exe" (
-  set "DOCTOR_EXIT=2"
-  >>"%LAUNCHER_LOG%" echo doctor_exit_code=2
-  exit /b 0
-)
-"%~dp0DaguandanAssistant.exe" --doctor --doctor-output "%DOCTOR_REPORT%"
-set "DOCTOR_EXIT=%ERRORLEVEL%"
->>"%LAUNCHER_LOG%" echo doctor_exit_code=%DOCTOR_EXIT%
+:cancelled
+echo Export cancelled. No problem ZIP was created by this script.
+exit /b 2
+
+:usage_error
+echo Unknown option. Use Collect_Diagnostics.bat --help for help.
+exit /b 2
+
+:help
+echo Double-click Collect_Diagnostics.bat to export an existing problem case.
+echo Answer Y to include screenshots, or N to omit them for privacy.
+echo Optional: Collect_Diagnostics.bat --problem-no-images
+echo Help: Collect_Diagnostics.bat --help
+echo The local EXE uses headless --export-problem even if the GUI cannot start.
+echo Default output: diagnostics\exports\DaguandanAssistant_problem_*.zip
+echo Explicit diagnostics/DATA_ROOT overrides still take precedence.
+echo Missing evidence and budget exclusions are recorded, not invented.
+echo Nothing is uploaded. Review the ZIP before sharing.
 exit /b 0

@@ -401,3 +401,109 @@ def test_production_failed_listener_frame_phase_has_capture_time_and_age(compact
     assert "失败前监听帧" in window.capture_label.text()
     assert "23:02:40" in window.capture_label.text()
     assert "2 秒前" in window.capture_label.text()
+
+
+def saved_case(root, name="case_中文 一局"):
+    case = root / "diagnostics" / "cases" / name
+    directory = case / "frames"
+    directory.mkdir(parents=True)
+    (case / "case.json").write_text("{}", encoding="utf-8")
+    image = directory / "000001.png"
+    image.write_bytes(b"saved frame")
+    return {
+        "status": "SUCCESS", "image_path": str(image), "session_directory": str(case),
+        "source": "manual_window_capture", "source_phase": "manual_window_capture",
+    }
+
+
+def test_new_case_frames_opens_without_changing_compact_size(compact, opened, tmp_path, app):
+    window, runtime = compact
+    result = saved_case(tmp_path)
+    runtime.directory = Path(result["image_path"]).parent
+    window.resize(420, 235)
+    window.show()
+    app.processEvents()
+    size = window.size()
+    runtime.diagnostic_frame_status.emit(result)
+    click_folder(window)
+    assert opened == [runtime.directory]
+    assert runtime.directory.name == "frames"
+    assert window.isVisible()
+    assert window.size() == size
+    assert "手动窗口截图" not in window.capture_label.text()  # Folder notice owns only the auxiliary line.
+
+
+@pytest.mark.parametrize("field", ["image_path", "session_directory"])
+def test_new_case_status_paths_are_cached_when_runtime_has_no_getter(compact, opened, tmp_path, field):
+    window, runtime = compact
+    result = saved_case(tmp_path)
+    runtime.diagnostic_frame_directory = None
+    runtime.diagnostic_frame_status.emit({"status": "SUCCESS", field: result[field]})
+    click_folder(window)
+    assert opened == [Path(result["image_path"]).parent]
+
+
+def test_new_case_saved_image_beats_unrelated_old_session(compact, opened, tmp_path):
+    window, runtime = compact
+    result = saved_case(tmp_path)
+    old = saved_frame(tmp_path)
+    result["session_directory"] = old["session_directory"]
+    runtime.diagnostic_frame_status.emit(result)
+    click_folder(window)
+    assert opened == [Path(result["image_path"]).parent]
+
+
+def test_no_case_yet_can_open_only_the_diagnostics_cases_root(compact, opened, tmp_path):
+    window, runtime = compact
+    directory = tmp_path / "diagnostics" / "cases"
+    directory.mkdir(parents=True)
+    runtime.directory = directory
+    click_folder(window)
+    assert opened == [directory]
+    assert list(directory.iterdir()) == []
+
+
+@pytest.mark.parametrize("relative", ["frames", "cases", "diagnostics/other", "case_fake/frames"])
+def test_arbitrary_unmarked_directories_are_not_opened(compact, opened, tmp_path, relative):
+    window, runtime = compact
+    directory = tmp_path / relative
+    directory.mkdir(parents=True)
+    runtime.directory = directory
+    click_folder(window)
+    assert opened == []
+    assert "尚无截图" in window.capture_label.text()
+
+
+def test_new_case_listener_manual_recovery_all_share_one_folder(compact, opened, tmp_path):
+    window, runtime = compact
+    result = saved_case(tmp_path)
+    for source, phase in (
+        ("live_listener_frame", "live_session"),
+        ("manual_window_capture", "manual_window_capture"),
+        ("live_listener_frame", "last_listener_frame"),
+    ):
+        runtime.diagnostic_frame_status.emit({**result, "source": source, "source_phase": phase})
+        click_folder(window)
+    assert opened == [Path(result["image_path"]).parent] * 3
+
+
+def test_removed_new_frames_falls_back_to_its_case_without_creating_directories(compact, opened, tmp_path):
+    window, runtime = compact
+    result = saved_case(tmp_path)
+    image = Path(result["image_path"])
+    runtime.directory = image.parent
+    runtime.diagnostic_frame_status.emit(result)
+    image.unlink()
+    image.parent.rmdir()
+    click_folder(window)
+    assert opened == [image.parent.parent]
+    assert "上级目录" in window.capture_label.text()
+    assert not image.parent.exists()
+
+
+def test_missing_cases_root_never_walks_up_to_arbitrary_project(compact, opened, tmp_path):
+    window, runtime = compact
+    runtime.directory = tmp_path / "diagnostics" / "cases"
+    click_folder(window)
+    assert opened == []
+    assert "已不存在" in window.capture_label.text()

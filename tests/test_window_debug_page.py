@@ -377,3 +377,113 @@ def test_key_blockers_ignore_action_only_roi_overlap_warning():
     })
 
     assert blockers == []
+
+
+def _saved_diagnostic_frames(case, *, new_layout):
+    from types import SimpleNamespace
+    import numpy as np
+    from daguandan_bridge.application.session_diagnostic_frames import SessionDiagnosticFrameStore
+
+    case.mkdir(parents=True)
+    if new_layout:
+        (case / "case.json").write_text("{}", encoding="utf-8")
+    store = SessionDiagnosticFrameStore()
+    return [store.save_snapshot(
+        case, SimpleNamespace(image=np.full((12, 20, 3), 40 * index, dtype=np.uint8)),
+        session_id="test-case", capture_generation=1, capture_seq=index,
+        source=source, source_phase=phase,
+    ) for index, (source, phase) in enumerate((
+        ("live_listener_frame", "live_session"),
+        ("manual_window_capture", "manual_window_capture"),
+        ("live_listener_frame", "last_listener_frame"),
+    ), 1)]
+
+
+def test_new_case_or_frames_selection_navigates_listener_manual_and_recovery(tmp_path):
+    _app()
+    case = tmp_path / "diagnostics" / "cases" / "case_中文历史"
+    frames = _saved_diagnostic_frames(case, new_layout=True)
+    for selected in (case, case / "frames"):
+        page = WindowDebugPage(FakeWindowDebugService())
+        assert page.set_session_directory(selected) == case
+        assert page.frame_selector.count() == 3
+        assert page.frame_index_label.text() == "1 / 3"
+        assert not page.previous_frame_button.isEnabled()
+        assert "实时监听帧" in page.status_label.text()
+        page.next_session_frame()
+        assert page.frame_index_label.text() == "2 / 3"
+        assert "手动窗口截图" in page.status_label.text()
+        assert frames[1].image_path.name in page.frame_metadata_view.toPlainText()
+        page.next_session_frame()
+        assert "故障恢复截图" in page.status_label.text()
+        assert not page.next_frame_button.isEnabled()
+        page.previous_session_frame()
+        assert page.frame_index_label.text() == "2 / 3"
+        assert page.recognize_frame_button.isEnabled()
+        page.close()
+        page.deleteLater()
+
+
+def test_legacy_session_or_diagnostic_frames_selection_remains_navigable(tmp_path):
+    _app()
+    session = tmp_path / "old_session"
+    _saved_diagnostic_frames(session, new_layout=False)
+    for selected in (session, session / "diagnostic_frames"):
+        page = WindowDebugPage(FakeWindowDebugService())
+        assert page.set_session_directory(selected) == session
+        assert page.frame_selector.count() == 3
+        page.next_session_frame()
+        assert page.frame_index_label.text() == "2 / 3"
+        page.previous_session_frame()
+        assert page.frame_index_label.text() == "1 / 3"
+        page.close()
+        page.deleteLater()
+
+
+def test_directory_selection_rejects_urls_relative_paths_and_unmarked_frames(tmp_path):
+    import pytest
+    _app()
+    page = WindowDebugPage(FakeWindowDebugService())
+    for selected in ("", ".", "relative/case", "https://example.com/frames", "file:///C:/frames", tmp_path / "frames"):
+        with pytest.raises(ValueError):
+            page.set_session_directory(selected)
+    assert page._session_directory is None
+    page.close()
+    page.deleteLater()
+
+
+def test_selected_case_store_error_is_shown_without_bypassing_integrity_or_switching_case(tmp_path, monkeypatch):
+    from daguandan_bridge.gui import window_debug_page as module
+    _app()
+    case = tmp_path / "case_历史"
+    records = _saved_diagnostic_frames(case, new_layout=True)
+
+    class RejectingStore:
+        def list_frames(self, directory):
+            assert directory == case
+            raise ValueError("诊断截图完整性检查失败")
+
+    monkeypatch.setattr(module, "SessionDiagnosticFrameStore", RejectingStore)
+    page = WindowDebugPage(FakeWindowDebugService())
+    page.set_session_directory(case)
+    assert records[0].image_path.is_file()
+    assert page._session_directory == case
+    assert page.frame_selector.count() == 0  # Must not fall back to a raw PNG scan.
+    assert "完整性检查失败" in page.status_label.text()
+    page.close()
+    page.deleteLater()
+
+
+def test_legacy_runtime_without_frame_store_can_browse_marked_case(tmp_path, monkeypatch):
+    from daguandan_bridge.gui import window_debug_page as module
+    _app()
+    case = tmp_path / "case_compat"
+    _saved_diagnostic_frames(case, new_layout=True)
+    monkeypatch.setattr(module, "SessionDiagnosticFrameStore", None)
+    page = WindowDebugPage(FakeWindowDebugService())
+    assert page.set_session_directory(case / "frames") == case
+    assert page.frame_selector.count() == 3
+    page.next_session_frame()
+    assert page.frame_index_label.text() == "2 / 3"
+    page.close()
+    page.deleteLater()

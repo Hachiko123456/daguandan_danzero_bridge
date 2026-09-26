@@ -190,6 +190,7 @@ class OpeningEvidenceMonitor:
         field_timeout_seconds: float = 8.0,
         writer_queue_size: int = 4,
         max_persisted_frames: int = 3,
+        persist_images: bool = True,
         max_persisted_image_bytes: int = 16 * 1024 * 1024,
         max_run_image_bytes: int = 64 * 1024 * 1024,
         max_total_image_bytes: int = 512 * 1024 * 1024,
@@ -215,6 +216,7 @@ class OpeningEvidenceMonitor:
         self.max_bytes = int(max_bytes)
         self.field_timeout_ms = max(1, int(field_timeout_seconds * 1000))
         self.max_persisted_frames = max(1, int(max_persisted_frames))
+        self.persist_images = bool(persist_images)
         self.max_persisted_image_bytes = max(1, int(max_persisted_image_bytes))
         self.max_incident_text_bytes = max(1, int(max_incident_text_bytes))
         self.max_run_incidents = max(1, int(max_run_incidents))
@@ -1437,7 +1439,8 @@ class OpeningEvidenceMonitor:
                     bytes_written, artifacts = self._write_record_images(
                         staging, record, remaining=max(0, image_limit - image_bytes),
                     )
-                    document["media_status"] = "stored" if artifacts else "omitted_budget"
+                    document["media_status"] = ("stored" if artifacts else
+                                                "external_case_store" if not self.persist_images else "omitted_budget")
                     if artifacts:
                         shared_updates[media_key] = {
                             "incident_id": incident_id,
@@ -1566,7 +1569,7 @@ class OpeningEvidenceMonitor:
         *,
         remaining: int,
     ) -> tuple[int, list[dict[str, object]]]:
-        if remaining <= 0:
+        if not self.persist_images or remaining <= 0:
             return 0, []
         standard = getattr(record.snapshot, "image", None)
         captured = getattr(record.snapshot, "frame", None)

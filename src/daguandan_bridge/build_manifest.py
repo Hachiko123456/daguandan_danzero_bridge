@@ -947,12 +947,99 @@ def _record_file_difference(
         errors.append(message)
 
 
+# Evidence names are bounded, not arbitrary subtrees or extension-only rules.
+# Support both compact UTC and local timestamp spellings used by capture/export.
+_DIAGNOSTIC_STAMP = r"[0-9]{8}[t_][0-9]{6}(?:[._][0-9]{1,6})?z?"
+_DIAGNOSTIC_SEGMENT = r"[a-z0-9_][a-z0-9_.-]{0,127}"
+_CASE_DIRECTORY = re.compile(rf"case_{_DIAGNOSTIC_STAMP}_[0-9a-f]{{8}}")
+_PROBLEM_ARCHIVE = re.compile(
+    rf"daguandanassistant_problem_{_DIAGNOSTIC_STAMP}_[0-9a-f]{{8,32}}\.zip"
+)
+_CASE_CONFIG_FILES = frozenset({
+    "profile.json", "regions_config.json", "templates_config.json",
+})
+# Exact producer contract from doctor.DEPENDENCIES and its UUID scratch names.
+# Do not import doctor here: manifest checks run before startup/native imports.
+_DOCTOR_PROBE_FILE = re.compile(
+    r"dependency-(?:numpy|opencv|pyside6(?:-qtgui)?|qfluentwidgets|"
+    r"qframelesswindow|mss|pywin32|torch|rlcard(?:-blackjack)?)-[0-9a-f]{32}\.json"
+)
+# OpeningEvidenceMonitor uses monotonic milliseconds + uuid4().hex[:8].
+_OPENING_INCIDENT_DIRECTORY = re.compile(r"open-[0-9]{1,20}-[0-9a-f]{8}")
+_OPENING_INCIDENT_FILES = frozenset({
+    "incident.json", "opening_evidence.json", "repro.json", "recognition_trace.jsonl",
+})
+
+
+def _is_run_diagnostic_evidence(parts: tuple[str, ...]) -> bool:
+    # DiagnosticBudget creates this ONE fixed, one-byte cooperative lock.
+    if parts == (".opening-budget.lock",):
+        return True
+    if len(parts) < 2 or re.fullmatch(_DIAGNOSTIC_SEGMENT, parts[0]) is None:
+        return False
+    if len(parts) == 2:
+        return re.fullmatch(
+            rf"{_DIAGNOSTIC_SEGMENT}\.(?:log|jsonl?|txt)(?:\.[1-9][0-9]{{0,5}})?",
+            parts[1],
+        ) is not None
+    if len(parts) == 3:
+        if parts[1] == "dependency-probes":
+            return _DOCTOR_PROBE_FILE.fullmatch(parts[2]) is not None
+        return parts[1:] == ("opening", "latest.json")
+    return bool(
+        len(parts) == 5
+        and parts[1:3] == ("opening", "incidents")
+        and _OPENING_INCIDENT_DIRECTORY.fullmatch(parts[3])
+        and parts[4] in _OPENING_INCIDENT_FILES
+    )
+
+
+def _is_unified_diagnostic_evidence(parts: tuple[str, ...]) -> bool:
+    """Allow only unmanifested evidence at the agreed diagnostics layout.
+
+    Inventoried files still use the ordinary immutable hash check. Do not
+    extend this to arbitrary PNG/JSON/ZIP files, nested directories, runtime
+    code, models, or temp files. Bundle walking still rejects all reparse chains.
+    """
+
+    folded = tuple(part.casefold() for part in parts)
+    if len(folded) < 3 or folded[0] != "diagnostics":
+        return False
+    if folded[1] == "runs":
+        return _is_run_diagnostic_evidence(folded[2:])
+    if folded[1] == "exports" and len(folded) == 3:
+        return _PROBLEM_ARCHIVE.fullmatch(folded[2]) is not None
+    if folded[1] != "cases" or _CASE_DIRECTORY.fullmatch(folded[2]) is None:
+        return False
+    if len(folded) == 4:
+        return folded[3] == "case.json"
+    if len(folded) != 5:
+        return False
+    if folded[3] == "config":
+        return folded[4] in _CASE_CONFIG_FILES
+    if folded[3] == "frames":
+        return bool(re.fullmatch(
+            rf"(?:[0-9]{{6,18}}\.(?:png|json)|incident_{_DIAGNOSTIC_SEGMENT}\.json)",
+            folded[4],
+        ))
+    return False
+
+
 def _unexpected_file_disposition(relative: str) -> str:
     parts = PurePosixPath(_portable_relative_path(relative)).parts
-    # Only unmanifested runtime evidence under the dedicated application-local
-    # logs directory is allowed. Inventoried files remain immutable, including
-    # any accidentally shipped log, and traversal still rejects every reparse.
+    if _is_unified_diagnostic_evidence(parts):
+        return "allow"
+    # Preserve the existing unmanifested legacy log/support exception. Old logs
+    # are not moved, removed, or repackaged by changing the diagnostics default.
     if len(parts) >= 2 and parts[0].casefold() == "logs":
+        # Explicit legacy overrides such as logs/diagnostics or logs/custom
+        # still route new cases/exports there. Allow the SAME bounded suffix,
+        # not arbitrary images or archives anywhere under logs.
+        if any(
+            _is_unified_diagnostic_evidence(("diagnostics", *parts[index:]))
+            for index in range(1, len(parts))
+        ):
+            return "allow"
         name = parts[-1].casefold()
         if re.fullmatch(r".+\.(?:log|jsonl?|txt)(?:\.[1-9][0-9]*)?", name):
             return "allow"

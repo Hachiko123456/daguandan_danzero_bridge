@@ -37,6 +37,7 @@ release/
 .superpowers/
 
 # Project runtime output. Keep profile templates/configuration/model assets tracked.
+# Legacy/general logs stay in place; unified runs/cases/exports are local only.
 logs/
 /reports/
 /diagnostics/

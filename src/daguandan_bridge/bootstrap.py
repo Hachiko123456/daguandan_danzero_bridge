@@ -109,6 +109,9 @@ def build_application_dependencies(
             opening_evidence_monitor=build_opening_evidence_monitor(
                 profiles_root=live.capture.profiles_root,
                 profile_name=profile_name,
+                # Standardized screenshots have one case writer. Keep this
+                # legacy sidecar for detailed opening traces, not duplicate PNGs.
+                persist_images=False,
             ),
         )
         profiles_root = Path(live.capture.profiles_root)

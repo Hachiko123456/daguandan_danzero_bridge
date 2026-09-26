@@ -595,3 +595,22 @@ def test_nonblocking_sink_forwards_page_before_frame(tmp_path):
     assert monitor.metrics().incidents_queued == 0
     assert monitor.metrics().retained_frames == 0
     proxy.close()
+
+
+def test_case_store_owns_images_without_disabling_legacy_recognition_trace(tmp_path):
+    monitor = OpeningEvidenceMonitor(diagnostics_root=tmp_path, persist_images=False, clock_ms=lambda: 100)
+    monitor.begin(monotonic_ms=0)
+    snapshot = _snapshot(77)
+    monitor.observe_frame(snapshot, monotonic_ms=100)
+    monitor.observe_recognition(snapshot, _result(level="Q", hand=("3S",) * 27), {"roi_score": 0.75})
+    monitor.observe_failure(RuntimeError("capture test error"), stage="capture", snapshot=snapshot)
+    assert monitor.flush(5.0)
+    monitor.close(timeout=5.0)
+    assert not list(tmp_path.rglob("*.png"))
+    evidence = list(tmp_path.rglob("opening_evidence.json"))
+    assert evidence
+    document = json.loads(evidence[0].read_text("utf8"))
+    assert document["frames"]
+    assert document["frames"][0]["media_status"] == "external_case_store"
+    assert document["frames"][0]["artifacts"] == []
+    assert not monitor._media_exhausted

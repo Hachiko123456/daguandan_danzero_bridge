@@ -208,7 +208,8 @@ def test_save_latest_live_frame_delegates_without_capture_and_copies_pixels(
     assert result["source_phase"] == "live_session"
     assert result["count"] == 1
     call = _DiagnosticStore.instances[0].calls[0]
-    assert call["session_directory"] == tmp_path / "sessions" / "session-1"
+    assert call["session_directory"] == controller._diagnostic_cases.current
+    assert call["session_directory"].parent == tmp_path / "diagnostics" / "cases"
     saved = call["snapshot"]
     assert saved is not snapshot
     assert saved.image is not snapshot.image
@@ -366,9 +367,9 @@ def test_listening_without_orchestrator_saves_waiting_frame_to_stable_round_dire
     # frame, and all saves in this round must reuse this one fallback path.
     assert result["source"] == "live_listener_frame"
     assert result["source_phase"] == "preopening_listener"
-    assert result["session_id"].startswith("diagnostic_")
+    assert result["session_id"].startswith("case_")
     session_directory = Path(result["session_directory"])
-    assert session_directory.parent.name == "manual_diagnostic"
+    assert session_directory.parent.name == "cases"
     assert session_directory.name == result["session_id"]
     assert result["capture_generation"] == 5
     assert result["capture_seq"] == 1
@@ -402,7 +403,7 @@ def test_waiting_frames_in_one_round_share_directory_and_keep_ordered_sequence(
     assert [call["capture_seq"] for call in calls] == [3, 4]
 
 
-def test_new_listening_round_allocates_fallback_only_on_save_and_uses_new_path_next_round(
+def test_explicit_restart_gets_new_case_but_manual_before_first_listen_is_retained(
     tmp_path, monkeypatch
 ):
     _app()
@@ -429,7 +430,7 @@ def test_new_listening_round_allocates_fallback_only_on_save_and_uses_new_path_n
     controller._accept_waiting_frame(_WaitingFrameDelivery(_snapshot(71), 1, 1))
     first = controller.save_latest_live_frame_to_session()
     first_directory = Path(first["session_directory"])
-    assert first_directory.parent.name == "manual_diagnostic"
+    assert first_directory.parent.name == "cases"
     assert first["source_phase"] == "preopening_listener"
     assert controller._preopening_diagnostic_directory is None
 
@@ -442,7 +443,7 @@ def test_new_listening_round_allocates_fallback_only_on_save_and_uses_new_path_n
     controller._accept_waiting_frame(_WaitingFrameDelivery(_snapshot(72), 2, 1))
     second = controller.save_latest_live_frame_to_session()
     second_directory = Path(second["session_directory"])
-    assert second_directory.parent.name == "manual_diagnostic"
+    assert second_directory.parent.name == "cases"
     assert second_directory != first_directory
     assert second["session_id"] != first["session_id"]
 
@@ -517,7 +518,7 @@ def test_manual_capture_uses_open_live_source_capture_and_records_exact_identity
     assert result["evidence_frame_id"] == snapshot.evidence_frame_id
     assert result["raw_sha256"] == hashlib.sha256(snapshot.image.tobytes(order="C")).hexdigest()
     assert str(result["session_directory"]).replace("\\", "/").endswith(
-        "/manual_diagnostic/" + str(result["session_id"])
+        "/cases/" + str(result["session_id"])
     )
 
 
@@ -897,3 +898,8 @@ def test_same_frame_id_with_new_sequence_never_saves_older_ring_pixels(tmp_path,
     assert np.array_equal(saved["snapshot"].image, new.image)
     assert not np.array_equal(saved["snapshot"].image, old.image)
     assert controller._listener_evidence.writer.close()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_case_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAGUANDAN_DIAGNOSTICS_ROOT", str(tmp_path / "diagnostics"))

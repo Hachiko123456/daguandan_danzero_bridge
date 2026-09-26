@@ -3,7 +3,8 @@
 The source checkout intentionally keeps using ``<repo>/data``.  A frozen
 application keeps packaged data immutable and copies it into a versioned user
 generation below ``%LOCALAPPDATA%`` (or ``DAGUANDAN_DATA_ROOT``). Runtime logs
-are separate: ``<application>/logs``, never the working directory or _MEIPASS.
+are separate: diagnostics use ``<application>/diagnostics``; generic legacy
+logs may still use ``<application>/logs``. Neither depends on cwd or _MEIPASS.
 
 This module is standard-library-only so it can run before Qt, OpenCV, or model
 libraries are imported.
@@ -1060,7 +1061,8 @@ def resolve_log_diagnostics_root(
 
     Explicit diagnostics overrides win, followed by the historical explicit
     data-root diagnostics override (also honored by early source-mode logging).
-    LOCALAPPDATA controls frozen profiles/preferences only, never default logs.
+    LOCALAPPDATA controls frozen profiles/preferences only, never diagnostics.
+    The default is <checkout-or-exe-parent>/diagnostics; existing logs stay put.
     Invalid overrides are errors, not permission to silently pick another root.
     """
 
@@ -1084,13 +1086,22 @@ def resolve_log_diagnostics_root(
             selected = data_root / "diagnostics"
             source = "data_root_environment"
         else:
-            selected = app / "logs" / "diagnostics"
-            source = "application_logs_frozen" if is_frozen else "application_logs_source"
-    # Only the dedicated top-level log namespace is writable inside a release.
-    # Keep all ancestors link-free so logs cannot be redirected into resources.
+            selected = app / "diagnostics"
+            source = (
+                "application_diagnostics_frozen" if is_frozen
+                else "application_diagnostics_source"
+            )
+    # Only the unified diagnostics root and the legacy logs namespace may be
+    # selected inside a release. Manifest verification separately bounds the
+    # evidence filenames; this is NOT a blanket mutable bundle exception.
+    # Keep all ancestors link-free so writes cannot be redirected into resources.
     try:
         _assert_no_reparse_chain(selected)
-        if is_frozen and not selected.is_relative_to(app / "logs"):
+        if (
+            is_frozen
+            and selected != app / "diagnostics"
+            and not selected.is_relative_to(app / "logs")
+        ):
             _assert_external_runtime_root(selected, app)
     except (OSError, RuntimeLayoutError) as exc:
         raise RuntimeLayoutError(f"invalid diagnostics root {selected}: {exc}") from exc

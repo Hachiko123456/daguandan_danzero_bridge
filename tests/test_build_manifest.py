@@ -479,22 +479,25 @@ def test_release_record_and_checksum_are_atomic_and_path_portable(tmp_path: Path
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_diagnostics_launcher_runs_doctor_without_exporting_raw_logs():
+def test_diagnostics_launcher_exports_existing_evidence_without_doctor_or_raw_copy():
     launcher = (
         PROJECT_ROOT / "release_assets" / "Collect_Diagnostics.bat"
     ).read_text(encoding="utf-8")
 
-    assert "--doctor --doctor-output" in launcher
-    assert "launcher.log" in launcher
-    assert 'set "DIAG_ROOT=%~dp0logs\\diagnostics"' in launcher
-    assert 'set "DAGUANDAN_DIAGNOSTICS_ROOT=%DIAG_ROOT%"' in launcher
+    assert '"%~dp0DaguandanAssistant.exe" --export-problem' in launcher
+    assert "--problem-no-images" in launcher
+    assert "--help" in launcher
+    assert "--doctor" not in launcher
+    assert "--export-support" not in launcher
+    assert 'set "DIAG_ROOT=%~dp0diagnostics"' in launcher
+    # The EXE owns validation and override precedence; the BAT never replaces it.
+    assert 'set "DAGUANDAN_DIAGNOSTICS_ROOT=' not in launcher
     assert "%LOCALAPPDATA%" not in launcher
     assert "%TEMP%" not in launcher
-    assert "default_diagnostics_subdirectory=logs\\diagnostics" in launcher
-    assert "doctor_report=doctor.json" in launcher
     assert "Compress-Archive" not in launcher
     assert "Copy-Item" not in launcher
-    assert "support ZIP" in launcher
+    assert "Nothing is uploaded" in launcher
+    assert "No problem ZIP was created by this script" in launcher
 
 
 def test_manifest_cli_creates_and_strictly_verifies_a_temporary_bundle(tmp_path: Path):

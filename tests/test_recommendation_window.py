@@ -926,7 +926,7 @@ def test_compact_action_bar_uses_icon_buttons_with_chinese_tooltips():
     buttons = [
         window.capture_button, window.screenshot_folder_button,
         window.debug_button, window.copy_issue_button,
-        window.copy_summary_button, window.open_button, window.stop_button,
+        window.problem_export_button, window.open_button, window.stop_button,
     ]
     assert all(button.toolTip() for button in buttons)
     assert all(button.accessibleName() for button in buttons)

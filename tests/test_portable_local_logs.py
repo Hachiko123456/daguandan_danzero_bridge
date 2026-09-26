@@ -74,7 +74,7 @@ def test_local_roots_ignore_cwd_meipass_and_appdata(tmp_path, monkeypatch, froze
     layout = rl.resolve_runtime_layout(environ=env, frozen=frozen, executable_path=executable)
     early = sd.resolve_diagnostics_root(environ=env, frozen=frozen, executable_path=executable)
     assert layout.logs_root == app / "logs"
-    assert early.path == layout.diagnostics_root == app / "logs" / "diagnostics"
+    assert early.path == layout.diagnostics_root == app / "diagnostics"
     assert early.source == layout.diagnostics_root_source
     assert not (tmp_path / "appdata").exists()
     assert not (tmp_path / "temp").exists()
@@ -132,7 +132,7 @@ def test_diagnostics_override_precedence_and_allowed_local_namespace(tmp_path):
 
 def test_early_diagnostics_do_not_need_appdata_or_a_manifest(tmp_path):
     app = tmp_path / "fresh extraction"
-    assert sd.resolve_diagnostics_root(environ={}, frozen=True, bundle_root=app).path == app / "logs" / "diagnostics"
+    assert sd.resolve_diagnostics_root(environ={}, frozen=True, bundle_root=app).path == app / "diagnostics"
     assert not app.exists()
 
 
@@ -149,7 +149,7 @@ assert state.enabled, state.error
 assert initialize_startup_diagnostics() is state
 assert not any(name in sys.modules for name in ("cv2", "numpy", "PySide6", "torch"))
 ''', tmp_path)
-    run = app / "logs" / "diagnostics" / "runs" / "portable-test"
+    run = app / "diagnostics" / "runs" / "portable-test"
     report = json.loads((run / "startup_report.json").read_text(encoding="utf-8"))
     manifest = json.loads((app / bm.BUILD_MANIFEST_FILENAME).read_text(encoding="utf-8"))
     assert report["build_id"] == manifest["build_id"]
@@ -158,7 +158,7 @@ assert not any(name in sys.modules for name in ("cv2", "numpy", "PySide6", "torc
     assert report["active_profile"]["status"] == "not_selected"
     assert report["capture"]["capture_backend"] is None
     assert Path(report["paths"]["bundle_root"]) == app
-    assert Path(report["diagnostics"]["root"]) == app / "logs" / "diagnostics"
+    assert Path(report["diagnostics"]["root"]) == app / "diagnostics"
     assert Path(report["python"]["executable"]) == app / "DaguandanAssistant.exe"
     assert report["python"]["version"] and report["platform"]["system"]
     assert not (tmp_path / "app data").exists()
@@ -184,13 +184,13 @@ Path.mkdir = denied
 from daguandan_bridge.startup_diagnostics import initialize_startup_diagnostics
 state = initialize_startup_diagnostics()
 assert not state.enabled
-assert state.root == Path({str(app / "logs" / "diagnostics")!r})
+assert state.root == Path({str(app / "diagnostics")!r})
 assert "PermissionError" in state.error and "read-only application parent" in state.error
 assert str(state.root) in state.error
 assert "no fallback" in state.error
 ''', tmp_path)
     assert "read-only application parent" in result.stderr
-    assert str(app / "logs" / "diagnostics") in result.stderr
+    assert str(app / "diagnostics") in result.stderr
     assert not (tmp_path / "app data").exists()
     assert not (tmp_path / "temp").exists()
     assert list(app.iterdir()) == []
@@ -219,8 +219,8 @@ def test_selected_profile_report_uses_loaded_config_and_bounded_fingerprints(tmp
         environ={"LOCALAPPDATA": str(tmp_path / "local")}))
     active = layout.profiles_root / "tencent_daguandan"
     (active / "profile.json").write_text('{"capture_backend":"screen"}', encoding="utf-8")
-    monkeypatch.setattr(sd, "_STATE", sd.StartupDiagnosticsState("report", app / "logs" / "diagnostics",
-                        "application_logs_frozen", app / "logs" / "diagnostics" / "runs" / "report", True))
+    monkeypatch.setattr(sd, "_STATE", sd.StartupDiagnosticsState("report", app / "diagnostics",
+                        "application_diagnostics_frozen", app / "diagnostics" / "runs" / "report", True))
     original = Path.open
     def bounded(path, *args, **kwargs):
         assert "templates" not in path.parts and "models" not in path.parts
@@ -314,27 +314,13 @@ def test_logs_reparse_is_not_a_mutable_escape_hatch(tmp_path, monkeypatch):
     original = rl._path_is_reparse
     monkeypatch.setattr(rl, "_path_is_reparse", lambda p: Path(p) == logs or original(p))
     with pytest.raises(rl.RuntimeLayoutError, match="reparse"):
-        sd.resolve_diagnostics_root(frozen=True, bundle_root=app, environ={})
+        sd.resolve_diagnostics_root(frozen=True, bundle_root=app,
+            environ={"DAGUANDAN_DIAGNOSTICS_ROOT": str(logs / "diagnostics")})
     original_manifest = bm._is_link_or_reparse
     monkeypatch.setattr(bm, "_is_link_or_reparse", lambda p: Path(p) == logs or original_manifest(p))
     result = bm.verify_build_manifest(app, app / bm.BUILD_MANIFEST_FILENAME, strict=True)
     assert not result.ok
     assert any("reparse" in error for error in result.errors)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell launcher validation")
-@pytest.mark.parametrize("suffix,valid", [("logs/diagnostics", True), ("data/diagnostics", False), ("_internal/diagnostics", False)])
-def test_launcher_validation_uses_same_local_namespace(tmp_path, suffix, valid):
-    launcher = (PROJECT_ROOT / "release_assets" / "Collect_Diagnostics.bat").read_text(encoding="utf-8")
-    line = next(line for line in launcher.splitlines() if line.startswith('powershell.exe -NoProfile -Command "$ErrorActionPreference='))
-    command = line.split(' -Command "', 1)[1].rsplit('" >nul', 1)[0]
-    app = tmp_path / "应用 with spaces"
-    app.mkdir()
-    env = dict(os.environ, DIAG_APP_ROOT=str(app), DIAG_ROOT=str(app / suffix))
-    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], env=env,
-                            capture_output=True, text=True, timeout=20)
-    assert (result.returncode == 0) == valid, result.stderr
-    assert list(app.iterdir()) == []
 
 
 @pytest.mark.parametrize("override", ["DAGUANDAN_DATA_ROOT", "DAGUANDAN_DIAGNOSTICS_ROOT"])
@@ -364,13 +350,13 @@ layout.__file__ = {str(app / "src" / "daguandan_bridge" / "runtime_layout.py")!r
 from daguandan_bridge.startup_diagnostics import initialize_startup_diagnostics
 state = initialize_startup_diagnostics(run_id="source-test")
 assert state.enabled, state.error
-assert state.root == Path({str(app / "logs" / "diagnostics")!r})
+assert state.root == Path({str(app / "diagnostics")!r})
 ''', tmp_path)
-    report = json.loads((app / "logs" / "diagnostics" / "runs" / "source-test" / "startup_report.json").read_text(encoding="utf-8"))
+    report = json.loads((app / "diagnostics" / "runs" / "source-test" / "startup_report.json").read_text(encoding="utf-8"))
     assert report["build_id"] == "source"
     assert Path(report["paths"]["data_dir"]) == app / "data"
     assert Path(report["active_data_root"]) == app / "data"
-    assert Path(report["diagnostics_root"]) == app / "logs" / "diagnostics"
+    assert Path(report["diagnostics_root"]) == app / "diagnostics"
     assert report["source"]["sha256"]
     assert not (tmp_path / "app data").exists()
 
@@ -378,12 +364,12 @@ assert state.root == Path({str(app / "logs" / "diagnostics")!r})
 def test_atomic_report_failure_preserves_previous_report_and_exposes_permission_reason(tmp_path, monkeypatch, capsys):
     app = tmp_path / "source"
     layout = rl.resolve_runtime_layout(frozen=False, bundle_root=app, environ={})
-    run = app / "logs" / "diagnostics" / "runs" / "report"
+    run = app / "diagnostics" / "runs" / "report"
     run.mkdir(parents=True)
     destination = run / "startup_report.json"
     destination.write_text('{"previous":true}', encoding="utf-8")
     monkeypatch.setattr(sd, "_STATE", sd.StartupDiagnosticsState("report", run.parent.parent,
-                        "application_logs_source", run, True))
+                        "application_diagnostics_source", run, True))
     original = os.replace
     def denied(source, target):
         if Path(target) == destination:
@@ -402,7 +388,7 @@ def test_atomic_report_failure_preserves_previous_report_and_exposes_permission_
 
 def test_fault_log_reparse_is_rejected_before_open(tmp_path):
     app = tmp_path / "app"
-    run = app / "logs" / "diagnostics" / "runs" / "fixed"
+    run = app / "diagnostics" / "runs" / "fixed"
     run.mkdir(parents=True)
     fault = run / "faulthandler.log"
     fault.write_text("do not touch", encoding="utf-8")
