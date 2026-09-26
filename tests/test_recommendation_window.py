@@ -924,13 +924,18 @@ def test_compact_action_bar_uses_icon_buttons_with_chinese_tooltips():
     app = _app()
     window = RecommendationFloatWindow(FakeRuntime())
     buttons = [
-        window.capture_button, window.debug_button, window.copy_issue_button,
+        window.capture_button, window.screenshot_folder_button,
+        window.debug_button, window.copy_issue_button,
         window.copy_summary_button, window.open_button, window.stop_button,
     ]
     assert all(button.toolTip() for button in buttons)
     assert all(button.accessibleName() for button in buttons)
     assert all(not button.text() for button in buttons)
     assert "截取当前画面" in window.capture_button.toolTip()
+    assert window.screenshot_folder_button.toolTip() == "打开截图目录"
+    assert all(hasattr(button, "_compact_tooltip_filter") for button in buttons)
+    actions = window.layout().itemAt(1).layout()
+    assert actions.indexOf(window.screenshot_folder_button) == actions.indexOf(window.capture_button) + 1
     assert "打开窗口与牌局诊断" in window.debug_button.toolTip()
     window.close()
 

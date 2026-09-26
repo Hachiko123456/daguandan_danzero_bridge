@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -108,6 +109,20 @@ class WindowDebugReportService:
         recognizer = self._recognition_service()
         roi_validation = json_safe(recognizer.validate_configuration(standardized))
         result = recognizer.recognize(standardized, allow_unknown_suit=True)
+        # Snapshot the production pass now: later page/opening probes may
+        # replace or mutate the recognizer's thread-local diagnostic trace.
+        trace_json = json_safe(
+            recognizer.get_last_diagnostic_trace()
+            if hasattr(recognizer, "get_last_diagnostic_trace")
+            else None
+        )
+        input_sha256 = hashlib.sha256(memoryview(np.ascontiguousarray(standardized))).hexdigest()
+        metadata = (capture or {}).get("metadata")
+        captured_context = (
+            json_safe(metadata.get("diagnostic_context"))
+            if isinstance(metadata, Mapping)
+            else None
+        )
         anchor_scores = (
             recognizer.recognize_page_anchor_scores(standardized)
             if hasattr(recognizer, "recognize_page_anchor_scores")
@@ -127,14 +142,12 @@ class WindowDebugReportService:
                 "anchor_score": anchor_score,
                 "anchor_scores": dict(anchor_scores),
                 "opening_signal": json_safe(opening_signal),
+                "lead_player": getattr(result, "lead_player", None),
+                "input_sha256": input_sha256,
+                "captured_context": captured_context,
             },
         )
         result_json = json_safe(result)
-        trace_json = json_safe(
-            recognizer.get_last_diagnostic_trace()
-            if hasattr(recognizer, "get_last_diagnostic_trace")
-            else None
-        )
         readiness_json = readiness.to_dict()
         gate_json = json_safe(gate)
         detailed = build_detailed_diagnostic(
@@ -148,9 +161,11 @@ class WindowDebugReportService:
         )
         return {
             "roi_validation": roi_validation,
-            "recognition": {"result": result_json, "trace": trace_json},
+            "recognition": {"result": result_json, "trace": trace_json, "input_sha256": input_sha256},
             "detailed_diagnostic": detailed,
             "opening_readiness_inputs": {
+                "input_sha256": input_sha256,
+                "captured_context": captured_context,
                 "anchor_scores": json_safe(anchor_scores),
                 "recognition": result_json,
                 "opening_signal": json_safe(opening_signal),

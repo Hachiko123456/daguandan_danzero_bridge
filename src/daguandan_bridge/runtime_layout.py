@@ -1,9 +1,9 @@
 """Resolve and initialize immutable bundle resources and writable user data.
 
 The source checkout intentionally keeps using ``<repo>/data``.  A frozen
-application never writes below the directory containing the executable:
-packaged data is treated as an immutable seed and copied into a versioned user
-generation below ``%LOCALAPPDATA%`` (or ``DAGUANDAN_DATA_ROOT``).
+application keeps packaged data immutable and copies it into a versioned user
+generation below ``%LOCALAPPDATA%`` (or ``DAGUANDAN_DATA_ROOT``). Runtime logs
+are separate: ``<application>/logs``, never the working directory or _MEIPASS.
 
 This module is standard-library-only so it can run before Qt, OpenCV, or model
 libraries are imported.
@@ -317,30 +317,15 @@ def resolve_runtime_layout(
 
     values = os.environ if environ is None else environ
     is_frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
-    if bundle_root is not None:
-        application_root = _absolute_path_without_resolving(Path(bundle_root).expanduser())
-    elif is_frozen:
-        application_root = _absolute_path_without_resolving(
-            Path(executable_path or sys.executable)
-        ).parent
-    else:
-        application_root = Path(__file__).resolve().parents[2]
+    application_root = resolve_application_root(
+        frozen=is_frozen, bundle_root=bundle_root, executable_path=executable_path
+    )
     resource_data = application_root / "data"
-
-    diagnostics_override = str(
-        values.get(DIAGNOSTICS_ROOT_ENV)
-        or values.get(DIAGNOSTICS_ROOT_ENV_ALIAS)
-        or ""
-    ).strip()
+    diagnostics_root, diagnostics_source = resolve_log_diagnostics_root(
+        environ=values, frozen=is_frozen, application_root=application_root
+    )
 
     if not is_frozen:
-        diagnostics_root, diagnostics_source = _resolve_diagnostics_root(
-            values,
-            # Source mode keeps its historical checkout layout, but all
-            # writable domains still share the explicit application root.
-            data_override=application_root,
-            diagnostics_override=diagnostics_override,
-        )
         return RuntimeLayout(
             frozen=False,
             bundle_root=application_root,
@@ -394,12 +379,6 @@ def resolve_runtime_layout(
         generation_id,
         field="generation id",
     )
-    diagnostics_root, diagnostics_source = _resolve_diagnostics_root(
-        values,
-        data_override=runtime_root,
-        diagnostics_override=diagnostics_override,
-    )
-    _assert_external_runtime_root(diagnostics_root, application_root)
     return RuntimeLayout(
         frozen=True,
         bundle_root=application_root,
@@ -415,7 +394,7 @@ def resolve_runtime_layout(
         generation_root=generation_root,
         data_dir=generation_root / "data",
         profiles_root=generation_root / "data" / "profiles",
-        logs_root=runtime_root / "logs",
+        logs_root=application_root / "logs",
         diagnostics_root=diagnostics_root,
         diagnostics_root_source=diagnostics_source,
         # Preferences and cache are user-owned, versioned namespaces rather
@@ -480,9 +459,15 @@ def _prepare_runtime_layout_locked(selected: RuntimeLayout) -> RuntimeLayout:
 
     _ensure_owned_runtime_root(selected)
     _assert_no_reparse_chain(selected.runtime_root)
+    for path in (selected.logs_root, selected.diagnostics_root):
+        try:
+            _ensure_safe_directory(path)
+        except (OSError, RuntimeLayoutError) as exc:
+            raise RuntimeLayoutError(
+                f"cannot create runtime logs at {path}: {type(exc).__name__}: {exc}; "
+                "no fallback directory was selected"
+            ) from exc
     for path in (
-        selected.logs_root,
-        selected.diagnostics_root,
         selected.preferences_root,
         selected.cache_root,
         selected.calibration_root,
@@ -1047,36 +1032,75 @@ def _read_build_identity(bundle_root: Path) -> tuple[str, str, str | None]:
     return build_id, "identified", None
 
 
-def _resolve_diagnostics_root(
-    environ: Mapping[str, str],
+def resolve_application_root(
     *,
-    data_override: Path | None,
-    diagnostics_override: str,
+    frozen: bool | None = None,
+    bundle_root: Path | str | None = None,
+    executable_path: Path | str | None = None,
+) -> Path:
+    """Locate this checkout/extracted application, independently of cwd/_MEIPASS."""
+
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
+    if bundle_root is not None:
+        return _absolute_path_without_resolving(Path(bundle_root).expanduser())
+    if is_frozen:
+        return _absolute_path_without_resolving(
+            Path(executable_path or sys.executable).expanduser()
+        ).parent
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_log_diagnostics_root(
+    *,
+    environ: Mapping[str, str] | None = None,
+    frozen: bool | None = None,
+    application_root: Path | None = None,
 ) -> tuple[Path, str]:
-    if diagnostics_override:
-        return (
-            _absolute_user_path(diagnostics_override, field=DIAGNOSTICS_ROOT_ENV),
-            "diagnostics_environment",
-        )
-    if data_override is not None:
-        return data_override / "diagnostics", "data_root"
-    local_app_data = str(environ.get("LOCALAPPDATA") or "").strip()
-    if local_app_data:
-        return (
-            Path(local_app_data).expanduser().resolve(strict=False)
-            / APP_DIRECTORY_NAME
-            / "diagnostics",
-            "local_app_data",
-        )
-    temporary = str(environ.get("TEMP") or environ.get("TMP") or "").strip()
-    base = Path(temporary).expanduser() if temporary else Path(os.getcwd())
-    return base.resolve(strict=False) / APP_DIRECTORY_NAME / "diagnostics", "temporary"
+    """Share early/runtime diagnostic routing without resolving mutable state.
+
+    Explicit diagnostics overrides win, followed by the historical explicit
+    data-root diagnostics override (also honored by early source-mode logging).
+    LOCALAPPDATA controls frozen profiles/preferences only, never default logs.
+    Invalid overrides are errors, not permission to silently pick another root.
+    """
+
+    values = os.environ if environ is None else environ
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
+    app = application_root or resolve_application_root(frozen=is_frozen)
+    override = str(
+        values.get(DIAGNOSTICS_ROOT_ENV)
+        or values.get(DIAGNOSTICS_ROOT_ENV_ALIAS)
+        or ""
+    ).strip()
+    if override:
+        selected = _absolute_user_path(override, field=DIAGNOSTICS_ROOT_ENV)
+        source = "environment"
+    else:
+        data_override = str(values.get(DATA_ROOT_ENV) or "").strip()
+        if data_override:
+            data_root = _absolute_user_path(data_override, field=DATA_ROOT_ENV)
+            if is_frozen:
+                _assert_external_runtime_root(data_root, app)
+            selected = data_root / "diagnostics"
+            source = "data_root_environment"
+        else:
+            selected = app / "logs" / "diagnostics"
+            source = "application_logs_frozen" if is_frozen else "application_logs_source"
+    # Only the dedicated top-level log namespace is writable inside a release.
+    # Keep all ancestors link-free so logs cannot be redirected into resources.
+    try:
+        _assert_no_reparse_chain(selected)
+        if is_frozen and not selected.is_relative_to(app / "logs"):
+            _assert_external_runtime_root(selected, app)
+    except (OSError, RuntimeLayoutError) as exc:
+        raise RuntimeLayoutError(f"invalid diagnostics root {selected}: {exc}") from exc
+    return selected, source
 
 
 def _absolute_user_path(value: str, *, field: str) -> Path:
     expanded = Path(value).expanduser()
     if not expanded.is_absolute():
-        raise RuntimeLayoutError(f"{field} must be an absolute path")
+        raise RuntimeLayoutError(f"{field} must be an absolute path: {value!r}")
     resolved = _absolute_path_without_resolving(expanded)
     anchor = Path(resolved.anchor)
     if resolved == anchor:
@@ -1138,7 +1162,7 @@ def _assert_below(path: Path, root: Path, *, field: str) -> None:
 def _assert_no_reparse_chain(path: Path) -> None:
     current = _absolute_path_without_resolving(path)
     while True:
-        if current.exists() and _path_is_reparse(current):
+        if _path_is_reparse(current):
             raise RuntimeLayoutError(f"path traverses a reparse point: {current.name}")
         parent = current.parent
         if parent == current:
@@ -1438,6 +1462,8 @@ __all__ = [
     "make_active_generation_pointer",
     "prepare_runtime_layout",
     "resolve_runtime_layout",
+    "resolve_application_root",
+    "resolve_log_diagnostics_root",
     "calibration_path",
     "load_calibration",
     "load_window_binding",

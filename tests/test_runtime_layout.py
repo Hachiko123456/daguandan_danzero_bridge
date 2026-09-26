@@ -279,14 +279,13 @@ def test_corrupted_active_pointer_fails_closed(tmp_path):
         _layout(bundle, tmp_path / "runtime")
 
 
-def test_application_data_root_contains_all_writable_domains_and_persists_portable_binding(tmp_path):
+def test_application_data_root_preserves_state_while_logs_are_application_local(tmp_path):
     bundle = _bundle(tmp_path)
     user_root = tmp_path / "portable data"
     layout = ensure_runtime_layout(_layout(bundle, user_root))
 
     domains = (
         layout.profiles_root,
-        layout.logs_root,
         layout.diagnostics_root,
         layout.cache_root,
         layout.preferences_root,
@@ -294,6 +293,8 @@ def test_application_data_root_contains_all_writable_domains_and_persists_portab
         layout.window_bindings_root,
     )
     assert all(layout.app_data_root in path.parents for path in domains)
+    assert layout.logs_root == bundle / "logs"
+    assert layout.diagnostics_root == user_root / "diagnostics"  # explicit DATA_ROOT
     assert layout.calibration_root.is_dir()
     assert layout.window_bindings_root.is_dir()
 

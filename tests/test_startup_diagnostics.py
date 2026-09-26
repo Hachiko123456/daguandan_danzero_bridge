@@ -6,6 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
+from daguandan_bridge.runtime_layout import RuntimeLayoutError
 from daguandan_bridge.startup_diagnostics import resolve_diagnostics_root
 
 
@@ -142,37 +145,33 @@ def test_data_root_override_also_routes_early_diagnostics_outside_bundle(tmp_pat
     assert resolved.source == "data_root_environment"
 
 
-def test_relative_early_overrides_never_select_the_working_directory(tmp_path):
-    resolved = resolve_diagnostics_root(
-        environ={
-            "DAGUANDAN_DATA_ROOT": "relative-data",
-            "DAGUANDAN_DIAGNOSTICS_ROOT": "relative-diagnostics",
-            "LOCALAPPDATA": str(tmp_path / "local"),
-        },
-        frozen=True,
-    )
+def test_relative_early_overrides_fail_explicitly_without_fallback(tmp_path):
+    with pytest.raises(RuntimeLayoutError, match="must be an absolute path"):
+        resolve_diagnostics_root(
+            environ={
+                "DAGUANDAN_DATA_ROOT": "relative-data",
+                "DAGUANDAN_DIAGNOSTICS_ROOT": "relative-diagnostics",
+                "LOCALAPPDATA": str(tmp_path / "local"),
+            },
+            frozen=True,
+        )
+    assert not (tmp_path / "local").exists()
 
-    assert resolved.path == tmp_path / "local" / "DaguandanAssistant" / "diagnostics"
-    assert resolved.source == "local_app_data_frozen"
 
-
-def test_early_frozen_diagnostics_rejects_paths_inside_the_bundle(tmp_path, monkeypatch):
+def test_early_frozen_diagnostics_rejects_paths_inside_resources(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
     executable = bundle / "DaguandanAssistant.exe"
     bundle.mkdir()
     executable.write_bytes(b"exe")
     monkeypatch.setattr(sys, "executable", str(executable))
 
-    resolved = resolve_diagnostics_root(
-        environ={
-            "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "diagnostics"),
-            "DAGUANDAN_DATA_ROOT": str(bundle / "data-root"),
-            "LOCALAPPDATA": str(tmp_path / "safe-local"),
-        },
-        frozen=True,
-    )
-
-    assert resolved.path == (
-        tmp_path / "safe-local" / "DaguandanAssistant" / "diagnostics"
-    )
-    assert resolved.source == "local_app_data_frozen"
+    with pytest.raises(RuntimeLayoutError, match="outside the bundle tree"):
+        resolve_diagnostics_root(
+            environ={
+                "DAGUANDAN_DIAGNOSTICS_ROOT": str(bundle / "diagnostics"),
+                "DAGUANDAN_DATA_ROOT": str(bundle / "data-root"),
+                "LOCALAPPDATA": str(tmp_path / "safe-local"),
+            },
+            frozen=True,
+        )
+    assert not (tmp_path / "safe-local").exists()

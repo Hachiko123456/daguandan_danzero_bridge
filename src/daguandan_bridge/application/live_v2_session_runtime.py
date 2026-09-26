@@ -438,6 +438,18 @@ class LiveV2SessionRuntime(
             synchronous=self._synchronous_vision,
         )
 
+        def with_processed_receipt(update: LiveUpdate) -> LiveUpdate:
+            # This identifies consumed vision, not the new submission or recovery.
+            # Preserve lifecycle/block state; the controller decides recovery.
+            if not results or faults:
+                return update
+            processed = results[-1].frame
+            return replace(
+                update,
+                processed_capture_seq=processed.frame_sequence,
+                processed_captured_ms=processed.captured_ms,
+            )
+
         with self._lock:
             self._require_engine()
             if self.status in {"finalizing", "sealed"}:
@@ -466,7 +478,7 @@ class LiveV2SessionRuntime(
                 fast, frame=(results[-1].frame if results else None),
             )
             if terminal is not None:
-                return terminal
+                return with_processed_receipt(terminal)
             observations = tuple(
                 item for result in results for item in result.observations
             )
@@ -477,7 +489,7 @@ class LiveV2SessionRuntime(
                 observations, expected_seat=expected, fast=fast,
             )
             if repaired is not None:
-                return repaired
+                return with_processed_receipt(repaired)
             candidates = self._filter_suppressed_correction_surfaces(
                 candidates, observations
             )
@@ -490,11 +502,11 @@ class LiveV2SessionRuntime(
                 )
                 if opening is not None:
                     self._opening_required = not bool(opening.snapshot.play_history)
-                    return opening
-                return self._plain_update(
+                    return with_processed_receipt(opening)
+                return with_processed_receipt(self._plain_update(
                     fast=fast,
                     block_reason="opening_waiting_for_unique_visual_action",
-                )
+                ))
             selected = gated.selected
             if selected:
                 selected_seats = {item.seat for item in selected}
@@ -502,7 +514,7 @@ class LiveV2SessionRuntime(
                     if pending.seat in selected_seats:
                         self._visual_corrections.pop(action_id, None)
             self._pending.update((item.candidate_id, item) for item in selected)
-            return self._process(
+            update = self._process(
                 EngineInput(
                     observations=observations,
                     candidates=selected,
@@ -510,6 +522,7 @@ class LiveV2SessionRuntime(
                 ),
                 fast=fast,
             )
+            return with_processed_receipt(update)
 
     def _observe_terminal_control(
         self, fast: Any | None, *, frame: FrameIdentity | None,

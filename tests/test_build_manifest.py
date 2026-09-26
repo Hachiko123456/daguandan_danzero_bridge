@@ -267,8 +267,8 @@ def test_integrity_verification_detects_mutation_and_optional_extra_files(tmp_pa
     extra.write_text("runtime-only", encoding="utf-8")
     assert verify_build_manifest(bundle, manifest_path).ok is True
     strict = verify_build_manifest(bundle, manifest_path, strict=True)
-    assert strict.ok is False
-    assert "unexpected bundle file: logs/startup.log" in strict.errors
+    assert strict.ok is True
+    assert strict.errors == ()
     assert strict.unexpected_files == ("logs/startup.log",)
 
     target = bundle / "data" / "profiles" / "tencent_daguandan" / "models" / "best.npz"
@@ -486,8 +486,11 @@ def test_diagnostics_launcher_runs_doctor_without_exporting_raw_logs():
 
     assert "--doctor --doctor-output" in launcher
     assert "launcher.log" in launcher
-    assert 'set "DAGUANDAN_DIAGNOSTICS_ROOT=%DIAG_ROOT%\\diagnostics"' in launcher
-    assert "diagnostics_subdirectory=diagnostics" in launcher
+    assert 'set "DIAG_ROOT=%~dp0logs\\diagnostics"' in launcher
+    assert 'set "DAGUANDAN_DIAGNOSTICS_ROOT=%DIAG_ROOT%"' in launcher
+    assert "%LOCALAPPDATA%" not in launcher
+    assert "%TEMP%" not in launcher
+    assert "default_diagnostics_subdirectory=logs\\diagnostics" in launcher
     assert "doctor_report=doctor.json" in launcher
     assert "Compress-Archive" not in launcher
     assert "Copy-Item" not in launcher

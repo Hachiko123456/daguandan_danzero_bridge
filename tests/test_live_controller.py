@@ -2277,7 +2277,7 @@ def test_publish_ready_waiting_first_action_keeps_legacy_message_field(tmp_path)
 
     controller._publish_opening_status(
         "ready_waiting_first_action",
-        SimpleNamespace(my_hand=("3S",) * 27),
+        SimpleNamespace(my_hand=("3S",) * 27, lead_player="self"),
     )
 
     assert statuses[-1]["phase"] == "ready_waiting_first_action"

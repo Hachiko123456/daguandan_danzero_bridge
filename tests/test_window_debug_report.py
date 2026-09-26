@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import hashlib
 
 import cv2
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from daguandan_bridge.application.session_diagnostic_frames import SessionDiagnosticFrameStore
 from daguandan_bridge.application.window_debug_report import WindowDebugReportService
@@ -249,7 +251,7 @@ def test_build_from_report_file_reports_missing_media(tmp_path):
 
 
 
-def _saved_listener_frame(tmp_path):
+def _saved_listener_frame(tmp_path, *, diagnostic_context=None):
     image = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
     standardization = StandardizationResult(
         image=image,
@@ -279,6 +281,7 @@ def _saved_listener_frame(tmp_path):
         session_id="session-1",
         capture_generation=4,
         capture_seq=55,
+        diagnostic_context=diagnostic_context,
     )
 
 
@@ -327,3 +330,99 @@ def test_build_from_listener_frame_recognize_false_still_validates_roi(tmp_path)
     assert report["recognition_status"] == "NOT_REQUESTED"
     assert report["roi_validation"]["status"] == "pass"
     assert "recognition" not in report
+
+
+@pytest.mark.parametrize("probe", ["anchor", "opening"])
+def test_production_trace_is_snapshotted_before_later_probes_mutate_it(probe):
+    image = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
+    expected_hash = hashlib.sha256(image.tobytes()).hexdigest()
+
+    class MutatingRecognizer(FakeRecognizer):
+        def recognize(self, frame, *, allow_unknown_suit=False):
+            self.trace = {
+                "input_sha256": expected_hash,
+                "result": {"round_level": "2", "hand_count": 2},
+                "candidates": [{"field": "round_level", "score": .95}],
+            }
+            return super().recognize(frame, allow_unknown_suit=allow_unknown_suit)
+
+        def overwrite_trace(self):
+            self.trace["result"]["round_level"] = "A"
+            self.trace["candidates"][0]["score"] = .1
+            self.trace["input_sha256"] = "not-the-production-pass"
+
+        def recognize_page_anchor_scores(self, frame):
+            if probe == "anchor":
+                self.overwrite_trace()
+            return super().recognize_page_anchor_scores(frame)
+
+        def recognize_opening_signal(self, frame):
+            if probe == "opening":
+                self.overwrite_trace()
+            return super().recognize_opening_signal(frame)
+
+        def get_last_diagnostic_trace(self):
+            return self.trace
+
+    report = WindowDebugReportService(recognizer=MutatingRecognizer())._recognize_standardized(image)
+    trace = report["recognition"]["trace"]
+    assert trace["input_sha256"] == expected_hash
+    assert trace["result"]["round_level"] == "2"
+    assert trace["candidates"][0]["score"] == .95
+    assert report["recognition"]["input_sha256"] == expected_hash
+    assert report["opening_readiness_inputs"]["input_sha256"] == expected_hash
+    assert report["opening_readiness_inputs"]["readiness"]["input_sha256"] == expected_hash
+
+
+@pytest.mark.parametrize("lead,label", [(None, ""), ("self", "自己"), ("right", "下家")])
+def test_debug_report_passes_actual_lead_to_waiting_copy(lead, label):
+    class WaitingRecognizer(FakeRecognizer):
+        def recognize(self, frame, *, allow_unknown_suit=False):
+            item = super().recognize(frame, allow_unknown_suit=allow_unknown_suit)
+            item.my_hand = tuple(f"{rank}{suit}" for rank in "3456789" for suit in "SHCD")[:27]
+            item.lead_player = item.current_player = lead
+            return item
+
+    report = WindowDebugReportService(recognizer=WaitingRecognizer())._recognize_standardized(
+        np.zeros((6, 8, 3), dtype=np.uint8),
+    )
+    readiness = report["opening_readiness_inputs"]["readiness"]
+    assert readiness["status"] == "PASS"
+    assert readiness["lead_player"] == lead
+    assert readiness["message"] == f"已进入牌桌，等待{label}首出"
+
+
+def test_debug_report_exposes_doubling_without_accepting_false_passes():
+    class DoublingRecognizer(FakeRecognizer):
+        def recognize(self, frame, *, allow_unknown_suit=False):
+            item = super().recognize(frame, allow_unknown_suit=allow_unknown_suit)
+            item.my_hand = tuple(f"{rank}{suit}" for rank in "3456789" for suit in "SHCD")[:27]
+            item.buttons = ("super_double",)
+            item.events = (SimpleNamespace(player="right", cards=(), is_pass=True, confidence=.95),)
+            return item
+
+    report = WindowDebugReportService(recognizer=DoublingRecognizer())._recognize_standardized(
+        np.zeros((6, 8, 3), dtype=np.uint8),
+    )
+    inputs = report["opening_readiness_inputs"]
+    assert inputs["gate"]["reason"] == "doubling" and inputs["gate"]["seed"] is None
+    assert inputs["readiness"]["status"] == "WAIT"
+    assert inputs["readiness"]["message"] == "已进入牌桌，等待加倍结束"
+    # The raw misrecognition remains auditable, not converted to a game event.
+    assert report["recognition"]["result"]["events"][0]["is_pass"] is True
+
+
+def test_listener_frame_keeps_capture_time_context_separate_from_new_readiness(tmp_path):
+    context = {
+        "page": {"stage": "table", "anchor_score": .95},
+        "readiness": {"status": "WAIT", "phase": "doubling"},
+    }
+    record = _saved_listener_frame(tmp_path, diagnostic_context=context)
+    report = _replay_service_with_capture(lambda *_args, **_kwargs: None).build_from_listener_frame(record.image_path)
+    inputs = report["opening_readiness_inputs"]
+    assert inputs["captured_context"] == context
+    assert inputs["readiness"]["captured_context"] == context
+    assert inputs["readiness"]["phase"] == "hand_count_mismatch"
+    assert inputs["readiness"]["message"] == "当前未确认完整开局，等待新局"
+    assert inputs["input_sha256"] == record.metadata["raw_sha256"]
+    assert inputs["readiness"]["input_sha256"] == inputs["input_sha256"]

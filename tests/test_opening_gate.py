@@ -375,3 +375,76 @@ def test_level_conflict_while_hand_missing_discards_staged_marker():
     observe(tracker, result(hand=(), lead=None, current=None, cards=None, level="6"), 300)
     assert not observe(tracker, result(lead=None, level="6"), 400).ready
     assert not observe(tracker, result(lead=None, level="6"), 500).ready
+
+
+@pytest.mark.parametrize("button", ["double", "super_double"])
+@pytest.mark.parametrize("event_kind", ["none", "pass", "play"])
+def test_doubling_guards_before_seed_action_and_conflicting_lead_evidence(button, event_kind):
+    item = result(cards=None if event_kind == "none" else ("2C",))
+    item.buttons = (button,)
+    if event_kind == "pass":
+        item.events[0].cards = ()
+        item.events[0].is_pass = True
+    item.lead_evidence = (LeadEvidence("right", status="conflict"),)
+    tracker = OpeningTracker()
+
+    evaluations = [evaluate_opening_gate(item, anchor_score=.95)]
+    evaluations.extend(observe(tracker, item, tick) for tick in (100, 200, 300))
+    for evaluation in evaluations:
+        assert evaluation.reason == "doubling"
+        assert evaluation.status == "NOT_READY"
+        assert not evaluation.ready and not evaluation.session_ready
+        assert not evaluation.action_confirmed
+        assert evaluation.seed is None and evaluation.normalized_hand is None
+    assert tracker.candidate is None
+    assert tracker.candidate_count == tracker.hand_count == tracker.lead_count == 0
+    assert tracker.candidate_evidence == ()
+    assert not tracker.completed and not tracker.saw_action
+
+
+@pytest.mark.parametrize("button", ["double", "super_double"])
+@pytest.mark.parametrize("anchor", [None, .84, float("nan")])
+def test_doubling_does_not_bypass_table_anchor_requirement(button, anchor):
+    item = result()
+    item.buttons = (button,)
+    gate = evaluate_opening_gate(item, anchor_score=anchor)
+    tracked = OpeningTracker().observe(item, anchor_score=anchor, generation=0, monotonic_ms=100)
+    assert gate.reason == tracked.reason == "table_anchor_unresolved"
+    assert not gate.session_ready and not tracked.session_ready
+
+
+@pytest.mark.parametrize("prior_votes", [0, 1, 2])
+@pytest.mark.parametrize("resume_action", [False, True])
+def test_doubling_discards_waiting_votes_then_requires_fresh_normal_confirmation(prior_votes, resume_action):
+    tracker = OpeningTracker()
+    waiting = result(lead=None, current=None, cards=None)
+    for tick in range(prior_votes):
+        observe(tracker, waiting, tick)
+    doubling = result(hand=HAND[:-1])
+    doubling.buttons = ("super_double",)
+    assert observe(tracker, doubling, 100).reason == "doubling"
+    assert tracker.candidate is None and not tracker.waiting_for_action
+
+    after = result() if resume_action else waiting
+    assert not observe(tracker, after, 200).ready
+    accepted = observe(tracker, after, 300)
+    assert accepted.ready
+    assert accepted.seed is not None
+    assert (accepted.seed.opening_action is not None) is resume_action
+    assert sorted(accepted.seed.hand) == sorted(HAND)
+
+
+def test_doubling_never_reopens_an_action_confirmed_tracker():
+    tracker = OpeningTracker()
+    observe(tracker, result(), 100)
+    assert observe(tracker, result(), 200).action_confirmed
+    item = result()
+    item.buttons = ("double",)
+    assert observe(tracker, item, 300).reason == "already_started"
+    assert observe(tracker, result(), 400).reason == "already_started"
+
+
+def test_non_doubling_controls_do_not_invent_a_doubling_phase():
+    item = result(lead=None, current=None, cards=None)
+    item.buttons = ("hint", "play_cards", "pass")
+    assert evaluate_opening_gate(item, anchor_score=.95).reason == "ready_waiting_first_action"

@@ -97,6 +97,9 @@ class LiveUpdate:
     block_reason: str = ""
     missing_player: Seat | None = None
     missing_action_kind: str = ""
+    # Only a consumed vision result sets these; an async submission/poll is not proof.
+    processed_capture_seq: int | None = None
+    processed_captured_ms: int | None = None
 
 
 __all__ = [

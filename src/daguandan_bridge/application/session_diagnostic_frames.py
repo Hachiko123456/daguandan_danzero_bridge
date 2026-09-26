@@ -283,6 +283,11 @@ class SessionDiagnosticFrameStore:
         _assert_no_reparse_components(diagnostic)
         return session, diagnostic
 
+    @classmethod
+    def diagnostic_directory(cls, session_directory: Path | str, *, create: bool = False) -> Path:
+        """Validate the full lexical destination chain before migration can write."""
+        return cls._diagnostic_directory(session_directory, create=create)[1]
+
     @staticmethod
     def _next_sequence(directory: Path) -> int:
         highest = 0
@@ -342,6 +347,7 @@ class SessionDiagnosticFrameStore:
         capture_seq: int,
         source: str = SOURCE_KIND,
         source_phase: str | None = None,
+        diagnostic_context: Mapping[str, object] | None = None,
     ) -> SessionDiagnosticFrame:
         """Atomically save one exact standardized image and its provenance sidecar."""
 
@@ -420,6 +426,32 @@ class SessionDiagnosticFrameStore:
                 "png_sha256": _sha256_bytes(png_bytes),
                 "source": source,
             }
+            # raw_sha256 historically names the standardized listener pixels,
+            # not the unscaled native-window buffer. Keep that stable spelling
+            # and add explicit geometry/provenance without altering any pixels.
+            metadata["standardized_sha256"] = metadata["raw_sha256"]
+            standardization = _attribute(frame, "standardization", None)
+            if standardization is not None:
+                geometry = {}
+                for name in ("source_size", "source_viewport", "content_box", "scale",
+                             "padding", "aspect_error", "aspect_compatible"):
+                    value = _attribute(standardization, name, None)
+                    if hasattr(value, "to_list"):
+                        value = value.to_list()
+                    if value is not None:
+                        geometry[name] = _json_safe(value)
+                metadata["standardization"] = geometry
+            original = _attribute(frame, "raw_image", None)
+            if isinstance(original, np.ndarray):
+                metadata["capture_raw_sha256"] = _sha256_bytes(original.tobytes(order="C"))
+                metadata["capture_raw_shape"] = list(original.shape)
+            if diagnostic_context is not None:
+                safe_context = _json_safe(dict(diagnostic_context))
+                if len(json.dumps(safe_context, ensure_ascii=False).encode("utf-8")) > 65536:
+                    raise SessionDiagnosticFrameError("截图诊断上下文超过 64 KiB 限制")
+                # Nested only: callers cannot overwrite authoritative frame ID,
+                # source, or hashes with diagnostic text from another frame.
+                metadata["diagnostic_context"] = safe_context
             if source_phase is not None:
                 metadata["source_phase"] = source_phase
             checked_metadata = _validate_metadata(metadata, sequence)
@@ -434,6 +466,38 @@ class SessionDiagnosticFrameStore:
                 # only exposes complete PNG/JSON pairs.
                 raise
             return SessionDiagnosticFrame(sequence, image_path, metadata_path, session, checked_metadata)
+
+    def copy_frame(
+        self, record: SessionDiagnosticFrame, session_directory: Path | str, *,
+        session_id: str, provenance_field: str,
+    ) -> SessionDiagnosticFrame:
+        """Copy a validated pair without reusing orphan stems or changing pixels.
+
+        PNG is published atomically first, metadata last. A crash between them
+        leaves an invisible orphan, never a partial image paired with old JSON.
+        The caller removes the source only after the complete copy succeeds.
+        """
+        if provenance_field not in {"original_manual_fallback_session_id", "original_preopening_session_id"}:
+            raise SessionDiagnosticFrameError("invalid migration provenance")
+        if not str(session_id).strip():
+            raise SessionDiagnosticFrameError("session_id 不能为空")
+        self.load_image(record)
+        original = self.read_record(record.image_path, metadata_path=record.metadata_path)
+        png_bytes = original.image_path.read_bytes()
+        if _sha256_bytes(png_bytes) != original.metadata["png_sha256"]:
+            raise SessionDiagnosticFrameError("source changed during migration")
+        session, directory = self._diagnostic_directory(session_directory, create=True)
+        with _directory_lock(directory):
+            sequence = self._next_sequence(directory)
+            metadata = dict(original.metadata)
+            metadata.update(session_id=session_id, sequence=sequence)
+            metadata[provenance_field] = original.metadata["session_id"]
+            metadata = _validate_metadata(metadata, sequence)
+            image_path = directory / f"{sequence:06d}.png"
+            metadata_path = directory / f"{sequence:06d}.json"
+            _atomic_bytes(image_path, png_bytes)
+            _atomic_json(metadata_path, metadata)
+            return SessionDiagnosticFrame(sequence, image_path, metadata_path, session, metadata)
 
     def list_frames(self, session_directory: Path | str) -> tuple[SessionDiagnosticFrame, ...]:
         """Return complete, well-formed frame pairs in sequence order."""

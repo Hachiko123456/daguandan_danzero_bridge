@@ -65,6 +65,22 @@ def build_live_controller_dependencies(
         advice_adapter,
         profile_name=profile_name,
     )
+    # Bind the startup report to the *actual* selected profile. This is done
+    # once at composition, never on the capture thread or for each frame.
+    from .startup_diagnostics import (
+        initialized_startup_diagnostics, record_startup_event, write_startup_report,
+    )
+    if initialized_startup_diagnostics() is not None:
+        try:
+            write_startup_report(
+                profiles_root=Path(capture_adapter.profiles_root).resolve(),
+                profile_name=profile_name,
+                resource_identity=recognizer.recognition_resource_identity(),
+            )
+        except Exception as exc:
+            record_startup_event("profile_evidence_failed", {
+                "error": f"{type(exc).__name__}: {exc}", "profile_name": profile_name,
+            })
     return LiveControllerDependencies(
         capture_adapter,
         recognizer,

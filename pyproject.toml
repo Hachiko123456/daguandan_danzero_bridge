@@ -69,6 +69,10 @@ visual_fixture = [
   "tests/test_failure_scope_acceptance.py",
 ]
 integration = [
+  "tests/test_live_listener_diagnostic_capture.py",
+  "tests/test_live_controller_page_recovery.py",
+  "tests/test_session_diagnostic_frames.py",
+  "tests/test_episode_directory_lifecycle.py",
   "tests/test_live_v2_session_factory.py",
   "tests/test_live_end_to_end.py",
   "tests/test_failure_scope_acceptance.py",

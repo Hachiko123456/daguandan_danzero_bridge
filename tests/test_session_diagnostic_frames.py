@@ -163,3 +163,62 @@ def test_manual_source_metadata_is_lossless_and_selectable(tmp_path):
     listed = store.list_frames(tmp_path / "manual-diagnostic")
     assert len(listed) == 1
     assert listed[0].metadata["source"] == MANUAL_SOURCE_KIND
+
+
+def test_geometry_and_capture_hash_distinguish_raw_window_from_listener_pixels(tmp_path):
+    from dataclasses import replace
+    import hashlib
+    image = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+    snapshot = _snapshot(image)
+    original = np.zeros((6, 8, 3), dtype=np.uint8)
+    snapshot = replace(snapshot, frame=replace(snapshot.frame, raw_image=original))
+    store = SessionDiagnosticFrameStore()
+    record = store.save_snapshot(
+        tmp_path / "evidence", snapshot, session_id="s", capture_generation=2, capture_seq=17,
+        diagnostic_context={"page": {"stage": "unknown", "anchor_score": 0.2},
+                            "source": "not-authoritative", "raw_sha256": "not-authoritative"},
+    )
+    assert record.metadata["standardized_sha256"] == hashlib.sha256(image.tobytes()).hexdigest()
+    assert record.metadata["raw_sha256"] == record.metadata["standardized_sha256"]
+    assert record.metadata["capture_raw_sha256"] == hashlib.sha256(original.tobytes()).hexdigest()
+    assert record.metadata["capture_raw_shape"] == [6, 8, 3]
+    assert record.metadata["standardization"]["source_viewport"] == [0, 0, 5, 4]
+    assert record.metadata["diagnostic_context"]["page"]["stage"] == "unknown"
+    assert record.metadata["source"] == SOURCE_KIND
+    np.testing.assert_array_equal(store.load_image(record), image)
+
+
+def test_oversized_diagnostic_context_never_creates_partial_frame(tmp_path):
+    store = SessionDiagnosticFrameStore()
+    with pytest.raises(SessionDiagnosticFrameError, match="64 KiB"):
+        store.save_snapshot(tmp_path / "evidence", _snapshot(np.zeros((4, 5, 3), np.uint8)),
+                            session_id="s", capture_generation=2, capture_seq=17,
+                            diagnostic_context={"trace": "x" * 70000})
+    assert store.list_frames(tmp_path / "evidence") == ()
+
+
+def test_copy_frame_reserves_orphan_stems_and_publishes_metadata_last(tmp_path, monkeypatch):
+    from daguandan_bridge.application import session_diagnostic_frames as module
+    store = SessionDiagnosticFrameStore()
+    original = store.save_snapshot(tmp_path / "source", _snapshot(np.full((3, 4, 3), 42, np.uint8)),
+                                   session_id="source", capture_generation=2, capture_seq=8)
+    target = tmp_path / "target"
+    directory = store.diagnostic_directory(target, create=True)
+    orphan = directory / "000001.json"
+    orphan.write_bytes(original.metadata_path.read_bytes())
+    original_json = module._atomic_json
+    def fail_metadata(*args):
+        raise OSError("simulated interruption")
+    monkeypatch.setattr(module, "_atomic_json", fail_metadata)
+    with pytest.raises(OSError, match="simulated interruption"):
+        store.copy_frame(original, target, session_id="target", provenance_field="original_preopening_session_id")
+    assert orphan.read_bytes() == original.metadata_path.read_bytes()
+    assert not (directory / "000001.png").exists()
+    assert store.list_frames(target) == ()
+    assert original.image_path.is_file()
+    monkeypatch.setattr(module, "_atomic_json", original_json)
+    copied = store.copy_frame(original, target, session_id="target", provenance_field="original_preopening_session_id")
+    assert copied.sequence == 3
+    assert np.array_equal(store.load_image(copied), store.load_image(original))
+    assert copied.image_path.read_bytes() == original.image_path.read_bytes()
+    assert copied.metadata["original_preopening_session_id"] == "source"

@@ -948,7 +948,17 @@ def _record_file_difference(
 
 
 def _unexpected_file_disposition(relative: str) -> str:
-    _portable_relative_path(relative)
+    parts = PurePosixPath(_portable_relative_path(relative)).parts
+    # Only unmanifested runtime evidence under the dedicated application-local
+    # logs directory is allowed. Inventoried files remain immutable, including
+    # any accidentally shipped log, and traversal still rejects every reparse.
+    if len(parts) >= 2 and parts[0].casefold() == "logs":
+        name = parts[-1].casefold()
+        if re.fullmatch(r".+\.(?:log|jsonl?|txt)(?:\.[1-9][0-9]*)?", name):
+            return "allow"
+        if (len(parts) >= 3 and parts[-2].casefold() == "support"
+                and re.fullmatch(r"support_[0-9_]+\.zip", name)):
+            return "allow"
     return "error"
 
 

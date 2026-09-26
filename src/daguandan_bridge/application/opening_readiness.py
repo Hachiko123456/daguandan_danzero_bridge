@@ -167,13 +167,18 @@ def listening_report(*, message: str = "持续监听页面中") -> OpeningReadin
     )
 
 
-def ready_report(*, message: str = "完整开局已确认，正在建立对局") -> OpeningReadinessReport:
+def ready_report(
+    *,
+    message: str = "完整开局已确认，正在建立对局",
+    details: Mapping[str, object] | None = None,
+) -> OpeningReadinessReport:
     return _report(
         PASS,
         OpeningReadinessCode.READY,
         message,
         "等待推荐窗口显示当前回合建议",
         recoverable=True,
+        details=details,
     )
 
 
@@ -237,17 +242,36 @@ def report_for_phase(
     extra = {"phase": value, "hand_count": count}
     extra.update(dict(details or {}))
 
+    if value == "doubling":
+        return _report(
+            WAIT,
+            OpeningReadinessCode.OPENING_UNRESOLVED,
+            message or "已进入牌桌，等待加倍结束",
+            "保持监听，加倍结束后继续确认完整开局",
+            recoverable=True,
+            details=extra,
+        )
+    if value == "page_recovering":
+        return _report(WAIT, OpeningReadinessCode.LISTENING,
+                       message or "页面暂时无法确认，继续等待恢复", "保持窗口可见；无需退出监听",
+                       recoverable=True, details=extra)
     if value in {"ready_waiting_first_action", "ready_waiting_lead"}:
+        lead = extra.get("lead_player")
+        lead = getattr(lead, "value", lead)
+        lead_label = {
+            "self": "自己", "right": "下家", "opposite": "对家", "left": "上家",
+        }.get(str(lead), "")
+        waiting = f"等待{lead_label}首出"
         return _report(
             PASS,
             OpeningReadinessCode.READY_WAITING_FIRST_ACTION,
-            message or "已进入牌桌，等待自己首出",
-            "等待自己首出；首出后继续识别出牌",
+            message or f"已进入牌桌，{waiting}",
+            f"{waiting}；首出后继续识别出牌",
             recoverable=True,
             details=extra,
         )
     if value == "ready":
-        return ready_report(message=message or "完整开局已确认，正在建立对局")
+        return ready_report(message=message or "完整开局已确认，正在建立对局", details=extra)
     if value in {"unknown", "lobby", "settlement", "settlement_screen", "waiting_table", "table_anchor_unresolved"}:
         settlement = value in {"settlement", "settlement_screen"}
         return _report(
@@ -264,10 +288,10 @@ def report_for_phase(
         )
     if value in {"missed_opening", "deal_in_progress", "already_started"}:
         return _report(
-            FAIL,
+            WAIT,
             OpeningReadinessCode.DEAL_IN_PROGRESS,
-            message or f"当前对局已进行，当前识别到{count}张手牌",
-            "等待下一局开局后再开始监听",
+            message or "当前未确认完整开局，等待新局",
+            "保持监听，等待新局完整27张起手牌",
             recoverable=True,
             details=extra,
         )
@@ -275,8 +299,16 @@ def report_for_phase(
         return _report(
             WAIT,
             OpeningReadinessCode.MID_GAME_HAND_COUNT,
-            message or f"起手牌数量尚未稳定，当前识别到{count}张",
-            "保持牌桌清晰，等待完整27张起手牌",
+            message or (
+                "当前未确认完整开局，等待新局"
+                if 0 < count < 27
+                else f"起手牌数量尚未稳定，当前识别到{count}张"
+            ),
+            (
+                "保持监听，等待新局完整27张起手牌"
+                if 0 < count < 27
+                else "保持牌桌清晰，等待完整27张起手牌"
+            ),
             recoverable=True,
             details=extra,
         )

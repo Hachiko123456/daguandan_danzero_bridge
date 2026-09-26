@@ -14,6 +14,7 @@ from .live.turns import TURN_ORDER, next_active_seat
 
 DEFAULT_TABLE_ANCHOR_THRESHOLD = 0.85
 _SETTLEMENT_BUTTONS = frozenset({"change_table", "continue_game"})
+_DOUBLING_BUTTONS = frozenset({"double", "super_double"})
 MIN_OPENING_ACTION_CONFIDENCE = 0.80
 
 # Canonical opening evidence states.  These are deliberately strings rather
@@ -41,6 +42,7 @@ LEGACY_REASON_STATUS = {
     "confirming_opening": NOT_READY,
     "duplicate_frame": NOT_READY,
     "waiting_table": NOT_READY,
+    "doubling": NOT_READY,
     "already_started": READY_ACTION_CONFIRMED,
     "candidate_conflict": CONFLICT,
     "opening_seed_conflict": CONFLICT,
@@ -304,6 +306,15 @@ class OpeningTracker:
             return OpeningGateEvaluation(
                 False, "already_started", None, None, READY_ACTION_CONFIRMED
             )
+        if buttons & _DOUBLING_BUTTONS:
+            # Doubling UI can look like play/pass or lead evidence. Neither
+            # these observations nor votes collected before them may seed a
+            # session; confirmation resumes from fresh frames when it clears.
+            self.discard_candidates()
+            evaluation = evaluate_opening_gate(result, anchor_score=anchor_score)
+            self.reason = evaluation.reason
+            self.status = evaluation.status
+            return evaluation
         if (
             (self.started_ms is not None and now - self.started_ms > self.max_age_ms)
             or (self.last_ms is not None and now < self.last_ms)
@@ -567,6 +578,8 @@ def evaluate_opening_gate(
         anchor_ready = False
     if not anchor_ready:
         return OpeningGateEvaluation(False, "table_anchor_unresolved", None, None)
+    if buttons & _DOUBLING_BUTTONS:
+        return OpeningGateEvaluation(False, "doubling", None, None)
     level = str(getattr(result, "round_level", "") or "")
     if level not in RANKS:
         return OpeningGateEvaluation(False, "round_level_unresolved", None, None)

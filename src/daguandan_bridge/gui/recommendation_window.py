@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from datetime import datetime
+from math import isfinite
+from pathlib import Path
 from typing import Any
 from time import monotonic_ns
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer
-from PySide6.QtGui import QCloseEvent, QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer, QUrl
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
+from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import (
     CaptionLabel,
     CardWidget,
@@ -196,6 +200,8 @@ class RecommendationFloatWindow(QWidget):
         self._opening_readiness = None
         self._fault_identity: tuple[str, int] | None = None
         self._diagnostic_frame_saving = False
+        self._last_diagnostic_image_path: Path | None = None
+        self._last_diagnostic_session_directory: Path | None = None
         self._hint_expiry_timer = QTimer(self)
         self._hint_expiry_timer.setSingleShot(True)
         self._hint_expiry_timer.timeout.connect(self._expire_local_hint)
@@ -250,14 +256,22 @@ class RecommendationFloatWindow(QWidget):
 
         actions = QHBoxLayout()
         self.capture_label = CaptionLabel("")
+        self.capture_label.setWordWrap(True)
+        self.capture_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         actions.addWidget(self.capture_label, 1)
 
         self.capture_button = self._make_action_button(
             FluentIcon.CAMERA,
-            "截取当前画面：保存最近一帧实时监听截图，稍后到窗口与牌局诊断中识别",
+            "截取当前画面：优先保存最近监听帧（停止后为保留帧），无监听帧时手动截取窗口",
             self.capture_diagnostic_requested.emit,
         )
         actions.addWidget(self.capture_button)
+        self.screenshot_folder_button = self._make_action_button(
+            FluentIcon.FOLDER,
+            "打开截图目录",
+            self.open_screenshot_folder,
+        )
+        actions.addWidget(self.screenshot_folder_button)
         self.debug_button = self._make_action_button(
             FluentIcon.SEARCH,
             "打开窗口与牌局诊断：打开完整助手中的窗口与牌局诊断页",
@@ -539,7 +553,15 @@ class RecommendationFloatWindow(QWidget):
             OpeningReadinessCode.WORKER_FAULT.value: "后台识别失败",
         }
         title = titles.get(reason_value, "开局状态不可用")
+        details = getattr(report, "details", {})
+        phase = details.get("phase", "") if isinstance(details, Mapping) else ""
         message = str(getattr(report, "message", "") or "")
+        if phase == "doubling":
+            title = "等待加倍结束"
+        elif phase == "page_recovering":
+            title = "等待画面恢复"
+        elif reason_value == OpeningReadinessCode.READY_WAITING_FIRST_ACTION.value and message:
+            title = message
         suggested_action = str(getattr(report, "suggested_action", "") or "")
         detail_parts = [part for part in (message, f"建议：{suggested_action}" if suggested_action else "") if part]
         detail = "\n".join(detail_parts)
@@ -554,45 +576,183 @@ class RecommendationFloatWindow(QWidget):
             kind = "listening"
         self._render_view(CompactViewState(kind, title, detail))
 
+    @staticmethod
+    def _absolute_diagnostic_path(value: object) -> Path | None:
+        # An empty/relative path must never become the working directory.
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            return None
+        try:
+            path = Path(value)
+            if not path.is_absolute() or path == Path(path.anchor) or ".." in path.parts:
+                return None
+            return path
+        except (OSError, ValueError):
+            return None
+
+    def _remember_diagnostic_frame(self, value: Mapping[str, object]) -> None:
+        image = self._absolute_diagnostic_path(value.get("image_path"))
+        session = self._absolute_diagnostic_path(value.get("session_directory"))
+        if image is not None and image.parent.name.casefold() == "diagnostic_frames":
+            # The saved PNG is stronger evidence than a stale session directory.
+            self._last_diagnostic_image_path = image
+            self._last_diagnostic_session_directory = image.parent.parent
+        elif session is not None:
+            self._last_diagnostic_image_path = None
+            self._last_diagnostic_session_directory = session
+
+    def open_screenshot_folder(self) -> None:
+        """Open saved evidence in Explorer, never via full-assistant navigation."""
+        candidates: list[Path] = []
+        getter = getattr(self.runtime, "diagnostic_frame_directory", None)
+        if callable(getter):
+            try:
+                directory = self._absolute_diagnostic_path(getter())
+            except Exception:
+                directory = None
+            if directory is not None and directory.name.casefold() == "diagnostic_frames":
+                candidates.append(directory)
+        image = self._last_diagnostic_image_path
+        session = self._last_diagnostic_session_directory
+        if image is not None:
+            candidates.append(image.parent)
+        elif session is not None:
+            candidates.append(
+                session if session.name.casefold() == "diagnostic_frames"
+                else session / "diagnostic_frames"
+            )
+
+        def existing_directory(path: Path) -> bool:
+            try:
+                return path.is_dir()
+            except (OSError, ValueError):
+                return False
+
+        directory = next((path for path in candidates if existing_directory(path)), None)
+        fallback = directory is None
+        if fallback:
+            # A removed frame directory may still have its session or sessions
+            # parent. Do not walk arbitrarily up to a drive root or create paths.
+            directory = next((
+                parent
+                for path in candidates
+                for parent in (path.parent, path.parent.parent)
+                if parent != Path(parent.anchor) and existing_directory(parent)
+            ), None)
+        if directory is None:
+            self._set_capture_notice(
+                "截图目录已不存在，请重新截图" if candidates else "尚无截图，请先截取一帧"
+            )
+            return
+        try:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        except Exception:
+            opened = False
+        if opened:
+            self._set_capture_notice(
+                "截图目录已移除，已打开上级目录" if fallback else "已打开截图目录",
+                str(directory),
+            )
+        else:
+            self._set_capture_notice("无法打开截图目录，请稍后重试", str(directory))
+
+    def _set_capture_notice(self, text: str, detail: str = "") -> None:
+        self.capture_label.setText(text)
+        self.capture_label.setToolTip(detail)
+
+    @staticmethod
+    def _diagnostic_source(value: Mapping[str, object]) -> tuple[str, bool]:
+        metadata = value.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        source = str(value.get("source") or metadata.get("source") or "")
+        phase = str(value.get("source_phase") or metadata.get("source_phase") or "")
+        if source == "manual_window_capture" or phase == "manual_window_capture":
+            return "手动窗口截图", False
+        if phase == "last_listener_frame":
+            return "故障前最近监听帧", True
+        if phase == "listener_stopped":
+            return "停止前监听帧", True
+        if phase in {"failed_listener_frame", "listener_failed", "waiting_capture_failed", "geometry_recovery_failed"}:
+            return "失败前监听帧", True
+        if source == "live_listener_frame":
+            return "实时监听截图", False
+        return "截图", False
+
+    @staticmethod
+    def _retained_frame_time(value: Mapping[str, object]) -> str:
+        metadata = value.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        captured = value.get("captured_at") or metadata.get("captured_at")
+        try:
+            captured = captured if isinstance(captured, datetime) else datetime.fromisoformat(str(captured))
+        except (TypeError, ValueError):
+            captured = None
+        age = value.get("frame_age_seconds", metadata.get("frame_age_seconds"))
+        if age is None and value.get("frame_age_ms") is not None:
+            try:
+                age = float(value["frame_age_ms"]) / 1000.0
+            except (TypeError, ValueError, OverflowError):
+                age = None
+        try:
+            age = float(age)
+            if not isfinite(age):
+                age = None
+        except (TypeError, ValueError, OverflowError):
+            age = None
+        if age is None and captured is not None:
+            age = (datetime.now().astimezone() - captured.astimezone()).total_seconds()
+        parts = [f"采集 {captured:%H:%M:%S}" if captured else "采集时间未知"]
+        if age is not None:
+            seconds = max(0, int(age))
+            if seconds < 60:
+                parts.append(f"{seconds} 秒前")
+            elif seconds < 3600:
+                parts.append(f"{seconds // 60} 分钟前")
+            elif seconds < 86400:
+                parts.append(f"{seconds // 3600} 小时前")
+            else:
+                parts.append(f"{seconds // 86400} 天前")
+        return " · ".join(parts)
+
     def apply_diagnostic_frame_status(self, value: object) -> None:
-        """Render the save-only compact screenshot status."""
-        if not isinstance(value, dict):
+        """Render save provenance and retain only successful screenshot paths."""
+        if not isinstance(value, Mapping):
             return
         status = str(value.get("status") or value.get("state") or "").upper()
+        message = str(value.get("message") or "")
+        if status in {"PASS", "SUCCESS", "SAVED", "COMPLETED", "DONE"} and "复制" in message:
+            # Clipboard feedback is not a save and cannot complete one in flight.
+            self._set_capture_notice(message)
+            return
+        source_label, retained = self._diagnostic_source(value)
         if status in {"RUNNING", "SAVING", "PENDING", "STARTED", "LOADING"}:
             self._diagnostic_frame_saving = True
             self.capture_button.setEnabled(False)
-            self.capture_label.setText("正在保存实时监听截图…")
+            self._set_capture_notice(f"正在保存{source_label}…")
             return
 
         self._diagnostic_frame_saving = False
         self.capture_button.setEnabled(True)
         if status in {"PASS", "SUCCESS", "SAVED", "COMPLETED", "DONE"}:
-            message = str(value.get("message") or "")
-            if "复制" in message and not any(
-                value.get(key) for key in ("session_directory", "session_dir", "directory", "count", "frame_count", "saved_count")
-            ):
-                self.capture_label.setText(message)
-                return
-            directory = str(
-                value.get("session_directory")
-                or value.get("session_dir")
-                or value.get("directory")
-                or ""
-            )
+            self._remember_diagnostic_frame(value)
             count = value.get("count", value.get("frame_count", value.get("saved_count")))
-            detail = "截图已保存"
-            if count is not None:
-                detail += f"，当前对局共 {count} 张"
-            if directory:
-                detail += f" · 对局目录：{directory}"
-            detail += "；请到窗口与牌局诊断中识别"
-            self.capture_label.setText(detail)
+            detail = f"{source_label}已保存"
+            if retained:
+                detail += "\n" + self._retained_frame_time(value)
+            elif count is not None:
+                detail += f" · {count} 张"
+            tooltip = "\n".join(str(part) for part in (
+                message,
+                value.get("image_path"),
+                value.get("session_directory"),
+                "保留的历史监听帧，非当前画面" if retained else "",
+            ) if part)
+            self._set_capture_notice(detail, tooltip)
         elif status in {"FAIL", "FAILURE", "ERROR", "FAILED"}:
-            message = str(value.get("message") or value.get("error") or "保存实时监听截图失败")
-            self.capture_label.setText(f"截图保存失败：{message}")
+            message = message or str(value.get("error") or "保存截图失败")
+            self._set_capture_notice("截图保存失败", message)
         elif status:
-            self.capture_label.setText(str(value.get("message") or status))
+            self._set_capture_notice(message or status)
+
     def apply_recording_status(self, value: object) -> None:
         if isinstance(value, dict) and value.get("reason") == "recording_capacity_reached":
             self._recording_capacity_notice = str(value.get("message", ""))

@@ -129,7 +129,7 @@ def test_unknown_delivery_publishes_recovery_stage_reason_and_retry_count(tmp_pa
     )
 
 
-def test_unknown_frames_stop_only_after_bounded_recovery_budget(tmp_path):
+def test_unknown_frames_enter_low_frequency_recovery_after_budget(tmp_path):
     _app()
     controller = _controller(tmp_path)
     controller._PAGE_UNKNOWN_MAX_RETRIES = 2
@@ -146,15 +146,11 @@ def test_unknown_frames_stop_only_after_bounded_recovery_budget(tmp_path):
 
     controller._apply_listening_page(ListeningPageSignal("unknown", 0.0), snapshot)
 
-    assert controller._listening_enabled is False
-    assert controller._test_recording.closed_with == [
-        "transient_page_unknown_budget_exhausted"
-    ]
-    assert faults[-1]["kind"] == "page_recovery"
-    assert faults[-1]["stage"] == "page"
-    assert faults[-1]["retry_count"] == 3
-    assert faults[-1]["reason"] == "transient_page_unknown_budget_exhausted"
-    assert statuses[-1]["state"] == "failed"
+    assert controller._listening_enabled is True
+    assert controller._test_recording.closed_with == []
+    assert faults == []
+    assert controller._page_recovery_slow is True
+    assert statuses[-1]["state"] == "recovering"
     assert statuses[-1]["failure_class"] == "transient_page_recovery_exhausted"
     assert statuses[-1]["retry_count"] == 3
 
@@ -198,3 +194,29 @@ def test_geometry_capture_failure_still_enters_existing_geometry_recovery(
     assert len(started) == 1
     assert controller._listening_enabled is True
     assert controller._test_recording.closed_with == []
+
+
+
+def test_unknown_recovery_resumes_without_false_opening_and_user_stop_wins(tmp_path):
+    _app()
+    controller = _controller(tmp_path)
+    controller._PAGE_UNKNOWN_MAX_RETRIES = 0
+    observed = []
+    controller._opening_tracker.observe = lambda *_a, **_kw: observed.append(True)
+    envelope = _WaitingRecognitionEnvelope(
+        snapshot=_snapshot(), generation=controller._waiting_generation,
+        trace=None, opening_seed_valid=True,
+        page=ListeningPageSignal("unknown", 0.0),
+    )
+    result = SimpleNamespace(my_hand=("AS",) * 27, round_level="A", buttons=("play",))
+    controller._consume_waiting_recognition(result, envelope)
+    assert observed == []
+    assert controller._listening_enabled is True
+    assert controller._page_recovery_slow is True
+    controller._apply_listening_page(ListeningPageSignal("table", 0.95), _snapshot())
+    assert controller._page_recovery_slow is False
+    assert controller._page_unknown_retry_count == 0
+    controller.stop_listening()
+    controller._consume_waiting_recognition(result, envelope)
+    assert observed == []
+    assert controller._listening_enabled is False

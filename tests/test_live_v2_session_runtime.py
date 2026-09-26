@@ -197,6 +197,7 @@ class DelayedVisionRuntime:
     def __init__(
         self, result_seat: Seat = Seat.RIGHT,
         result_cards: tuple[str, ...] = ("3D",),
+        *, pipeline=None, include_fault: bool = False,
     ) -> None:
         self.started = False
         self.closed = False
@@ -204,6 +205,8 @@ class DelayedVisionRuntime:
         self.calls = 0
         self.result_seat = result_seat
         self.result_cards = result_cards
+        self.pipeline = pipeline
+        self.include_fault = include_fault
 
     def start(self, *, timeout=10.0): self.started = True
 
@@ -215,8 +218,10 @@ class DelayedVisionRuntime:
         completed = ()
         if self.pending is not None:
             old_frame, old_version, old_expected, old_sequence = self.pending
-            scripted = ScriptedVision()
-            scripted.queue(self.result_seat, ActionKind.PLAY, self.result_cards)
+            scripted = self.pipeline
+            if scripted is None:
+                scripted = ScriptedVision()
+                scripted.queue(self.result_seat, ActionKind.PLAY, self.result_cards)
             pipeline = scripted.process_frame(
                 object(), frame=old_frame, version=old_version,
                 wild_rank="2", expected_seat=old_expected, now_ms=frame.captured_ms,
@@ -227,6 +232,12 @@ class DelayedVisionRuntime:
                 pipeline_result=pipeline,
             ),)
         self.pending = (frame, version, expected_seat, request_sequence)
+        if self.include_fault:
+            completed += (VisionRuntimeResult(
+                VisionRequestIdentity(frame, version, request_sequence),
+                VisionRuntimeStatus.WORKER_ERROR, 1, 202,
+                failure_code="test_worker_fault", message="receipt fault regression",
+            ),)
         return completed
 
     def drain_results(self): return ()
@@ -681,11 +692,88 @@ def test_async_vision_consumes_completed_prior_frame_under_current_flow_version(
     clock.value = 100
     first = live.analyze_frame(object(), monotonic_ms=100)
     assert not first.snapshot.play_history
+    assert first.processed_capture_seq is None
+    assert first.processed_captured_ms is None
     clock.value = 200
     completed = live.analyze_frame(object(), monotonic_ms=200)
+    assert completed.processed_capture_seq == 1
+    assert completed.processed_captured_ms == 100  # consumed previous frame, not the new submission
     assert completed.snapshot.current_player == "opposite"
     assert completed.snapshot.play_history[-1].cards == ("3D",)
     assert visions[0].started
+
+
+@pytest.mark.parametrize("include_fault", [False, True], ids=["completed", "faulted"])
+@pytest.mark.parametrize("branch", ["normal", "correction", "opening", "opening_wait", "terminal"])
+def test_processed_receipt_follows_consumed_frame_on_real_branches(branch, include_fault):
+    """Use actual branch logic and async receipts, never the newly submitted frame."""
+    store, recorder, clock = MemoryStore(), MemoryRecorder(), ManualClock()
+    store.start({"schema": "test.live-v2/1"})
+    if branch == "correction":
+        pipeline = VisualCorrectionVision()
+        # Its initial action ends at sequence 2; correction needs two newer reads.
+        completed_frames = 4
+    elif branch == "terminal":
+        pipeline = TerminalVision()
+        completed_frames = 2
+    else:
+        pipeline = ScriptedVision()
+        if branch != "opening_wait":
+            pipeline.queue(Seat.RIGHT, ActionKind.PLAY, ("3D",))
+        completed_frames = 1
+    vision = DelayedVisionRuntime(pipeline=pipeline, include_fault=include_fault)
+    live = LiveV2SessionRuntime(
+        rule_session=ProductionRuleSession(store), store=store, recorder=recorder,
+        recognition_service=FakeRecognition(), vision_factory=lambda _version: vision,
+        advice_runtime_factory=lambda _version: FakeAdviceRuntime(),
+        processing_clock_ms=clock, local_hint_window_ms=0,
+    )
+    _LIVE_RUNTIMES.append(live)
+    live.start(
+        round_level="2", hand=HAND,
+        lead_player=None if branch in {"opening", "opening_wait"} else "right",
+        monotonic_ms=0,
+    )
+    live.bind_capture_generation(1)
+
+    clock.value = 100
+    pending = live.analyze_frame(object(), monotonic_ms=100)
+    # Covers both an empty poll and faults without any completed frame.
+    assert pending.processed_capture_seq is None
+    assert pending.processed_captured_ms is None
+    for sequence in range(2, completed_frames + 2):
+        clock.value = sequence * 100
+        update = live.analyze_frame(object(), monotonic_ms=clock.value)
+
+    # Assert the real semantic branch was reached before checking its receipt.
+    if branch == "correction":
+        assert update.event and update.event.event_type == "event_correction"
+        assert update.snapshot.play_history[-1].cards == ("5S",)
+    elif branch == "opening":
+        assert update.snapshot.lead_player == "right"
+        assert len(update.snapshot.play_history) == 1
+        assert update.event and update.event.event_type == "player_played"
+        assert update.status == "running"
+    elif branch == "opening_wait":
+        assert update.status == "waiting_lead"
+        assert update.block_reason == "opening_waiting_for_unique_visual_action"
+        assert not update.snapshot.play_history
+    elif branch == "terminal":
+        assert update.status == "running"
+        assert update.block_reason == "terminal_suspected_inconsistent_rule_state"
+        assert update.event is None
+    else:
+        assert update.event and update.event.event_type == "player_played"
+        assert update.snapshot.play_history[-1].cards == ("3D",)
+
+    if include_fault:
+        # A mixed completed-result/fault batch must not manufacture a clean receipt.
+        assert update.processed_capture_seq is None
+        assert update.processed_captured_ms is None
+    else:
+        assert update.processed_capture_seq == completed_frames
+        assert update.processed_captured_ms == completed_frames * 100
+        assert update.processed_captured_ms != clock.value
 
 
 def test_async_candidate_overlapping_committed_boundary_is_dropped() -> None:
